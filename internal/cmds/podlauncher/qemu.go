@@ -55,8 +55,9 @@ type Config struct {
 	Interface string
 	// Forwards are the guest TCP ports published in user mode.
 	Forwards []Forward
-	// QuoteSocket is the host quoting service's unix socket (TDX). QEMU needs
-	// it to answer the guest's GetQuote; without it only the vsock path works.
+	// QuoteSocket is where QEMU reaches the host quoting service to answer the
+	// guest's GetQuote (TDX): a unix socket path, or vsock:<cid>:<port>.
+	// Without it the guest can only get a quote over its own vsock device.
 	QuoteSocket string
 	// VsockCID gives the guest a vsock device with this context id, which the
 	// guest's quote path prefers. Zero attaches none.
@@ -116,6 +117,25 @@ func (f Forward) validate() error {
 	return nil
 }
 
+// quoteSocketAddress renders --quote-socket as a QEMU SocketAddress. Intel's
+// qgsd listens on a unix socket, on vsock, or on both, depending on its
+// version and configuration.
+func quoteSocketAddress(s string) (map[string]string, error) {
+	if rest, ok := strings.CutPrefix(s, "vsock:"); ok {
+		cid, port, found := strings.Cut(rest, ":")
+		c, errCID := strconv.ParseUint(cid, 10, 32)
+		p, errPort := strconv.ParseUint(port, 10, 32)
+		if !found || errCID != nil || errPort != nil || p == 0 {
+			return nil, fmt.Errorf("--quote-socket %q must be vsock:<cid>:<port>", s)
+		}
+		return map[string]string{"type": "vsock", "cid": strconv.FormatUint(c, 10), "port": strconv.FormatUint(p, 10)}, nil
+	}
+	if !filepath.IsAbs(s) || strings.Contains(s, ",") {
+		return nil, fmt.Errorf("--quote-socket must be an absolute path with no comma, or vsock:<cid>:<port>")
+	}
+	return map[string]string{"type": "unix", "path": s}, nil
+}
+
 // tapDevice is a tap the launcher opened. QEMU inherits it as descriptor 3,
 // and vhost-net as descriptor 4, so the VMM itself needs no network privilege.
 type tapDevice struct {
@@ -143,8 +163,10 @@ func (c *Config) validate() error {
 			return fmt.Errorf("%s %q contains a comma, which QEMU would read as an option separator", name, path)
 		}
 	}
-	if c.QuoteSocket != "" && (strings.Contains(c.QuoteSocket, ",") || !filepath.IsAbs(c.QuoteSocket)) {
-		return fmt.Errorf("--quote-socket must be an absolute path with no comma")
+	if c.QuoteSocket != "" {
+		if _, err := quoteSocketAddress(c.QuoteSocket); err != nil {
+			return err
+		}
 	}
 	if c.VCPUs < 1 || c.VCPUs > 256 {
 		return fmt.Errorf("--vcpus must be 1..256")
@@ -204,7 +226,11 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 	case "tdx":
 		object := map[string]any{"qom-type": "tdx-guest", "id": "tee0"}
 		if c.QuoteSocket != "" {
-			object["quote-generation-socket"] = map[string]string{"type": "unix", "path": c.QuoteSocket}
+			address, err := quoteSocketAddress(c.QuoteSocket)
+			if err != nil {
+				return nil, err
+			}
+			object["quote-generation-socket"] = address
 		}
 		encoded, err := json.Marshal(object)
 		if err != nil {

@@ -75,7 +75,7 @@ misbehaves produces a guest that will not boot or will not verify.`,
 	f.StringVar(&cfg.Interface, "interface", "eth0", "pod interface the guest takes over (--network tap)")
 	f.StringArrayVar(&ports, "port", []string{strconv.Itoa(podcvm.AgentPort)},
 		"guest TCP port to publish (--network user): [address:]host:guest, or one port for both")
-	f.StringVar(&cfg.QuoteSocket, "quote-socket", "", "host quoting service unix socket (TDX)")
+	f.StringVar(&cfg.QuoteSocket, "quote-socket", "", "host quoting service (TDX): a unix socket path, or vsock:<cid>:<port>")
 	f.Uint32Var(&cfg.VsockCID, "vsock-cid", 0, "guest vsock context id, for the fast quote path; 0 attaches no vsock device")
 	f.BoolVar(&cfg.Console, "console", false, "attach a guest console to this process's output (dev images; a locked image prints nothing)")
 	for _, name := range []string{"platform", "image-dir", "launch-dir", "work-dir"} {

@@ -85,6 +85,20 @@ func TestQEMUArgsTap(t *testing.T) {
 	}
 }
 
+func TestQuoteSocketForms(t *testing.T) {
+	cfg := baseConfig()
+	cfg.QuoteSocket = "vsock:2:4050"
+	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.Contains(args, `"quote-generation-socket":{"cid":"2","port":"4050","type":"vsock"}`) {
+		t.Fatalf("vsock quoting service not rendered:\n%s", args)
+	}
+	for _, bad := range []string{"vsock:2", "vsock:two:4050", "vsock:2:0", "vsock:2:port", "vsock::4050", "unix:/run/qgs.socket", "qgs.socket"} {
+		cfg.QuoteSocket = bad
+		if err := cfg.validate(); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
 func TestParseForward(t *testing.T) {
 	for spec, want := range map[string]Forward{
 		"8443":                 {Host: 8443, Guest: 8443},

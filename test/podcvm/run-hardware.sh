@@ -18,7 +18,8 @@
 #                         manifest.json. Required.
 #   C8S_POD_PLATFORM      tdx (default) or snp
 #   C8S_POD_QEMU          QEMU binary (default qemu-system-x86_64)
-#   C8S_POD_QUOTE_SOCKET  host quoting service socket (default
+#   C8S_POD_QUOTE_SOCKET  host quoting service: a unix socket path or
+#                         vsock:<cid>:<port> (default
 #                         /var/run/tdx-qgs/qgs.socket when it exists)
 #   C8S_POD_VSOCK_CID     guest vsock CID, enabling the fast quote path
 #   C8S_POD_PORT          local port published for the agent (default 18443)
