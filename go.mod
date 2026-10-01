@@ -17,6 +17,7 @@ require (
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/go-logr/logr v1.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/google/go-configfs-tsm v0.3.3
 	github.com/google/go-sev-guest v0.15.0
 	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d
 	github.com/klauspost/compress v1.20.0
