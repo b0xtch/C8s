@@ -40,18 +40,12 @@ func load(cfg LoadConfig) error {
 			return err
 		}
 	}
-	raw, err := os.ReadFile(filepath.Join(cfg.SourceDir, podcvm.HostConfigFile))
-	if os.IsNotExist(err) {
-		return nil // no host request: the image's DHCP default applies
-	}
+	host, err := podcvm.ReadHostConfig(filepath.Join(cfg.SourceDir, podcvm.HostConfigFile))
 	if err != nil {
 		return err
 	}
-	host, err := podcvm.ParseHostConfig(raw)
-	if err != nil {
-		return err
-	}
-	if host.Network == nil {
+	// No host request: the image's DHCP default applies.
+	if host == nil || host.Network == nil {
 		return nil
 	}
 	if err := os.MkdirAll(cfg.NetworkDir, 0o755); err != nil {
@@ -60,8 +54,9 @@ func load(cfg LoadConfig) error {
 	return fileutil.WriteAtomic(filepath.Join(cfg.NetworkDir, networkUnitName), []byte(networkUnit(host.Network)), 0o644)
 }
 
-// networkUnit renders a validated host network request. Every value was
-// parsed as an address or an integer, so none can carry a second directive.
+// networkUnit renders a validated host network request. Validation rewrote
+// every value from its parsed form, an address or an integer, so none can
+// carry a second directive.
 func networkUnit(n *podcvm.HostNetwork) string {
 	var b strings.Builder
 	b.WriteString("# Rendered by c8s pod-agent load from the host's unsigned host.json.\n")

@@ -60,6 +60,21 @@ func TestLoadOnLinkGateway(t *testing.T) {
 	}
 }
 
+// What reaches the unit is the parsed value in canonical form, whatever
+// spelling the host chose.
+func TestLoadRendersCanonicalAddresses(t *testing.T) {
+	cfg := loadFixture(t, `{"network":{"address":"FD00:0:0:0:0:0:0:2/64","gateway":"FD00:0:0:0:0:0:0:1","dns":["FD00::0:53"]}}`)
+	if err := load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	unit, _ := os.ReadFile(filepath.Join(cfg.NetworkDir, networkUnitName))
+	for _, want := range []string{"Address=fd00::2/64\n", "Gateway=fd00::1\n", "DNS=fd00::53\n"} {
+		if !strings.Contains(string(unit), want) {
+			t.Fatalf("network unit lacks %q:\n%s", want, unit)
+		}
+	}
+}
+
 func TestLoadWithoutANetworkRequestLeavesDHCP(t *testing.T) {
 	for name, host := range map[string]string{"no host.json": "", "empty request": `{}`} {
 		cfg := loadFixture(t, host)
@@ -81,11 +96,16 @@ func TestLoadRejectsHostileHostConfig(t *testing.T) {
 		"gateway outside prefix":  `{"network":{"address":"10.0.0.2/24","gateway":"192.168.1.1"}}`,
 		"gateway of other family": `{"network":{"address":"10.0.0.2/24","gateway":"fe80::1","on_link":true}}`,
 		"dns injection":           `{"network":{"address":"10.0.0.2/24","dns":["1.1.1.1\n[Route]"]}}`,
-		"too many resolvers":      `{"network":{"address":"10.0.0.2/24","dns":["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"]}}`,
-		"absurd mtu":              `{"network":{"address":"10.0.0.2/24","mtu":9000000}}`,
-		"unknown field":           `{"network":{"address":"10.0.0.2/24"},"exec":"/bin/sh"}`,
-		"trailing document":       `{}{"network":{"address":"10.0.0.2/24"}}`,
-		"multicast address":       `{"network":{"address":"224.0.0.1/24"}}`,
+		// netip takes any bytes after "%" as the zone of an IPv6 address.
+		"directive in a resolver's zone": `{"network":{"address":"10.0.0.2/24","dns":["fe80::1%x\nIPv4RouteLocalnet=yes"]}}`,
+		"directive in a gateway's zone":  `{"network":{"address":"fd00::2/64","gateway":"fe80::1%eth0\nIPForward=yes","on_link":true}}`,
+		"zoned resolver":                 `{"network":{"address":"10.0.0.2/24","dns":["fe80::1%eth0"]}}`,
+		"oversized":                      `{"network":{"address":"10.0.0.2/24"},"pad":"` + strings.Repeat("x", 17*1024) + `"}`,
+		"too many resolvers":             `{"network":{"address":"10.0.0.2/24","dns":["1.1.1.1","1.0.0.1","8.8.8.8","8.8.4.4"]}}`,
+		"absurd mtu":                     `{"network":{"address":"10.0.0.2/24","mtu":9000000}}`,
+		"unknown field":                  `{"network":{"address":"10.0.0.2/24"},"exec":"/bin/sh"}`,
+		"trailing document":              `{}{"network":{"address":"10.0.0.2/24"}}`,
+		"multicast address":              `{"network":{"address":"224.0.0.1/24"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := loadFixture(t, host)

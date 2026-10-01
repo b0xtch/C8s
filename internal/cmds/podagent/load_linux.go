@@ -32,7 +32,9 @@ func Load(cfg LoadConfig) error {
 		return err
 	}
 	defer os.Remove(mountpoint)
-	flags := uintptr(unix.MS_RDONLY | unix.MS_NODEV | unix.MS_NOSUID | unix.MS_NOEXEC)
+	// NOSYMFOLLOW: Rock Ridge can carry symlinks, and a host-made link named
+	// launch.yaml must not make this root process read a file of the guest's.
+	flags := uintptr(unix.MS_RDONLY | unix.MS_NODEV | unix.MS_NOSUID | unix.MS_NOEXEC | unix.MS_NOSYMFOLLOW)
 	if err := unix.Mount(device, mountpoint, "iso9660", flags, ""); err != nil {
 		return fmt.Errorf("mount %s: %w", device, err)
 	}
