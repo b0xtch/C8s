@@ -1,0 +1,94 @@
+# One worker pod as its own TDX confidential VM. See docs/pod-cvm.md.
+#
+# Before applying:
+#
+#   c8s pod launch-config new --out sbx-1 --image-manifest manifest.json \
+#     --tenant acme.user-42 --sandbox sbx-1 --credential test-token
+#   kubectl create configmap sbx-1-launch --from-file=sbx-1/opkeydata
+#
+# The opkeydata directory carries no secret, so a ConfigMap is the right
+# object for it. launch.key stays with whoever verifies the guest.
+#
+# The device resources below are the ones KubeVirt's device plugin publishes.
+# They give the container the device nodes without making it privileged.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sbx-1
+  labels:
+    confidential.ai/pod-cvm: "true"
+spec:
+  # A guest that exits has lost its instance key. The pod restarts and is
+  # attested afresh.
+  restartPolicy: Always
+  terminationGracePeriodSeconds: 30
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  containers:
+    - name: launcher
+      image: ghcr.io/confidential-dot-ai/c8s-pod-launcher:latest
+      args:
+        - --platform=tdx
+        - --image-dir=/image
+        - --launch-dir=/launch
+        - --work-dir=/work
+        - --name=sbx-1
+        - --vcpus=2
+        - --memory=2G
+        - --scratch=8G
+        - --quote-socket=/run/tdx-qgs/qgs.socket
+        # Must be unique on the node. Allocation is the operator's for now.
+        - --vsock-cid=4243
+      ports:
+        - name: agent
+          containerPort: 8443
+      securityContext:
+        # Root owns the device nodes it opens. Every capability is dropped
+        # except the one that builds the tap and its redirects in the pod's
+        # own network namespace.
+        runAsUser: 0
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+          add: ["NET_ADMIN"]
+      resources:
+        requests:
+          cpu: "2"
+          memory: 2560Mi
+        limits:
+          # Guest memory plus the VMM's own.
+          memory: 2560Mi
+          devices.kubevirt.io/kvm: "1"
+          devices.kubevirt.io/tun: "1"
+          devices.kubevirt.io/vhost-net: "1"
+          devices.kubevirt.io/vhost-vsock: "1"
+      volumeMounts:
+        - name: image
+          mountPath: /image
+          readOnly: true
+        - name: launch
+          mountPath: /launch
+          readOnly: true
+        - name: work
+          mountPath: /work
+        - name: qgs
+          mountPath: /run/tdx-qgs
+  volumes:
+    # The measured guest image, published on the node. One copy serves every
+    # pod: the launcher attaches it read-only.
+    - name: image
+      hostPath:
+        path: /var/lib/c8s/pod-images/c8s-pod
+        type: Directory
+    - name: launch
+      configMap:
+        name: sbx-1-launch
+    # Holds the launch disk and the scratch disk, which is ciphertext under a
+    # key that exists only in guest memory.
+    - name: work
+      emptyDir: {}
+    - name: qgs
+      hostPath:
+        path: /run/tdx-qgs
+        type: Directory
