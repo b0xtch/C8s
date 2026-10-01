@@ -347,8 +347,9 @@ func newCredentialPutCmd() *cobra.Command {
 		Use:   "put <name>",
 		Short: "Release one credential into a pod CVM, after attesting it",
 		Long: `Attest the guest for a fresh nonce and, only if it verifies with its
-workload admitted, send the value over that same attested connection. The
-value is read from stdin or --from-file and stored exactly as read.
+workload admitted, send the value on a connection that terminates at the key
+it attested. The value is read from stdin or --from-file and stored exactly
+as read.
 
 Exit codes: 0 released, 1 usage error, 2 verification or policy failed
 (nothing was sent), 3 the guest could not be reached or refused the write.`,
