@@ -407,7 +407,7 @@ with a local PCCS. Guest: 2 vCPUs, 2 GiB. Each number is a single run.
 |---|---|
 | `run-hardware.sh`, direct launch | all six steps pass |
 | `run-kubernetes.sh`, guest in a pod on the pod's own address | all four steps pass |
-| Hardware suite | 26 tests pass in each collateral mode, in both runs |
+| Hardware suite | 5 tests and their 21 subtests pass in each collateral mode, in both runs |
 | Platform TCB from Intel collateral | platform, TDX module and quoting enclave all UpToDate, no advisories |
 | Image built twice from the same inputs | identical `disk.raw` and `uki.efi`, identical MRTD, RTMR[1], RTMR[2] |
 
@@ -421,11 +421,17 @@ with a local PCCS. Guest: 2 vCPUs, 2 GiB. Each number is a single run.
 | One authenticated command, on an attested connection | 5 ms to 10 ms round trip |
 | `c8s pod exec true` from a new process, collateral skipped | 54 ms |
 | Guest memory in use when idle | 97 MiB of 1848 MiB |
-| VMM resident memory with the guest idle | 185 MiB, which excludes the guest's private memory |
+| VMM resident memory with the guest idle | 180 MiB, which excludes the guest's private memory |
 
 About ten of the thirteen seconds pass before the guest kernel starts: QEMU
-builds the TD, and the firmware loads and measures a 45 MiB UKI. That is where
-cold start has to be won.
+builds the TD, and the firmware loads and measures a 43 MiB UKI, 33 MiB of it
+initrd. That is where cold start has to be won.
+
+The binaries under test were built from the commit that added the resolved
+kernel configuration. The commits after it change a test comment, one line of
+the run script's summary, and this document. The launcher image in the
+Kubernetes run was built before the TCB evaluation was added, which the
+launcher does not use.
 
 Found on hardware and fixed: the image build skipped creating the workload
 user without failing, so the first guest powered itself off. The build now
