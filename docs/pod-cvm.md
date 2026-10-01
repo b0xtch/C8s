@@ -24,7 +24,8 @@ image-policy and RA-TLS contracts the node image already uses.
 | Workload from an OCI image | schema and measurement order in place, no in-guest runtime yet |
 
 Anything not marked as run on hardware is unverified there. The hardware suite
-is `test/podcvm` (build tag `podcvm_hardware`).
+is `test/podcvm` (build tag `podcvm_hardware`), and `test/podcvm/run-hardware.sh`
+boots the guests it needs and runs it. See [Hardware tests](#hardware-tests).
 
 ## Shape
 
@@ -315,6 +316,25 @@ a confos build of the `c8s-pod` profile, with `kernel/pod.config` merged into
 the guest kernel (vsock, for the millisecond quote path). `C8S_DEV=1` builds a
 debug image with a serial console and host-visible logs, at a different
 measurement.
+
+## Hardware tests
+
+```sh
+C8S_POD_IMAGE_DIR=/path/to/output/c8s-pod test/podcvm/run-hardware.sh
+```
+
+The script boots three guests in turn on QEMU's user-mode network, so it needs
+no cluster:
+
+| Guest | What it shows |
+|---|---|
+| a, the bundle under test | The suite passes once per collateral mode: attest, release, exec, 13 evidence rejection cases on real evidence, wrong callers and policies, exec idempotency, and the tenant probes. |
+| b, the same image under another launch key | A verifier holding bundle a refuses it, after a control shows it verifies under its own bundle. |
+| c, a document signed for another image | The guest refuses to stage and powers off without serving its API. |
+
+Boot refusals for a tampered document, a missing signature and a swapped key
+are covered against the simulated TD only: the launcher checks a bundle before
+it boots one, so the script cannot hand a guest those inputs.
 
 ## Known gaps
 
