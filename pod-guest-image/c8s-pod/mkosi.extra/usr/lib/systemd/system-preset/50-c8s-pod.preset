@@ -1,0 +1,4 @@
+# Presets are applied at image build time.
+enable c8s-pod-load.service
+enable c8s-pod-agent.service
+enable systemd-timesyncd.service

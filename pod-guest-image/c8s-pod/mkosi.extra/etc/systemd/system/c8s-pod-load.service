@@ -1,0 +1,17 @@
+[Unit]
+Description=Load the pod CVM launch files and the host's network request
+Documentation=https://github.com/confidential-dot-ai/c8s/blob/main/docs/pod-cvm.md
+# Before networkd reads its configuration, so a static address applies on the
+# first link-up with no DHCP round trip.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target systemd-networkd.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/c8s pod-agent load
+
+[Install]
+WantedBy=multi-user.target

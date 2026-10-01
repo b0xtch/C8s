@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# mkosi sync hook for the c8s-pod profile. It renders the one platform
+# dependent bit, the agent's --platform, from the build's sync-input. There
+# is no default: an image that guessed its TEE would refuse to stage on the
+# other one, and that failure belongs at build time.
+set -euo pipefail
+
+STAGE_DIR="$SRCDIR/mkosi.local/mkosi.extra"
+SYNC_INPUTS="$SRCDIR/mkosi.local/.confos-sync-inputs"
+PLATFORM=$(cat "$SYNC_INPUTS/platform" 2>/dev/null || true)
+case "$PLATFORM" in
+    tdx|snp) ;;
+    *) echo "c8s-pod sync: FATAL platform sync-input must be tdx or snp, got '${PLATFORM}'" >&2; exit 1 ;;
+esac
+[ -x "$STAGE_DIR/usr/local/bin/c8s" ] \
+    || { echo "c8s-pod sync: FATAL no c8s binary staged at usr/local/bin/c8s (build with pod-guest-image/build)" >&2; exit 1; }
+
+mkdir -p "$STAGE_DIR/etc/systemd/system/c8s-pod-agent.service.d"
+printf '[Service]\nEnvironment=C8S_POD_PLATFORM=%s\n' "$PLATFORM" \
+    > "$STAGE_DIR/etc/systemd/system/c8s-pod-agent.service.d/10-platform.conf"
+
+# Dev builds forward the journal to the console the launcher can attach.
+DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
+if [ "$DEV" = 1 ]; then
+    mkdir -p "$STAGE_DIR/etc/systemd/journald.conf.d"
+    printf '# DEV build: guest logs are host-visible. Never ship.\n[Journal]\nForwardToConsole=yes\nMaxLevelConsole=info\n' \
+        > "$STAGE_DIR/etc/systemd/journald.conf.d/90-dev-console.conf"
+fi

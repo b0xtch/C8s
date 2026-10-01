@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Build the c8s pod guest image from THIS repo's profile, with a
+# confidential-os-builder checkout as the builder (same division of labour
+# as node-guest-image/build).
+#
+# The in-guest binary is compiled here, from this checkout, and staged into
+# the image, so the measured agent is exactly the source at this commit.
+#
+# Knobs:
+#   C8S_PLATFORM=   REQUIRED. tdx or snp. No default: the agent refuses to
+#                   stage on a TEE other than the one the image was built for.
+#   C8S_DEV=1       debug build: serial console, root autologin on it, and the
+#                   journal forwarded to the console. Different measurement,
+#                   host-readable logs. Never ship. Default name: c8s-pod-dev.
+#   C8S_NAME=...    output name (default c8s-pod -> output/c8s-pod/)
+#   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
+#   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s binary and skip the
+#                   compile. A reproducibility check uses it to prove two
+#                   builds of one binary measure the same.
+#   CONFOS_DIR=...  confos checkout to build with (default: sibling of this
+#                   repo's checkout).
+#
+# Extra args are passed through to `confos build`.
+set -euo pipefail
+case "${C8S_PLATFORM:-}" in
+tdx|snp) ;;
+*)  echo "pod-guest-image/build: C8S_PLATFORM must be tdx or snp, got '${C8S_PLATFORM:-}'" >&2; exit 1 ;;
+esac
+PGI_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(cd "$PGI_DIR/.." && pwd)
+CONFOS_DIR=${CONFOS_DIR:-"$REPO_DIR/../confidential-os-builder"}
+[ -x "$CONFOS_DIR/bin/confos" ] || { echo "pod-guest-image/build: confos checkout not found at $CONFOS_DIR (set CONFOS_DIR)" >&2; exit 1; }
+
+FRAGMENT="$PGI_DIR/kernel/pod.config"
+DEV_PROFILE=()
+if [ "${C8S_DEV:-0}" = 1 ]; then
+    FRAGMENT="$PGI_DIR/kernel/pod-dev.config"
+    DEV_PROFILE=(--profile dev)
+    : "${C8S_NAME:=c8s-pod-dev}"
+fi
+
+if [ -z "${C8S_BINARY:-}" ]; then
+    # -trimpath and an empty build id keep the binary a function of the
+    # source and toolchain alone, so two builds of one commit measure alike.
+    VERSION=$(git -C "$REPO_DIR" describe --tags --always --dirty 2>/dev/null || echo dev)
+    C8S_BINARY="$REPO_DIR/build/c8s-pod"
+    mkdir -p "$REPO_DIR/build"
+    (cd "$REPO_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-buildvcs=false \
+        go build -trimpath -tags c8s_node \
+        -ldflags "-s -w -buildid= -X github.com/confidential-dot-ai/c8s/internal/version.Version=$VERSION" \
+        -o "$C8S_BINARY" ./cmd/c8s)
+fi
+[ -f "$C8S_BINARY" ] || { echo "pod-guest-image/build: C8S_BINARY=$C8S_BINARY is not a file" >&2; exit 1; }
+echo "pod-guest-image/build: staging $(sha256sum "$C8S_BINARY" | cut -d' ' -f1)  $C8S_BINARY"
+
+cd "$CONFOS_DIR"
+install -D -m 0755 "$C8S_BINARY" mkosi/base/mkosi.local/mkosi.extra/usr/local/bin/c8s
+exec bin/confos build "${C8S_NAME:-c8s-pod}" \
+    ${DEV_PROFILE[@]+"${DEV_PROFILE[@]}"} \
+    --profile-dir "$PGI_DIR/c8s-pod" \
+    --sync-input "platform=${C8S_PLATFORM}" \
+    --sync-input "dev=${C8S_DEV:-0}" \
+    --kernel-config-fragment "$FRAGMENT" \
+    --platform "$C8S_PLATFORM" \
+    --memory "${C8S_MEMORY:-1G}" \
+    "$@"

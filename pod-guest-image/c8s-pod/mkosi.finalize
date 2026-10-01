@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+
+# Tenant commands run as an unprivileged user on this root. With no setuid or
+# setgid program left on it, that user has no way up, whatever a command does.
+# Nothing in the image needs one: every service starts as the user it runs as.
+find "$BUILDROOT" -xdev -type f -perm /6000 -exec chmod a-s {} +
+if [ -n "$(find "$BUILDROOT" -xdev -type f -perm /6000 -print -quit)" ]; then
+    echo "c8s-pod finalize: FATAL a setuid or setgid file survived" >&2
+    exit 1
+fi
