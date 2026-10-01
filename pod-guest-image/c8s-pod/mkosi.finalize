@@ -9,3 +9,11 @@ if [ -n "$(find "$BUILDROOT" -xdev -type f -perm /6000 -print -quit)" ]; then
     echo "c8s-pod finalize: FATAL a setuid or setgid file survived" >&2
     exit 1
 fi
+
+# /etc is read-only at run time, so the account must exist now. sysusers
+# reports a user it could not create and carries on; the agent would then
+# refuse to start and the guest would power off on every boot.
+if ! grep -q '^workload:x:2000:2000:' "$BUILDROOT/etc/passwd"; then
+    echo "c8s-pod finalize: FATAL the workload user (2000:2000) is not in /etc/passwd" >&2
+    exit 1
+fi

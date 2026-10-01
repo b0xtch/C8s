@@ -7,6 +7,9 @@ DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target systemd-networkd.service
 Wants=network-pre.target
+# Without the launch files the agent never starts, and a guest with no agent
+# can be neither verified nor driven. Power off so the pod restarts.
+FailureAction=poweroff-force
 
 [Service]
 Type=oneshot
