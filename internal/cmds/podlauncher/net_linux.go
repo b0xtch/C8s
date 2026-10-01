@@ -143,6 +143,12 @@ func interfaceNetwork(link netlink.Link) (*podcvm.HostNetwork, error) {
 		prefix, err := netip.ParsePrefix(out.Address)
 		gw, ok := netip.AddrFromSlice(r.Gw.To4())
 		out.OnLink = err == nil && ok && !prefix.Masked().Contains(gw)
+		// An overlay CNI leaves the link at 1500 and puts the tunnel's smaller
+		// MTU on the route. The guest has one link and one route, so it takes
+		// the smaller value as its link MTU.
+		if r.MTU > 0 && r.MTU < out.MTU {
+			out.MTU = r.MTU
+		}
 		break
 	}
 	if err := (&podcvm.HostConfig{Network: out}).Validate(); err != nil {

@@ -3,7 +3,6 @@ package podlauncher
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -111,14 +110,15 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	// guest; removing it just returns the space.
 	_ = os.Remove(filepath.Join(cfg.WorkDir, scratchFile))
 	_ = os.Remove(filepath.Join(cfg.WorkDir, opkeyISO))
+	uptime := time.Since(started).Round(time.Millisecond).String()
 	if ctx.Err() != nil {
-		log.Info("guest stopped", "uptime", time.Since(started).Round(time.Millisecond))
+		log.Info("guest stopped", "uptime", uptime)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("guest exited after %s: %w", time.Since(started).Round(time.Millisecond), err)
+		return fmt.Errorf("guest exited after %s: %w", uptime, err)
 	}
-	return errors.New("guest exited on its own")
+	return fmt.Errorf("guest exited on its own after %s", uptime)
 }
 
 // imageFiles lists what the platform boots from.

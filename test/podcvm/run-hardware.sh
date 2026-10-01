@@ -22,7 +22,7 @@
 #                         vsock:<cid>:<port> (default
 #                         /var/run/tdx-qgs/qgs.socket when it exists)
 #   C8S_POD_VSOCK_CID     guest vsock CID, enabling the fast quote path
-#   C8S_POD_PORT          local port published for the agent (default 18443)
+#   C8S_POD_PORT          local port published for the agent (default 28443)
 #   C8S_POD_COLLATERAL    collateral modes to run (default "required skip")
 #   C8S_POD_VCPUS, C8S_POD_MEMORY, C8S_POD_SCRATCH   guest shape (2, 2G, 4G)
 #   C8S_POD_BOOT_TIMEOUT  seconds to wait for a guest (default 180)
@@ -40,7 +40,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 image_dir="${C8S_POD_IMAGE_DIR:?set C8S_POD_IMAGE_DIR to the pod guest image directory}"
 platform="${C8S_POD_PLATFORM:-tdx}"
 qemu="${C8S_POD_QEMU:-qemu-system-x86_64}"
-port="${C8S_POD_PORT:-18443}"
+port="${C8S_POD_PORT:-28443}"
 modes="${C8S_POD_COLLATERAL:-required skip}"
 boot_timeout="${C8S_POD_BOOT_TIMEOUT:-180}"
 out="${C8S_POD_OUT:-$(mktemp -d -t c8s-pod-hw.XXXXXX)}"
