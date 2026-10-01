@@ -11,6 +11,8 @@
 // C8S_POD_COLLATERAL selects "required" (default: Intel collateral fetched,
 // TCB must be UpToDate) or "skip". Run it both ways on a new host: a host
 // whose TCB is behind fails "required", and that is a finding about the host.
+// C8S_POD_ACCEPT_TCB (comma-separated, e.g. OutOfDate) then names the statuses
+// to accept, so the rest of the suite still runs with collateral checked.
 package podcvm_test
 
 import (
@@ -66,7 +68,12 @@ func load(t *testing.T) *env {
 	if mode == "" {
 		mode = podcvm.CollateralRequired
 	}
-	engine, err := podcvm.NewEngine(mode)
+	// C8S_POD_ACCEPT_TCB lists TCB statuses the run accepts besides UpToDate.
+	var accept []string
+	if list := os.Getenv("C8S_POD_ACCEPT_TCB"); list != "" {
+		accept = strings.Split(list, ",")
+	}
+	engine, err := podcvm.NewEngine(podcvm.EngineOptions{Collateral: mode, AcceptTCBStatus: accept})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,6 +128,9 @@ func TestHardwareAttestReleaseExec(t *testing.T) {
 		att.Phase, att.Events, att.Result.CollateralVerified)
 	t.Logf("MRTD=%s RTMR3=%v instance_key=sha256:%s", att.Result.Claims.LaunchDigest,
 		att.Result.Claims.PlatformData["rtmr_3"], certutil.CertFingerprint(att.InstanceKey))
+	if finding := podcvm.TCBOf(att.Result); finding != nil {
+		t.Logf("TCB: platform=%s tdx_module=%s quoting_enclave=%s advisories=%v", finding.Platform, finding.Module, finding.QuotingEnclave, finding.Advisories)
+	}
 	if att.Phase != podcvm.PhaseRunning {
 		t.Fatalf("phase = %s", att.Phase)
 	}

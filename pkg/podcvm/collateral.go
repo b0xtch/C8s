@@ -90,6 +90,17 @@ func (r *fetchRecorder) GetContext(ctx context.Context, url string) (map[string]
 	return header, body, nil
 }
 
+// body returns the document this verification was served for url.
+func (r *fetchRecorder) body(url string) ([]byte, bool) {
+	r.mu.Lock()
+	entry, ok := r.fetched[url]
+	r.mu.Unlock()
+	if !ok {
+		entry, ok = r.cache.lookup(url)
+	}
+	return entry.body, ok
+}
+
 // caused reports whether err stems from a fetch this recorder saw fail.
 func (r *fetchRecorder) caused(err error) bool {
 	if err == nil {

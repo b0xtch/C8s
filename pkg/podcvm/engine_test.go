@@ -33,7 +33,7 @@ func realEvidence(t *testing.T) teetypes.AttestationEvidence {
 }
 
 func TestEngineVerifiesRealQuote(t *testing.T) {
-	engine, err := podcvm.NewEngine(podcvm.CollateralSkip)
+	engine, err := podcvm.NewEngine(podcvm.EngineOptions{Collateral: podcvm.CollateralSkip})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestEngineVerifiesRealQuote(t *testing.T) {
 }
 
 func TestEngineRefusesRealQuote(t *testing.T) {
-	engine, err := podcvm.NewEngine(podcvm.CollateralSkip)
+	engine, err := podcvm.NewEngine(podcvm.EngineOptions{Collateral: podcvm.CollateralSkip})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,26 +110,44 @@ func TestEngineRefusesRealQuote(t *testing.T) {
 }
 
 // Collateral verification needs Intel PCS, so it runs only on request. The
-// captured platform's TCB has since been superseded, which is exactly what the
-// strict mode exists to refuse.
-func TestEngineCollateralRequiredRefusesStaleTCB(t *testing.T) {
+// captured platform's TCB has since been superseded: the strict policy must
+// refuse it by name, and a policy that accepts that status must pass and
+// report what it accepted.
+func TestEngineCollateralAgainstIntelPCS(t *testing.T) {
 	if os.Getenv("C8S_TEST_INTEL_PCS") == "" {
 		t.Skip("set C8S_TEST_INTEL_PCS=1 to fetch live Intel collateral")
 	}
-	engine, err := podcvm.NewEngine(podcvm.CollateralRequired)
+	strict, err := podcvm.NewEngine(podcvm.EngineOptions{Collateral: podcvm.CollateralRequired})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = engine.VerifyEvidence(context.Background(), realEvidence(t), realReportData)
+	_, err = strict.VerifyEvidence(context.Background(), realEvidence(t), realReportData)
 	var verdict *podcvm.VerificationError
 	if !errors.As(err, &verdict) {
 		t.Fatalf("want a verification refusal, got %v", err)
 	}
-	t.Logf("strict collateral verdict: %v", err)
+	t.Logf("strict verdict: %v", err)
+
+	tolerant, err := podcvm.NewEngine(podcvm.EngineOptions{
+		Collateral:      podcvm.CollateralRequired,
+		AcceptTCBStatus: []string{"OutOfDate", "OutOfDateConfigurationNeeded", "SWHardeningNeeded", "ConfigurationNeeded", "ConfigurationAndSWHardeningNeeded"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := tolerant.VerifyEvidence(context.Background(), realEvidence(t), realReportData)
+	if err != nil {
+		t.Fatalf("a policy accepting every non-revoked status refused the quote: %v", err)
+	}
+	finding := podcvm.TCBOf(res)
+	if finding == nil || !res.CollateralVerified || finding.UpToDate() {
+		t.Fatalf("finding = %+v, collateral verified = %v: the strict refusal above has no cause", finding, res.CollateralVerified)
+	}
+	t.Logf("finding: %+v", *finding)
 }
 
 func TestNewEngineRejectsUnknownMode(t *testing.T) {
-	if _, err := podcvm.NewEngine("lenient"); err == nil {
+	if _, err := podcvm.NewEngine(podcvm.EngineOptions{Collateral: "lenient"}); err == nil {
 		t.Fatal("accepted an unknown collateral mode")
 	}
 }

@@ -243,11 +243,24 @@ the handshake then proves the image and nothing about who launched the guest,
 so a host could answer an early connection with a guest of the same image that
 it launched itself.
 
-`--collateral required` (the default) also fetches Intel TCB info, QE identity
-and CRLs and refuses any TCB status other than UpToDate. The quote is judged
-offline first, so a quote that does not verify is refused before anything is
-fetched. If Intel PCS cannot be reached, nothing is released and the result is
-"no verdict", since nothing was learned about the evidence.
+`--collateral required` (the default) also fetches Intel's TCB info, QE
+identity and CRLs. The quote is judged offline first, so a quote that does not
+verify is refused before anything is fetched. If Intel PCS cannot be reached,
+nothing is released and the result is "no verdict", since nothing was learned
+about the evidence.
+
+With collateral, three TCB levels are judged, each against Intel's signed
+documents: the platform (CPU microcode and PCE), the TDX module, and the
+quoting enclave. Each must be UpToDate. `--accept-tcb-status` names other
+statuses a policy will take, for example `OutOfDate` on a host that has not
+yet applied a microcode update; `Revoked` cannot be named. The verdict then
+lists each level's status and the Intel advisories that apply.
+
+This package evaluates the levels itself, from the documents go-tdx-guest
+authenticated. The go-tdx-guest version this module pins returns the TDX
+module's level alone once the TD report names a module version, so on its own
+it passes a platform whose microcode is behind whenever the module is
+current. Upstream has since changed that function.
 
 `--collateral skip` stops after the offline checks. The quoting enclave's
 identity is pinned from constants in the verifier, which is what keeps a

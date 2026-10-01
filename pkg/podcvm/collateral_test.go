@@ -166,7 +166,14 @@ func TestForgedQuoteIsRefusedBeforeAnyFetch(t *testing.T) {
 // signer, must be what Intel publishes.
 func TestQuoteOriginIsPinned(t *testing.T) {
 	env, _ := fixture(t)
-	if err := checkTDQuoteOrigin(env.Evidence); err != nil {
+	origin := func(env teetypes.AttestationEvidence) error {
+		quote, err := parseTDQuote(env.Evidence)
+		if err != nil {
+			return err
+		}
+		return checkTDQuoteOrigin(quote)
+	}
+	if err := origin(env); err != nil {
 		t.Fatalf("control: a genuine quote was refused: %v", err)
 	}
 	// Offsets into a v4 quote: 48-byte header, 584-byte TD report body, a
@@ -189,7 +196,7 @@ func TestQuoteOriginIsPinned(t *testing.T) {
 		"TDX module attributes set":      {flipQuote(t, env, body+112), "TDX module attributes"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := checkTDQuoteOrigin(tc.bent.Evidence)
+			err := origin(tc.bent)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want a refusal mentioning %q, got %v", tc.want, err)
 			}

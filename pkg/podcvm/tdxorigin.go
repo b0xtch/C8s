@@ -26,28 +26,33 @@ var (
 
 const tdQEProdID = 2
 
-// checkTDQuoteOrigin requires a TDX quote to come from Intel's TD quoting
-// enclave, running outside debug mode, over a report from an Intel-signed TDX
-// module. It does not judge the enclave's version, which needs collateral.
-func checkTDQuoteOrigin(evidence json.RawMessage) error {
+// parseTDQuote decodes the version 4 quote in bare-metal TDX evidence.
+func parseTDQuote(evidence json.RawMessage) (*pb.QuoteV4, error) {
 	var envelope struct {
 		Quote string `json:"quote"`
 	}
 	if err := json.Unmarshal(evidence, &envelope); err != nil {
-		return fmt.Errorf("TDX evidence: %w", err)
+		return nil, fmt.Errorf("TDX evidence: %w", err)
 	}
 	raw, err := base64.StdEncoding.DecodeString(envelope.Quote)
 	if err != nil {
-		return fmt.Errorf("TDX quote encoding: %w", err)
+		return nil, fmt.Errorf("TDX quote encoding: %w", err)
 	}
 	parsed, err := abi.QuoteToProto(raw)
 	if err != nil {
-		return fmt.Errorf("TDX quote: %w", err)
+		return nil, fmt.Errorf("TDX quote: %w", err)
 	}
 	quote, ok := parsed.(*pb.QuoteV4)
 	if !ok {
-		return fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
+		return nil, fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
 	}
+	return quote, nil
+}
+
+// checkTDQuoteOrigin requires a TDX quote to come from Intel's TD quoting
+// enclave, running outside debug mode, over a report from an Intel-signed TDX
+// module. It does not judge the enclave's version, which needs collateral.
+func checkTDQuoteOrigin(quote *pb.QuoteV4) error {
 	qe := quote.GetSignedData().GetCertificationData().GetQeReportCertificationData().GetQeReport()
 	if qe == nil {
 		return errors.New("TDX quote carries no quoting enclave report")

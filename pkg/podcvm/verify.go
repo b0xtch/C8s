@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	"github.com/google/go-tdx-guest/pcs"
+	tdxverify "github.com/google/go-tdx-guest/verify"
 	"github.com/google/go-tdx-guest/verify/trust"
 
-	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
@@ -76,8 +78,9 @@ type Engine interface {
 type Collateral string
 
 const (
-	// CollateralRequired fetches Intel collateral and CRLs and refuses any TDX
-	// TCB status other than UpToDate. This is the release-grade setting.
+	// CollateralRequired fetches Intel's TCB info, QE identity and CRLs and
+	// judges the platform, the TDX module and the quoting enclave against
+	// them. Each must be UpToDate unless the options accept another status.
 	CollateralRequired Collateral = "required"
 	// CollateralSkip verifies the quote signature and PCK chain against the
 	// pinned Intel root, and the quoting enclave against Intel's pinned
@@ -86,22 +89,43 @@ const (
 	CollateralSkip Collateral = "skip"
 )
 
+// EngineOptions configures the in-process verifier.
+type EngineOptions struct {
+	Collateral Collateral
+	// AcceptTCBStatus names Intel TCB statuses, besides UpToDate, that the
+	// platform, its TDX module or its quoting enclave may have. It applies with
+	// CollateralRequired only. Revoked cannot be accepted.
+	AcceptTCBStatus []string
+}
+
 type dcapEngine struct {
 	collateral Collateral
+	accept     map[string]bool
 	cache      *collateralCache
 	fetch      trust.HTTPSGetter
 }
 
-// NewEngine returns the in-process verifier (attestation-go), the same engine
-// `c8s verify` uses.
-func NewEngine(collateral Collateral) (Engine, error) {
-	switch collateral {
+// NewEngine returns the in-process verifier, built on attestation-go and
+// go-tdx-guest like `c8s verify`.
+func NewEngine(opts EngineOptions) (Engine, error) {
+	switch opts.Collateral {
 	case CollateralRequired, CollateralSkip:
 	default:
 		return nil, fmt.Errorf("collateral mode must be %q or %q", CollateralRequired, CollateralSkip)
 	}
+	accept := map[string]bool{}
+	for _, status := range opts.AcceptTCBStatus {
+		if !slices.Contains(acceptableTCBStatuses, status) {
+			return nil, fmt.Errorf("TCB status %q cannot be accepted: choose from %s", status, strings.Join(acceptableTCBStatuses, ", "))
+		}
+		accept[status] = true
+	}
+	if len(accept) > 0 && opts.Collateral != CollateralRequired {
+		return nil, errors.New("accepting a TCB status needs collateral: without it no status is known")
+	}
 	return &dcapEngine{
-		collateral: collateral,
+		collateral: opts.Collateral,
+		accept:     accept,
 		cache:      newCollateralCache(),
 		fetch: &trust.RetryHTTPSGetter{
 			Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: &trust.SimpleHTTPSGetter{},
@@ -145,6 +169,18 @@ func (e *dcapEngine) VerifyEvidence(ctx context.Context, env teetypes.Attestatio
 	return res, nil
 }
 
+// tcbClaim is where the engine records the TCB finding in a result's claims.
+const tcbClaim = "c8s_tcb"
+
+// TCBOf returns the TCB finding of a result verified with collateral, or nil.
+func TCBOf(res *teetypes.VerificationResult) *TCBFinding {
+	if res == nil || res.Claims.PlatformData == nil {
+		return nil
+	}
+	finding, _ := res.Claims.PlatformData[tcbClaim].(*TCBFinding)
+	return finding
+}
+
 // verifyTDX judges the quote offline first: signature, PCK chain, binding and
 // the quoting enclave's identity. Only a quote that passed is worth a fetch,
 // because the collateral lookup is keyed on fields of the PCK certificate, and
@@ -154,28 +190,65 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	if err := checkTDQuoteOrigin(env.Evidence); err != nil {
+	quote, err := parseTDQuote(env.Evidence)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if err := checkTDQuoteOrigin(quote); err != nil {
 		return nil, &VerificationError{Err: err}
 	}
 	if e.collateral != CollateralRequired {
 		return res, nil
 	}
+
+	// go-tdx-guest authenticates the collateral (Intel's signing chains, the
+	// validity windows, the CRLs) and checks the PCK chain against the CRLs.
+	// Its own TCB verdict is not used: see evaluateTDXTCB.
 	fetches := &fetchRecorder{cache: e.cache, inner: e.fetch}
-	res, err = teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{
-		TDX: tdx.Options{GetCollateral: true, CheckRevocations: true, Getter: fetches},
-	})
+	err = tdxverify.TdxQuoteContext(ctx, quote, &tdxverify.Options{GetCollateral: true, CheckRevocations: true, Getter: fetches})
 	// Intel PCS being unreachable says nothing about the evidence.
 	if fetches.caused(err) {
 		return nil, fmt.Errorf("TDX collateral unavailable: %w", err)
 	}
+	// The TCB status check is the last thing go-tdx-guest does with each
+	// document, so a failure there still means the documents are authentic.
+	if err != nil && !strings.Contains(err.Error(), "failed TCB status check") {
+		return nil, &VerificationError{Err: err}
+	}
+	chain, err := tdxverify.ExtractChainFromQuote(quote)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	if !res.CollateralVerified {
-		return nil, refuse("TDX collateral was required but not verified")
+	exts, err := pcs.PckCertificateExtensions(chain.PCKCertificate)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	tcbInfo, haveTCB := fetches.body(pcs.TcbInfoURL(exts.FMSPC))
+	qeIdentity, haveQE := fetches.body(pcs.QeIdentityURL())
+	if !haveTCB || !haveQE {
+		return nil, errors.New("TDX collateral was verified but its documents are not at hand")
+	}
+	finding, err := evaluateTDXTCB(quote, tcbInfo, qeIdentity)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	for _, c := range finding.components() {
+		switch {
+		case c.status == TCBUpToDate:
+		case c.status == TCBRevoked:
+			return nil, refuse("%s TCB level is revoked", c.name)
+		case !e.accept[c.status]:
+			return nil, refuse("%s TCB status is %s, which this policy does not accept (advisories: %s)",
+				c.name, c.status, strings.Join(finding.Advisories, ", "))
+		}
 	}
 	// Only collateral that carried a verification to success is worth keeping.
 	fetches.commit()
+	res.CollateralVerified = true
+	if res.Claims.PlatformData == nil {
+		res.Claims.PlatformData = map[string]any{}
+	}
+	res.Claims.PlatformData[tcbClaim] = finding
 	return res, nil
 }
 

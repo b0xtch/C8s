@@ -170,6 +170,7 @@ type trust struct {
 	sandbox       string
 	key           string
 	collateral    string
+	acceptTCB     []string
 	allowStaged   bool
 	timeout       time.Duration
 	engineForTest podcvm.Engine
@@ -185,7 +186,9 @@ func (t *trust) register(cmd *cobra.Command) {
 	f.StringVar(&t.sandbox, "sandbox", "", "sandbox the guest must be")
 	f.StringVar(&t.key, "key", "", "private key that signs requests (default <bundle>/launch.key)")
 	f.StringVar(&t.collateral, "collateral", string(podcvm.CollateralRequired),
-		"required: fetch Intel collateral and refuse any TCB status but UpToDate; skip: check the quote signature, the PCK chain and the quoting enclave identity only")
+		"required: fetch Intel collateral and require the platform, the TDX module and the quoting enclave to be UpToDate; skip: check the quote signature, the PCK chain and the quoting enclave identity only")
+	f.StringSliceVar(&t.acceptTCB, "accept-tcb-status", nil,
+		"with --collateral required: Intel TCB statuses to accept besides UpToDate, e.g. OutOfDate or SWHardeningNeeded (Revoked is never accepted)")
 	f.DurationVar(&t.timeout, "timeout", 2*time.Minute, "overall deadline")
 	for _, name := range []string{"url", "image-manifest"} {
 		_ = cmd.MarkFlagRequired(name)
@@ -236,7 +239,8 @@ func (t *trust) client() (*podcvm.Client, error) {
 	}
 	engine := t.engineForTest
 	if engine == nil {
-		if engine, err = podcvm.NewEngine(podcvm.Collateral(t.collateral)); err != nil {
+		engine, err = podcvm.NewEngine(podcvm.EngineOptions{Collateral: podcvm.Collateral(t.collateral), AcceptTCBStatus: t.acceptTCB})
+		if err != nil {
 			return nil, fmt.Errorf("--collateral: %w", err)
 		}
 	}
@@ -269,6 +273,9 @@ type verdict struct {
 	MRTD               string   `json:"mrtd,omitempty"`
 	InstanceKeySHA256  string   `json:"instance_key_sha256,omitempty"`
 	CollateralVerified bool     `json:"collateral_verified"`
+	// TCB is where the platform stands in Intel's TCB info, when collateral
+	// was checked.
+	TCB *podcvm.TCBFinding `json:"tcb,omitempty"`
 	// NotProven lists what this verdict does not establish.
 	NotProven []string `json:"not_proven,omitempty"`
 }
@@ -322,8 +329,12 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 		v.MRTD = att.Result.Claims.LaunchDigest
 		v.InstanceKeySHA256 = certutil.CertFingerprint(att.InstanceKey)
 		v.CollateralVerified = att.Result.CollateralVerified
-		if !att.Result.CollateralVerified {
+		v.TCB = podcvm.TCBOf(att.Result)
+		switch {
+		case !att.Result.CollateralVerified:
 			v.NotProven = append(v.NotProven, "platform TCB level, quoting enclave version and certificate revocation (collateral was not checked)")
+		case v.TCB != nil && !v.TCB.UpToDate():
+			v.NotProven = append(v.NotProven, "that the platform is patched: its TCB is behind Intel's current level and was accepted by --accept-tcb-status")
 		}
 	}
 	if asJSON {
@@ -333,6 +344,16 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 	} else {
 		fmt.Fprintf(stdout, "VERIFIED %s pod CVM\n  tenant        %s\n  sandbox       %s\n  phase         %s\n  launch doc    %s\n  events        %s\n  image (MRTD)  %s\n  instance key  sha256:%s\n",
 			v.Platform, v.Tenant, v.Sandbox, v.Phase, v.LaunchDigest, strings.Join(v.Events, " "), v.MRTD, v.InstanceKeySHA256)
+		if v.TCB != nil {
+			fmt.Fprintf(stdout, "  platform TCB  %s", v.TCB.Platform)
+			if v.TCB.Module != "" {
+				fmt.Fprintf(stdout, ", TDX module %s", v.TCB.Module)
+			}
+			fmt.Fprintf(stdout, ", quoting enclave %s\n", v.TCB.QuotingEnclave)
+			if len(v.TCB.Advisories) > 0 {
+				fmt.Fprintf(stdout, "  advisories    %s\n", strings.Join(v.TCB.Advisories, " "))
+			}
+		}
 		for _, gap := range v.NotProven {
 			fmt.Fprintf(stdout, "  NOT PROVEN    %s\n", gap)
 		}

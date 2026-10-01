@@ -24,6 +24,8 @@
 #   C8S_POD_VSOCK_CID     guest vsock CID, enabling the fast quote path
 #   C8S_POD_PORT          local port published for the agent (default 28443)
 #   C8S_POD_COLLATERAL    collateral modes to run (default "required skip")
+#   C8S_POD_ACCEPT_TCB    TCB statuses to accept besides UpToDate, comma
+#                         separated, for a host whose TCB is behind
 #   C8S_POD_VCPUS, C8S_POD_MEMORY, C8S_POD_SCRATCH   guest shape (2, 2G, 4G)
 #   C8S_POD_BOOT_TIMEOUT  seconds to wait for a guest (default 180)
 #   C8S_POD_CONSOLE=1     attach the guest console (dev images only)
