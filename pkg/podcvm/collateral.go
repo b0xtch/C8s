@@ -15,12 +15,12 @@ import (
 // verifications from fetching the same four documents each time.
 const collateralTTL = 5 * time.Minute
 
-// cachingGetter memoizes successful collateral fetches for the life of an
-// engine. One attestation is verified twice, the serving certificate and then
-// the fresh evidence, and both need the same TCB info, QE identity and CRLs.
-type cachingGetter struct {
-	inner trust.HTTPSGetter
-	now   func() time.Time
+// collateralCache holds Intel PCS responses that carried a verification to
+// success, for the life of an engine. One attestation is verified twice, the
+// serving certificate and then the fresh evidence, and both need the same TCB
+// info, QE identity and CRLs.
+type collateralCache struct {
+	now func() time.Time
 
 	mu      sync.Mutex
 	entries map[string]collateralEntry
@@ -32,14 +32,38 @@ type collateralEntry struct {
 	fetched time.Time
 }
 
-// fetchRecorder notes the collateral fetches that failed during one
-// verification. go-tdx-guest flattens fetch errors into text, so their type is
-// gone by the time the verification error comes back; their message is not.
+func newCollateralCache() *collateralCache {
+	return &collateralCache{now: time.Now, entries: map[string]collateralEntry{}}
+}
+
+func (c *collateralCache) lookup(url string) (collateralEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[url]
+	if !ok || c.now().Sub(entry.fetched) >= collateralTTL {
+		return collateralEntry{}, false
+	}
+	return entry, true
+}
+
+func (c *collateralCache) store(url string, entry collateralEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[url] = entry
+}
+
+// fetchRecorder serves one verification's collateral: from the cache when it
+// can, from Intel PCS otherwise. It notes which fetches failed, because
+// go-tdx-guest flattens fetch errors into text and their type is gone by the
+// time the verification error comes back. It holds what it fetched until the
+// verification succeeds, so a response that parsed badly is never cached.
 type fetchRecorder struct {
+	cache *collateralCache
 	inner trust.HTTPSGetter
 
-	mu     sync.Mutex
-	failed []string
+	mu      sync.Mutex
+	failed  []string
+	fetched map[string]collateralEntry
 }
 
 func (r *fetchRecorder) Get(url string) (map[string][]string, []byte, error) {
@@ -47,21 +71,28 @@ func (r *fetchRecorder) Get(url string) (map[string][]string, []byte, error) {
 }
 
 func (r *fetchRecorder) GetContext(ctx context.Context, url string) (map[string][]string, []byte, error) {
+	if entry, ok := r.cache.lookup(url); ok {
+		return entry.header, entry.body, nil
+	}
 	header, body, err := trust.GetWith(ctx, r.inner, url)
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err != nil {
 		// The URL makes the message specific enough to recognise later.
 		err = fmt.Errorf("fetch %s: %w", url, err)
-		r.mu.Lock()
 		r.failed = append(r.failed, err.Error())
-		r.mu.Unlock()
+		return nil, nil, err
 	}
-	return header, body, err
+	if r.fetched == nil {
+		r.fetched = map[string]collateralEntry{}
+	}
+	r.fetched[url] = collateralEntry{header: header, body: body, fetched: r.cache.now()}
+	return header, body, nil
 }
 
-// caused reports whether err stems from a fetch this recorder saw fail. A nil
-// recorder saw none.
+// caused reports whether err stems from a fetch this recorder saw fail.
 func (r *fetchRecorder) caused(err error) bool {
-	if r == nil || err == nil {
+	if err == nil {
 		return false
 	}
 	msg := err.Error()
@@ -75,27 +106,11 @@ func (r *fetchRecorder) caused(err error) bool {
 	return false
 }
 
-func newCachingGetter(inner trust.HTTPSGetter) *cachingGetter {
-	return &cachingGetter{inner: inner, now: time.Now, entries: map[string]collateralEntry{}}
-}
-
-func (g *cachingGetter) Get(url string) (map[string][]string, []byte, error) {
-	return g.GetContext(context.Background(), url)
-}
-
-func (g *cachingGetter) GetContext(ctx context.Context, url string) (map[string][]string, []byte, error) {
-	g.mu.Lock()
-	entry, ok := g.entries[url]
-	g.mu.Unlock()
-	if ok && g.now().Sub(entry.fetched) < collateralTTL {
-		return entry.header, entry.body, nil
+// commit publishes this verification's fetches to the shared cache.
+func (r *fetchRecorder) commit() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for url, entry := range r.fetched {
+		r.cache.store(url, entry)
 	}
-	header, body, err := trust.GetWith(ctx, g.inner, url)
-	if err != nil {
-		return nil, nil, err
-	}
-	g.mu.Lock()
-	g.entries[url] = collateralEntry{header: header, body: body, fetched: g.now()}
-	g.mu.Unlock()
-	return header, body, nil
 }

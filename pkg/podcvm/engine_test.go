@@ -81,6 +81,10 @@ func TestEngineRefusesRealQuote(t *testing.T) {
 	wrong[0] ^= 1
 	relabelled := realEvidence(t)
 	relabelled.Platform = "dstack"
+	// A cloud overlay tag would bind REPORTDATA through a vTPM key the
+	// attester names; only the bare-metal tag is accepted.
+	overlay := realEvidence(t)
+	overlay.Platform = teetypes.PlatformAzTDX
 
 	// Offsets into a v4 quote: 48-byte header, then the TD report body.
 	const mrtd, rtmr3, reportData, signature = 48 + 136, 48 + 472, 48 + 520, 48 + 584 + 4
@@ -95,6 +99,7 @@ func TestEngineRefusesRealQuote(t *testing.T) {
 		"REPORTDATA bit flipped": {tamper(t, reportData), realReportData},
 		"signature bit flipped":  {tamper(t, signature), realReportData},
 		"unknown platform tag":   {relabelled, realReportData},
+		"cloud overlay tag":      {overlay, realReportData},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if res, err := engine.VerifyEvidence(context.Background(), tc.env, tc.rd); err == nil {

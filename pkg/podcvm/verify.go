@@ -80,13 +80,16 @@ const (
 	// TCB status other than UpToDate. This is the release-grade setting.
 	CollateralRequired Collateral = "required"
 	// CollateralSkip verifies the quote signature and PCK chain against the
-	// pinned Intel root only. TCB level and revocation go unchecked.
+	// pinned Intel root, and the quoting enclave against Intel's pinned
+	// identity. The TCB level, the quoting enclave's version and revocation go
+	// unchecked.
 	CollateralSkip Collateral = "skip"
 )
 
 type dcapEngine struct {
 	collateral Collateral
-	getter     trust.HTTPSGetter
+	cache      *collateralCache
+	fetch      trust.HTTPSGetter
 }
 
 // NewEngine returns the in-process verifier (attestation-go), the same engine
@@ -99,9 +102,10 @@ func NewEngine(collateral Collateral) (Engine, error) {
 	}
 	return &dcapEngine{
 		collateral: collateral,
-		getter: newCachingGetter(&trust.RetryHTTPSGetter{
+		cache:      newCollateralCache(),
+		fetch: &trust.RetryHTTPSGetter{
 			Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: &trust.SimpleHTTPSGetter{},
-		}),
+		},
 	}, nil
 }
 
@@ -112,31 +116,25 @@ func (e *dcapEngine) VerifyEvidence(ctx context.Context, env teetypes.Attestatio
 	params := teetypes.VerifyParams{ExpectedReportData: expectedReportData}
 	var res *teetypes.VerificationResult
 	var err error
-	switch env.Platform.Family() {
-	case teetypes.FamilyTDX:
-		opts := teeverify.Options{}
-		var fetches *fetchRecorder
-		if e.collateral == CollateralRequired {
-			fetches = &fetchRecorder{inner: e.getter}
-			opts.TDX = tdx.Options{GetCollateral: true, CheckRevocations: true, Getter: fetches}
+	// The bare-metal tags only. A cloud overlay tag would move the REPORTDATA
+	// binding to a vTPM key that the attester names.
+	switch env.Platform {
+	case teetypes.PlatformTDX:
+		if res, err = e.verifyTDX(ctx, env, params); err != nil {
+			return nil, err
 		}
-		res, err = teeverify.VerifyEnvelope(ctx, env, params, opts)
-		// Intel PCS being unreachable says nothing about the evidence.
-		if fetches.caused(err) {
-			return nil, fmt.Errorf("TDX collateral unavailable: %w", err)
-		}
-	case teetypes.FamilySNP:
+	case teetypes.PlatformSNP:
 		// localverify fetches the VCEK from AMD KDS when the report carries none.
 		res, err = localverify.Verify(ctx, string(env.Platform), env.Evidence, localverify.Params{VerifyParams: params})
 		var collateral *localverify.CollateralError
 		if errors.As(err, &collateral) {
 			return nil, err
 		}
+		if err != nil {
+			return nil, &VerificationError{Err: err}
+		}
 	default:
 		return nil, refuse("unsupported platform %q", env.Platform)
-	}
-	if err != nil {
-		return nil, &VerificationError{Err: err}
 	}
 	if err := res.Check(); err != nil {
 		return nil, &VerificationError{Err: err}
@@ -144,9 +142,40 @@ func (e *dcapEngine) VerifyEvidence(ctx context.Context, env teetypes.Attestatio
 	if res.ReportDataMatch == nil || !*res.ReportDataMatch {
 		return nil, refuse("REPORTDATA does not match the expected binding")
 	}
-	if e.collateral == CollateralRequired && env.Platform.Family() == teetypes.FamilyTDX && !res.CollateralVerified {
+	return res, nil
+}
+
+// verifyTDX judges the quote offline first: signature, PCK chain, binding and
+// the quoting enclave's identity. Only a quote that passed is worth a fetch,
+// because the collateral lookup is keyed on fields of the PCK certificate, and
+// a failure before this point must read as a verdict on the evidence.
+func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvidence, params teetypes.VerifyParams) (*teetypes.VerificationResult, error) {
+	res, err := teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{})
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if err := checkTDQuoteOrigin(env.Evidence); err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if e.collateral != CollateralRequired {
+		return res, nil
+	}
+	fetches := &fetchRecorder{cache: e.cache, inner: e.fetch}
+	res, err = teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{
+		TDX: tdx.Options{GetCollateral: true, CheckRevocations: true, Getter: fetches},
+	})
+	// Intel PCS being unreachable says nothing about the evidence.
+	if fetches.caused(err) {
+		return nil, fmt.Errorf("TDX collateral unavailable: %w", err)
+	}
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if !res.CollateralVerified {
 		return nil, refuse("TDX collateral was required but not verified")
 	}
+	// Only collateral that carried a verification to success is worth keeping.
+	fetches.commit()
 	return res, nil
 }
 

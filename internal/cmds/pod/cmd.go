@@ -185,7 +185,7 @@ func (t *trust) register(cmd *cobra.Command) {
 	f.StringVar(&t.sandbox, "sandbox", "", "sandbox the guest must be")
 	f.StringVar(&t.key, "key", "", "private key that signs requests (default <bundle>/launch.key)")
 	f.StringVar(&t.collateral, "collateral", string(podcvm.CollateralRequired),
-		"required: fetch Intel collateral and refuse any TCB status but UpToDate; skip: check the quote signature and PCK chain only")
+		"required: fetch Intel collateral and refuse any TCB status but UpToDate; skip: check the quote signature, the PCK chain and the quoting enclave identity only")
 	f.DurationVar(&t.timeout, "timeout", 2*time.Minute, "overall deadline")
 	for _, name := range []string{"url", "image-manifest"} {
 		_ = cmd.MarkFlagRequired(name)
@@ -323,7 +323,7 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 		v.InstanceKeySHA256 = certutil.CertFingerprint(att.InstanceKey)
 		v.CollateralVerified = att.Result.CollateralVerified
 		if !att.Result.CollateralVerified {
-			v.NotProven = append(v.NotProven, "platform TCB level and certificate revocation (collateral was not checked)")
+			v.NotProven = append(v.NotProven, "platform TCB level, quoting enclave version and certificate revocation (collateral was not checked)")
 		}
 	}
 	if asJSON {
