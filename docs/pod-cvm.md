@@ -450,6 +450,10 @@ fails on that.
   whose policy allows a migration agent is not refused.
 - vsock CIDs are chosen by whoever launches the guest. Nothing allocates them
   across pods.
+- The launcher pod runs as uid 0 with `NET_ADMIN` and takes the guest image
+  and the quoting socket as hostPath volumes, so its namespace must allow the
+  `privileged` Pod Security level. The launcher is outside the guest's trust
+  boundary, and this is a cost to the cluster's own hardening.
 - A collateral document from Intel PCS that fails to parse or has expired is
   reported as a refusal of the evidence. It should be "no verdict".
 - The browser verification path (c8s-verify) is not wired to this endpoint.
