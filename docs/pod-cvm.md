@@ -14,18 +14,20 @@ image-policy and RA-TLS contracts the node image already uses.
 
 | Piece | State |
 |---|---|
-| Signed launch document, measurement chain, verifier trust gate (`pkg/podcvm`) | implemented, unit-tested |
-| In-guest agent: stage, attest, credential release, exec (`c8s pod-agent`) | implemented, unit-tested against a simulated TD |
-| Verifier engine on real evidence | tested on a captured non-debug TDX quote, including live Intel collateral |
-| Host launcher (`c8s pod-launcher`) | implemented, unit-tested with a stand-in VMM |
-| Guest image profile (`pod-guest-image/`) | written, build pending |
-| Boot, attestation, release and exec on TDX hardware | not yet run |
+| Signed launch document, measurement chain, verifier trust gate (`pkg/podcvm`) | run on TDX hardware |
+| In-guest agent: stage, attest, credential release, exec (`c8s pod-agent`) | run on TDX hardware |
+| Verifier engine | run on live quotes with Intel collateral, and on a captured quote in unit tests |
+| Host launcher (`c8s pod-launcher`) | run on TDX hardware, directly and as a Kubernetes pod |
+| Guest image profile (`pod-guest-image/`) | built, booted, and rebuilt to identical bytes |
 | SEV-SNP | launch arguments and verifier paths written, never run |
 | Workload from an OCI image | schema and measurement order in place, no in-guest runtime yet |
 
-Anything not marked as run on hardware is unverified there. The hardware suite
-is `test/podcvm` (build tag `podcvm_hardware`), and `test/podcvm/run-hardware.sh`
-boots the guests it needs and runs it. See [Hardware tests](#hardware-tests).
+"Run on TDX hardware" means one host: an Intel Xeon 6527P on Linux 7.0 with
+QEMU 10.2.1, on 2026-10-01. See [Results on hardware](#results-on-hardware).
+The hardware suite is `test/podcvm` (build tag `podcvm_hardware`).
+`test/podcvm/run-hardware.sh` boots the guests it needs and runs it, and
+`test/podcvm/run-kubernetes.sh` does the same with the guest in a pod. See
+[Hardware tests](#hardware-tests).
 
 ## Shape
 
@@ -291,26 +293,50 @@ be run, 125 if verification refused it.
 
 ## Assessment
 
-KRAB vector, provisional until the hardware run and a reproducibility gate:
-`A3 | R[f1/o?/l?/a?] | B2 | K4`.
+KRAB vector, an internal score since the branch and its build evidence are not
+published: `A3 | R[f1/o1/l1/a1] | B2 | K4`.
+
+Deployment context: bare-metal Intel TDX on hosts the operator owns, one guest
+per tenant, verified by the developer's control plane or CLI.
 
 Verified facts:
 
-- The verifier reaches Intel's root directly; no third-party attestation
-  service is trusted (A3). Tested against a real quote.
-- A fresh verifier nonce and the TLS key are both in REPORTDATA and compared
-  exactly; the key is pinned for the client's lifetime (B2).
-- Release requires the exact image tuple, the exact RTMR[3] chain, and the
-  live bound session (K4). Tested against a simulated TD.
+- **A3.** The verifier checks the quote against Intel's root itself, with
+  Intel's collateral, and trusts no attestation service in between. The
+  measurement chain reaches the agent and its configuration (dm-verity root,
+  in RTMR[2]) and the per-tenant launch document (RTMR[3]). Run on live
+  quotes.
+- **B2.** A fresh verifier nonce and the TLS key are both in REPORTDATA and
+  compared exactly, and the key is pinned for the client's lifetime. The
+  replay and wrong-key refusals ran on hardware.
+- **K4.** A credential is released only on the exact image tuple, the exact
+  RTMR[3] chain and the live bound session. Run on hardware.
+- A debuggable guest is refused by the agent and by the verifier, and the
+  quoting enclave must be Intel's production one.
+- The image rebuilds to identical bytes from the same inputs on one builder,
+  and the agent binary rebuilds to the same hash from a clean export of its
+  commit.
 
 Assumptions and unknowns:
 
-- R is unscored for the OS, loader and agent until the pod image is built
-  twice and compared. confos gates this for the node image; the pod image has
-  no gate yet. The firmware is Ubuntu's packaged TDVF, source available.
-- Nothing here has run on TDX hardware yet.
+- **R1 on every layer.** Sources are public, and no independent party has
+  rebuilt anything. The firmware is the TDVF binary confos vendors from
+  KubeVirt's virt-launcher image, pinned by hash and not rebuilt here.
+  Determinism on one builder is necessary for R4 and does not reach it.
 - K4 holds for verifiers using this library. A caller that releases a secret
   some other way is outside it.
+- Everything hardware-related was observed on one host and one CPU model.
+
+Highest-leverage upgrades:
+
+1. Raise R for the OS, loader and agent to R4: rebuild the image in CI on a
+   second builder and fail on any difference, as the node image does.
+2. Raise R for the firmware: build TDVF from a pinned edk2 commit, or pin a
+   build with published provenance.
+3. Publish the manifest with a signature and its provenance, so a verifier's
+   reference values have an origin (R3 for the reference values themselves).
+4. Bind uniqueness: have the control plane refuse a second attestation for one
+   launch document id, which closes the twin-guest gap for honest verifiers.
 
 ## Launching
 
@@ -370,6 +396,40 @@ no cluster:
 Boot refusals for a tampered document, a missing signature and a swapped key
 are covered against the simulated TD only: the launcher checks a bundle before
 it boots one, so the script cannot hand a guest those inputs.
+
+## Results on hardware
+
+One host, 2026-10-01: Intel Xeon 6527P, Ubuntu 26.04 with Linux 7.0.0-31,
+QEMU 10.2.1, RKE2 1.35 with Cilium and KubeVirt's device plugin, Intel QGS
+with a local PCCS. Guest: 2 vCPUs, 2 GiB. Each number is a single run.
+
+| Check | Result |
+|---|---|
+| `run-hardware.sh`, direct launch | all six steps pass |
+| `run-kubernetes.sh`, guest in a pod on the pod's own address | all four steps pass |
+| Hardware suite | 26 tests pass in each collateral mode, in both runs |
+| Platform TCB from Intel collateral | platform, TDX module and quoting enclave all UpToDate, no advisories |
+| Image built twice from the same inputs | identical `disk.raw` and `uki.efi`, identical MRTD, RTMR[1], RTMR[2] |
+
+| Measure | Value |
+|---|---|
+| Launch to first answer on the API, direct | 12.9 s and 13.6 s |
+| `kubectl apply` to first answer on the pod address | 13.2 s |
+| Of which the guest kernel and userspace | 2.3 s (1.0 s kernel, 1.3 s userspace) |
+| Fresh attestation, verified without collateral | 7 ms to 21 ms |
+| Fresh attestation, verified with Intel collateral | 0.8 s to 1.5 s, the first fetch included |
+| One authenticated command, on an attested connection | 5 ms to 10 ms round trip |
+| `c8s pod exec true` from a new process, collateral skipped | 54 ms |
+| Guest memory in use when idle | 97 MiB of 1848 MiB |
+| VMM resident memory with the guest idle | 185 MiB, which excludes the guest's private memory |
+
+About ten of the thirteen seconds pass before the guest kernel starts: QEMU
+builds the TD, and the firmware loads and measures a 45 MiB UKI. That is where
+cold start has to be won.
+
+Found on hardware and fixed: the image build skipped creating the workload
+user without failing, so the first guest powered itself off. The build now
+fails on that.
 
 ## Known gaps
 

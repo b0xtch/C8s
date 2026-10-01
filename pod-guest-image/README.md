@@ -46,6 +46,14 @@ inherits.
 
 ## Status
 
-The profile has not been built yet, and it has no reproducibility check. The
-node image's check builds twice and compares measurements; this image needs
-the same before its manifest is worth pinning in production.
+Built and booted on Intel TDX (docs/pod-cvm.md, "Results on hardware"). Two
+builds from the same inputs on one build machine gave identical `disk.raw` and
+`uki.efi` and the same MRTD, RTMR[1] and RTMR[2].
+
+There is no CI check for that yet. The node image's check builds twice and
+compares measurements; this image needs the same, on a second builder, before
+its manifest is worth pinning in production.
+
+`bin/setup` in confos installs host packages from a pinned snapshot and allows
+downgrades. Build in a throwaway VM or container: on a host you care about it
+can move systemd and QEMU backwards.
