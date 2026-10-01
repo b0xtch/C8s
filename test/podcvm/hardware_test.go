@@ -236,8 +236,10 @@ func TestHardwareRejectsInvalidEvidence(t *testing.T) {
 		}
 		policy := e.policy
 		policy.Image = identity
-		// The launch document pins the real image, so pin the tenant instead:
-		// the case under test is the hardware claim against the image pin.
+		// These cases are refused because the signed document names another
+		// image than the policy. The quote's own registers cannot be made to
+		// disagree with a document a real guest accepted, so that comparison
+		// is exercised against the simulated TD in pkg/podcvm.
 		policy.Launch, policy.Tenant, policy.Sandbox = nil, e.bundle.Document.Tenant, e.bundle.Document.Sandbox
 		return policy
 	}

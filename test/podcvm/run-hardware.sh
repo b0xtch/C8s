@@ -179,7 +179,7 @@ if [[ -d "$out/a/bundle" ]] && bundle b "$manifest"; then
       verify a skip "$out/b/verify-as-a.json"
       status=$?
       if (( status == 2 )); then
-        record PASS "a guest launched under another key is refused" "$(sed -n 's/.*"error":"\([^"]*\)".*/\1/p' "$out/b/verify-as-a.json")"
+        record PASS "a guest launched under another key is refused" "verify exited 2; verdict in $out/b/verify-as-a.json"
       else
         record FAIL "a guest launched under another key is refused" "c8s pod verify exited $status, want 2"
       fi
