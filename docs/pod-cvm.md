@@ -159,8 +159,11 @@ so a signature made for one build is not honoured by another.
    during the pull and reports phase `staged`; exec and credentials are
    refused until phase `running`.
 
-If the agent cannot run, the unit powers the guest off after three attempts.
-The launcher then exits and the pod restarts to a fresh attestation.
+The agent's life is the guest's. If it stops for any reason, the guest powers
+off, the launcher exits, and the pod restarts to a fresh guest and a fresh
+attestation. A second agent in the same guest would hold a new instance key
+and no record of the commands the first one ran, with the first one's files
+and credentials still in place.
 
 ## The agent API
 
@@ -177,16 +180,24 @@ standard c8s RA-TLS extension), so existing RA-TLS verifiers can read it.
 
 Authorization is the `operatorauth` token c8s already uses: an ES256 JWT bound
 to the method, path and body hash. A captured token authorizes nothing else.
-Exec carries a caller-chosen 128-bit id and is at-most-once per id: a retry
-joins the run in flight or replays its result, and an id whose result has
-aged out is refused.
+Exec carries a caller-chosen 128-bit id and is at-most-once per id for the
+life of the guest: a retry joins the run in flight or replays its result, and
+an id whose result has aged out is refused. The record of spent ids is in the
+agent's memory, which is why the agent's death ends the guest. A command that
+ran is always reported with its own exit status, including one that left a
+child holding its output or finished as its deadline passed.
+
+The agent serves HTTP/1 on at most 64 connections and holds at most 24
+requests at a time, because a token covers the request body and the body is
+therefore read before the token can be checked.
 
 Commands run as the unprivileged `workload` user with a fixed baseline
-environment, in a per-command cgroup that is killed whole when the command
-ends. The image has no setuid or setgid file, the agent's unit sets
-`NoNewPrivileges`, and only root can reach the TDX device, so tenant code
-cannot obtain a quote or extend RTMR[3]. The hardware suite probes each of
-these from inside the guest.
+environment, in a per-command cgroup that is capped at 1024 tasks and killed
+whole when the command ends. Under memory pressure the kernel takes tenant
+commands first and the agent last. The image has no setuid or setgid file, the
+agent's unit sets `NoNewPrivileges`, and only root can reach the TDX device,
+so tenant code cannot obtain a quote or extend RTMR[3]. The hardware suite
+probes each of these from inside the guest.
 
 A guest launched with `--vsock-cid` has a vsock device, which the agent uses
 to reach the host's quoting service. Tenant code can open vsock connections to
@@ -212,10 +223,15 @@ REPORTDATA = SHA-384(PKIX(instance key) ‖ binding)
    events must equal them.
 5. Hardware evidence verifies in process: quote signature, QE report, PCK
    chain to the pinned Intel root, and REPORTDATA equal to the transcript over
-   the verifier's own nonce and the key the TLS handshake just proved.
-6. The guest is not debuggable.
-7. MRTD, RTMR[1] and RTMR[2] equal the image manifest's.
-8. RTMR[3] equals the launch-key seed extended by exactly the expected events.
+   the verifier's own nonce and the key the TLS handshake just proved. Only
+   the bare-metal `tdx` and `snp` evidence formats are accepted.
+6. The quote was signed by Intel's production TD quoting enclave, over a
+   report from an Intel-signed TDX module. A PCK chain alone does not show
+   this: the platform certifies any provisioning enclave its host runs, and
+   such an enclave could sign a report body of its own invention.
+7. The guest is not debuggable.
+8. MRTD, RTMR[1] and RTMR[2] equal the image manifest's.
+9. RTMR[3] equals the launch-key seed extended by exactly the expected events.
 
 A credential is released only after this passes for a fresh nonce, with the
 workload admitted. The first attestation pins the instance key for the life of
@@ -228,11 +244,16 @@ so a host could answer an early connection with a guest of the same image that
 it launched itself.
 
 `--collateral required` (the default) also fetches Intel TCB info, QE identity
-and CRLs and refuses any TCB status other than UpToDate. If Intel PCS cannot
-be reached, nothing is released and the result is "no verdict", since nothing
-was learned about the evidence. `--collateral skip` checks the signature chain
-only, and `c8s pod verify` then reports the platform TCB level and revocation
-as not proven.
+and CRLs and refuses any TCB status other than UpToDate. The quote is judged
+offline first, so a quote that does not verify is refused before anything is
+fetched. If Intel PCS cannot be reached, nothing is released and the result is
+"no verdict", since nothing was learned about the evidence.
+
+`--collateral skip` stops after the offline checks. The quoting enclave's
+identity is pinned from constants in the verifier, which is what keeps a
+hostile host from forging a quote in this mode. `c8s pod verify` then reports
+as not proven: the platform TCB level, the quoting enclave's version, and
+certificate revocation.
 
 Exit codes for `verify` and `credential put`: 0 verified, 1 usage, 2 refused,
 3 no verdict. `exec` exits with the command's own status, 124 if it could not
@@ -252,7 +273,8 @@ be run, 125 if verification refused it.
   exec ids and attestation nonces, which the host cannot influence.
 - **The provenance of `manifest.json`.** The verdict is only as good as the
   reference values it was given.
-- **TCB level, with `--collateral skip`.**
+- **TCB level, quoting enclave version and revocation, with `--collateral
+  skip`.** A platform with known vulnerabilities, or a revoked one, passes.
 
 ## Assessment
 
@@ -344,6 +366,13 @@ it boots one, so the script cannot hand a guest those inputs.
   milestones.
 - CDS does not yet accept pod CVM evidence: `ImagePin.Anchor` checks the bare
   launch-key seed, and a pod CVM's RTMR[3] carries events on top of it.
+- SEV-SNP verification is weaker than TDX's and has never run: `--collateral
+  required` adds nothing there yet (no CRL check, no TCB floor), and a guest
+  whose policy allows a migration agent is not refused.
+- vsock CIDs are chosen by whoever launches the guest. Nothing allocates them
+  across pods.
+- A collateral document from Intel PCS that fails to parse or has expired is
+  reported as a refusal of the evidence. It should be "no verdict".
 - The browser verification path (c8s-verify) is not wired to this endpoint.
 - The guest image is the general confos base. It is not yet tuned for boot
   time or memory.

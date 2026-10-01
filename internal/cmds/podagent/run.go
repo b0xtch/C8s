@@ -63,8 +63,13 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 // Server is the agent's HTTPS server, bounded so an unauthenticated peer can
 // hold neither memory nor a connection for long.
 func (a *Agent) Server() *http.Server {
+	// HTTP/1 only: HTTP/2 would put hundreds of concurrent streams on each of
+	// the capped connections, every one allowed a body before its token is read.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
 	return &http.Server{
 		Handler:           a.Handler(),
+		Protocols:         protocols,
 		TLSConfig:         a.tlsCfg,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,

@@ -18,7 +18,10 @@ import (
 
 const (
 	maxConcurrentAttests = 4
-	attestTimeout        = 30 * time.Second
+	// maxInflightRequests covers eight commands, four attestations and room
+	// for credentials, at up to MaxRequestBytes of unauthenticated body each.
+	maxInflightRequests = 24
+	attestTimeout       = 30 * time.Second
 	// tokenClockSkew is wide because a guest's clock starts from a
 	// host-supplied value. Tokens travel only inside the attested channel and
 	// every mutating route is idempotent, so the wider window adds no replay.
@@ -44,6 +47,16 @@ func (a *Agent) Handler() http.Handler {
 func (a *Agent) authorized(keys []*ecdsa.PublicKey, next func(http.ResponseWriter, *http.Request, []byte)) http.HandlerFunc {
 	verifier := operatorauth.Verifier{Keys: keys, ClockSkew: tokenClockSkew}
 	return func(w http.ResponseWriter, r *http.Request) {
+		// The token covers the body, so the body is read before the token can
+		// be checked. This bounds how much unauthenticated data is held at once.
+		select {
+		case a.inflight <- struct{}{}:
+			defer func() { <-a.inflight }()
+		default:
+			w.Header().Set("Retry-After", "1")
+			httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "too many requests in flight")
+			return
+		}
 		body, ok := httputil.ReadCappedBody(w, r, podcvm.MaxRequestBytes)
 		if !ok {
 			return
@@ -73,17 +86,20 @@ func (a *Agent) serveAttest(w http.ResponseWriter, r *http.Request, body []byte)
 		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "too many attestations in flight")
 		return
 	}
-	// Phase and events are read once, so the transcript and the response agree
-	// even if the workload is admitted while the quote is in flight.
-	phase, events := a.state()
+	// The register cannot move while the quote is taken, so the events this
+	// response reports are the ones the quote's register holds.
+	a.measured.RLock()
+	phase, events := a.stateLocked()
 	reportData, err := podcvm.ReportData(&a.key.PublicKey, req.Nonce, events)
 	if err != nil {
+		a.measured.RUnlock()
 		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "attestation unavailable")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), attestTimeout)
 	defer cancel()
 	evidence, err := a.tee.Evidence(ctx, reportData)
+	a.measured.RUnlock()
 	if err != nil {
 		a.log.Warn("evidence generation failed", "error", err)
 		httputil.WriteError(w, http.StatusBadGateway, types.ErrorCodeAttestationUnavailable, "attestation unavailable")
@@ -104,7 +120,7 @@ func (a *Agent) serveExec(w http.ResponseWriter, r *http.Request, body []byte) {
 		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, err.Error())
 		return
 	}
-	if phase, _ := a.state(); phase != podcvm.PhaseRunning {
+	if !a.workloadRunning() {
 		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, "the workload has not been admitted yet")
 		return
 	}
@@ -138,7 +154,7 @@ func (a *Agent) serveCredential(w http.ResponseWriter, r *http.Request, body []b
 	}
 	// A credential is for the measured workload, never for a guest still
 	// waiting to admit one.
-	if phase, _ := a.state(); phase != podcvm.PhaseRunning {
+	if !a.workloadRunning() {
 		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, "the workload has not been admitted yet")
 		return
 	}

@@ -59,15 +59,22 @@ type Agent struct {
 	// are measured so far.
 	events []string
 
-	mu     sync.Mutex
-	staged int
+	// measured guards staged and admitted. A quote is taken under its read
+	// side and the register is extended under its write side, so the events a
+	// response reports are always the ones its quote carries.
+	measured sync.RWMutex
+	staged   int
+	// admitted: the workload this agent process started is running. Commands
+	// and credentials wait for it.
+	admitted bool
 
-	key     *ecdsa.PrivateKey
-	certs   *ratls.CertManager
-	tlsCfg  *tls.Config
-	creds   *credentialStore
-	execs   *execService
-	attests chan struct{}
+	key      *ecdsa.PrivateKey
+	certs    *ratls.CertManager
+	tlsCfg   *tls.Config
+	creds    *credentialStore
+	execs    *execService
+	attests  chan struct{}
+	inflight chan struct{}
 }
 
 // Stage authenticates this boot's launch document and measures it. Nothing the
@@ -128,7 +135,8 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	a := &Agent{
 		cfg: cfg, log: cfg.Logger, tee: cfg.TEE, doc: doc, launch: launch,
 		signature: string(bytes.TrimSpace(signature)), launchPub: pub, events: events,
-		attests: make(chan struct{}, maxConcurrentAttests),
+		attests:  make(chan struct{}, maxConcurrentAttests),
+		inflight: make(chan struct{}, maxInflightRequests),
 	}
 	// The pubkey file is not itself measured, only its digest: confirm the
 	// staged key is the one the hardware binds before trusting anything it signed.
@@ -142,14 +150,20 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 		if err := a.chain.advance(1); err != nil {
 			return nil, fmt.Errorf("measure launch document: %w", err)
 		}
+		// The register is the record. An earlier agent process in this guest
+		// may have taken it further than the document.
+		if a.staged, err = a.chain.position(); err != nil {
+			return nil, err
+		}
 	case errors.Is(err, runtimemeasure.ErrNoRegister):
 		if err := runtimemeasure.VerifyBinding(self, pub, nil); err != nil {
 			return nil, fmt.Errorf("launch key is not the one this guest was launched for: %w", err)
 		}
+		a.staged = 1
 	default:
 		return nil, err
 	}
-	a.staged = 1
+	a.admitted = doc.Workload == nil
 	uid, gid := cfg.Runner.CredentialOwner()
 	if a.creds, err = newCredentialStore(cfg.CredentialDir, uid, gid); err != nil {
 		return nil, err
@@ -179,18 +193,10 @@ func (a *Agent) Admit(ctx context.Context) error {
 		if err := a.cfg.Runner.Prepare(ctx, a.doc.Workload); err != nil {
 			return fmt.Errorf("prepare workload: %w", err)
 		}
-		if a.chain != nil {
-			if err := a.chain.advance(len(a.events)); err != nil {
-				return fmt.Errorf("measure workload image: %w", err)
-			}
-		}
-		if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
-			return fmt.Errorf("start workload: %w", err)
+		if err := a.measureAndStart(ctx); err != nil {
+			return err
 		}
 	}
-	a.mu.Lock()
-	a.staged = len(a.events)
-	a.mu.Unlock()
 	// The serving certificate's quote predates the last extend; reissue it so
 	// a handshake alone shows the final register.
 	if a.certs.CertReady() {
@@ -202,18 +208,43 @@ func (a *Agent) Admit(ctx context.Context) error {
 	return nil
 }
 
+// measureAndStart extends the register with the workload image and starts the
+// workload, as one step no quote can fall inside.
+func (a *Agent) measureAndStart(ctx context.Context) error {
+	a.measured.Lock()
+	defer a.measured.Unlock()
+	if a.chain != nil {
+		if err := a.chain.advance(len(a.events)); err != nil {
+			return fmt.Errorf("measure workload image: %w", err)
+		}
+	}
+	a.staged = len(a.events)
+	if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
+		return fmt.Errorf("start workload: %w", err)
+	}
+	a.admitted = true
+	return nil
+}
+
 // WarmUp provisions the serving certificate before the first handshake.
 func (a *Agent) WarmUp(ctx context.Context) error { return a.certs.WarmUp(ctx) }
 
-// state returns the phase and the events measured so far.
-func (a *Agent) state() (podcvm.Phase, []string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// stateLocked returns the phase and the events the register holds. The caller
+// holds measured.
+func (a *Agent) stateLocked() (podcvm.Phase, []string) {
 	phase := podcvm.PhaseStaged
 	if a.staged == len(a.events) {
 		phase = podcvm.PhaseRunning
 	}
 	return phase, append([]string(nil), a.events[:a.staged]...)
+}
+
+// workloadRunning reports whether commands and credentials have a workload to
+// go to.
+func (a *Agent) workloadRunning() bool {
+	a.measured.RLock()
+	defer a.measured.RUnlock()
+	return a.admitted
 }
 
 // checkOwnImage refuses a document signed for another build: a launch key

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"os"
 	"os/exec"
 	"sort"
 	"sync"
@@ -61,9 +62,9 @@ const (
 	// Exit statuses for a command that never ran, as shells report them.
 	exitNotExecutable = 126
 	exitNotFound      = 127
-	// waitDelay bounds how long output pipes held open by a killed command's
+	// waitDelay bounds how long output pipes held open by a command's
 	// descendants can delay its result.
-	waitDelay = 5 * time.Second
+	waitDelay = 2 * time.Second
 )
 
 func (r *ProcessRunner) Exec(ctx context.Context, req *podcvm.ExecRequest) (*podcvm.ExecResponse, error) {
@@ -95,7 +96,12 @@ func (r *ProcessRunner) Exec(ctx context.Context, req *podcvm.ExecRequest) (*pod
 	cmd.WaitDelay = waitDelay
 
 	start := time.Now()
-	runErr := cmd.Run()
+	startErr := cmd.Start()
+	var waitErr error
+	if startErr == nil {
+		group.started(cmd.Process)
+		waitErr = cmd.Wait()
+	}
 	// Stragglers that outlived the command must not outlive its result.
 	_ = group.kill(cmd.Process)
 	resp := &podcvm.ExecResponse{
@@ -103,27 +109,35 @@ func (r *ProcessRunner) Exec(ctx context.Context, req *podcvm.ExecRequest) (*pod
 		StdoutTruncated: stdout.truncated(), StderrTruncated: stderr.truncated(),
 		DurationMillis: time.Since(start).Milliseconds(),
 	}
-	var exitErr *exec.ExitError
 	switch {
-	case runErr == nil:
-	case errors.As(runErr, &exitErr):
-		resp.ExitCode = exitErr.ExitCode()
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			resp.ExitCode = 128 + int(status.Signal())
-		}
-	case cmd.ProcessState == nil:
+	case startErr != nil:
 		// The command never started. That is an outcome of this request, so it
 		// is reported as a result with the status a shell would give.
 		resp.ExitCode = exitNotExecutable
-		if errors.Is(runErr, exec.ErrNotFound) || errors.Is(runErr, fs.ErrNotExist) {
+		if errors.Is(startErr, exec.ErrNotFound) || errors.Is(startErr, fs.ErrNotExist) {
 			resp.ExitCode = exitNotFound
 		}
-		resp.Stderr = []byte(runErr.Error() + "\n")
+		resp.Stderr = []byte(startErr.Error() + "\n")
+	case cmd.ProcessState != nil:
+		// The command ran, and its own status is the result. Wait can return an
+		// error that says nothing about it: a descendant held an output pipe
+		// open past waitDelay, or the deadline passed just as it exited.
+		// Reporting those as "could not be run" would invite a second run.
+		resp.ExitCode = exitStatus(cmd.ProcessState)
 	default:
-		return nil, fmt.Errorf("run command: %w", runErr)
+		return nil, fmt.Errorf("wait for command: %w", waitErr)
 	}
 	resp.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
 	return resp, nil
+}
+
+// exitStatus is the status a shell would report: 128 plus the signal for a
+// command that was killed.
+func exitStatus(state *os.ProcessState) int {
+	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return state.ExitCode()
 }
 
 // environ is a fixed baseline plus the request's variables. Nothing is

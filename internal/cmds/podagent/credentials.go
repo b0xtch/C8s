@@ -3,7 +3,9 @@ package podagent
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/confidential-dot-ai/c8s/internal/fileutil"
@@ -22,7 +24,16 @@ func newCredentialStore(dir string, uid, gid int) (*credentialStore, error) {
 	if dir == "" {
 		return nil, errors.New("credential directory is required")
 	}
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	// The workload user must be able to reach the directory, so its parents
+	// are traversable by everyone. Only the leaf is private.
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		return nil, fmt.Errorf("create credential directory: %w", err)
+	}
+	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("create credential directory: %w", err)
+	}
+	// Mkdir honours the umask and leaves an existing directory as it was.
+	if err := os.Chmod(dir, 0o750); err != nil {
 		return nil, fmt.Errorf("create credential directory: %w", err)
 	}
 	if err := requireRAMBacked(dir); err != nil {

@@ -21,6 +21,8 @@ func (g *processGroup) sysProcAttr(uid, gid int) *syscall.SysProcAttr {
 	return attr
 }
 
+func (g *processGroup) started(*os.Process) {}
+
 func (g *processGroup) kill(p *os.Process) error {
 	if p == nil {
 		return nil

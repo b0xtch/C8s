@@ -352,6 +352,24 @@ func TestAgentRefusesMalformedRequests(t *testing.T) {
 	}
 }
 
+// The agent speaks HTTP/1 only: one capped connection must not carry hundreds
+// of concurrent request bodies before any token is checked.
+func TestAgentDoesNotOfferHTTP2(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start(t)
+	conn, err := tls.Dial("tcp", strings.TrimPrefix(h.url, "https://"), &tls.Config{
+		InsecureSkipVerify: true, //nolint:gosec // a probe: nothing about this peer is trusted
+		NextProtos:         []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if proto := conn.ConnectionState().NegotiatedProtocol; proto == "h2" {
+		t.Fatal("the agent negotiated HTTP/2")
+	}
+}
+
 // raw sends one request with no trust gate in front of it, the way an
 // arbitrary network peer would.
 func (h *harness) raw(t *testing.T, method, path string, body []byte, authorization string) int {
@@ -428,6 +446,14 @@ func TestExecResults(t *testing.T) {
 		}},
 		"timeout kills the whole group": {podcvm.ExecRequest{Argv: []string{"sh", "-c", "sleep 30 & sleep 30"}, TimeoutSeconds: 1}, func(t *testing.T, r *podcvm.ExecResponse) {
 			if !r.TimedOut || r.ExitCode == 0 || r.DurationMillis > 10_000 {
+				t.Fatalf("%+v", r)
+			}
+		}},
+		// The command finished; a child it left behind still holds its stdout.
+		// That is a result with the command's own status. Reported as a
+		// failure to run, it would invite the caller to run the work twice.
+		"descendant keeps the output pipe open": {podcvm.ExecRequest{Argv: []string{"sh", "-c", "echo done; sleep 30 &"}}, func(t *testing.T, r *podcvm.ExecResponse) {
+			if r.ExitCode != 0 || string(r.Stdout) != "done\n" || r.TimedOut || r.DurationMillis > 15_000 {
 				t.Fatalf("%+v", r)
 			}
 		}},
