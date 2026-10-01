@@ -28,6 +28,7 @@ func NewCmd() *cobra.Command {
 func newRunCmd() *cobra.Command {
 	var cfg Config
 	var memory, scratch string
+	var ports []string
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Boot one guest and wait for it",
@@ -48,6 +49,13 @@ misbehaves produces a guest that will not boot or will not verify.`,
 			if cfg.ScratchMiB, err = parseMiB(scratch); err != nil {
 				return fmt.Errorf("--scratch: %w", err)
 			}
+			for _, spec := range ports {
+				forward, err := ParseForward(spec)
+				if err != nil {
+					return fmt.Errorf("--port: %w", err)
+				}
+				cfg.Forwards = append(cfg.Forwards, forward)
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
 			return Run(ctx, cfg, slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -65,7 +73,8 @@ misbehaves produces a guest that will not boot or will not verify.`,
 	f.StringVar(&scratch, "scratch", "8G", "encrypted scratch disk size; 0 leaves writable state on a 2G RAM tmpfs")
 	f.StringVar(&cfg.Network, "network", NetworkTap, "tap: the guest takes over this pod's interface; user: QEMU user-mode stack with forwarded ports")
 	f.StringVar(&cfg.Interface, "interface", "eth0", "pod interface the guest takes over (--network tap)")
-	f.IntSliceVar(&cfg.Ports, "port", []int{podcvm.AgentPort}, "TCP port forwarded to the guest (--network user)")
+	f.StringArrayVar(&ports, "port", []string{strconv.Itoa(podcvm.AgentPort)},
+		"guest TCP port to publish (--network user): [address:]host:guest, or one port for both")
 	f.StringVar(&cfg.QuoteSocket, "quote-socket", "", "host quoting service unix socket (TDX)")
 	f.Uint32Var(&cfg.VsockCID, "vsock-cid", 0, "guest vsock context id, for the fast quote path; 0 attaches no vsock device")
 	f.BoolVar(&cfg.Console, "console", false, "attach a guest console to this process's output (dev images; a locked image prints nothing)")

@@ -22,7 +22,7 @@ func baseConfig() Config {
 	return Config{
 		Platform: "tdx", QEMU: "/usr/bin/qemu-system-x86_64", ImageDir: "/images/pod", LaunchDir: "/launch",
 		WorkDir: "/work", Name: "sbx-1", VCPUs: 2, MemoryMiB: 2048, ScratchMiB: 8192,
-		Network: NetworkUser, Ports: []int{8443}, QuoteSocket: "/run/tdx-qgs/qgs.socket", VsockCID: 7,
+		Network: NetworkUser, Forwards: []Forward{{Host: 8443, Guest: 8443}}, QuoteSocket: "/run/tdx-qgs/qgs.socket", VsockCID: 7,
 	}
 }
 
@@ -65,7 +65,7 @@ func TestQEMUArgsTDX(t *testing.T) {
 
 func TestQEMUArgsTap(t *testing.T) {
 	cfg := baseConfig()
-	cfg.Network, cfg.Interface, cfg.Ports = NetworkTap, "eth0", nil
+	cfg.Network, cfg.Interface, cfg.Forwards = NetworkTap, "eth0", nil
 	if _, err := cfg.QEMUArgs(nil); err == nil {
 		t.Fatal("built tap arguments before the tap was set up")
 	}
@@ -82,6 +82,29 @@ func TestQEMUArgsTap(t *testing.T) {
 	cfg.tap.vhost = false
 	if args := strings.Join(mustArgs(t, &cfg, nil), " "); strings.Contains(args, "vhost=on") || !strings.Contains(args, "-netdev tap,id=net0,fd=3 ") {
 		t.Fatalf("argv without vhost-net is wrong:\n%s", args)
+	}
+}
+
+func TestParseForward(t *testing.T) {
+	for spec, want := range map[string]Forward{
+		"8443":                 {Host: 8443, Guest: 8443},
+		"18443:8443":           {Host: 18443, Guest: 8443},
+		"127.0.0.1:18443:8443": {Address: "127.0.0.1", Host: 18443, Guest: 8443},
+	} {
+		if got, err := ParseForward(spec); err != nil || got != want {
+			t.Errorf("%s = %+v, %v; want %+v", spec, got, err, want)
+		}
+	}
+	// A comma or an IPv6 address would change what QEMU reads from hostfwd=.
+	for _, spec := range []string{"", "0", "70000", "a:8443", "8443:b", "::1:18443:8443", "127.0.0.1,x:1:2", "localhost:1:2", "1:2:3:4"} {
+		if got, err := ParseForward(spec); err == nil {
+			t.Errorf("%q accepted as %+v", spec, got)
+		}
+	}
+	cfg := baseConfig()
+	cfg.Forwards = []Forward{{Address: "127.0.0.1", Host: 18443, Guest: 8443}}
+	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.Contains(args, "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:18443-:8443 ") {
+		t.Fatalf("forward not rendered:\n%s", args)
 	}
 }
 
@@ -133,8 +156,8 @@ func TestConfigValidate(t *testing.T) {
 		"negative scratch":    func(c *Config) { c.ScratchMiB = -1 },
 		"unknown network":     func(c *Config) { c.Network = "bridge" },
 		"tap without iface":   func(c *Config) { c.Network, c.Interface = NetworkTap, "" },
-		"user without ports":  func(c *Config) { c.Ports = nil },
-		"bad port":            func(c *Config) { c.Ports = []int{70000} },
+		"user without ports":  func(c *Config) { c.Forwards = nil },
+		"bad port":            func(c *Config) { c.Forwards = []Forward{{Host: 70000, Guest: 8443}} },
 		"reserved vsock cid":  func(c *Config) { c.VsockCID = 2 },
 		"name with comma":     func(c *Config) { c.Name = "a,b" },
 		"empty name":          func(c *Config) { c.Name = "" },
@@ -190,7 +213,7 @@ func launchConfig(t *testing.T, qemu string) Config {
 	return Config{
 		Platform: "tdx", QEMU: qemu, ImageDir: image, LaunchDir: filepath.Join(bundle, podcvm.OpkeyDir),
 		WorkDir: filepath.Join(t.TempDir(), "work"), Name: "sbx-1", VCPUs: 1, MemoryMiB: 1024, ScratchMiB: 64,
-		Network: NetworkUser, Ports: []int{8443},
+		Network: NetworkUser, Forwards: []Forward{{Host: 8443, Guest: 8443}},
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -52,8 +53,8 @@ type Config struct {
 	Network    string
 	// Interface is the pod interface a tap guest takes over.
 	Interface string
-	// Ports are the TCP ports forwarded to the guest in user mode.
-	Ports []int
+	// Forwards are the guest TCP ports published in user mode.
+	Forwards []Forward
 	// QuoteSocket is the host quoting service's unix socket (TDX). QEMU needs
 	// it to answer the guest's GetQuote; without it only the vsock path works.
 	QuoteSocket string
@@ -66,6 +67,53 @@ type Config struct {
 	Console bool
 	// tap is filled in by network setup.
 	tap *tapDevice
+}
+
+// Forward publishes one guest TCP port on the launcher's side of a user-mode
+// network.
+type Forward struct {
+	// Address is the IPv4 address to listen on; empty listens on all of them.
+	Address string
+	Host    int
+	Guest   int
+}
+
+// ParseForward reads "[address:]host:guest", or one port number for both.
+func ParseForward(s string) (Forward, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) > 3 {
+		return Forward{}, fmt.Errorf("%q must be [address:]host:guest or a single port", s)
+	}
+	var f Forward
+	if len(parts) == 3 {
+		f.Address, parts = parts[0], parts[1:]
+	}
+	var err error
+	if f.Host, err = strconv.Atoi(parts[0]); err != nil {
+		return Forward{}, fmt.Errorf("%q: %q is not a port", s, parts[0])
+	}
+	f.Guest = f.Host
+	if len(parts) == 2 {
+		if f.Guest, err = strconv.Atoi(parts[1]); err != nil {
+			return Forward{}, fmt.Errorf("%q: %q is not a port", s, parts[1])
+		}
+	}
+	return f, f.validate()
+}
+
+func (f Forward) validate() error {
+	for _, port := range []int{f.Host, f.Guest} {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("%d is not a TCP port", port)
+		}
+	}
+	if f.Address != "" {
+		// QEMU's hostfwd separates its fields with colons, which rules IPv6 out.
+		if addr, err := netip.ParseAddr(f.Address); err != nil || !addr.Is4() {
+			return fmt.Errorf("%q is not an IPv4 address", f.Address)
+		}
+	}
+	return nil
 }
 
 // tapDevice is a tap the launcher opened. QEMU inherits it as descriptor 3,
@@ -113,12 +161,12 @@ func (c *Config) validate() error {
 			return fmt.Errorf("--interface is required with --network tap")
 		}
 	case NetworkUser:
-		if len(c.Ports) == 0 {
+		if len(c.Forwards) == 0 {
 			return fmt.Errorf("--port is required with --network user")
 		}
-		for _, port := range c.Ports {
-			if port < 1 || port > 65535 {
-				return fmt.Errorf("--port %d is not a TCP port", port)
+		for _, forward := range c.Forwards {
+			if err := forward.validate(); err != nil {
+				return fmt.Errorf("--port: %w", err)
 			}
 		}
 	default:
@@ -216,8 +264,8 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 		)
 	case NetworkUser:
 		netdev := "user,id=net0"
-		for _, port := range c.Ports {
-			netdev += fmt.Sprintf(",hostfwd=tcp::%d-:%d", port, port)
+		for _, forward := range c.Forwards {
+			netdev += fmt.Sprintf(",hostfwd=tcp:%s:%d-:%d", forward.Address, forward.Host, forward.Guest)
 		}
 		args = append(args, "-netdev", netdev, "-device", "virtio-net-pci,netdev=net0,romfile=")
 	}
