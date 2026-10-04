@@ -69,6 +69,10 @@ type Config struct {
 	// KeyServiceDial opens the connection to the key service. Nil dials its
 	// address.
 	KeyServiceDial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// CollateralDial opens a connection to the host's answer to an ask for
+	// Intel's documents: see Agent.AskHost. Nil is a guest that asks nobody
+	// and serves none.
+	CollateralDial func(ctx context.Context) (net.Conn, error)
 }
 
 // Agent is a staged guest: its launch document is authenticated and
@@ -142,11 +146,12 @@ type Agent struct {
 	// judged against, from the first quote the guest took. Nil before that,
 	// and on a platform whose evidence names none.
 	platform atomic.Pointer[session.CollateralPlatform]
-	// collateral is what the host last handed in for PathCollateral, unread.
+	// collateral is what the host last answered an ask with, unread: the
+	// guest's answer to PathCollateral.
 	collateral atomic.Pointer[[]byte]
-	// handed is closed at the first hand-in.
-	handed     chan struct{}
-	handedOnce sync.Once
+	// kept is closed at the first answer kept.
+	kept     chan struct{}
+	keptOnce sync.Once
 	// keyService is the guest's session with the key service its launch
 	// document pins, or nil.
 	keyService *keyService
@@ -197,7 +202,7 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 		signature: string(bytes.TrimSpace(signature)), launchPub: pub, events: events,
 		stagedAt: cfg.Now(),
 		bound:    make(chan struct{}),
-		handed:   make(chan struct{}),
+		kept:     make(chan struct{}),
 		fatal:    make(chan error, 1),
 		attests:  make(chan struct{}, maxConcurrentAttests),
 		quotes:   newQuoteBudget(cfg.Now),

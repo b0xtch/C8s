@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"os"
@@ -130,6 +129,18 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		defer carrier.ln.Close()
 		described = append(described, "key_service_port", host.KeyServicePort)
 	}
+	// A TD with a vsock device asks its launcher for Intel's documents for
+	// its platform. The launcher looks for them now, ahead of the ask.
+	if cid := cfg.guestCID(); cfg.Collateral && cfg.Platform == "tdx" && cid != 0 {
+		keeper, port, err := collateralStock(&cfg, cid, log)
+		if err != nil {
+			return fmt.Errorf("collateral: %w", err)
+		}
+		host.CollateralPort = port
+		keeping, stop := context.WithCancel(ctx)
+		defer stop()
+		go keeper.run(keeping)
+	}
 	// Every file of the guest reaches QEMU open, so it is given no path into
 	// the image directory or the work directory and needs no right to enter
 	// either.
@@ -209,11 +220,6 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		if len(off) > 0 {
 			log.Info("the VMM is kept off the first CPU of each package", "cpus", off)
 		}
-		if feed := cfg.feeder(log); feed != nil {
-			feeding, stop := context.WithCancel(ctx)
-			go feed.run(feeding)
-			defer stop()
-		}
 		if carrier != nil {
 			carrying, stop := context.WithCancel(ctx)
 			go carrier.run(carrying)
@@ -267,20 +273,6 @@ func (c *Config) guestCID() uint32 {
 		return c.vsock.cid
 	}
 	return c.VsockCID
-}
-
-// feeder is what hands this guest Intel's documents, or nil for a guest that
-// is handed none: one whose launcher was told so, one that is no TD, and one
-// with no vsock device to reach it by.
-func (c *Config) feeder(log *slog.Logger) *feeder {
-	cid := c.guestCID()
-	if !c.Collateral || c.Platform != "tdx" || cid == 0 {
-		return nil
-	}
-	return &feeder{
-		dial:  func() (io.ReadWriteCloser, error) { return dialGuest(cid, session.CollateralVsockPort) },
-		fetch: session.FetchCollateral, pace: collateralPace, log: log,
-	}
 }
 
 // firmwareFile is what the platform boots besides the image's disk: the TDX

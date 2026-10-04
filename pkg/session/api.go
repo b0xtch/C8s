@@ -29,24 +29,18 @@ const (
 	PathCollateral  = "/v1/collateral"
 )
 
-// CollateralVsockPort is the vsock port a guest takes its host's hand-in of
-// Intel's documents on. The guest answers a connection from its host with one
-// line, its CollateralPlatform as JSON, reads what the host sends until the
-// host is done, and keeps it unread as its answer to PathCollateral. Nothing
-// else reaches a guest from its host this way, and the guest acts on none of
-// it.
-const CollateralVsockPort = 8444
-
-// MaxCollateralBytes bounds what a host hands in, and so what a guest answers
-// PathCollateral with: Intel's four documents are a tenth of it.
+// MaxCollateralBytes bounds what a guest takes from its host as Intel's
+// documents, and so what it answers PathCollateral with: Intel's four
+// documents are a tenth of it.
 const MaxCollateralBytes = 256 << 10
 
-// CollateralResponse is what a host hands its guest and a guest answers GET
-// PathCollateral with, byte for byte: Intel's documents for the guest's
-// platform, as the host last fetched them. The guest does not read it and
-// vouches for none of it. Each document is signed by Intel, and a verifier
-// holds it to that signature and to Intel's own date on it: see
-// WithCollateralSource. A guest whose host handed it nothing answers 404.
+// CollateralResponse is what a host answers its guest's ask with and a guest
+// answers GET PathCollateral with, byte for byte: Intel's documents for the
+// guest's platform, as the host last fetched them (HostConfig.CollateralPort).
+// The guest does not read it and vouches for none of it. Each document is
+// signed by Intel, and a verifier holds it to that signature and to Intel's
+// own date on it: see WithCollateralSource. A guest whose host answered with
+// nothing answers 404.
 type CollateralResponse struct {
 	Documents []CollateralDocument `json:"documents"`
 }

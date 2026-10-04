@@ -110,11 +110,13 @@ func newRunCmd() *cobra.Command {
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
 			var err error
 			// For the key service a launch document may pin. The guest has no
-			// road to the vendor: its host hands it the vendor's documents.
+			// road to the vendor: it asks its host for the vendor's documents.
 			cfg.Engine = session.NewEngine(session.EngineOptions{HandedCollateralOnly: true})
-			if cfg.KeyServiceDial, err = hostKeyServiceDial(cfg.LaunchDir); err != nil {
+			dials, err := readHostDials(cfg.LaunchDir)
+			if err != nil {
 				return err
 			}
+			cfg.KeyServiceDial, cfg.CollateralDial = dials.KeyService, dials.Collateral
 			if cfg.TEE, err = OpenTEE(cfg.Platform); err != nil {
 				return err
 			}

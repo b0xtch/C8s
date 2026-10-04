@@ -1,7 +1,6 @@
 package sessionlauncher
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,70 +8,61 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/vsock"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
-var fedPlatform = session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}
+var askedPlatform = session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}
 
-// fedGuest is a guest's hand-in port as a launcher finds it: every connection
-// is told one line, and what the launcher sends on it is kept.
-type fedGuest struct {
-	mu sync.Mutex
-	// lines are what the guest says on its first connection, its second, and
-	// so on; the last holds for every later one. An empty line says nothing.
-	lines []string
-	// down refuses every connection.
-	down bool
-	// taken is what each connection was sent before the launcher closed it.
-	taken [][]byte
-	done  sync.WaitGroup
+// asks is the stock's port as a test reaches it: every connection is one end
+// of a pipe.
+type asks struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
 }
 
-func (g *fedGuest) dial() (io.ReadWriteCloser, error) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.down {
-		return nil, errors.New("connection refused")
+func newAsks() *asks { return &asks{conns: make(chan net.Conn), closed: make(chan struct{})} }
+
+func (a *asks) Accept() (net.Conn, error) {
+	select {
+	case conn := <-a.conns:
+		return conn, nil
+	case <-a.closed:
+		return nil, net.ErrClosed
 	}
-	n := len(g.taken)
-	g.taken = append(g.taken, nil)
-	line := g.lines[min(n, len(g.lines)-1)]
-	host, guest := net.Pipe()
-	g.done.Add(1)
-	go func() {
-		defer g.done.Done()
-		defer guest.Close()
-		if line == "" {
-			return
-		}
-		if _, err := io.WriteString(guest, line); err != nil {
-			return
-		}
-		// A guest that ends mid-line is gone. On a real connection one that
-		// stays and says no more runs into the launcher's read deadline.
-		if !strings.HasSuffix(line, "\n") {
-			return
-		}
-		sent, _ := io.ReadAll(guest)
-		g.mu.Lock()
-		g.taken[n] = sent
-		g.mu.Unlock()
-	}()
-	return host, nil
 }
 
-// handed is what each connection was sent, once the guest has read them all.
-func (g *fedGuest) handed() [][]byte {
-	g.done.Wait()
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return slices.Clone(g.taken)
+func (a *asks) Close() error   { a.once.Do(func() { close(a.closed) }); return nil }
+func (a *asks) Addr() net.Addr { return vsock.Addr{} }
+
+// ask is one connection of a guest's: its line, and what it was answered
+// with once the launcher was done.
+func (a *asks) ask(t *testing.T, line string) []byte {
+	t.Helper()
+	guest, host := net.Pipe()
+	defer guest.Close()
+	select {
+	case a.conns <- host:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the launcher took no connection")
+	}
+	// A launcher that stops reading ends the write when it hangs up.
+	go func() { _, _ = io.WriteString(guest, line) }()
+	_ = guest.SetReadDeadline(time.Now().Add(10 * time.Second))
+	answer, err := io.ReadAll(guest)
+	if err != nil {
+		t.Fatalf("the launcher's answer: %v", err)
+	}
+	return answer
 }
 
 func platformLine(t *testing.T, p session.CollateralPlatform) string {
@@ -90,12 +80,24 @@ type fetched struct {
 	asked []session.CollateralPlatform
 	docs  []session.CollateralDocument
 	err   error
+	// slow, when set, is waited for before each answer.
+	slow chan struct{}
 }
 
-func (f *fetched) fetch(_ context.Context, p session.CollateralPlatform) ([]session.CollateralDocument, error) {
+func (f *fetched) fetch(ctx context.Context, p session.CollateralPlatform) ([]session.CollateralDocument, error) {
+	f.mu.Lock()
+	f.asked = append(f.asked, p)
+	slow := f.slow
+	f.mu.Unlock()
+	if slow != nil {
+		select {
+		case <-slow:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.asked = append(f.asked, p)
 	return f.docs, f.err
 }
 
@@ -105,139 +107,18 @@ func (f *fetched) questions() []session.CollateralPlatform {
 	return slices.Clone(f.asked)
 }
 
+func (f *fetched) fail(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.err = err
+}
+
 func fourDocuments() []session.CollateralDocument {
 	return []session.CollateralDocument{
 		{URL: "https://pcs.example/tcb", Header: map[string][]string{"Tcb-Info-Issuer-Chain": {"chain"}}, Body: []byte("tcb info")},
 		{URL: "https://pcs.example/qe", Body: []byte("identity")},
 		{URL: "https://pcs.example/pckcrl", Body: []byte{0x30, 0x00}},
 		{URL: "https://pcs.example/root", Body: []byte{0x30, 0x01}},
-	}
-}
-
-// A round asks the guest which platform it is, fetches Intel's documents for
-// that platform, and hands them in on a second connection, so that the guest
-// waits for no fetch.
-func TestFeederHandsAGuestItsPlatformsDocuments(t *testing.T) {
-	guest := &fedGuest{lines: []string{platformLine(t, fedPlatform)}}
-	intel := &fetched{docs: fourDocuments()}
-	f := &feeder{dial: guest.dial, fetch: intel.fetch, pace: collateralPace, log: slog.New(slog.DiscardHandler)}
-	if err := f.round(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if got := intel.questions(); !slices.Equal(got, []session.CollateralPlatform{fedPlatform}) {
-		t.Fatalf("Intel was asked for %+v", got)
-	}
-	handed := guest.handed()
-	if len(handed) != 2 || len(handed[0]) != 0 {
-		t.Fatalf("%d connections, the first sent %d bytes: want two, and nothing on the one that only asks", len(handed), len(handed[0]))
-	}
-	var answer session.CollateralResponse
-	if err := json.Unmarshal(handed[1], &answer); err != nil || len(answer.Documents) != 4 {
-		t.Fatalf("the guest was handed %q, %v", handed[1], err)
-	}
-	for i, doc := range answer.Documents {
-		want := intel.docs[i]
-		if doc.URL != want.URL || !bytes.Equal(doc.Body, want.Body) || len(doc.Header) != len(want.Header) {
-			t.Errorf("document %d: %+v, want %+v", i, doc, want)
-		}
-	}
-}
-
-// What a guest says decides what its host asks Intel for. A line that is not
-// the two values of a fixed shape gets nothing fetched at all.
-func TestFeederFetchesOnlyForAPlatformOfTheFixedShape(t *testing.T) {
-	for name, line := range map[string]string{
-		"not JSON":             "tdx\n",
-		"another host":         `{"fmspc":"evil.example/x?","ca":"platform"}` + "\n",
-		"a path":               `{"fmspc":"../../../../x","ca":"platform"}` + "\n",
-		"uppercase":            `{"fmspc":"B0C06F000000","ca":"platform"}` + "\n",
-		"too short":            `{"fmspc":"b0c06f00000","ca":"platform"}` + "\n",
-		"a query in the CA":    `{"fmspc":"b0c06f000000","ca":"platform&x=y"}` + "\n",
-		"no CA":                `{"fmspc":"b0c06f000000"}` + "\n",
-		"a line with no end":   `{"fmspc":"b0c06f000000","ca":"platform"}`,
-		"a line that is long":  `{"fmspc":"b0c06f000000","ca":"platform","pad":"` + strings.Repeat("a", maxPlatformLine) + `"}` + "\n",
-		"nothing":              "",
-		"an empty line":        "\n",
-		"a platform and a URL": `{"fmspc":"b0c06f000000","ca":"platform","url":"https://evil.example/"}` + "\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			guest := &fedGuest{lines: []string{line}}
-			intel := &fetched{docs: fourDocuments()}
-			f := &feeder{dial: guest.dial, fetch: intel.fetch, pace: collateralPace, log: slog.New(slog.DiscardHandler)}
-			err := f.round(context.Background())
-			// A field the launcher does not know changes nothing: the URLs are
-			// built from the two it does.
-			if name == "a platform and a URL" {
-				if err != nil || !slices.Equal(intel.questions(), []session.CollateralPlatform{fedPlatform}) {
-					t.Fatalf("%v, after asking Intel for %+v", err, intel.questions())
-				}
-				return
-			}
-			if err == nil || len(intel.questions()) != 0 {
-				t.Fatalf("round = %v, after asking Intel for %+v", err, intel.questions())
-			}
-			for i, sent := range guest.handed() {
-				if len(sent) != 0 {
-					t.Errorf("connection %d was sent %d bytes", i, len(sent))
-				}
-			}
-			// A guest that names nothing is one to ask again soon. One that
-			// names something else is not asked again any sooner for it.
-			if quiet := name == "nothing"; errors.Is(err, errNoAnswer) != quiet {
-				t.Errorf("round = %v: read as a guest that does not answer: %v, want %v", err, !quiet, quiet)
-			}
-		})
-	}
-}
-
-func TestFeederRoundThatHandsNothing(t *testing.T) {
-	line := platformLine(t, fedPlatform)
-	other := platformLine(t, session.CollateralPlatform{FMSPC: "00906ed50000", CA: "processor"})
-	huge := []session.CollateralDocument{{URL: "https://pcs.example/tcb", Body: make([]byte, session.MaxCollateralBytes)}}
-	for name, tc := range map[string]struct {
-		guest    *fedGuest
-		intel    *fetched
-		noAnswer bool
-	}{
-		"a guest that takes no connection":          {&fedGuest{lines: []string{line}, down: true}, &fetched{docs: fourDocuments()}, true},
-		"Intel out of reach":                        {&fedGuest{lines: []string{line}}, &fetched{err: errors.New("no route")}, false},
-		"more than a guest takes":                   {&fedGuest{lines: []string{line}}, &fetched{docs: huge}, false},
-		"another platform on the second asking":     {&fedGuest{lines: []string{line, other}}, &fetched{docs: fourDocuments()}, false},
-		"a guest gone quiet by the second asking":   {&fedGuest{lines: []string{line, ""}}, &fetched{docs: fourDocuments()}, true},
-		"a guest gone strange by the second asking": {&fedGuest{lines: []string{line, "x\n"}}, &fetched{docs: fourDocuments()}, false},
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := &feeder{dial: tc.guest.dial, fetch: tc.intel.fetch, pace: collateralPace, log: slog.New(slog.DiscardHandler)}
-			err := f.round(context.Background())
-			if err == nil || errors.Is(err, errNoAnswer) != tc.noAnswer {
-				t.Fatalf("round = %v, want an error, of a guest that does not answer: %v", err, tc.noAnswer)
-			}
-			for i, sent := range tc.guest.handed() {
-				if len(sent) != 0 {
-					t.Errorf("connection %d was sent %d bytes", i, len(sent))
-				}
-			}
-		})
-	}
-	// The most a guest takes is taken.
-	largest := []session.CollateralDocument{{URL: "u", Body: make([]byte, 0)}}
-	for {
-		blob, _ := json.Marshal(session.CollateralResponse{Documents: largest})
-		if len(blob) >= session.MaxCollateralBytes {
-			break
-		}
-		largest[0].Body = append(largest[0].Body, make([]byte, max(1, (session.MaxCollateralBytes-len(blob))*3/4-2))...)
-	}
-	for len(mustJSON(t, largest)) > session.MaxCollateralBytes {
-		largest[0].Body = largest[0].Body[:len(largest[0].Body)-1]
-	}
-	if n := len(mustJSON(t, largest)); n > session.MaxCollateralBytes || n < session.MaxCollateralBytes-4 {
-		t.Fatalf("fixture: the blob is %d bytes", n)
-	}
-	guest := &fedGuest{lines: []string{line}}
-	f := &feeder{dial: guest.dial, fetch: (&fetched{docs: largest}).fetch, pace: collateralPace, log: slog.New(slog.DiscardHandler)}
-	if err := f.round(context.Background()); err != nil {
-		t.Fatalf("a blob of %d bytes: %v", len(mustJSON(t, largest)), err)
 	}
 }
 
@@ -269,189 +150,444 @@ func (l *logged) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// The launcher knocks about every second while its guest can still be
-// booting and backs off after that, hands in every twenty minutes once that
-// works, comes back in half a minute when a round fails, and says each change
-// of state once.
-func TestFeederPace(t *testing.T) {
-	guest := &fedGuest{lines: []string{platformLine(t, fedPlatform)}, down: true}
-	intel := &fetched{docs: fourDocuments()}
-	pace := feedPace{
-		every: 20 * time.Minute, knock: 250 * time.Millisecond, booting: time.Second, boot: 4 * time.Second,
-		retry: 30 * time.Second, fetch: time.Second,
-	}
-	out := &logged{}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var waits []time.Duration
-	// What happens before each round, by how many came before it.
-	before := map[int]func(){
-		10: func() { guest.mu.Lock(); guest.down = false; guest.mu.Unlock() },
-		12: func() { intel.mu.Lock(); intel.err = errors.New("no route to Intel"); intel.mu.Unlock() },
-		14: func() { intel.mu.Lock(); intel.err = nil; intel.mu.Unlock() },
-		15: func() { guest.mu.Lock(); guest.down = true; guest.mu.Unlock() },
-	}
-	now := time.Unix(1_700_000_000, 0)
-	f := &feeder{dial: guest.dial, fetch: intel.fetch, pace: pace, log: slog.New(slog.NewJSONHandler(out, nil)), now: func() time.Time { return now }}
-	f.wait = func(_ context.Context, d time.Duration) bool {
-		waits = append(waits, d)
-		now = now.Add(d)
-		if change := before[len(waits)]; change != nil {
-			change()
-		}
-		if len(waits) == 18 {
-			cancel()
-			return false
-		}
-		return true
-	}
-	f.run(ctx)
-	ms := time.Millisecond
-	want := []time.Duration{
-		// A guest that can still be booting, for four seconds: sooner at
-		// first, and then once a second.
-		250 * ms, 500 * ms, 1000 * ms, 1000 * ms, 1000 * ms, 1000 * ms,
-		// It did not come up in that time: slower from here.
-		1000 * ms, 2000 * ms, 4000 * ms, 8000 * ms,
-		// It answers: two rounds that work.
-		pace.every, pace.every,
-		// Intel out of reach for two rounds, then back.
-		pace.retry, pace.retry, pace.every,
-		// The guest stops answering: knocking starts over, and it is long
-		// past booting.
-		250 * ms, 500 * ms, 1000 * ms,
-	}
-	if !slices.Equal(waits, want) {
-		t.Fatalf("waits %v\n want %v", waits, want)
-	}
-	out.mu.Lock()
-	defer out.mu.Unlock()
-	wantLines := []string{
-		"INFO handed the guest Intel's collateral for its platform",
-		"WARN the guest goes without Intel's collateral for now, and its verifiers ask Intel",
-		"INFO handed the guest Intel's collateral for its platform",
-	}
-	if !slices.Equal(out.lines, wantLines) {
-		t.Fatalf("the launcher said %q\n want %q", out.lines, wantLines)
-	}
+func (l *logged) said() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.lines)
+}
 
-	// One that never answers is asked every half minute at the most.
-	guest = &fedGuest{lines: []string{platformLine(t, fedPlatform)}, down: true}
-	waits, now = nil, time.Unix(1_700_000_000, 0)
-	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
-	f = &feeder{dial: guest.dial, fetch: intel.fetch, pace: pace, log: slog.New(slog.DiscardHandler), now: func() time.Time { return now }}
-	f.wait = func(_ context.Context, d time.Duration) bool {
-		waits = append(waits, d)
-		now = now.Add(d)
-		if len(waits) == 14 {
-			cancel()
-			return false
-		}
-		return true
+// clock is a clock a test moves.
+type clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newClock() *clock { return &clock{now: time.Unix(1_700_000_000, 0)} }
+
+func (c *clock) read() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *clock) add(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+var testPace = stockPace{
+	fresh: 10 * time.Minute, retry: 30 * time.Second, fetch: 5 * time.Second, hold: 5 * time.Second,
+	line: 100 * time.Millisecond, answer: 5 * time.Second,
+}
+
+// running is a launcher's stock that takes connections until its test ends.
+type running struct {
+	*stock
+	port *asks
+	out  *logged
+}
+
+func runStock(t *testing.T, dir string, intel *fetched, at *clock) *running {
+	t.Helper()
+	port, out := newAsks(), &logged{}
+	s := &stock{
+		ln: port, own: func(net.Conn) bool { return true }, fetch: intel.fetch, dir: dir, pace: testPace,
+		log: slog.New(slog.NewJSONHandler(out, nil)), now: at.read,
 	}
-	f.run(ctx)
-	if tail := waits[10:]; !slices.Equal(tail, []time.Duration{16000 * ms, 30000 * ms, 30000 * ms, 30000 * ms}) {
-		t.Fatalf("a guest that never answers is asked after %v", waits)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.run(ctx); close(done) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("the stock went on after its launcher ended")
+		}
+	})
+	return &running{stock: s, port: port, out: out}
+}
+
+// A guest says which platform it is and is answered with Intel's documents
+// for it on the same connection. The launcher fetches them once, and keeps
+// them for the host's other launchers.
+func TestStockAnswersAGuestWithItsPlatformsDocuments(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "collateral")
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, dir, intel, newClock())
+	line := platformLine(t, askedPlatform)
+
+	blob := s.port.ask(t, line)
+	var answer session.CollateralResponse
+	if err := json.Unmarshal(blob, &answer); err != nil || len(answer.Documents) != 4 {
+		t.Fatalf("the guest was answered with %q, %v", blob, err)
+	}
+	for i, doc := range answer.Documents {
+		want := intel.docs[i]
+		if doc.URL != want.URL || !bytes.Equal(doc.Body, want.Body) || len(doc.Header) != len(want.Header) {
+			t.Errorf("document %d: %+v, want %+v", i, doc, want)
+		}
+	}
+	// The next ask is answered with the same bytes, and Intel is not asked.
+	if again := s.port.ask(t, line); !bytes.Equal(again, blob) {
+		t.Fatalf("the second answer differs: %q", again)
+	}
+	if got := intel.questions(); !slices.Equal(got, []session.CollateralPlatform{askedPlatform}) {
+		t.Fatalf("Intel was asked for %+v", got)
+	}
+	keptFile := filepath.Join(dir, "b0c06f000000-platform.json")
+	onDisk, err := os.ReadFile(keptFile)
+	if err != nil || !bytes.Equal(onDisk, blob) {
+		t.Fatalf("kept for the host's launchers: %q, %v", onDisk, err)
+	}
+	if info, err := os.Stat(keptFile); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("the kept set's mode: %v, %v", info.Mode(), err)
+	}
+	if said := s.out.said(); !slices.Equal(said, []string{"INFO answered the guest with Intel's collateral for its platform"}) {
+		t.Fatalf("the launcher said %q", said)
 	}
 }
 
-// Between rounds the launcher waits on the clock, and stops when its guest
-// is gone.
-func TestFeederStopsWithItsGuest(t *testing.T) {
-	guest := &fedGuest{lines: []string{platformLine(t, fedPlatform)}}
-	f := &feeder{
-		dial: guest.dial, fetch: (&fetched{docs: fourDocuments()}).fetch, log: slog.New(slog.DiscardHandler),
-		pace: feedPace{every: time.Millisecond, knock: time.Millisecond, booting: time.Millisecond, retry: time.Millisecond, fetch: time.Second},
+// What a guest says decides what its host asks Intel for. A line that is not
+// the two values of a fixed shape gets nothing fetched and nothing answered.
+func TestStockFetchesOnlyForAPlatformOfTheFixedShape(t *testing.T) {
+	for name, line := range map[string]string{
+		"not JSON":             "tdx\n",
+		"another host":         `{"fmspc":"evil.example/x?","ca":"platform"}` + "\n",
+		"a path":               `{"fmspc":"../../../../x","ca":"platform"}` + "\n",
+		"uppercase":            `{"fmspc":"B0C06F000000","ca":"platform"}` + "\n",
+		"too short":            `{"fmspc":"b0c06f00000","ca":"platform"}` + "\n",
+		"a query in the CA":    `{"fmspc":"b0c06f000000","ca":"platform&x=y"}` + "\n",
+		"no CA":                `{"fmspc":"b0c06f000000"}` + "\n",
+		"a line with no end":   `{"fmspc":"b0c06f000000","ca":"platform"}`,
+		"a line that is long":  `{"fmspc":"b0c06f000000","ca":"platform","pad":"` + strings.Repeat("a", maxPlatformLine) + `"}` + "\n",
+		"nothing":              "",
+		"an empty line":        "\n",
+		"a platform and a URL": `{"fmspc":"b0c06f000000","ca":"platform","url":"https://evil.example/"}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			intel := &fetched{docs: fourDocuments()}
+			s := runStock(t, dir, intel, newClock())
+			if answer := s.port.ask(t, line); len(answer) != 0 {
+				t.Fatalf("the guest was answered with %d bytes", len(answer))
+			}
+			if asked := intel.questions(); len(asked) != 0 {
+				t.Fatalf("Intel was asked for %+v", asked)
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+				t.Fatalf("the line left %d files behind", len(entries))
+			}
+		})
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	stopped := make(chan struct{})
-	go func() { f.run(ctx); close(stopped) }()
+}
+
+// One host's guests name one platform, and one fetch serves them all: a
+// launcher answers its guest with what another guest's launcher fetched.
+func TestStockAnswersWithWhatAnotherLauncherFetched(t *testing.T) {
+	dir, at := t.TempDir(), newClock()
+	first := runStock(t, dir, &fetched{docs: fourDocuments()}, at)
+	line := platformLine(t, askedPlatform)
+	blob := first.port.ask(t, line)
+
+	at.add(testPace.fresh - time.Second)
+	intel := &fetched{err: errors.New("this launcher asks Intel for nothing")}
+	second := runStock(t, dir, intel, at)
+	if answer := second.port.ask(t, line); !bytes.Equal(answer, blob) {
+		t.Fatalf("the second launcher's guest was answered with %q", answer)
+	}
+	if asked := intel.questions(); len(asked) != 0 {
+		t.Fatalf("the second launcher asked Intel for %+v", asked)
+	}
+}
+
+// A set is answered with for ten minutes and fetched anew at the first ask
+// after that. While Intel is out of reach the old set is what a guest gets,
+// Intel is asked again no sooner than the retry time, and the launcher says
+// so once.
+func TestStockFetchesAnewWhenItsSetIsOld(t *testing.T) {
+	dir, at := t.TempDir(), newClock()
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, dir, intel, at)
+	line := platformLine(t, askedPlatform)
+	old := s.port.ask(t, line)
+
+	at.add(testPace.fresh)
+	intel.fail(errors.New("no route to Intel"))
+	for range 3 {
+		if answer := s.port.ask(t, line); !bytes.Equal(answer, old) {
+			t.Fatalf("with Intel out of reach the guest was answered with %q", answer)
+		}
+	}
+	if asked := len(intel.questions()); asked != 2 {
+		t.Fatalf("Intel was asked %d times, want once for the first set and once after it aged", asked)
+	}
+	at.add(testPace.retry)
+	if answer := s.port.ask(t, line); !bytes.Equal(answer, old) {
+		t.Fatalf("the guest was answered with %q", answer)
+	}
+	if asked := len(intel.questions()); asked != 3 {
+		t.Fatalf("Intel was asked %d times, want a third after the retry time", asked)
+	}
+
+	// Intel is back with newer documents.
+	at.add(testPace.retry)
+	intel.mu.Lock()
+	intel.err, intel.docs = nil, fourDocuments()[:2]
+	intel.mu.Unlock()
+	fresh := s.port.ask(t, line)
+	var answer session.CollateralResponse
+	if err := json.Unmarshal(fresh, &answer); err != nil || len(answer.Documents) != 2 {
+		t.Fatalf("after Intel came back the guest was answered with %q, %v", fresh, err)
+	}
+	want := []string{
+		"INFO answered the guest with Intel's collateral for its platform",
+		"WARN the guest goes without fresh collateral from Intel for now, and its verifiers ask Intel",
+	}
+	if said := s.out.said(); !slices.Equal(said, want) {
+		t.Fatalf("the launcher said %q\nwant %q", said, want)
+	}
+}
+
+// A guest's quotes come from one platform. A guest that names a second one
+// is answered with nothing, and Intel is not asked for it.
+func TestStockKeepsToThePlatformItsGuestNamedFirst(t *testing.T) {
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, t.TempDir(), intel, newClock())
+	if answer := s.port.ask(t, platformLine(t, askedPlatform)); len(answer) == 0 {
+		t.Fatal("the first platform was answered with nothing")
+	}
+	other := session.CollateralPlatform{FMSPC: "00906ed50000", CA: "processor"}
+	if answer := s.port.ask(t, platformLine(t, other)); len(answer) != 0 {
+		t.Fatalf("a second platform was answered with %d bytes", len(answer))
+	}
+	if got := intel.questions(); !slices.Equal(got, []session.CollateralPlatform{askedPlatform}) {
+		t.Fatalf("Intel was asked for %+v", got)
+	}
+	if answer := s.port.ask(t, platformLine(t, askedPlatform)); len(answer) == 0 {
+		t.Fatal("the first platform is answered with nothing after a second was named")
+	}
+}
+
+// The port is the host's, and every guest on the host reaches it. Only the
+// launcher's own guest is read and answered.
+func TestStockTakesOnlyItsOwnGuest(t *testing.T) {
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, t.TempDir(), intel, newClock())
+	s.own = func(net.Conn) bool { return false }
+	if answer := s.port.ask(t, platformLine(t, askedPlatform)); len(answer) != 0 {
+		t.Fatalf("another guest was answered with %d bytes", len(answer))
+	}
+	if asked := intel.questions(); len(asked) != 0 {
+		t.Fatalf("Intel was asked for %+v at another guest's word", asked)
+	}
+}
+
+// A launcher with nothing to answer with answers with nothing, and leaves
+// nothing behind for a platform it could not fetch.
+func TestStockThatHasNothing(t *testing.T) {
+	huge := []session.CollateralDocument{{URL: "https://pcs.example/tcb", Body: make([]byte, session.MaxCollateralBytes)}}
+	for name, intel := range map[string]*fetched{
+		"Intel out of reach":      {err: errors.New("no route")},
+		"more than a guest takes": {docs: huge},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			s := runStock(t, dir, intel, newClock())
+			if answer := s.port.ask(t, platformLine(t, askedPlatform)); len(answer) != 0 {
+				t.Fatalf("the guest was answered with %d bytes", len(answer))
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				t.Errorf("%s was left behind", entry.Name())
+			}
+		})
+	}
+
+	// The most a guest takes is kept and answered with.
+	largest := []session.CollateralDocument{{URL: "u", Body: make([]byte, session.MaxCollateralBytes*3/4-64)}}
+	for len(mustJSON(t, largest)) > session.MaxCollateralBytes {
+		largest[0].Body = largest[0].Body[:len(largest[0].Body)-1]
+	}
+	for len(mustJSON(t, largest)) < session.MaxCollateralBytes-4 {
+		largest[0].Body = append(largest[0].Body, 0)
+	}
+	if n := len(mustJSON(t, largest)); n > session.MaxCollateralBytes || n < session.MaxCollateralBytes-4 {
+		t.Fatalf("fixture: the blob is %d bytes", n)
+	}
+	s := runStock(t, t.TempDir(), &fetched{docs: largest}, newClock())
+	if answer := s.port.ask(t, platformLine(t, askedPlatform)); len(answer) != len(mustJSON(t, largest)) {
+		t.Fatalf("a blob of %d bytes was answered with %d", len(mustJSON(t, largest)), len(answer))
+	}
+}
+
+// A launcher looks for the host's last set as it starts, ahead of its
+// guest's first ask, which then waits for no fetch.
+func TestStockFetchesAheadOfItsGuest(t *testing.T) {
+	dir, at := t.TempDir(), newClock()
+	if err := writeKept(dir, &kept{platform: askedPlatform, blob: []byte("an old set"), at: at.read().Add(-time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	// Files that name no platform are not read as one.
+	for _, name := range []string{"notes.json", "b0c06f000000-other.json", "B0C06F000000-platform.json", "b0c06f000000-platform.lock.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, dir, intel, at)
+	deadline := time.Now().Add(5 * time.Second)
+	for len(intel.questions()) == 0 || readKept(dir, askedPlatform) == nil || string(readKept(dir, askedPlatform).blob) == "an old set" {
+		if time.Now().After(deadline) {
+			t.Fatalf("the launcher did not fetch ahead: asked Intel for %+v", intel.questions())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if answer := s.port.ask(t, platformLine(t, askedPlatform)); !bytes.Equal(answer, mustJSON(t, fourDocuments())) {
+		t.Fatalf("the guest was answered with %q", answer)
+	}
+	if got := intel.questions(); !slices.Equal(got, []session.CollateralPlatform{askedPlatform}) {
+		t.Fatalf("Intel was asked for %+v", got)
+	}
+}
+
+// An ask waits for a fetch no longer than the launcher holds it, and the
+// next ask finds what the fetch brought.
+func TestStockHoldsAnAskNoLongerThanItsLimit(t *testing.T) {
+	intel := &fetched{docs: fourDocuments(), slow: make(chan struct{})}
+	s := runStock(t, t.TempDir(), intel, newClock())
+	s.pace.hold = 50 * time.Millisecond
+	line := platformLine(t, askedPlatform)
+	began := time.Now()
+	if answer := s.port.ask(t, line); len(answer) != 0 {
+		t.Fatalf("answered with %d bytes before Intel answered", len(answer))
+	}
+	if waited := time.Since(began); waited > 2*time.Second {
+		t.Fatalf("the ask was held for %s", waited)
+	}
+	close(intel.slow)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		guest.mu.Lock()
-		connections := len(guest.taken)
-		guest.mu.Unlock()
-		// Two rounds of two connections: it came back after its wait.
-		if connections >= 4 {
+		if answer := s.port.ask(t, line); len(answer) != 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d connections in five seconds", connections)
+			t.Fatal("the fetch's documents never reached the guest")
 		}
-		time.Sleep(time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
-	cancel()
-	select {
-	case <-stopped:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the feeder outlived its guest")
+	if asked := len(intel.questions()); asked != 1 {
+		t.Fatalf("Intel was asked %d times", asked)
 	}
 }
 
-// The line is read from a connection that may say more: what follows it is
-// not read, and a reader that stops there does not block the guest.
-func TestFeederReadsOneLine(t *testing.T) {
-	host, guest := net.Pipe()
-	go func() {
-		w := bufio.NewWriter(guest)
-		_, _ = w.WriteString(platformLine(t, fedPlatform))
-		_ = w.Flush()
-	}()
-	f := &feeder{dial: func() (io.ReadWriteCloser, error) { return host, nil }}
-	platform, conn, err := f.ask()
-	if err != nil || platform != fedPlatform {
-		t.Fatalf("ask = %+v, %v", platform, err)
+// The launchers of one host fetch a platform's documents one at a time, and
+// whoever waited takes what the first one brought.
+func TestLaunchersFetchOneAtATime(t *testing.T) {
+	dir, at := t.TempDir(), newClock()
+	intel := &fetched{docs: fourDocuments(), slow: make(chan struct{})}
+	line := platformLine(t, askedPlatform)
+	const launchers = 4
+	answers := make(chan []byte, launchers)
+	for range launchers {
+		s := runStock(t, dir, intel, at)
+		go func() { answers <- s.port.ask(t, line) }()
 	}
-	_ = conn.Close()
-	_ = guest.Close()
-}
-
-// A guest is handed Intel's documents when it is a TD its launcher can reach
-// over vsock, unless the launcher was told otherwise. It is told to by default.
-func TestWhichGuestsAreFed(t *testing.T) {
-	log := slog.New(slog.DiscardHandler)
-	fed := Config{Platform: "tdx", Collateral: true, VsockCID: 1042}
-	if fed.feeder(log) == nil {
-		t.Fatal("a TD with a vsock device is handed nothing")
+	deadline := time.Now().Add(5 * time.Second)
+	for len(intel.questions()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no launcher asked Intel")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	reserved := Config{Platform: "tdx", Collateral: true, vsock: &vsockDevice{cid: 70000, fd: 5}}
-	if reserved.guestCID() != 70000 || reserved.feeder(log) == nil {
-		t.Fatalf("a TD whose context id the kernel picked (%d) is handed nothing", reserved.guestCID())
-	}
-	for name, change := range map[string]func(*Config){
-		"told not to":     func(c *Config) { c.Collateral = false },
-		"no TD":           func(c *Config) { c.Platform = "snp" },
-		"no vsock device": func(c *Config) { c.VsockCID = 0 },
-	} {
-		cfg := fed
-		change(&cfg)
-		if cfg.feeder(log) != nil {
-			t.Errorf("%s: the guest is handed Intel's documents", name)
+	// The others wait on the first one's lock while it fetches.
+	time.Sleep(4 * lockPoll)
+	close(intel.slow)
+	for range launchers {
+		if answer := <-answers; !bytes.Equal(answer, mustJSON(t, fourDocuments())) {
+			t.Fatalf("a guest was answered with %q", answer)
 		}
 	}
-	if flag := newRunCmd().Flags().Lookup("collateral"); flag == nil || flag.DefValue != "true" {
-		t.Fatalf("--collateral: %+v", flag)
+	if asked := len(intel.questions()); asked != 1 {
+		t.Fatalf("Intel was asked %d times by %d launchers", asked, launchers)
 	}
 }
 
-// A launcher that feeds its guest stops as cleanly as one that does not, with
-// a guest that never answers.
-func TestRunStopsWithItsFeeder(t *testing.T) {
-	qemu, _ := fakeQEMU(t, "exec sleep 30")
-	cfg := launchConfig(t, qemu)
-	cfg.Collateral, cfg.VsockCID = true, 1042
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- Run(ctx, cfg, slog.New(slog.DiscardHandler)) }()
-	time.Sleep(300 * time.Millisecond)
-	cancel()
-	select {
-	case err := <-done:
-		if err != nil {
+// A launcher with no directory keeps its own set, and reads none.
+func TestStockWithoutADirectory(t *testing.T) {
+	at := newClock()
+	intel := &fetched{docs: fourDocuments()}
+	s := runStock(t, "", intel, at)
+	line := platformLine(t, askedPlatform)
+	blob := s.port.ask(t, line)
+	if len(blob) == 0 || !bytes.Equal(s.port.ask(t, line), blob) {
+		t.Fatalf("answered with %q", blob)
+	}
+	at.add(testPace.fresh)
+	if answer := s.port.ask(t, line); !bytes.Equal(answer, blob) {
+		t.Fatalf("answered with %q", answer)
+	}
+	if asked := len(intel.questions()); asked != 2 {
+		t.Fatalf("Intel was asked %d times", asked)
+	}
+}
+
+// What the launchers keep is read with the bounds a guest's answer has, and
+// a set dated ahead of the clock is fetched anew.
+func TestKeptSets(t *testing.T) {
+	dir, at := t.TempDir(), newClock()
+	path := filepath.Join(dir, keptName(askedPlatform)+keptSuffix)
+	for name, content := range map[string][]byte{"empty": nil, "too large": make([]byte, session.MaxCollateralBytes+1)} {
+		if err := os.WriteFile(path, content, 0o600); err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("the launcher did not stop")
+		if set := readKept(dir, askedPlatform); set != nil {
+			t.Errorf("%s: read as a set of %d bytes", name, len(set.blob))
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if set := readKept(dir, askedPlatform); set != nil {
+		t.Error("a directory was read as a set")
+	}
+	if _, ok := newestKept(dir); ok {
+		t.Error("a directory was taken for the host's last set")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := newestKept(filepath.Join(dir, "absent")); ok {
+		t.Error("a directory that is not there named a platform")
+	}
+
+	// Of two sets, the one written last names the host's platform.
+	other := session.CollateralPlatform{FMSPC: "00906ed50000", CA: "processor"}
+	for platform, age := range map[session.CollateralPlatform]time.Duration{askedPlatform: time.Hour, other: time.Minute} {
+		if err := writeKept(dir, &kept{platform: platform, blob: []byte("set"), at: at.read().Add(-age)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if newest, ok := newestKept(dir); !ok || newest != other {
+		t.Fatalf("the host's last set is %+v, %v", newest, ok)
+	}
+
+	if err := writeKept(dir, &kept{platform: askedPlatform, blob: []byte("from the future"), at: at.read().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	intel := &fetched{docs: fourDocuments()}
+	s := &stock{fetch: intel.fetch, dir: dir, pace: testPace, log: slog.New(slog.DiscardHandler), now: at.read}
+	if blob, fresh := s.look(askedPlatform); fresh || string(blob) != "from the future" {
+		t.Fatalf("a set dated ahead of the clock: %q, fresh %v", blob, fresh)
+	}
+	if blob := s.current(context.Background(), askedPlatform); !bytes.Equal(blob, mustJSON(t, fourDocuments())) {
+		t.Fatalf("answered with %q", blob)
 	}
 }

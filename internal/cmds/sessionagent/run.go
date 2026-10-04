@@ -47,25 +47,20 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 	served := make(chan error, 1)
 	go func() { served <- agent.Serve(srv, netutil.LimitListener(ln, maxConnections)) }()
 	cfg.Logger.Info("agent serving", "listen", listen)
-	// The host may hand in Intel's documents for this guest's platform, which
-	// the guest passes on unread. A guest it cannot reach this way serves
-	// none, and its verifiers ask Intel.
-	handIns := false
-	if hand, err := ListenHost(session.CollateralVsockPort); err != nil {
-		cfg.Logger.Info("the host can hand this guest nothing", "error", err)
-	} else {
-		defer hand.Close()
-		go func() { _ = agent.TakeHandIns(hand) }()
-		handIns = true
+	// The guest asks its host for Intel's documents for its platform, which
+	// it passes on unread. A guest with nobody to ask serves none, and its
+	// verifiers ask Intel.
+	if cfg.CollateralDial != nil {
+		go agent.AskHost(ctx, cfg.CollateralDial)
 	}
 
 	// The key service judges this guest's evidence now, while the guest is
 	// nobody's, so that a bind costs it no quote. A TD judges the key service
-	// by the vendor's documents its host hands in, and has nothing to judge
-	// by until the first hand-in.
+	// by the vendor's documents its host answers with, and has nothing to
+	// judge by until the first answer.
 	go func() {
-		if handIns && cfg.Platform == "tdx" {
-			agent.AwaitHandIn(ctx, HandInWait)
+		if cfg.CollateralDial != nil && cfg.Platform == "tdx" {
+			agent.AwaitCollateral(ctx, CollateralWait)
 		}
 		agent.OpenKeyService(ctx)
 	}()

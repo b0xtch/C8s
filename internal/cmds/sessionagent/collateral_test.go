@@ -6,12 +6,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
@@ -29,31 +29,11 @@ func (r realQuote) Evidence(context.Context, []byte) (teetypes.AttestationEviden
 	return r.env, nil
 }
 
-// fromHost is the guest's hand-in port as a test reaches it: each connection
-// is one end of a pipe.
-type fromHost struct{ conns chan net.Conn }
-
-func (f *fromHost) Accept() (io.ReadWriteCloser, error) {
-	conn, ok := <-f.conns
-	if !ok {
-		return nil, errors.New("the listener ended")
-	}
-	return conn, nil
-}
-
-func (f *fromHost) Close() error { close(f.conns); return nil }
-
-func (f *fromHost) connect() net.Conn {
-	host, guest := net.Pipe()
-	f.conns <- guest
-	return host
-}
-
 // A guest tells its host which platform its quotes come from as soon as it
 // serves, takes Intel's documents for it, and answers anyone who asks with
-// what it was handed: also a caller with no key, on a guest that is nobody's
-// yet, over a connection nothing has verified.
-func TestGuestPassesOnWhatItsHostHandsIn(t *testing.T) {
+// what its host answered: also a caller with no key, on a guest that is
+// nobody's yet, over a connection nothing has verified.
+func TestGuestPassesOnWhatItsHostAnswersWith(t *testing.T) {
 	data, err := os.ReadFile("../../../pkg/session/testdata/tdx-evidence.json")
 	if err != nil {
 		t.Fatal(err)
@@ -65,9 +45,6 @@ func TestGuestPassesOnWhatItsHostHandsIn(t *testing.T) {
 	p := newPool(t)
 	p.cfg.TEE = realQuote{TEE: sessiontest.TEE{TD: p.td}, env: env}
 	p.start(t)
-	ln := &fromHost{conns: make(chan net.Conn)}
-	go func() { _ = p.agent.TakeHandIns(ln) }()
-	defer ln.Close()
 
 	ask := func() (int, []byte) {
 		t.Helper()
@@ -87,27 +64,43 @@ func TestGuestPassesOnWhatItsHostHandsIn(t *testing.T) {
 		return resp.StatusCode, body
 	}
 	if status, body := ask(); status != http.StatusNotFound {
-		t.Fatalf("before any hand-in: %d %s", status, body)
+		t.Fatalf("before the guest asked its host: %d %s", status, body)
 	}
 
-	conn := ln.connect()
-	line, err := bufio.NewReader(conn).ReadBytes('\n')
-	if err != nil {
-		t.Fatalf("the guest's line: %v", err)
-	}
-	var platform session.CollateralPlatform
-	if err := json.Unmarshal(line, &platform); err != nil || platform != (session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}) {
-		t.Fatalf("the guest said %q, %v", line, err)
-	}
 	blob := []byte(`{"documents":[{"url":"https://pcs.example/tcb","body":"Ym9keQ=="}]}`)
-	if _, err := conn.Write(blob); err != nil {
-		t.Fatal(err)
+	said := make(chan []byte, 1)
+	// The host's end of the guest's connection.
+	dial := func(context.Context) (net.Conn, error) {
+		guest, host := net.Pipe()
+		go func() {
+			defer host.Close()
+			line, err := bufio.NewReader(host).ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			select {
+			case said <- line:
+			default:
+			}
+			_, _ = host.Write(blob)
+		}()
+		return guest, nil
 	}
-	_ = conn.Close()
-	// The next connection is taken once that one is done with.
-	_ = ln.connect().Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go p.agent.AskHost(ctx, dial)
+	p.agent.AwaitCollateral(ctx, 10*time.Second)
 
+	var platform session.CollateralPlatform
+	select {
+	case line := <-said:
+		if err := json.Unmarshal(line, &platform); err != nil || platform != (session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}) {
+			t.Fatalf("the guest said %q, %v", line, err)
+		}
+	default:
+		t.Fatal("the guest said nothing to its host")
+	}
 	if status, body := ask(); status != http.StatusOK || !bytes.Equal(body, blob) {
-		t.Fatalf("after the hand-in: %d %q", status, body)
+		t.Fatalf("after the host's answer: %d %q", status, body)
 	}
 }

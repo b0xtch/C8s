@@ -13,8 +13,9 @@ import (
 
 // HostConfigFile is the unsigned file the launcher places beside the signed
 // launch document. It carries only what the host decides anyway: how the guest
-// reaches the network and its key service. Nothing in it is trusted, and
-// nothing in it can change what the guest measures or who may drive it.
+// reaches the network, its key service and Intel's documents. Nothing in it
+// is trusted, and nothing in it can change what the guest measures or who may
+// drive it.
 const HostConfigFile = "host.json"
 
 const maxHostConfigSize = 16 * 1024
@@ -26,6 +27,14 @@ type HostConfig struct {
 	// launcher carries a connection to the key service the launch document
 	// pins. Zero is none: the guest dials the key service's address itself.
 	KeyServicePort uint32 `json:"key_service_port,omitempty"`
+	// CollateralPort is the vsock port of the host on which the guest's
+	// launcher answers with Intel's documents for the guest's platform. The
+	// guest opens a connection, says one line, its CollateralPlatform as
+	// JSON, and reads until the host is done: a CollateralResponse, which it
+	// keeps unread as its answer to PathCollateral. An answer of no bytes is
+	// a host that has none now. Zero is no port: the guest serves none, and
+	// its verifiers ask Intel.
+	CollateralPort uint32 `json:"collateral_port,omitempty"`
 }
 
 // HostNetwork is a static address for the guest's one interface. Absent, the
@@ -83,6 +92,9 @@ func (c *HostConfig) Validate() error {
 	// The kernel reads this one as any port.
 	if c.KeyServicePort == math.MaxUint32 {
 		return fmt.Errorf("key_service_port %d is no port", c.KeyServicePort)
+	}
+	if c.CollateralPort == math.MaxUint32 {
+		return fmt.Errorf("collateral_port %d is no port", c.CollateralPort)
 	}
 	n := c.Network
 	if n == nil {

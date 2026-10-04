@@ -18,9 +18,10 @@ const (
 	// session with its key service, which starts at keyServiceFirstRetry.
 	keyServiceRetry      = 30 * time.Second
 	keyServiceFirstRetry = 250 * time.Millisecond
-	// HandInWait is how long a guest waits for its host's first hand-in of
-	// the vendor's documents before it tries its key service without them.
-	HandInWait = 15 * time.Second
+	// CollateralWait is how long a guest waits for its host's first answer
+	// with the vendor's documents before it tries its key service without
+	// them.
+	CollateralWait = 15 * time.Second
 	// keyServiceTimeout bounds one call to the key service.
 	keyServiceTimeout = time.Minute
 	// certRenewAhead is how long before its end the certificate the guest
@@ -68,10 +69,10 @@ func (a *Agent) newKeyService(pin *session.KeyService) (*keyService, error) {
 			return a.keyServiceCertificate(ks)
 		},
 		// A guest has no road to the vendor of its own: it judges the key
-		// service by the documents its host handed it, each held to the
+		// service by the documents its host answered with, each held to the
 		// vendor's signature and dates.
 		Judging: func(ctx context.Context) context.Context {
-			return session.AllowStapledRootCRL(session.WithCollateralSource(ctx, a.handedCollateral))
+			return session.AllowStapledRootCRL(session.WithCollateralSource(ctx, a.keptCollateral))
 		},
 		Dial: a.cfg.KeyServiceDial,
 		Now:  a.cfg.Now,
@@ -100,9 +101,9 @@ func (a *Agent) keyServiceCertificate(ks *keyService) (*tls.Certificate, error) 
 	return cert, nil
 }
 
-// handedCollateral is the vendor's documents as the guest's host handed them
-// in: what the guest serves its own verifiers.
-func (a *Agent) handedCollateral(context.Context) []session.CollateralDocument {
+// keptCollateral is the vendor's documents as the guest's host last answered
+// with them: what the guest serves its own verifiers.
+func (a *Agent) keptCollateral(context.Context) []session.CollateralDocument {
 	blob := a.collateral.Load()
 	if blob == nil {
 		return nil

@@ -33,8 +33,9 @@ func fakeLauncher(t *testing.T) (path, argsFile string) {
 func userRunner(t *testing.T, self string) (*QEMURunner, Spec) {
 	t.Helper()
 	cfg := &Config{
-		Network: Network{Mode: NetworkUser, FirstPort: 39000},
-		VMM:     VMM{QuoteSocket: "/run/qgs.socket", Confine: "64055"},
+		StateDir: "/state",
+		Network:  Network{Mode: NetworkUser, FirstPort: 39000},
+		VMM:      VMM{QuoteSocket: "/run/qgs.socket", Confine: "64055"},
 	}
 	pool := &Pool{ImageDir: "/images/session", LaunchDir: "/bundle/opkeydata", ImageStore: "/store/images.store", platform: "tdx"}
 	spec := Spec{ID: "td-test", Dir: t.TempDir(), Slot: 3, Pool: pool, Class: Class{VCPUs: 4, Memory: "16G", Scratch: "8G"}}
@@ -77,6 +78,7 @@ func TestRunnerStartsAdoptsAndStops(t *testing.T) {
 	}
 	want := "session-launcher run --platform tdx --image-dir /images/session --launch-dir /bundle/opkeydata" +
 		" --work-dir " + filepath.Join(spec.Dir, workDir) + " --name td-test --vcpus 4 --memory 16G --vsock-cid auto" +
+		" --collateral-cache /state/collateral" +
 		" --quote-socket /run/qgs.socket --confine 64055 --scratch 8G --image-store /store/images.store" +
 		" --network user --port 127.0.0.1:39003:8443"
 	if args != want {

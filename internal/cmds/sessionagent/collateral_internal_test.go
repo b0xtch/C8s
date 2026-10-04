@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,132 +25,266 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
-// hostSide is a hostListener that hands out one end of a pipe for every
-// connection its test opens.
-type hostSide struct {
-	conns chan net.Conn
+// askedHost is the guest's host as an ask reaches it: each connection is one
+// end of a pipe, and the host answers what its test scripted.
+type askedHost struct {
+	mu sync.Mutex
+	// answers are what the host writes on its first connection, its second,
+	// and so on; the last holds for every later one. Nil answers nothing.
+	answers [][]byte
+	// down refuses every connection, and silent takes one and says nothing.
+	down, silent bool
+	// said is the line each connection was told.
+	said [][]byte
+	done sync.WaitGroup
 }
 
-func newHostSide() *hostSide { return &hostSide{conns: make(chan net.Conn)} }
-
-func (h *hostSide) Accept() (io.ReadWriteCloser, error) {
-	conn, ok := <-h.conns
-	if !ok {
-		return nil, errors.New("the listener ended")
+func (h *askedHost) dial(context.Context) (net.Conn, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.down {
+		return nil, errors.New("connection refused")
 	}
-	return conn, nil
+	n := len(h.said)
+	h.said = append(h.said, nil)
+	var answer []byte
+	if len(h.answers) > 0 {
+		answer = h.answers[min(n, len(h.answers)-1)]
+	}
+	silent := h.silent
+	guest, host := net.Pipe()
+	h.done.Add(1)
+	go func() {
+		defer h.done.Done()
+		defer host.Close()
+		line, err := bufio.NewReader(host).ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		h.mu.Lock()
+		h.said[n] = line
+		h.mu.Unlock()
+		if silent {
+			// Until the guest hangs up.
+			_, _ = io.Copy(io.Discard, host)
+			return
+		}
+		_, _ = host.Write(answer)
+	}()
+	return guest, nil
 }
 
-func (h *hostSide) Close() error { close(h.conns); return nil }
-
-// connect is a connection from the host: its end of the pipe.
-func (h *hostSide) connect() net.Conn {
-	host, guest := net.Pipe()
-	h.conns <- guest
-	return host
+func (h *askedHost) lines() [][]byte {
+	h.done.Wait()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.said)
 }
 
-func fedAgent(platform *session.CollateralPlatform) *Agent {
-	a := &Agent{log: slog.New(slog.DiscardHandler)}
+func (h *askedHost) set(change func(*askedHost)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	change(h)
+}
+
+var testAskPace = askPace{every: 10 * time.Minute, first: 250 * time.Millisecond, retry: 2 * time.Second, answer: 5 * time.Second}
+
+func askingAgent(platform *session.CollateralPlatform, out io.Writer) *Agent {
+	a := &Agent{log: slog.New(slog.NewJSONHandler(out, nil)), kept: make(chan struct{})}
 	a.platform.Store(platform)
 	return a
 }
 
-// asked is the agent's answer to GET PathCollateral.
-func asked(t *testing.T, a *Agent, method string) *httptest.ResponseRecorder {
+// asks runs the agent's asking for as many rounds as waits lists changes
+// for, and returns how long it waited after each.
+func asks(a *Agent, host *askedHost, rounds int, before map[int]func()) []time.Duration {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var waits []time.Duration
+	a.askHost(ctx, host.dial, testAskPace, func(_ context.Context, d time.Duration) bool {
+		waits = append(waits, d)
+		if change := before[len(waits)]; change != nil {
+			change()
+		}
+		if len(waits) == rounds {
+			cancel()
+			return false
+		}
+		return true
+	})
+	return waits
+}
+
+// collateralAnswer is the agent's answer to a request for PathCollateral.
+func collateralAnswer(t *testing.T, a *Agent, method string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	a.Handler().ServeHTTP(rec, httptest.NewRequest(method, session.PathCollateral, nil))
 	return rec
 }
 
-// A host is told which platform the guest's quotes come from and hands in
-// Intel's documents for it. The guest serves what it was handed byte for
-// byte, to anyone, and reads none of it.
-func TestHostHandsInIntelsDocuments(t *testing.T) {
+// A guest tells its host which platform its quotes come from and is answered
+// with Intel's documents for it. It serves what it was answered with byte
+// for byte, to anyone, and reads none of it.
+func TestGuestAsksItsHostForIntelsDocuments(t *testing.T) {
 	platform := &session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}
-	a := fedAgent(platform)
-	ln := newHostSide()
-	served := make(chan error, 1)
-	go func() { served <- a.TakeHandIns(ln) }()
-
-	if rec := asked(t, a, http.MethodGet); rec.Code != http.StatusNotFound {
-		t.Fatalf("before any hand-in: %d %s", rec.Code, rec.Body)
+	a := askingAgent(platform, io.Discard)
+	if rec := collateralAnswer(t, a, http.MethodGet); rec.Code != http.StatusNotFound {
+		t.Fatalf("before any ask: %d %s", rec.Code, rec.Body)
 	}
-	// handIn is one connection: what the guest said, then what the host sent.
-	handIn := func(blob []byte) {
-		t.Helper()
-		conn := ln.connect()
-		line, err := bufio.NewReader(conn).ReadBytes('\n')
-		if err != nil {
-			t.Fatalf("the guest's line: %v", err)
-		}
-		var said session.CollateralPlatform
-		if err := json.Unmarshal(line, &said); err != nil || said != *platform {
-			t.Fatalf("the guest said %q, %v", line, err)
-		}
-		if _, err := conn.Write(blob); err != nil {
-			t.Fatal(err)
-		}
-		_ = conn.Close()
-		// The next connection is taken once this one is done with.
-		_ = ln.connect().Close()
-	}
-
 	// Not JSON, on purpose: the guest keeps bytes.
 	blob := []byte("\x00not for the guest to read\xff")
-	handIn(blob)
-	rec := asked(t, a, http.MethodGet)
-	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), blob) || rec.Header().Get("Content-Type") != "application/json" {
-		t.Fatalf("after a hand-in: %d %q %v", rec.Code, rec.Body.Bytes(), rec.Header())
-	}
-	// A host that only asks which platform this is leaves what the guest holds.
-	handIn(nil)
-	if rec := asked(t, a, http.MethodGet); !bytes.Equal(rec.Body.Bytes(), blob) {
-		t.Fatalf("after a connection that sent nothing: %q", rec.Body.Bytes())
-	}
-	// More than a guest takes is not taken, in part or whole.
-	handIn(make([]byte, session.MaxCollateralBytes+1))
-	if rec := asked(t, a, http.MethodGet); !bytes.Equal(rec.Body.Bytes(), blob) {
-		t.Fatalf("after a hand-in that was too large: %d bytes", rec.Body.Len())
-	}
 	largest := bytes.Repeat([]byte{'a'}, session.MaxCollateralBytes)
-	handIn(largest)
-	if rec := asked(t, a, http.MethodGet); !bytes.Equal(rec.Body.Bytes(), largest) {
-		t.Fatalf("after the largest hand-in: %d bytes", rec.Body.Len())
+	host := &askedHost{answers: [][]byte{blob, nil, make([]byte, session.MaxCollateralBytes+1), largest}}
+	served := func(when string, want []byte) func() {
+		return func() {
+			t.Helper()
+			rec := collateralAnswer(t, a, http.MethodGet)
+			if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), want) || rec.Header().Get("Content-Type") != "application/json" {
+				t.Errorf("%s: %d, %d bytes, %v", when, rec.Code, rec.Body.Len(), rec.Header())
+			}
+		}
+	}
+	waits := asks(a, host, 4, map[int]func(){
+		1: served("after an answer", blob),
+		// A host that answers with nothing leaves what the guest holds.
+		2: served("after an answer of no bytes", blob),
+		// More than a guest takes is not taken, in part or whole.
+		3: served("after an answer that was too large", blob),
+		4: served("after the largest answer", largest),
+	})
+	want := []time.Duration{testAskPace.every, testAskPace.first, 2 * testAskPace.first, testAskPace.every}
+	if !slices.Equal(waits, want) {
+		t.Fatalf("the guest waited %v between its asks, want %v", waits, want)
+	}
+	select {
+	case <-a.kept:
+	default:
+		t.Fatal("nobody was told that the guest holds an answer")
+	}
+	// The one thing the guest says: its platform, as one line.
+	for i, line := range host.lines() {
+		var said session.CollateralPlatform
+		if err := json.Unmarshal(line, &said); err != nil || said != *platform || !bytes.HasSuffix(line, []byte("\n")) {
+			t.Errorf("ask %d said %q, %v", i, line, err)
+		}
 	}
 
-	// Nothing is handed in through the guest's API: only its host reaches
-	// the port that takes a hand-in.
+	// Nothing reaches what the guest holds through its API.
 	for _, method := range []string{http.MethodPut, http.MethodPost, http.MethodDelete} {
-		if rec := asked(t, a, method); rec.Code != http.StatusMethodNotAllowed {
+		if rec := collateralAnswer(t, a, method); rec.Code != http.StatusMethodNotAllowed {
 			t.Errorf("%s %s: %d", method, session.PathCollateral, rec.Code)
 		}
 	}
-	if rec := asked(t, a, http.MethodGet); !bytes.Equal(rec.Body.Bytes(), largest) {
-		t.Fatal("a request through the API changed what the guest holds")
-	}
+	served("after requests through the API", largest)()
+}
 
-	_ = ln.Close()
-	if err := <-served; err == nil {
-		t.Fatal("the agent went on taking hand-ins from a listener that ended")
+// records collects what the agent logs.
+type records struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *records) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var record struct {
+		Level string `json:"level"`
+		Msg   string `json:"msg"`
+	}
+	if json.Unmarshal(p, &record) == nil {
+		r.lines = append(r.lines, record.Level+" "+record.Msg)
+	}
+	return len(p), nil
+}
+
+// A guest asks again soon after an ask that was not answered, twice as late
+// each time up to a limit, every ten minutes once it is, and says each
+// change once.
+func TestGuestAsksAgainAtItsPace(t *testing.T) {
+	out := &records{}
+	a := askingAgent(&session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}, out)
+	host := &askedHost{answers: [][]byte{[]byte("documents")}, down: true}
+	waits := asks(a, host, 11, map[int]func(){
+		5: func() { host.set(func(h *askedHost) { h.down = false }) },
+		7: func() { host.set(func(h *askedHost) { h.answers = [][]byte{nil} }) },
+		9: func() { host.set(func(h *askedHost) { h.answers = [][]byte{[]byte("newer documents")} }) },
+	})
+	ms := time.Millisecond
+	want := []time.Duration{
+		// A host that takes no connection.
+		250 * ms, 500 * ms, 1000 * ms, 2000 * ms, 2000 * ms,
+		// It answers.
+		testAskPace.every, testAskPace.every,
+		// It has nothing for two asks, and then something again.
+		250 * ms, 500 * ms, testAskPace.every, testAskPace.every,
+	}
+	if !slices.Equal(waits, want) {
+		t.Fatalf("waits %v\n want %v", waits, want)
+	}
+	if rec := collateralAnswer(t, a, http.MethodGet); rec.Body.String() != "newer documents" {
+		t.Fatalf("the guest serves %q", rec.Body)
+	}
+	out.mu.Lock()
+	defer out.mu.Unlock()
+	wantLines := []string{
+		"WARN the host answered with none of Intel's documents, and this guest's verifiers ask Intel",
+		"INFO took Intel's documents for this platform from the host",
+		"WARN the host answered with none of Intel's documents, and this guest's verifiers ask Intel",
+		"INFO took Intel's documents for this platform from the host",
+	}
+	if !slices.Equal(out.lines, wantLines) {
+		t.Fatalf("the agent said %q\nwant %q", out.lines, wantLines)
 	}
 }
 
 // A guest whose evidence names no Intel platform has nothing to ask its host
-// for, and takes nothing.
-func TestGuestWithNoPlatformTakesNoHandIn(t *testing.T) {
-	a := fedAgent(nil)
-	ln := newHostSide()
-	go func() { _ = a.TakeHandIns(ln) }()
-	defer ln.Close()
-	conn := ln.connect()
-	// The guest hangs up without a word, whatever the host has to say.
-	if line, err := io.ReadAll(conn); err != nil || len(line) != 0 {
-		t.Fatalf("the guest said %q, %v", line, err)
+// for, and asks nobody.
+func TestGuestWithNoPlatformAsksNobody(t *testing.T) {
+	a := askingAgent(nil, io.Discard)
+	host := &askedHost{answers: [][]byte{[]byte("documents")}}
+	a.askHost(t.Context(), host.dial, testAskPace, func(context.Context, time.Duration) bool {
+		t.Fatal("the guest waited to ask again")
+		return false
+	})
+	if n := len(host.lines()); n != 0 {
+		t.Fatalf("the guest opened %d connections", n)
 	}
-	_ = conn.Close()
-	if rec := asked(t, a, http.MethodGet); rec.Code != http.StatusNotFound {
+	if rec := collateralAnswer(t, a, http.MethodGet); rec.Code != http.StatusNotFound {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+// A host that takes the guest's line and says nothing holds one ask for the
+// ask's own limit and no longer, and one that the guest's end ends.
+func TestGuestWaitsForAnAnswerNoLongerThanItsLimit(t *testing.T) {
+	a := askingAgent(&session.CollateralPlatform{FMSPC: "b0c06f000000", CA: "platform"}, io.Discard)
+	host := &askedHost{silent: true}
+	began := time.Now()
+	if _, err := a.ask(t.Context(), host.dial, []byte("{}\n"), 50*time.Millisecond); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("ask = %v, want its deadline", err)
+	}
+	if waited := time.Since(began); waited > 2*time.Second {
+		t.Fatalf("the ask waited %s", waited)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.ask(ctx, host.dial, []byte("{}\n"), time.Minute)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("an ask the guest ended returned an answer")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the ask went on after the guest ended it")
+	}
+	if rec := collateralAnswer(t, a, http.MethodGet); rec.Code != http.StatusNotFound {
 		t.Fatalf("%d %s", rec.Code, rec.Body)
 	}
 }

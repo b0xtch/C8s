@@ -4,7 +4,6 @@ package sessionlauncher
 
 import (
 	"errors"
-	"io"
 	"os"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -17,5 +16,3 @@ func setupTap(*Config) (*session.HostNetwork, string, *os.File, *os.File, error)
 }
 
 func reserveVsock() (*os.File, uint32, error) { return nil, 0, errNeedsLinux }
-
-func dialGuest(uint32, uint32) (io.ReadWriteCloser, error) { return nil, errNeedsLinux }

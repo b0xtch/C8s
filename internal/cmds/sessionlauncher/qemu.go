@@ -102,10 +102,14 @@ type Config struct {
 	// VsockAuto gives the guest a vsock device with a context id no other
 	// guest on this host holds, reserved through the kernel.
 	VsockAuto bool
-	// Collateral has the launcher fetch Intel's documents for the guest's
-	// platform and hand them to the guest over its vsock device, so that a
-	// verifier takes them from the guest and need not ask Intel (TDX).
+	// Collateral has the launcher answer its guest's asks for Intel's
+	// documents for the guest's platform, over the guest's vsock device, so
+	// that a verifier takes them from the guest and need not ask Intel (TDX).
 	Collateral bool
+	// CollateralCache is a directory the launchers of one host keep those
+	// documents in, so that each guest is answered with what another's
+	// launcher fetched. Empty has this launcher fetch for itself.
+	CollateralCache string
 	// AvoidFirstCPU keeps the VMM off the first online CPU of each package,
 	// on TDX: see packageFirstCPUs.
 	AvoidFirstCPU bool

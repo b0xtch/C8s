@@ -27,6 +27,10 @@ const (
 	// workDir is where a TD's launch disk and scratch disk live, in its own
 	// directory.
 	workDir = "vm"
+	// collateralDir is where the launchers keep the vendor's documents they
+	// answer their guests with, in the state directory: one set for every TD
+	// of the host.
+	collateralDir = "collateral"
 	// maxRelays bounds the evidence requests the daemon relays at once, and
 	// maxStreams the connections it carries, for every caller together.
 	maxRelays  = 64
