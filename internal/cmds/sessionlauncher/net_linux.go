@@ -99,7 +99,9 @@ func reserveVsock() (*os.File, uint32, error) {
 // virtio-net expects of an inherited descriptor. It is what --network fd
 // takes from a caller that gives each guest a tap of its own making.
 func OpenTap(name string) (*os.File, error) {
-	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
+	// Close-on-exec: a daemon starts many launchers, and a tap that every
+	// one of them inherited would outlive its own guest and stay busy.
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
 	}
