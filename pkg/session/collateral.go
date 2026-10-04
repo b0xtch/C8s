@@ -55,8 +55,10 @@ const maxCollateralFile = 1 << 20
 const flightTimeout = 45 * time.Second
 
 // CollateralFinding is what a verdict on TDX evidence rests on besides the
-// evidence: Intel's documents, and how this verifier came by them.
+// evidence: where Intel's documents place the platform, and how this verifier
+// came by them.
 type CollateralFinding struct {
+	TCBFinding
 	// Fetched is when the oldest of Intel's documents behind this finding
 	// left Intel: when this verifier fetched it or, for one somebody handed
 	// over, when Intel signed it.
@@ -802,6 +804,15 @@ func (r *fetchRecorder) finding() (*CollateralFinding, error) {
 		finding.RootCRLFetched = r.docs[url].fetched
 	}
 	return finding, nil
+}
+
+// body returns the document this verification was served for url: the bytes
+// the verification authenticated.
+func (r *fetchRecorder) body(url string) ([]byte, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.docs[url]
+	return entry.body, ok
 }
 
 // fromCache reports whether any document of this verification came from

@@ -569,9 +569,16 @@ func TestScopeOfAFixedPolicy(t *testing.T) {
 		Image: identity, LaunchKey: []byte("launch key"), Launch: []byte("launch"), Authority: []byte("authority"),
 		Bind: []byte("bind"), Tenant: "tenant", Session: "session",
 	}
-	const want = "sha256:d97d7d5df31ef213f116c2879300a4a78df214d51627e6192c152dd4e54c060e"
+	const want = "sha256:ffcbb228e723051c927fc15acea285deb0de63c5c8c18c9b5ccbcaaceb176f05"
 	if got := session.ScopeOf(policy, sessiontest.Engine{}); got != want {
 		t.Fatalf("scope = %s, want %s", got, want)
+	}
+	// A verdict reached under an allowance is of another scope, so that a
+	// policy that accepts less never takes it.
+	lenient := policy
+	lenient.AcceptTCBStatus = []string{"OutOfDate"}
+	if got := session.ScopeOf(lenient, sessiontest.Engine{}); got == want || got == "" {
+		t.Fatalf("a policy that accepts OutOfDate has scope %s", got)
 	}
 }
 

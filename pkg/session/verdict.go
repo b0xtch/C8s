@@ -26,7 +26,7 @@ const (
 	// verdictRules is part of every scope. Raise it with any change to what a
 	// judgment requires of evidence, so that a verifier never takes the
 	// verdict of an earlier one that required less.
-	verdictRules = 1
+	verdictRules = 2
 )
 
 // Verdict is a client's record that it judged a guest's evidence and found
@@ -88,12 +88,13 @@ func scopeOf(policy Policy, engine Engine) string {
 		Tenant, Session                       string
 		AllowBound, AllowReady                bool
 		RequireMachine                        bool
+		AcceptTCB                             []string
 		Engine                                string
 	}{
 		verdictRules, string(policy.Image.Family()), launch, registers,
 		policy.LaunchKey, policy.Launch, policy.Authority, policy.Bind,
 		policy.Tenant, policy.Session, policy.AllowBound, policy.AllowReady,
-		policy.RequireMachine,
+		policy.RequireMachine, policy.AcceptTCBStatus,
 		described.Requirements(),
 	})
 	if err != nil {

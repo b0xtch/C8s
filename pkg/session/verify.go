@@ -11,11 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
+	"github.com/google/go-tdx-guest/pcs"
+	tdxverify "github.com/google/go-tdx-guest/verify"
 	"github.com/google/go-tdx-guest/verify/trust"
 
-	"github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
@@ -55,6 +57,16 @@ type Policy struct {
 	// RequireMachine refuses a guest whose launch document pins no machine. A
 	// document that pins one is held to it either way.
 	RequireMachine bool
+	// AcceptTCBStatus names Intel TCB statuses, besides UpToDate, that the
+	// guest's platform, its TDX module or its quoting enclave may have:
+	// sorted, each once. Revoked cannot be accepted. The verdict's finding
+	// says where each stands: see CollateralOf.
+	AcceptTCBStatus []string
+}
+
+// judging is ctx as the engine gets it for a verification under this policy.
+func (p Policy) judging(ctx context.Context) context.Context {
+	return WithAcceptedTCB(ctx, p.AcceptTCBStatus)
 }
 
 func (p Policy) validate() error {
@@ -63,6 +75,9 @@ func (p Policy) validate() error {
 	}
 	if _, err := parsePublicKey(string(p.LaunchKey)); err != nil {
 		return fmt.Errorf("policy launch key: %w", err)
+	}
+	if err := ValidateTCBStatuses(p.AcceptTCBStatus); err != nil {
+		return fmt.Errorf("policy: %w", err)
 	}
 	if p.Authority == nil {
 		if !p.AllowReady || p.AllowBound || p.Bind != nil || p.Tenant != "" || p.Session != "" {
@@ -135,10 +150,12 @@ type dcapEngine struct {
 	ownOnly   bool
 }
 
-// NewEngine returns the in-process verifier, built on attestation-go like
-// `c8s verify`. It judges TDX evidence against Intel's collateral, always:
-// the TCB info, the quoting enclave's identity and the revocation lists. A
-// verdict it cannot fetch the collateral for is no verdict.
+// NewEngine returns the in-process verifier, built on attestation-go and
+// go-tdx-guest like `c8s verify`. It judges TDX evidence against Intel's
+// collateral, always: the TCB info, the quoting enclave's identity and the
+// revocation lists. A verdict it cannot fetch the collateral for is no
+// verdict. The platform, its TDX module and its quoting enclave must each be
+// UpToDate, unless the context names another status: see WithAcceptedTCB.
 func NewEngine(opts EngineOptions) Engine {
 	var fetch trust.HTTPSGetter = &trust.RetryHTTPSGetter{
 		Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: pcsGetter{},
@@ -262,38 +279,70 @@ func CollateralOf(res *teetypes.VerificationResult) *CollateralFinding {
 	return finding
 }
 
-// verifyTDX judges the quote offline first: signature, PCK chain and binding.
-// Only a quote that passed is worth a fetch, and a failure before this point
-// must read as a verdict on the evidence. The second pass holds the same
-// quote to Intel's collateral, which states the platform's TCB status, names
-// the quoting enclave and lists what Intel has revoked.
+// verifyTDX judges the quote offline first: signature, PCK chain, binding and
+// the quoting enclave's identity. Only a quote that passed is worth a fetch,
+// and a failure before this point must read as a verdict on the evidence. The
+// second pass holds the same quote to Intel's collateral, which names the
+// quoting enclave, lists what Intel has revoked, and states where the
+// platform, its TDX module and its quoting enclave stand.
 func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvidence, params teetypes.VerifyParams) (*teetypes.VerificationResult, error) {
-	if _, err := teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{}); err != nil {
+	res, err := teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{})
+	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
+	quote, err := parseTDQuote(env.Evidence)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if err := checkTDQuoteOrigin(quote); err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+
+	// go-tdx-guest authenticates the collateral (Intel's signing chains, the
+	// validity windows, the CRLs) and checks the PCK chain against the CRLs.
+	// Its own TCB verdict is not used: see evaluateTDXTCB.
 	roots, err := intelRoots()
 	if err != nil {
 		return nil, err
 	}
-	var res *teetypes.VerificationResult
-	fetches, err := e.withCollateral(ctx, func(fetches *fetchRecorder) (err error) {
+	fetches, err := e.withCollateral(ctx, func(fetches *fetchRecorder) error {
 		// One clock for how old a kept document is and for Intel's dates on it.
-		res, err = teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{TDX: tdx.Options{
-			GetCollateral: true, CheckRevocations: true, Getter: fetches, TrustedRoots: roots, Now: e.cache.now(),
-		}})
-		return err
+		return tdxverify.TdxQuoteContext(ctx, quote, &tdxverify.Options{
+			GetCollateral: true, CheckRevocations: true, Getter: fetches, TrustedRoots: roots, Now: allAt(e.cache.now()),
+		})
 	})
 	// Intel PCS being unreachable says nothing about the evidence.
 	if fetches.caused(err) {
 		return nil, fmt.Errorf("TDX collateral unavailable: %w", err)
 	}
-	if err != nil {
+	if err != nil && !authenticCollateral(err) {
 		return nil, &VerificationError{Err: err}
 	}
 	finding, err := fetches.finding()
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
+	chain, err := tdxverify.ExtractChainFromQuote(quote)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	exts, err := pcs.PckCertificateExtensions(chain.PCKCertificate)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	tcbInfo, haveTCB := fetches.body(pcs.TcbInfoURL(exts.FMSPC))
+	qeIdentity, haveQE := fetches.body(pcs.QeIdentityURL())
+	if !haveTCB || !haveQE {
+		return nil, errors.New("TDX collateral was verified but its documents are not at hand")
+	}
+	tcb, err := evaluateTDXTCB(quote, tcbInfo, qeIdentity)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if err := tcb.judge(AcceptedTCB(ctx)); err != nil {
+		return nil, err
+	}
+	finding.TCBFinding = *tcb
 	// Only collateral that carried a verification to success is worth keeping.
 	fetches.commit()
 	res.CollateralVerified = true
@@ -302,6 +351,21 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	}
 	res.Claims.PlatformData[CollateralClaim] = finding
 	return res, nil
+}
+
+// allAt is the time at which every certificate and document of a
+// verification is checked for validity.
+func allAt(now time.Time) *tdxverify.TimeSet {
+	return &tdxverify.TimeSet{PckCertChain: now, TcbInfo: now, QeIdentity: now, PckCrl: now, RootCaCrl: now}
+}
+
+// authenticCollateral reports whether a failed collateral check still found
+// the documents authentic. The TCB status check is the last thing go-tdx-guest
+// does with each document, so a failure there means exactly that. What it
+// leaves undone after the first such failure, holding the quoting enclave to
+// Intel's identity document, checkTDQuoteOrigin and evaluateTDXTCB do.
+func authenticCollateral(err error) bool {
+	return strings.Contains(err.Error(), "failed TCB status check")
 }
 
 // withCollateral runs check with collateral from the cache where the cache
@@ -318,7 +382,7 @@ func (e *dcapEngine) withCollateral(ctx context.Context, check func(*fetchRecord
 		fetches.stapledRoot = ctx.Value(stapledRootKey{}) != nil
 	}
 	err := check(fetches)
-	if err == nil || fetches.caused(err) || !fetches.fromCache() {
+	if err == nil || authenticCollateral(err) || fetches.caused(err) || !fetches.fromCache() {
 		return fetches, err
 	}
 	fetches = &fetchRecorder{ctx: ctx, cache: e.cache, inner: e.fetch, anew: true, only: intelDocument}
@@ -431,7 +495,7 @@ func VerifyAttestation(ctx context.Context, policy Policy, engine Engine, instan
 	if err != nil {
 		return nil, err
 	}
-	res, err := engine.VerifyEvidence(ctx, resp.Evidence, reportData)
+	res, err := engine.VerifyEvidence(policy.judging(ctx), resp.Evidence, reportData)
 	if err != nil {
 		return nil, err
 	}
@@ -541,7 +605,7 @@ func servingCertResult(ctx context.Context, policy Policy, engine Engine, leaf *
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	res, err := engine.VerifyEvidence(ctx, env, rd[:sha512.Size384])
+	res, err := engine.VerifyEvidence(policy.judging(ctx), env, rd[:sha512.Size384])
 	if err != nil {
 		return nil, err
 	}
