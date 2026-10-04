@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -214,11 +215,47 @@ func TestKeyServiceBundlePinAndPool(t *testing.T) {
 		t.Fatalf("the key service's document lists %+v", doc.Pools)
 	}
 
+	// Each document names the TCB statuses its author accepts besides
+	// UpToDate, in one order however the flags came, and the pool's document
+	// carries its key service's pin with them.
+	lenient := filepath.Join(dir, "key-service-lenient")
+	if out, err := run("key-service", "launch-config", "new", "--out", lenient, "--image-manifest", service.ManifestPath,
+		"--pool", pool.ManifestPath+":"+key+".pub", "--accept-tcb-status", "SWHardeningNeeded", "--accept-tcb-status", "OutOfDate,OutOfDate"); err != nil {
+		t.Fatalf("key-service launch-config new --accept-tcb-status: %v: %s", err, out)
+	}
+	lenientDoc, err := os.ReadFile(filepath.Join(lenient, session.OpkeyDir, session.DocumentFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := []string{"OutOfDate", "SWHardeningNeeded"}
+	if parsed, err := keyservice.Parse(lenientDoc); err != nil || !slices.Equal(parsed.Pools[0].AcceptTCBStatus, accepted) {
+		t.Fatalf("the key service's document accepts %+v, %v", parsed, err)
+	}
+	lenientPin := filepath.Join(dir, "pin-lenient.json")
+	if out, err := run("key-service", "pin", "--bundle", lenient, "--url", "https://192.0.2.7:8443", "--out", lenientPin,
+		"--accept-tcb-status", "SWHardeningNeeded,OutOfDate"); err != nil {
+		t.Fatalf("key-service pin --accept-tcb-status: %v: %s", err, out)
+	}
+	loadedLenient, err := session.LoadKeyServicePin(lenientPin)
+	if err != nil || !slices.Equal(loadedLenient.AcceptTCBStatus, accepted) {
+		t.Fatalf("the pin accepts %+v, %v", loadedLenient, err)
+	}
+	lenientPool := filepath.Join(dir, "pool-lenient")
+	if said, err := run("launch-config", "new", "--out", lenientPool, "--image-manifest", pool.ManifestPath, "--pool", "agents", "--class", "s-4x16",
+		"--key", key, "--key-service", lenientPin); err != nil {
+		t.Fatalf("launch-config new: %v: %s", err, said)
+	}
+	if b, err := session.LoadBundle(lenientPool); err != nil || !slices.Equal(b.Document.KeyService.AcceptTCBStatus, accepted) {
+		t.Fatalf("the pool's document pins %+v, %v", b, err)
+	}
+
 	for name, args := range map[string][]string{
-		"a pool with no launch key":              {"key-service", "launch-config", "new", "--out", filepath.Join(dir, "a"), "--image-manifest", service.ManifestPath, "--pool", pool.ManifestPath},
-		"a pool whose key is no key":             {"key-service", "launch-config", "new", "--out", filepath.Join(dir, "b"), "--image-manifest", service.ManifestPath, "--pool", pool.ManifestPath + ":" + pin},
-		"a pin with a URL that is none":          {"key-service", "pin", "--bundle", bundle, "--url", "http://192.0.2.7", "--out", filepath.Join(dir, "c.json")},
-		"a pool that pins a pin that is no file": {"launch-config", "new", "--out", filepath.Join(dir, "d"), "--image-manifest", pool.ManifestPath, "--pool", "agents", "--class", "s-4x16", "--key-service", "/nonexistent"},
+		"a key service that accepts Revoked of its pools": {"key-service", "launch-config", "new", "--out", filepath.Join(dir, "e"), "--image-manifest", service.ManifestPath, "--pool", pool.ManifestPath + ":" + key + ".pub", "--accept-tcb-status", "Revoked"},
+		"a pin that accepts a status nobody has":          {"key-service", "pin", "--bundle", bundle, "--url", "https://192.0.2.7:8443", "--out", filepath.Join(dir, "f.json"), "--accept-tcb-status", "Fine"},
+		"a pool with no launch key":                       {"key-service", "launch-config", "new", "--out", filepath.Join(dir, "a"), "--image-manifest", service.ManifestPath, "--pool", pool.ManifestPath},
+		"a pool whose key is no key":                      {"key-service", "launch-config", "new", "--out", filepath.Join(dir, "b"), "--image-manifest", service.ManifestPath, "--pool", pool.ManifestPath + ":" + pin},
+		"a pin with a URL that is none":                   {"key-service", "pin", "--bundle", bundle, "--url", "http://192.0.2.7", "--out", filepath.Join(dir, "c.json")},
+		"a pool that pins a pin that is no file":          {"launch-config", "new", "--out", filepath.Join(dir, "d"), "--image-manifest", pool.ManifestPath, "--pool", "agents", "--class", "s-4x16", "--key-service", "/nonexistent"},
 	} {
 		if _, err := run(args...); err == nil {
 			t.Errorf("%s was accepted", name)

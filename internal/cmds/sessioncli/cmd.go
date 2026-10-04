@@ -400,6 +400,9 @@ type trust struct {
 	fresh bool
 	// requireMachine refuses a guest whose launch document pins no machine.
 	requireMachine bool
+	// acceptTCB names Intel TCB statuses, besides UpToDate, that the guest's
+	// platform may have.
+	acceptTCB []string
 	// kept is the verdict the binding held when the client was made.
 	kept          *session.Verdict
 	allowBound    bool
@@ -430,6 +433,16 @@ func (t *trust) collateralFlags(f *pflag.FlagSet) {
 		"take Intel's collateral from Intel's service alone. Without it a command that has none asks the guest for the copies its host fetched, and takes each that Intel signed within two hours; the root CA CRL it fetches itself before anything is released or run")
 	f.BoolVar(&t.timing, "timing", false, "print how long each step took, a line each, to standard error")
 	f.BoolVar(&t.requireMachine, "require-machine", false, "refuse a guest whose launch document lists no machine (RTMR[0]) it may be. A document that lists them is held to them either way")
+	f.StringSliceVar(&t.acceptTCB, "accept-tcb-status", nil,
+		"an Intel TCB status, besides UpToDate, that the guest's platform, its TDX module or its quoting enclave may have, such as OutOfDate or SWHardeningNeeded; repeat for more. Without it each of the three must be UpToDate. Revoked is never accepted")
+}
+
+// acceptedTCB is --accept-tcb-status as a policy carries it: sorted, each
+// status once.
+func (t *trust) acceptedTCB() []string {
+	accepted := slices.Clone(t.acceptTCB)
+	slices.Sort(accepted)
+	return slices.Compact(accepted)
 }
 
 // road is how the flags say to report on the way to the guest.
@@ -478,7 +491,10 @@ func (t *trust) client(stderr io.Writer) (*session.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("--image-manifest: %w", err)
 	}
-	policy := session.Policy{Image: identity, Tenant: t.tenant, Session: t.session, AllowBound: t.allowBound, RequireMachine: t.requireMachine}
+	policy := session.Policy{
+		Image: identity, Tenant: t.tenant, Session: t.session, AllowBound: t.allowBound, RequireMachine: t.requireMachine,
+		AcceptTCBStatus: t.acceptedTCB(),
+	}
 	if t.authority != "" {
 		if policy.Authority, err = session.ReadBounded(t.authority, 8192); err != nil {
 			return nil, fmt.Errorf("--authority: %w", err)
@@ -498,6 +514,7 @@ func (t *trust) client(stderr io.Writer) (*session.Client, error) {
 		}
 		pinned := binding.Policy(identity)
 		pinned.Tenant, pinned.Session, pinned.AllowBound, pinned.RequireMachine = t.tenant, t.session, t.allowBound, t.requireMachine
+		pinned.AcceptTCBStatus = t.acceptedTCB()
 		policy = pinned
 		if keyPath == "" {
 			keyPath = filepath.Join(t.binding, session.AccessKeyFile)
@@ -767,6 +784,9 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 			v.NotProven = append(v.NotProven, fmt.Sprintf("that Intel has published nothing newer about this platform since %s: its service could not be reached, and the verdict rests on the collateral fetched then",
 				v.Collateral.Fetched.UTC().Format(time.RFC3339)))
 		}
+		if v.Collateral != nil && !v.Collateral.UpToDate() {
+			v.NotProven = append(v.NotProven, "that the platform is patched: its TCB is behind Intel's current level and was accepted by --accept-tcb-status")
+		}
 		if v.Machine != "" && !v.MachinePinned {
 			v.NotProven = append(v.NotProven, "that the guest's host built it a machine anyone recorded: its launch document lists none (RTMR[0])")
 		}
@@ -794,6 +814,13 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 				pinned = "not pinned"
 			}
 			fmt.Fprintf(stdout, "  machine       %s (%s)\n", v.Machine, pinned)
+		}
+		if v.Collateral != nil && v.Collateral.Platform != "" {
+			tcb := "platform " + v.Collateral.Platform
+			if v.Collateral.Module != "" {
+				tcb += ", TDX module " + v.Collateral.Module
+			}
+			fmt.Fprintf(stdout, "  TCB           %s, quoting enclave %s\n", tcb, v.Collateral.QuotingEnclave)
 		}
 		if v.Collateral != nil && v.Collateral.Stapled {
 			fmt.Fprintf(stdout, "  collateral    handed over by the guest, the oldest signed by Intel at %s\n", v.Collateral.Fetched.UTC().Format(time.RFC3339))
@@ -954,7 +981,10 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 			printed(step, took)
 		}
 	})}
-	readyPolicy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, RequireMachine: b.requireMachine}
+	readyPolicy := session.Policy{
+		Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, RequireMachine: b.requireMachine,
+		AcceptTCBStatus: b.acceptedTCB(),
+	}
 	client, err := session.NewClient(b.url, readyPolicy, b.engine(), signer, road...)
 	if err != nil {
 		return finish(ExitUsage, err)
@@ -991,7 +1021,7 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 	// connection the guest was reached on.
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	bound := binding.Policy(identity)
-	bound.RequireMachine = b.requireMachine
+	bound.RequireMachine, bound.AcceptTCBStatus = b.requireMachine, b.acceptedTCB()
 	started = time.Now()
 	answer, att, err := client.BindAttested(ctx, bind, bound)
 	if err != nil {

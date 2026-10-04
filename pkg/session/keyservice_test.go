@@ -61,6 +61,33 @@ func TestKeyServicePin(t *testing.T) {
 		t.Error("a pin at another address is the same pin")
 	}
 
+	// What a pin accepts of the key service's platform is part of it: an
+	// owner's bind equals its guest's pin only if it accepts the same.
+	lenient := *pin
+	lenient.AcceptTCBStatus = []string{"OutOfDate", "SWHardeningNeeded"}
+	if err := lenient.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	alike := lenient
+	alike.AcceptTCBStatus = []string{"OutOfDate", "SWHardeningNeeded"}
+	fewer := lenient
+	fewer.AcceptTCBStatus = []string{"OutOfDate"}
+	if pin.Equal(&lenient) || lenient.Equal(pin) || lenient.Equal(&fewer) || !lenient.Equal(&alike) {
+		t.Error("Equal does not tell what two pins accept apart")
+	}
+	for name, statuses := range map[string][]string{
+		"Revoked":         {"Revoked"},
+		"a made-up one":   {"Fine"},
+		"an unsorted one": {"SWHardeningNeeded", "OutOfDate"},
+		"one twice":       {"OutOfDate", "OutOfDate"},
+	} {
+		changed := *pin
+		changed.AcceptTCBStatus = statuses
+		if err := changed.Validate(); err == nil {
+			t.Errorf("a pin that accepts %s was taken", name)
+		}
+	}
+
 	// The file form, as 'c8s session key-service pin' writes it.
 	path := filepath.Join(t.TempDir(), "pin.json")
 	write := func(body string) {
@@ -77,6 +104,17 @@ func TestKeyServicePin(t *testing.T) {
 	write(`{"url":"https://192.0.2.7:8443","extra":1}`)
 	if _, err := session.LoadKeyServicePin(path); err == nil {
 		t.Error("a pin file with an unknown field was accepted")
+	}
+	write(`{"url":"https://192.0.2.7:8443","image":{"platform":"tdx","measurement":"` + pin.Image.Measurement +
+		`","rtmrs":{"1":"` + pin.Image.RTMRs[1] + `","2":"` + pin.Image.RTMRs[2] + `"}},"launchKey":` + quoted(pin.LaunchKey) +
+		`,"acceptTCBStatus":["OutOfDate","SWHardeningNeeded"]}`)
+	if loaded, err := session.LoadKeyServicePin(path); err != nil || !loaded.Equal(&lenient) {
+		t.Fatalf("the pin file with accepted statuses reads %+v, %v", loaded, err)
+	}
+	write(`{"url":"https://192.0.2.7:8443","image":{"platform":"tdx","measurement":"` + pin.Image.Measurement +
+		`"},"launchKey":` + quoted(pin.LaunchKey) + `,"acceptTCBStatus":["Revoked"]}`)
+	if _, err := session.LoadKeyServicePin(path); err == nil {
+		t.Error("a pin file that accepts Revoked was taken")
 	}
 }
 

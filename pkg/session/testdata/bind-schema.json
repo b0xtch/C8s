@@ -199,6 +199,14 @@
         {
           "name": "launchKey",
           "type": "string"
+        },
+        {
+          "name": "acceptTCBStatus",
+          "type": "list",
+          "optional": true,
+          "item": {
+            "type": "string"
+          }
         }
       ]
     }

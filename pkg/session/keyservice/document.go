@@ -54,6 +54,10 @@ type Document struct {
 type Pool struct {
 	Image     session.Image `yaml:"image"`
 	LaunchKey string        `yaml:"launchKey"`
+	// AcceptTCBStatus names Intel TCB statuses, besides UpToDate, that the
+	// key service accepts of this pool's guests: see
+	// session.Policy.AcceptTCBStatus.
+	AcceptTCBStatus []string `yaml:"acceptTCBStatus,omitempty"`
 }
 
 // Parse strictly validates a key service's launch document. It authenticates
@@ -93,6 +97,9 @@ func (d *Document) Validate() error {
 		if _, err := runtimemeasure.ParsePublicKeyPEM([]byte(pool.LaunchKey)); err != nil {
 			return fmt.Errorf("pools[%d]: launchKey: %w", i, err)
 		}
+		if err := session.ValidateTCBStatuses(pool.AcceptTCBStatus); err != nil {
+			return fmt.Errorf("pools[%d]: acceptTCBStatus: %w", i, err)
+		}
 	}
 	return nil
 }
@@ -118,6 +125,9 @@ func VerifySigned(launchPubPEM, data []byte, signature string) (*Document, error
 type PoolOptions struct {
 	ManifestPath  string
 	LaunchKeyPath string
+	// AcceptTCBStatus is what the key service accepts of this pool's guests
+	// besides UpToDate: see Pool.
+	AcceptTCBStatus []string
 }
 
 // BundleOptions describes a new key service's launch bundle.
@@ -154,7 +164,7 @@ func NewBundle(opts BundleOptions) (err error) {
 		if err != nil {
 			return fmt.Errorf("pool: launch key: %w", err)
 		}
-		doc.Pools = append(doc.Pools, Pool{Image: image, LaunchKey: string(launchKey)})
+		doc.Pools = append(doc.Pools, Pool{Image: image, LaunchKey: string(launchKey), AcceptTCBStatus: pool.AcceptTCBStatus})
 	}
 	data, err := yaml.Marshal(&doc)
 	if err != nil {

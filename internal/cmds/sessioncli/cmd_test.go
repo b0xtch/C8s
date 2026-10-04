@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -234,6 +235,8 @@ func TestTrustFlagsUsageErrors(t *testing.T) {
 		"a manifest that is not there":   func(f *trust) { f.manifest = filepath.Join(t.TempDir(), "absent.json") },
 		"a signing key that is not one":  func(f *trust) { f.key = b.manifest },
 		"a binding that is not readable": func(f *trust) { f.binding = t.TempDir() },
+		"a TCB status nobody can accept": func(f *trust) { f.acceptTCB = []string{"Revoked"} },
+		"a TCB status Intel has not":     func(f *trust) { f.acceptTCB = []string{"Fine"} },
 	} {
 		f := *driving(b)
 		mutate(&f)
@@ -241,6 +244,21 @@ func TestTrustFlagsUsageErrors(t *testing.T) {
 		if code := runVerify(context.Background(), &f, false, &stdout, &stderr); code != ExitUsage {
 			t.Errorf("%s: exit %d: %s", name, code, stderr.String())
 		}
+	}
+
+	// The flag's statuses reach a policy in one order, each once, however
+	// they were given, and a guest that is UpToDate verifies under them.
+	f := *driving(b)
+	f.acceptTCB = []string{"SWHardeningNeeded", "OutOfDate", "OutOfDate"}
+	if got := f.acceptedTCB(); !slices.Equal(got, []string{"OutOfDate", "SWHardeningNeeded"}) {
+		t.Fatalf("the policy accepts %v", got)
+	}
+	if got := (&trust{}).acceptedTCB(); len(got) != 0 {
+		t.Fatalf("a command with no flag accepts %v", got)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runVerify(context.Background(), &f, false, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("verify --accept-tcb-status: exit %d: %s", code, stderr.String())
 	}
 }
 

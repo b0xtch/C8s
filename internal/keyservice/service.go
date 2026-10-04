@@ -149,7 +149,9 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		if err != nil {
 			return nil, err
 		}
-		s.pins = append(s.pins, pool{policy: session.Policy{Image: identity, LaunchKey: []byte(p.LaunchKey), AllowReady: true}})
+		s.pins = append(s.pins, pool{policy: session.Policy{
+			Image: identity, LaunchKey: []byte(p.LaunchKey), AllowReady: true, AcceptTCBStatus: p.AcceptTCBStatus,
+		}})
 	}
 	if s.key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader); err != nil {
 		return nil, fmt.Errorf("generate instance key: %w", err)

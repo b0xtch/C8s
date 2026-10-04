@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
@@ -39,6 +40,11 @@ type KeyService struct {
 	Image Image `yaml:"image" json:"image"`
 	// LaunchKey is the public key, PEM, that signs its launch document.
 	LaunchKey string `yaml:"launchKey" json:"launchKey"`
+	// AcceptTCBStatus names Intel TCB statuses, besides UpToDate, that the
+	// key service's platform may have: see Policy.AcceptTCBStatus. Whoever
+	// pins the key service accepts them of it, and a bind's pin equals its
+	// guest's only if it names the same ones.
+	AcceptTCBStatus []string `yaml:"acceptTCBStatus,omitempty" json:"acceptTCBStatus,omitempty"`
 }
 
 // LoadKeyServicePin reads a pin from the JSON file 'c8s session key-service
@@ -89,16 +95,21 @@ func (k *KeyService) validate() error {
 	if _, err := parsePublicKey(k.LaunchKey); err != nil {
 		return fmt.Errorf("launchKey: %w", err)
 	}
+	if err := ValidateTCBStatuses(k.AcceptTCBStatus); err != nil {
+		return fmt.Errorf("acceptTCBStatus: %w", err)
+	}
 	return nil
 }
 
-// Equal reports whether two pins name the same key service.
+// Equal reports whether two pins name the same key service and accept the
+// same of it.
 func (k *KeyService) Equal(other *KeyService) bool {
 	if k == nil || other == nil {
 		return k == other
 	}
 	if k.URL != other.URL || k.LaunchKey != other.LaunchKey || k.Image.Platform != other.Image.Platform ||
-		k.Image.Measurement != other.Image.Measurement || len(k.Image.RTMRs) != len(other.Image.RTMRs) {
+		k.Image.Measurement != other.Image.Measurement || len(k.Image.RTMRs) != len(other.Image.RTMRs) ||
+		!slices.Equal(k.AcceptTCBStatus, other.AcceptTCBStatus) {
 		return false
 	}
 	for index, value := range k.Image.RTMRs {
@@ -184,7 +195,7 @@ func VerifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x5
 	if err != nil {
 		return err
 	}
-	policy := Policy{Image: identity, LaunchKey: []byte(pin.LaunchKey)}
+	policy := Policy{Image: identity, LaunchKey: []byte(pin.LaunchKey), AcceptTCBStatus: pin.AcceptTCBStatus}
 	return verifyServingCert(ctx, policy, engine, leaf, now, nil, [][]string{{document}})
 }
 

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
 	"github.com/confidential-dot-ai/c8s/internal/readutil"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -41,9 +43,23 @@ See docs/session-key-service.md.`,
 	return cmd
 }
 
+// acceptedTCBFlag is the flag by which a document's author names the Intel
+// TCB statuses it accepts besides UpToDate.
+func acceptedTCBFlag(f *pflag.FlagSet, statuses *[]string, of string) {
+	f.StringSliceVar(statuses, "accept-tcb-status", nil,
+		"an Intel TCB status, besides UpToDate, that "+of+" may have, such as OutOfDate or SWHardeningNeeded; repeat for more. Whoever verifies the document sees the list. Revoked is never accepted")
+}
+
+// sortedOnce is a flag's list as a document carries it.
+func sortedOnce(statuses []string) []string {
+	out := slices.Clone(statuses)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
 func newKeyServiceBundleCmd() *cobra.Command {
 	var opts keyservice.BundleOptions
-	var pools []string
+	var pools, acceptTCB []string
 	cmd := &cobra.Command{
 		Use:   "new",
 		Short: "Write and sign a key service's launch document",
@@ -64,7 +80,7 @@ which guests it releases to.
 				if !ok || manifest == "" || key == "" {
 					return fmt.Errorf("--pool %q must be <image manifest>:<launch public key>", spec)
 				}
-				opts.Pools = append(opts.Pools, keyservice.PoolOptions{ManifestPath: manifest, LaunchKeyPath: key})
+				opts.Pools = append(opts.Pools, keyservice.PoolOptions{ManifestPath: manifest, LaunchKeyPath: key, AcceptTCBStatus: sortedOnce(acceptTCB)})
 			}
 			if err := keyservice.NewBundle(opts); err != nil {
 				return err
@@ -78,6 +94,7 @@ which guests it releases to.
 	f.StringVar(&opts.ManifestPath, "image-manifest", "", "manifest.json published with the key service's guest image")
 	f.StringVar(&opts.KeyPath, "key", "", "existing launch private key to sign with (default: generate <out>/launch.key)")
 	f.StringArrayVar(&pools, "pool", nil, "a pool the key service serves, as <manifest.json of its guest image>:<its launch public key PEM> (repeatable)")
+	acceptedTCBFlag(f, &acceptTCB, "the platform of a guest of these pools")
 	for _, name := range []string{"out", "image-manifest", "pool"} {
 		_ = cmd.MarkFlagRequired(name)
 	}
@@ -86,6 +103,7 @@ which guests it releases to.
 
 func newKeyServicePinCmd() *cobra.Command {
 	var bundle, url, out string
+	var acceptTCB []string
 	cmd := &cobra.Command{
 		Use:   "pin",
 		Short: "Write the pin of a key service: where it is reached and what it must be",
@@ -99,6 +117,7 @@ launch document is signed with. The file is public.`,
 			if err != nil {
 				return err
 			}
+			pin.AcceptTCBStatus = sortedOnce(acceptTCB)
 			if err := pin.Validate(); err != nil {
 				return err
 			}
@@ -117,6 +136,7 @@ launch document is signed with. The file is public.`,
 	f.StringVar(&bundle, "bundle", "", "the key service's launch bundle directory")
 	f.StringVar(&url, "url", "", "where the key service is reached, as https://host:port")
 	f.StringVar(&out, "out", "", "file to write")
+	acceptedTCBFlag(f, &acceptTCB, "the key service's platform")
 	for _, name := range []string{"bundle", "url", "out"} {
 		_ = cmd.MarkFlagRequired(name)
 	}

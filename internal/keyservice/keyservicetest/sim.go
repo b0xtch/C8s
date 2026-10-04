@@ -31,14 +31,34 @@ type Sim struct {
 	Service *keyservice.Service
 }
 
+// Options change the key service New boots.
+type Options struct {
+	// Engine judges the guests' evidence. Nil is the test engine.
+	Engine session.Engine
+	// AcceptTCBStatus is what its launch document accepts of its pools'
+	// guests besides UpToDate.
+	AcceptTCBStatus []string
+}
+
 // New boots a key service whose launch document lists pools, and serves it
 // on loopback until the test ends.
 func New(t testing.TB, pools ...*sessionsim.Pool) *Sim {
 	t.Helper()
+	return NewWith(t, Options{}, pools...)
+}
+
+// NewWith is New for a key service of these options.
+func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
+	t.Helper()
+	if with.Engine == nil {
+		with.Engine = sessiontest.Engine{}
+	}
 	td := sessiontest.NewTD()
 	opts := api.BundleOptions{Dir: filepath.Join(t.TempDir(), "key-service"), ManifestPath: td.WriteManifest(t)}
 	for _, pool := range pools {
-		opts.Pools = append(opts.Pools, api.PoolOptions{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath})
+		opts.Pools = append(opts.Pools, api.PoolOptions{
+			ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath, AcceptTCBStatus: with.AcceptTCBStatus,
+		})
 	}
 	if err := api.NewBundle(opts); err != nil {
 		t.Fatal(err)
@@ -62,7 +82,7 @@ func New(t testing.TB, pools ...*sessionsim.Pool) *Sim {
 	t.Cleanup(cancel)
 	service, err := keyservice.New(ctx, keyservice.Config{
 		Launch: launch, Signature: string(signature), LaunchKey: pub,
-		TEE: sessiontest.TEE{TD: td}, Engine: sessiontest.Engine{},
+		TEE: sessiontest.TEE{TD: td}, Engine: with.Engine,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {

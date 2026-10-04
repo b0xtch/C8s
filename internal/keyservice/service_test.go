@@ -13,11 +13,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/keyservice/keyservicetest"
@@ -588,6 +591,46 @@ func TestOnlyServedPoolsOpenASession(t *testing.T) {
 	debug.td.Debug = true
 	if err := debug.open(); status(err) != 403 {
 		t.Fatalf("a debug guest: %v", err)
+	}
+}
+
+// accepting is the test engine that notes which TCB statuses each judgment
+// was asked to accept.
+type accepting struct {
+	sessiontest.Engine
+	mu   sync.Mutex
+	seen [][]string
+}
+
+func (e *accepting) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	e.mu.Lock()
+	e.seen = append(e.seen, session.AcceptedTCB(ctx))
+	e.mu.Unlock()
+	return e.Engine.VerifyEvidence(ctx, env, reportData)
+}
+
+// A key service judges a pool's guests by what its launch document accepts
+// of them, and by nothing more: a document that names no status has its
+// engine accept only UpToDate.
+func TestKeyServiceJudgesGuestsByItsDocumentsTCBStatuses(t *testing.T) {
+	for name, accepted := range map[string][]string{"two statuses": {"OutOfDate", "SWHardeningNeeded"}, "none": nil} {
+		pool := sessionsim.NewPool(t)
+		engine := &accepting{}
+		ks := keyservicetest.NewWith(t, keyservicetest.Options{Engine: engine, AcceptTCBStatus: accepted}, pool)
+		if err := newGuest(t, pool, ks).open(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		engine.mu.Lock()
+		seen := slices.Clone(engine.seen)
+		engine.mu.Unlock()
+		if len(seen) == 0 {
+			t.Fatalf("%s: the key service judged nothing", name)
+		}
+		for i, got := range seen {
+			if !slices.Equal(got, accepted) {
+				t.Errorf("%s: judgment %d was asked to accept %v", name, i, got)
+			}
+		}
 	}
 }
 

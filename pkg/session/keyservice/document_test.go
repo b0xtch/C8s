@@ -3,6 +3,7 @@ package keyservice_test
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -84,14 +85,46 @@ func TestLaunchDocument(t *testing.T) {
 	}
 }
 
+// A pool's entry may name the TCB statuses the key service accepts of that
+// pool's guests, and whoever verifies the document reads them in it.
+func TestLaunchDocumentNamesAcceptedTCBStatuses(t *testing.T) {
+	pool, service := sessionsim.NewPool(t), sessionsim.NewPool(t)
+	dir := filepath.Join(t.TempDir(), "key-service")
+	accepted := []string{"OutOfDate", "SWHardeningNeeded"}
+	if err := keyservice.NewBundle(keyservice.BundleOptions{
+		Dir: dir, ManifestPath: service.ManifestPath,
+		Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath, AcceptTCBStatus: accepted}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := os.ReadFile(filepath.Join(dir, session.OpkeyDir, session.DocumentFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := keyservice.Parse(launch)
+	if err != nil || !slices.Equal(doc.Pools[0].AcceptTCBStatus, accepted) {
+		t.Fatalf("the document's pool accepts %v, %v", doc.Pools, err)
+	}
+	if !strings.Contains(string(launch), "acceptTCBStatus:") {
+		t.Fatalf("the document does not say what it accepts:\n%s", launch)
+	}
+	// A document that names none says nothing of it.
+	_, _, plain, _ := bundle(t)
+	if strings.Contains(string(plain), "acceptTCBStatus") {
+		t.Fatalf("a document that accepts nothing more says so:\n%s", plain)
+	}
+}
+
 func TestBundleRefuses(t *testing.T) {
 	pool := sessionsim.NewPool(t)
 	for name, opts := range map[string]keyservice.BundleOptions{
-		"no pool":                        {ManifestPath: pool.ManifestPath},
-		"no image":                       {Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath}}},
-		"a pool with no key":             {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: "/nonexistent"}}},
-		"a pool whose key is a manifest": {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.ManifestPath}}},
-		"a key that is no key":           {ManifestPath: pool.ManifestPath, KeyPath: pool.LaunchKeyPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath}}},
+		"a pool that accepts Revoked":     {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath, AcceptTCBStatus: []string{"Revoked"}}}},
+		"a pool whose list is not sorted": {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath, AcceptTCBStatus: []string{"SWHardeningNeeded", "OutOfDate"}}}},
+		"no pool":                         {ManifestPath: pool.ManifestPath},
+		"no image":                        {Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath}}},
+		"a pool with no key":              {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: "/nonexistent"}}},
+		"a pool whose key is a manifest":  {ManifestPath: pool.ManifestPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.ManifestPath}}},
+		"a key that is no key":            {ManifestPath: pool.ManifestPath, KeyPath: pool.LaunchKeyPath, Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath}}},
 	} {
 		opts.Dir = filepath.Join(t.TempDir(), "out")
 		if err := keyservice.NewBundle(opts); err == nil {
