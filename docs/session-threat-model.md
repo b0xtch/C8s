@@ -84,8 +84,16 @@ but not confidentiality.
   treats every byte from a device as untrusted.
 - **A debug or migratable TD.** Verifiers pin the TD's attributes, so neither
   passes.
-- **An old TCB.** The vendor's collateral states the platform's TCB status,
-  and verifiers require a floor.
+- **An old TCB, or a quote from the wrong enclave.** A verifier holds a
+  quote's signer to the vendor's TD quoting enclave, by the signer, product
+  and attributes it pins, before it fetches anything, then judges the TCB
+  status of the platform, the TDX module and the quoting enclave by the
+  vendor's published algorithm. UpToDate passes and Revoked never does; any
+  other status passes only where the verifier's policy names it, and the
+  verdict carries the statuses and the vendor's advisory ids, so a verdict
+  reached under an allowance is never taken for one under a stricter policy.
+  The guest holds its key service to the same rule, and the key service its
+  pools' guests.
 
 ### Binding and identity
 
@@ -295,3 +303,6 @@ the verifier code the browser runs.
    ([session-disclosure.md](session-disclosure.md#open-questions)).
 6. **What a journal record's size says** about a session, and which size
    classes hide it ([session-state.md](session-state.md#open-questions)).
+7. **Allowances by advisory.** Whether a policy should accept a status other
+   than UpToDate only for the vendor's advisory ids it names, so that an
+   allowance made for one advisory does not admit the next.

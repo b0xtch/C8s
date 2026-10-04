@@ -27,9 +27,10 @@ replicated records, a ledger that cannot go back, and recovery.
   [session-state.md](session-state.md#what-the-key-service-keeps-for-a-session).
   For each instance key that has presented a bind: the bind's digest, and for
   each pooled TD with an open session to the key service, the verdict on its
-  evidence. And the policy: the reference values it accepts, TCB floors, the
-  platforms it accepts, the operators who may change policy and the escrow
-  holders.
+  evidence. And the policy: the reference values it accepts, the TCB statuses
+  besides UpToDate it accepts of each pool's guests (in milestone 1,
+  `pools[].acceptTCBStatus` in its launch document), the platforms it accepts,
+  the operators who may change policy and the escrow holders.
 - **Keys are random and kept as records.** Each layer's key is made in the
   guest that writes it, and the key service keeps it as given. Deriving every
   key from one seed would leave a deleted session's keys derivable for as
@@ -165,8 +166,9 @@ The key service releases the keys of a seal's or a template's layers, or a
 stored credential, only when all of these hold:
 
 1. The TD's evidence verifies against an image and a class from the release
-   log, with their proofs, and against accepted attributes, platform and TCB
-   floor.
+   log, with their proofs, and against accepted attributes and platform, with
+   each TCB level UpToDate or accepted by name for the TD's pool ([An old
+   TCB](session-threat-model.md#launch-and-measurement)).
 2. The request arrives over a live channel to the instance key in that
    evidence.
 3. The TD presents a bind naming that instance key, signed by the authority
@@ -195,9 +197,9 @@ stored credential, only when all of these hold:
 
 ## Who decides
 
-- **Policy** (accepted reference values, TCB floors, platforms, the escrow
-  holders and how many it takes) changes only by a statement that m of n
-  named operators sign, applied as a ledger entry.
+- **Policy** (accepted reference values, accepted TCB statuses, platforms, the
+  escrow holders and how many it takes) changes only by a statement that m of
+  n named operators sign, applied as a ledger entry.
 - **A tenant's authority** changes only under the tenant's current key or its
   registered recovery key, never under an operator's statement. The first
   registration is trust on first use, and the owner's client checks for a
@@ -259,14 +261,16 @@ A guest checks the key service's evidence before it has that time, so that
 check uses floors in place of a clock. The guest's measured image carries the
 vendor's TCB evaluation data number current at its build, from the update
 channel the key service fetches, and the build's date. A launch document may
-raise either but never lower it, and both are measured, so a verifier sees the
-floors a guest used. The key service puts the vendor's documents for its own
-platform in its attested certificate, and the guest checks that they chain to
-the vendor's root, that the TCB information and the quoting enclave's identity
-carry at least the floor's number, and that no next-update date among them or
-the revocation lists falls before the floor's date. Not-before dates go
-unjudged, since only a clock could judge them. The key service's TCB status
-must then meet the class's policy, and the guest sends nothing until all of it
+raise either, in `keyService.floor`, but never lower it, and both are
+measured, so a verifier sees the floors a guest used. The key service puts the
+vendor's documents for its own platform in its attested certificate, and the
+guest checks that they chain to the vendor's root, that the TCB information
+and the quoting enclave's identity carry at least the floor's number, and that
+no next-update date among them or the revocation lists falls before the
+floor's date. Not-before dates go unjudged, since only a clock could judge
+them. The key service's TCB status must then pass as any verifier's does,
+UpToDate or accepted by name in the launch document's
+`keyService.acceptTCBStatus`, and the guest sends nothing until all of it
 passes. Once an answer carries the key service's time, the guest judges the
 same documents by it, and each lease renewal brings the key service's newest
 documents for its own platform beside the guest's. A key service whose

@@ -280,7 +280,7 @@ learns whose it is only from its bind.
 | `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared; a TD whose RTMR[0] is not among them ends, and a document that lists none is refused |
 | `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own monotonic clock |
 | `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
-| `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key |
+| `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key, and the TCB statuses besides UpToDate that a TD accepts of the key service's platform, by name (`acceptTCBStatus`, none by default; [An old TCB](session-threat-model.md#launch-and-measurement)); and floors above its image's own for the vendor's documents on that platform (`floor`: a TCB evaluation data number and a date; [Its clock](session-key-service.md#its-clock)) |
 
 ## The bind
 
@@ -325,12 +325,13 @@ use them; until then an agent refuses them as fields it does not know.
 2. The daemon claims a ready TD, fencing it.
 3. The daemon sends the TD's evidence to the tenant's binder in `SignBind`.
    The binder checks it as any verifier does, on the quote in the TD's RA-TLS
-   certificate: the vendor's collateral, the image pins, the TCB level and
-   the instance key the quote binds. That quote is as old as the certificate,
-   since a guest quotes fresh only in a bind's answer or over `Connect`. Then
-   the binder signs a bind naming the TD's instance key, the session, the
-   disks (a fresh root, and the read-only images by root hash), the policy, a
-   nonce and a `notAfter` a minute away.
+   certificate: the vendor's collateral, the image pins, the TCB status at
+   each level ([An old TCB](session-threat-model.md#launch-and-measurement))
+   and the instance key the quote binds. That quote is as old as the
+   certificate, since a guest quotes fresh only in a bind's answer or over
+   `Connect`. Then the binder signs a bind naming the TD's instance key, the
+   session, the disks (a fresh root, and the read-only images by root hash),
+   the policy, a nonce and a `notAfter` a minute away.
 4. The daemon calls `Bind`. The guest takes the bind, measures it, and starts
    the sandbox on the root file system it made before any bind, under a key it
    generated. The answer carries a fresh quote over the binder's nonce, with
