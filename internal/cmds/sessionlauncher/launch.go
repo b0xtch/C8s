@@ -18,6 +18,7 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/internal/fileutil"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/keyservice"
 )
 
 // opkeyLabel is the volume label the measured initrd looks for.
@@ -47,12 +48,12 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	// The guest is the one that enforces this. Checking here only turns a
 	// bundle that could never boot into an immediate, legible failure.
-	doc, err := session.VerifySigned(pub, launch, string(signature))
+	platform, described, err := describe(pub, launch, string(signature))
 	if err != nil {
 		return fmt.Errorf("launch bundle in %s: %w", cfg.LaunchDir, err)
 	}
-	if doc.Image.Platform != cfg.Platform {
-		return fmt.Errorf("launch document is for %s, launcher was asked for %s", doc.Image.Platform, cfg.Platform)
+	if platform != cfg.Platform {
+		return fmt.Errorf("launch document is for %s, launcher was asked for %s", platform, cfg.Platform)
 	}
 	// Checked before any interface is touched.
 	for _, name := range []string{firmwareFile(&cfg), diskFile} {
@@ -181,8 +182,9 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = shutdownGrace
-	log.Info("starting guest", "platform", cfg.Platform, "pool", doc.Pool, "class", doc.Class,
-		"launch_digest", session.DocumentDigest(launch), "vcpus", cfg.VCPUs, "memory_mib", cfg.MemoryMiB, "network", cfg.Network)
+	log.Info("starting guest", append([]any{"platform", cfg.Platform,
+		"launch_digest", session.DocumentDigest(launch), "vcpus", cfg.VCPUs, "memory_mib", cfg.MemoryMiB, "network", cfg.Network},
+		described...)...)
 	avoid, err := cfg.avoidCPUs()
 	if err != nil {
 		return fmt.Errorf("--avoid-first-cpu: %w", err)
@@ -213,6 +215,20 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		return fmt.Errorf("guest exited after %s: %w", uptime, err)
 	}
 	return fmt.Errorf("guest exited on its own after %s", uptime)
+}
+
+// describe reads a bundle's launch document: a session pool's, or a key
+// service's, which boots from a bundle of the same layout. It returns the
+// platform the document is for and what to log of it.
+func describe(pub, launch []byte, signature string) (platform string, described []any, err error) {
+	doc, err := session.VerifySigned(pub, launch, signature)
+	if err == nil {
+		return doc.Image.Platform, []any{"pool", doc.Pool, "class", doc.Class}, nil
+	}
+	if service, serviceErr := keyservice.VerifySigned(pub, launch, signature); serviceErr == nil {
+		return service.Image.Platform, []any{"key_service_pools", len(service.Pools)}, nil
+	}
+	return "", nil, err
 }
 
 // avoidCPUs lists the CPUs this guest's VMM is kept off: on TDX, the ones the
