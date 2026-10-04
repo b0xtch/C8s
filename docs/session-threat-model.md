@@ -319,5 +319,7 @@ the verifier code the browser runs.
    than UpToDate only for the vendor's advisory ids it names, so that an
    allowance made for one advisory does not admit the next.
 8. **The egress schema.** Whether the bind's egress and credential rules take
-   OpenShell's network policy schema at a pinned version, so that its policies
-   run unchanged, or translate from it.
+   OpenShell's network policy schema at a pinned version, limited to the forms
+   whose containment is a direct test ([Credentials and
+   egress](session-api.md#credentials-and-egress)), so that OpenShell's
+   policies within those forms run unchanged, or translate from it.

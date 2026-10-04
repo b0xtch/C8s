@@ -299,7 +299,7 @@ in the release log with its reference values
 | `session`, `tenant` | the session's name, scoped by the authority that signs it |
 | `purpose` | `start`, `restore`, `fork` or `template`; with the `generation` a restore expects, or the `template` a fork comes from |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from, with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`; with none, any public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
+| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from, with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`, which every bind carries; `any` allows every public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
 | `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
@@ -344,8 +344,20 @@ says what each may pass.
   attributes it to the calling executable, by path and digest, and to the
   programs that started it, and denies one it cannot attribute. A gVisor
   sandbox's processes never reach the guest's kernel, so its rules name no
-  program until gVisor can say which one connected. A bind with no egress
-  rules lets the sandbox reach any public destination.
+  program until gVisor can say which one connected.
+- **Rules take only forms whose containment is a direct test:** a name exactly
+  or under one leading wildcard label, an address, a port or a range of ports,
+  a path prefix of whole segments, a method exactly and a program by digest,
+  and a credential's endpoints the same. They take no globs or regular
+  expressions, which would need a solver to compare, and the gateway refuses a
+  request whose path is not in normal form, so that `..` or an encoded slash
+  cannot leave a prefix.
+- **Every bind states its egress.** A bind that lets the sandbox reach any
+  public destination says `any`, and the guest refuses a bind with no
+  `egress`, so a binder that forgets its rules gets a refusal rather than an
+  open session, and the evidence always states the posture. Milestone 1's
+  agent still lets a bind with no `egress` reach any public destination; from
+  milestone 2 it refuses one.
 - **The host sees ciphertext either way.** The gateway is part of the measured
   agent and ends TLS inside the TD, and the rules are part of the evidence, so
   the browser or SDK that verifies a session can show the rules it runs under.
@@ -363,11 +375,10 @@ authority, that names the session, the digest of the rules it replaces and the
 new rules. Its signature, not its carrier, authorizes it, so anyone may bring
 it to the guest's API over `Connect`, and since it names the rules it
 replaces, an old one cannot be replayed. The guest checks the signature, and
-that every rule in the revision lies inside the bind's `boundary` by
-containment of hosts, ports, methods, paths, programs and credential
-endpoints, a check that needs no solver. It then extends RTMR[3] with the
-revision's digest before the new rules take effect, so a fresh quote always
-names the rules in force, and the evidence carries the revisions, so a
+that every rule in the revision lies inside the bind's `boundary`, which for
+the forms rules take is a direct test with no solver. It then extends RTMR[3]
+with the revision's digest before the new rules take effect, so a fresh quote
+always names the rules in force, and the evidence carries the revisions, so a
 verifier can replay RTMR[3] through them. Nothing else in a bind changes while
 its TD runs, and a restore's or a fork's bind carries the rules in force at
 the time.
