@@ -299,15 +299,15 @@ until their memory is the host's again.
 `test/session/hardware.sh` (`make test-session-hardware`) runs all of the
 above on one TDX host with real TDs: a key service, a daemon with one pool
 that pins it, an owner who stores a credential, and two sessions of two
-tenants. It reads the class's machine from one guest's evidence and lists it
-in the pool's document. It checks that a session's command reads the stored
-credential and one that a key of its bind released, and then what must be
-refused:
+tenants. It reads the key service's machine and the class's, each from the
+evidence of one guest, and lists them in the two launch documents. It checks
+that a session's command reads the stored credential and one that a key of
+its bind released, and then what must be refused:
 
 | Refused | By whom |
 |---|---|
-| a bind to a guest whose launch document lists no machine | the guest |
-| a machine the launch document does not list; a device the class does not have | the guest, which ends before it serves |
+| a registration at a key service whose launch document lists no machine; a bind to a guest whose document lists none | the owner's client, before it sends anything, and the guest, to a caller that sends a bind anyway |
+| a machine the launch document does not list, for a key service and for a guest; a device the class does not have | the guest, which ends before it serves |
 | evidence of another image, of a pool under another launch key, of a pool that pins another key service | the owner's client, before it signs a bind |
 | a key service that is not the one pinned | the owner's client, before it sends anything |
 | a bind for a tenant nobody registered, or under another authority; a credential nobody stored | the key service |

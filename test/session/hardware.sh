@@ -7,12 +7,13 @@
 # the key service and a second one by a key its bind grants, and runs one
 # authenticated command that reads both.
 #
-# Before that it reads the class's machine (RTMR[0]) from the evidence of one
-# guest, and the pool's launch document lists it.
+# Before that it reads two machines (RTMR[0]) from evidence, the key service's
+# and the class's, each from one guest launched under a document that lists
+# none, and the documents everything else runs under list them.
 #
-# Then what must be refused: a bind to a guest whose launch document lists no
-# machine, a guest on a machine its document does not list, a guest with a
-# device its class does not have, evidence of
+# Then what must be refused: a key service and a guest whose launch documents
+# list no machine, each of the two on a machine its document does not list, a
+# guest with a device its class does not have, evidence of
 # another image, of a pool under another launch key, a key service that is
 # not the one pinned, a tenant nobody registered, a bind under another
 # authority, a credential nobody stored, a sandbox image whose content was
@@ -156,14 +157,14 @@ done
 openssl req -x509 -new -key "$out/stranger.key" -subj "/CN=stranger" -days 2 -out "$out/stranger.pem" 2>/dev/null
 
 # The pool's key first, then the key service's bundle and pin, then the pool's
-# bundle, which pins the key service. Two more bundles for the refusals: the
-# pool's image under another launch key, and a pool the key service does not
-# list.
+# bundle, which pins the key service. Each of the two bundles is written
+# twice: once listing no machine, for the guest its machine is read from, and
+# once with it. Two more pool bundles for the refusals: the pool's image
+# under another launch key, and a pool the key service does not list.
 pin=$out/ks-pin.json
+ks_pool=(--image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub" "${accept[@]}")
 expect 0 "the pool's launch key" pool-key "$C8S" session launch-config key --out "$out/pool.key"
-expect 0 "the key service's launch bundle" ks-bundle "$C8S" session key-service launch-config new --out "$out/ks" \
-    --image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub" "${accept[@]}"
-expect 0 "the key service's pin" ks-pin "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}"
+expect 0 "a key service bundle that lists no machine" ks-bundle-probe "$C8S" session key-service launch-config new --out "$out/ks-probe" "${ks_pool[@]}"
 
 ks_pid="" daemon_pid="" stray_pid="" probe_pid=""
 stop_pid() { # stop_pid <pid>
@@ -191,6 +192,8 @@ launcher=(session-launcher run --platform tdx --vsock-cid auto)
 # The shape of the one class: what the daemon launches each of its TDs with,
 # and so what every guest launched by hand here is given too.
 shape=(--vcpus 4 --memory 16G --low-memory 512M --scratch 4G ${store:+--image-store "$store"})
+# The key service's shape.
+ks_shape=(--vcpus 2 --memory 4G --low-memory 512M --scratch 2G)
 # serving <pid> <port>: wait until the guest of that launcher serves.
 serving() {
     local deadline=$(( $(date +%s) + 240 ))
@@ -201,6 +204,77 @@ serving() {
     done
     return 1
 }
+# ends_unserved <step> <log> <port> <launcher arguments...>: a guest launched
+# so must end by itself, and before it serves.
+ends_unserved() {
+    local step=$1 log=$2 at=$3 began served=0 code
+    shift 3
+    began=$(date +%s%N)
+    sudo -n timeout 120 "$C8S" "${launcher[@]}" "$@" --network user --port "127.0.0.1:$at:8443" > "$out/$log.log" 2>&1 &
+    probe_pid=$!
+    while kill -0 "$probe_pid" 2>/dev/null; do
+        [ "$(curl -sk --max-time 1 "https://127.0.0.1:$at/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
+        sleep 0.1
+    done
+    wait "$probe_pid" 2>/dev/null
+    code=$?
+    probe_pid=""
+    printf '{"step":"%s","exit":%d,"ms":%d}\n' "$log" "$code" $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
+    if [ "$served" = 0 ] && [ "$code" != 124 ] && grep -q "guest exited on its own" "$out/$log.log"; then
+        record PASS "$step"
+    else
+        record FAIL "$step" "served $served, exit $code: $(tail -c 300 "$out/$log.log" | tr '\n' ' ')"
+    fi
+}
+# launch_ks <bundle> <work directory> <log>: a key service's TD, on its port.
+launch_ks() {
+    sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$1/opkeydata" --work-dir "$2" \
+        --name "c8s-key-service-$run" "${ks_shape[@]}" --network user --port "127.0.0.1:$ks_port:8443" > "$3" 2>&1 &
+    ks_pid=$!
+}
+
+# The key service's launch document lists the machines a replica may be, as
+# values of RTMR[0], and a replica whose document lists none serves its state
+# and nothing else. The value is read from the evidence of one replica
+# launched in the key service's shape under a document that lists nothing.
+launch_ks "$out/ks-probe" "$out/ks-probe-vm" "$out/ks-probe.log"
+if ! serving "$ks_pid" "$ks_port"; then
+    record FAIL "a key service whose document lists no machine serves its state" "$(tail -c 600 "$out/ks-probe.log" | tr '\n' ' ')"
+    finish
+fi
+record PASS "a key service whose document lists no machine serves its state"
+expect 0 "the key service's machine is read from its evidence" ks-machine "$C8S" session key-service launch-config machine \
+    --bundle "$out/ks-probe" --url "https://127.0.0.1:$ks_port" "${accept[@]}"
+ks_machine=$(tr -d '[:space:]' < "$out/ks-machine.out")
+if ! [[ $ks_machine =~ ^[0-9a-f]{96}$ ]]; then
+    record FAIL "the key service's machine is a register's value" "$ks_machine"
+    finish
+fi
+expect 0 "a pin of that key service" ks-probe-pin "$C8S" session key-service pin --bundle "$out/ks-probe" \
+    --url "https://127.0.0.1:$ks_port" --out "$out/ks-probe-pin.json" "${accept[@]}"
+expect 2 "an owner sends nothing to a key service whose document lists no machine" register-unpinned \
+    "$C8S" session key-service tenant register --key-service "$out/ks-probe-pin.json" --tenant acme --authority-key "$out/authority.key"
+check "it said the document lists no machine" grep -q "lists no machine" "$out/register-unpinned.err"
+stop_pid "$ks_pid"; ks_pid=""
+
+# A replica on a machine its document does not list ends before it serves.
+# The document here lists the value with one digit changed, which stands for
+# a host that built another machine.
+other_ks_machine=$( [ "${ks_machine:0:1}" = 0 ] && echo 1 || echo 0 )${ks_machine:1}
+expect 0 "a key service bundle that lists another machine" ks-bundle-other "$C8S" session key-service launch-config new --out "$out/ks-other" \
+    --key "$out/ks-probe/launch.key" "${ks_pool[@]}" --machine "$other_ks_machine"
+ends_unserved "a key service on a machine its document does not list ends before it serves" ks-other-machine "$ks_port" \
+    --image-dir "$KSIMG" --launch-dir "$out/ks-other/opkeydata" --work-dir "$out/ks-other-vm" --name "c8s-key-service-other-$run" "${ks_shape[@]}"
+if [ "$dev" = 1 ]; then
+    check "it said its machine is none its document lists" grep -a -q "is none of the 1 its launch document lists" "$out/ks-other-machine.log"
+fi
+
+# The bundle the key service runs under, signed by the same key, and its pin,
+# which is the same for every bundle of that key and image.
+expect 0 "the key service's launch bundle, which lists its machine" ks-bundle "$C8S" session key-service launch-config new --out "$out/ks" \
+    --key "$out/ks-probe/launch.key" "${ks_pool[@]}" --machine "$ks_machine"
+expect 0 "the key service's pin" ks-pin "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}"
+check "the pin is the one made before the machine was listed" cmp -s "$pin" "$out/ks-probe-pin.json"
 
 # A launch document lists the machines its guests may be, as values of
 # RTMR[0], and a TD whose document lists none takes no bind. The class's value
@@ -224,10 +298,18 @@ if ! [[ $machine =~ ^[0-9a-f]{96}$ ]]; then
     record FAIL "the machine is a register's value" "$machine"
     finish
 fi
-expect 3 "a guest whose document lists no machine takes no bind" bind-unpinned \
+expect 2 "an owner sends no bind to a guest whose document lists no machine" bind-unpinned \
     "$C8S" session bind --url "https://127.0.0.1:$probe_port" --image-manifest "$manifest" --launch-key "$out/pool.key.pub" \
     --authority-key "$out/authority.key" --tenant acme --session s8 --out "$out/s8" --timeout 20s "${accept[@]}" "${sandbox[@]}"
-check "it said its document lists no machine" grep -q bind_no_machine "$out/bind-unpinned.err" "$out/bind-unpinned.out"
+check "it said the document lists no machine" grep -q "lists no machine" "$out/bind-unpinned.err" "$out/bind-unpinned.out"
+# The guest takes none either, from a caller that sends one unasked.
+code=$(curl -sk --max-time 10 -o "$out/bind-raw.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' \
+    "https://127.0.0.1:$probe_port/v1/bind")
+if [ "$code" = 409 ] && grep -q bind_no_machine "$out/bind-raw.out"; then
+    record PASS "the guest takes no bind, and says its document lists no machine"
+else
+    record FAIL "the guest takes no bind, and says its document lists no machine" "HTTP $code: $(head -c 300 "$out/bind-raw.out" | tr '\n' ' ')"
+fi
 stop_pid "$probe_pid"; probe_pid=""
 
 expect 0 "the pool's launch bundle, which pins the key service and lists the machine" bundle "$C8S" session launch-config new --out "$out/bundle" \
@@ -242,23 +324,10 @@ launch_key=$out/bundle/opkeydata/pubkey
 other_machine=$( [ "${machine:0:1}" = 0 ] && echo 1 || echo 0 )${machine:1}
 expect 0 "a bundle that lists another machine" bundle-other "$C8S" session launch-config new --out "$out/bundle-other" \
     --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --machine "$other_machine"
-began=$(date +%s%N)
-sudo -n timeout 120 "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-other/opkeydata" --work-dir "$out/other-vm" \
-    --name "c8s-session-other-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/other.log" 2>&1 &
-probe_pid=$!
-served=0
-while kill -0 "$probe_pid" 2>/dev/null; do
-    [ "$(curl -sk --max-time 1 "https://127.0.0.1:$probe_port/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
-    sleep 0.1
-done
-wait "$probe_pid" 2>/dev/null
-code=$?
-probe_pid=""
-printf '{"step":"other-machine","exit":%d,"ms":%d}\n' "$code" $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
-if [ "$served" = 0 ] && [ "$code" != 124 ] && grep -q "guest exited on its own" "$out/other.log"; then
-    record PASS "a guest on a machine its document does not list ends before it serves"
-else
-    record FAIL "a guest on a machine its document does not list ends before it serves" "served $served, exit $code: $(tail -c 300 "$out/other.log" | tr '\n' ' ')"
+ends_unserved "a guest on a machine its document does not list ends before it serves" other-machine "$probe_port" \
+    --image-dir "$IMG" --launch-dir "$out/bundle-other/opkeydata" --work-dir "$out/other-vm" --name "c8s-session-other-$run" "${shape[@]}"
+if [ "$dev" = 1 ]; then
+    check "it said its machine is none its document lists" grep -a -q "is none of the 1 its launch document lists" "$out/other-machine.log"
 fi
 
 # A host that keeps the shape and puts another device in a slot: the network
@@ -279,27 +348,11 @@ done
 exec qemu-system-x86_64 "$@"
 WRAP
 chmod 0755 "$wrapper"
-began=$(date +%s%N)
-sudo -n timeout 120 "$C8S" "${launcher[@]}" --qemu "$wrapper" --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/swapped-vm" \
-    --name "c8s-session-swapped-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/swapped.log" 2>&1 &
-probe_pid=$!
-served=0
-while kill -0 "$probe_pid" 2>/dev/null; do
-    [ "$(curl -sk --max-time 1 "https://127.0.0.1:$probe_port/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
-    sleep 0.1
-done
-wait "$probe_pid" 2>/dev/null
-code=$?
-probe_pid=""
+ends_unserved "a guest with a device its class does not have ends before it serves" swapped-device "$probe_port" \
+    --qemu "$wrapper" --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/swapped-vm" --name "c8s-session-swapped-$run" "${shape[@]}"
 rm -f "$wrapper"
-printf '{"step":"swapped-device","exit":%d,"ms":%d}\n' "$code" $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
-if [ "$served" = 0 ] && [ "$code" != 124 ] && grep -q "guest exited on its own" "$out/swapped.log"; then
-    record PASS "a guest with a device its class does not have ends before it serves"
-else
-    record FAIL "a guest with a device its class does not have ends before it serves" "served $served, exit $code: $(tail -c 300 "$out/swapped.log" | tr '\n' ' ')"
-fi
 if [ "$dev" = 1 ]; then
-    check "it said which device" grep -a -q "8086:10d3.*is none a session guest is given" "$out/swapped.log"
+    check "it said which device" grep -a -q "8086:10d3.*is none a session guest is given" "$out/swapped-device.log"
 fi
 # Reference values and a pin that differ from the real ones in one digit.
 python3 - "$manifest" "$out/manifest-other.json" "$pin" "$out/ks-pin-other.json" <<'EOF'
@@ -317,17 +370,8 @@ EOF
 # The key service, in a TD of its own, on a loopback port of this host. A
 # session guest has no road to it: its launcher carries the connection.
 began=$(date +%s%N)
-sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$out/ks/opkeydata" --work-dir "$out/ks-vm" \
-    --name "c8s-key-service-$run" --vcpus 2 --memory 4G --low-memory 512M --scratch 2G --network user --port "127.0.0.1:$ks_port:8443" > "$out/ks.log" 2>&1 &
-ks_pid=$!
-ok=0
-deadline=$(( $(date +%s) + 240 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    kill -0 "$ks_pid" 2>/dev/null || break
-    if [ "$(curl -sk --max-time 2 "https://127.0.0.1:$ks_port/healthz" 2>/dev/null)" = ok ]; then ok=1; break; fi
-    sleep 0.2
-done
-if [ "$ok" != 1 ]; then
+launch_ks "$out/ks" "$out/ks-vm" "$out/ks.log"
+if ! serving "$ks_pid" "$ks_port"; then
     record FAIL "the key service serves" "$(tail -c 600 "$out/ks.log" | tr '\n' ' ')"
     finish
 fi
