@@ -363,6 +363,12 @@ const minLowMemoryMiB = 384
 // sides that nothing needs.
 const bareBoard = "sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off"
 
+// modernOnly makes a virtio device one of the current kind alone. On a plain
+// PCI bus QEMU would also give it the legacy interface: a region of I/O
+// ports, driven by a layout of its own, that a session guest's kernel has no
+// driver for and its agent takes for another device.
+const modernOnly = "disable-legacy=on"
+
 // machine is the -machine value: the q35 chipset stripped to what a guest
 // uses, with what the platform adds, and the memory split if one is set.
 func (c *Config) machine(platform string) string {
@@ -435,7 +441,7 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 	args = append(args,
 		"-add-fd", fmt.Sprintf("fd=%d,set=%d", c.disks.root, rootSet),
 		"-drive", fmt.Sprintf("file=/dev/fdset/%d,format=raw,if=none,id=root0,readonly=on", rootSet),
-		"-device", "virtio-blk-pci,drive=root0,bootindex=0",
+		"-device", "virtio-blk-pci,drive=root0,bootindex=0,"+modernOnly,
 	)
 	if c.ScratchMiB > 0 {
 		if c.disks.scratch == 0 {
@@ -447,13 +453,13 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 			// O_DIRECT are the ones it would open with. auto-read-only would
 			// have it open read-only first, which the one descriptor is not.
 			"-drive", fmt.Sprintf("file=/dev/fdset/%d,format=raw,if=none,id=scratch0,cache=none,discard=unmap,auto-read-only=off", scratchSet),
-			"-device", "virtio-blk-pci,drive=scratch0,serial="+scratchSerial,
+			"-device", "virtio-blk-pci,drive=scratch0,serial="+scratchSerial+","+modernOnly,
 		)
 	}
 	args = append(args,
 		"-add-fd", fmt.Sprintf("fd=%d,set=%d", c.disks.opkey, opkeySet),
 		"-drive", fmt.Sprintf("file=/dev/fdset/%d,format=raw,if=none,id=opkey0,readonly=on", opkeySet),
-		"-device", "virtio-blk-pci,drive=opkey0",
+		"-device", "virtio-blk-pci,drive=opkey0,"+modernOnly,
 	)
 	if c.ImageStore != "" {
 		if c.disks.images == 0 {
@@ -464,7 +470,7 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 		args = append(args,
 			"-add-fd", fmt.Sprintf("fd=%d,set=%d", c.disks.images, imagesSet),
 			"-drive", fmt.Sprintf("file=/dev/fdset/%d,format=raw,if=none,id=images0,readonly=on", imagesSet),
-			"-device", "virtio-blk-pci,drive=images0,serial="+session.ImageStoreSerial,
+			"-device", "virtio-blk-pci,drive=images0,serial="+session.ImageStoreSerial+","+modernOnly,
 		)
 	}
 	switch c.Network {
@@ -480,27 +486,27 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 			"-netdev", netdev,
 			// romfile= keeps the firmware from adding a network boot option,
 			// which would change the measured boot path.
-			"-device", "virtio-net-pci,netdev=net0,mac="+c.tap.mac+",romfile=",
+			"-device", "virtio-net-pci,netdev=net0,mac="+c.tap.mac+",romfile=,"+modernOnly,
 		)
 	case NetworkUser:
 		netdev := "user,id=net0," + userNetdev
 		for _, forward := range c.Forwards {
 			netdev += fmt.Sprintf(",hostfwd=tcp:%s:%d-:%d", forward.Address, forward.Host, forward.Guest)
 		}
-		args = append(args, "-netdev", netdev, "-device", "virtio-net-pci,netdev=net0,romfile=")
+		args = append(args, "-netdev", netdev, "-device", "virtio-net-pci,netdev=net0,romfile=,"+modernOnly)
 	}
 	switch {
 	case c.vsock != nil:
-		args = append(args, "-device", fmt.Sprintf("vhost-vsock-pci,guest-cid=%d,vhostfd=%d", c.vsock.cid, c.vsock.fd))
+		args = append(args, "-device", fmt.Sprintf("vhost-vsock-pci,guest-cid=%d,vhostfd=%d,%s", c.vsock.cid, c.vsock.fd, modernOnly))
 	case c.VsockAuto:
 		return nil, errors.New("no vsock context id is reserved")
 	case c.VsockCID != 0:
-		args = append(args, "-device", fmt.Sprintf("vhost-vsock-pci,guest-cid=%d", c.VsockCID))
+		args = append(args, "-device", fmt.Sprintf("vhost-vsock-pci,guest-cid=%d,%s", c.VsockCID, modernOnly))
 	}
 	if c.Console {
 		args = append(args,
 			"-chardev", "stdio,id=con0,signal=off",
-			"-device", "virtio-serial-pci",
+			"-device", "virtio-serial-pci,"+modernOnly,
 			"-device", "virtconsole,chardev=con0",
 		)
 	}

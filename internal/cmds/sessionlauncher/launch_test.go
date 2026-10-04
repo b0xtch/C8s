@@ -45,16 +45,16 @@ func TestQEMUArgsTDX(t *testing.T) {
 		"-bios", "/proc/self/fd/3",
 		"-add-fd", "fd=4,set=1",
 		"-drive", "file=/dev/fdset/1,format=raw,if=none,id=root0,readonly=on",
-		"-device", "virtio-blk-pci,drive=root0,bootindex=0",
+		"-device", "virtio-blk-pci,drive=root0,bootindex=0,disable-legacy=on",
 		"-add-fd", "fd=6,set=2",
 		"-drive", "file=/dev/fdset/2,format=raw,if=none,id=scratch0,cache=none,discard=unmap,auto-read-only=off",
-		"-device", "virtio-blk-pci,drive=scratch0,serial=confai-scratch",
+		"-device", "virtio-blk-pci,drive=scratch0,serial=confai-scratch,disable-legacy=on",
 		"-add-fd", "fd=5,set=3",
 		"-drive", "file=/dev/fdset/3,format=raw,if=none,id=opkey0,readonly=on",
-		"-device", "virtio-blk-pci,drive=opkey0",
+		"-device", "virtio-blk-pci,drive=opkey0,disable-legacy=on",
 		"-netdev", "user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,hostfwd=tcp::8443-:8443",
-		"-device", "virtio-net-pci,netdev=net0,romfile=",
-		"-device", "vhost-vsock-pci,guest-cid=7",
+		"-device", "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on",
+		"-device", "vhost-vsock-pci,guest-cid=7,disable-legacy=on",
 	}
 	if strings.Join(args, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("argv differs:\n got: %q\nwant: %q", args, want)
@@ -75,7 +75,7 @@ func TestQEMUArgsTDX(t *testing.T) {
 	withStore := strings.Join(want[:len(want)-6], "\n") + "\n" + strings.Join([]string{
 		"-add-fd", "fd=7,set=4",
 		"-drive", "file=/dev/fdset/4,format=raw,if=none,id=images0,readonly=on",
-		"-device", "virtio-blk-pci,drive=images0,serial=c8s-images",
+		"-device", "virtio-blk-pci,drive=images0,serial=c8s-images,disable-legacy=on",
 	}, "\n") + "\n" + strings.Join(want[len(want)-6:], "\n")
 	if got != withStore {
 		t.Fatalf("argv with an image store differs:\n got: %q\nwant: %q", got, withStore)
@@ -88,7 +88,7 @@ func TestQEMUArgsTDX(t *testing.T) {
 		t.Fatal("built arguments for an image store that is not open")
 	}
 	cfg.Console = true
-	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.HasSuffix(args, "-chardev stdio,id=con0,signal=off -device virtio-serial-pci -device virtconsole,chardev=con0") {
+	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.HasSuffix(args, "-chardev stdio,id=con0,signal=off -device virtio-serial-pci,disable-legacy=on -device virtconsole,chardev=con0") {
 		t.Fatalf("console arguments missing:\n%s", args)
 	}
 }
@@ -166,7 +166,7 @@ func TestQEMUArgsTap(t *testing.T) {
 	args := strings.Join(mustArgs(t, &cfg, nil), " ")
 	for _, want := range []string{
 		"-netdev tap,id=net0,fd=3,vhost=on,vhostfd=4",
-		"-device virtio-net-pci,netdev=net0,mac=02:42:ac:11:00:02,romfile=",
+		"-device virtio-net-pci,netdev=net0,mac=02:42:ac:11:00:02,romfile=,disable-legacy=on",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("argv lacks %q:\n%s", want, args)
@@ -204,8 +204,8 @@ func TestQEMUArgsInheritedDevices(t *testing.T) {
 	args := strings.Join(mustArgs(t, &cfg, nil), " ")
 	for _, want := range []string{
 		"-netdev tap,id=net0,fd=3,vhost=on,vhostfd=4",
-		"-device virtio-net-pci,netdev=net0,mac=02:a8:1e:00:00:02,romfile=",
-		"-device vhost-vsock-pci,guest-cid=70000,vhostfd=5",
+		"-device virtio-net-pci,netdev=net0,mac=02:a8:1e:00:00:02,romfile=,disable-legacy=on",
+		"-device vhost-vsock-pci,guest-cid=70000,vhostfd=5,disable-legacy=on",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("argv lacks %q:\n%s", want, args)
