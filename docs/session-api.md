@@ -78,11 +78,14 @@ guest's own API on its TLS port.
   staple to its evidence, and releases nothing until a bind arrives. It is
   ready only once that session is open. Before then it refuses a bind unread,
   as not ready, so a pool whose key service it cannot reach offers no TD.
-- **ready to claimed.** `Claim` fences the TD, so that no connection opened
-  before the claim survives it, and reserves the TD for a session. A claim
-  nobody binds before the bind grace runs out returns the TD to ready, since
-  nothing of a tenant has entered it, and so does a `Destroy` of a claimed TD
-  that was never sent a bind.
+- **ready to claimed.** `Claim` fences the TD on the daemon's own connection
+  to it, so that no other connection opened before the claim survives it, and
+  reserves the TD for a session. The daemon asks the guest for the fence alone
+  and relays the evidence the guest gave when it became ready, with the
+  vendor's documents it last handed over, since nothing a ready guest says of
+  itself changes before a bind. A claim nobody binds before the bind grace
+  runs out returns the TD to ready, since nothing of a tenant has entered it,
+  and so does a `Destroy` of a claimed TD that was never sent a bind.
 - **claimed to bound.** The guest takes one bind, measures it and refuses
   every other. A refused bind ends the guest. Since an unbound guest takes
   the first valid bind it is sent, the daemon lets nothing reach it before
@@ -169,7 +172,8 @@ message BindRequest {
   repeated LayerPlacement layers = 6;  // where each layer sits in the in slot
 }
 message Bound {
-  Evidence evidence = 1;               // includes the bind; fresh over its nonce
+  Evidence evidence = 1;               // includes the bind
+  bytes receipt = 2;                   // c8s-bind-receipt/v1, signed by the instance key over the bind's nonce
 }
 message Evidence {
   bytes certificate = 1;               // RA-TLS; report data binds the instance key
@@ -177,7 +181,7 @@ message Evidence {
   bytes launch_signature = 3;
   repeated string events = 4;          // the digests the guest extended, in order
   bytes bind = 5;                      // when bound
-  bytes quote = 6;                     // only in Bound: the guest's evidence envelope (JSON), fresh over the bind's nonce
+  bytes quote = 6;                     // once bound: the guest's evidence envelope (JSON) over the bind's nonce, served once taken
   bytes collateral = 7;                // the vendor's documents, from the key service, stapled
   repeated bytes release_proofs = 8;   // the release log's proofs for the image, class and policies, stapled
   bytes bind_signature = 9;            // when bound; a verifier holds the bind to it
@@ -253,15 +257,15 @@ What each call does, and what a daemon that cheats could do with it:
 | Call | Caller | The daemon | The guest | If the daemon cheats |
 |---|---|---|---|---|
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
-| `Claim` | orchestrator | fences a ready TD and returns its evidence; waits up to `wait`, then says when the next will be ready | nothing until a bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
-| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, and returns the evidence the guest answers with, fresh over the bind's nonce | checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
+| `Claim` | orchestrator | fences a ready TD on its own connection to it and returns the evidence the guest gave when it became ready; waits up to `wait`, then says when the next will be ready | closes every other connection opened before the fence, and says it is still nobody's | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
+| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, and returns the guest's receipt for it, signed over the bind's nonce, with its evidence | checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation, and answers with a receipt while it takes the quote over the bind's nonce | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
 | `Connect` | anyone, once the TD is bound | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored; refuses a TD that is not bound yet | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
 | `Commit` | orchestrator | makes room on the TD's `out` slot, stores the layer the guest writes there, then asks the guest to commit it | snapshots its files without stopping the sandbox, writes what changed since the last layer, records the generation at the key service, keeps its lease and runs on | it loses the layer, and the commit fails |
 | `Seal` | orchestrator | makes room on the TD's `out` slot, stores the layers the guest writes there, then asks the guest to commit them | drains its gateways, checkpoints the sandbox if the level keeps processes (in continuous mode, only its last epoch), and writes new layers, each under a new key; then records the generation at the key service and ends | it loses the seal before the commit, and the session runs on at its last generation; after the commit, the key service refuses any older seal in its place |
 | `Destroy` | orchestrator | ends the TD and deletes the session's ciphertext; returns a claimed TD that was never sent a bind to its pool, as a lapsed claim does | nothing: ending a TD needs no cooperation | the same as any host stopping a guest |
-| `GetEvidence` | anyone | returns what the guest serves, with no fresh quote | serves its certificate, documents, events, bind and phase; it quotes fresh only in a bind's answer or over `Connect` | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
+| `GetEvidence` | anyone | returns what the guest serves, and never asks it to quote | serves its certificate, documents, events, bind, phase and the quote over the bind's nonce once it has it; it quotes fresh only for a bind or over `Connect` | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
 | `GetStats` | orchestrator | reports what a host sees | nothing | nothing new: the host saw it anyway |
 | `Start`, `Restore`, `Fork` | orchestrator | `Claim`, then `SignBind` on the binder, then `Bind` | as for `Bind` | as for each step |
 
@@ -279,7 +283,7 @@ learns whose it is only from its bind.
 | `image` | the measured image the pool boots |
 | `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the machine the host declared but not what kind each device is, which the guest checks itself ([The host declares another machine](session-threat-model.md#launch-and-measurement)); a TD whose RTMR[0] is not among them ends before it serves. Under a document that lists none, a TD serves its state and evidence, so that the value can be read from its own evidence, and nothing more: it takes no bind (`bind_no_machine`), is never ready and opens no session with the key service |
 | `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own monotonic clock |
-| `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
+| `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant. For the first of them the guest also makes the sandbox's container before any bind, with only its own measured init inside, which becomes the image's process when a bind names that image: nothing of the image runs before the bind, which still extends the image into RTMR[3], and a bind that names another image gets a container of its own |
 | `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key, and the TCB statuses besides UpToDate that a TD accepts of the key service's platform, by name (`acceptTCBStatus`, none by default; [An old TCB](session-threat-model.md#launch-and-measurement)); and floors above its image's own for the vendor's documents on that platform (`floor`: a TCB evaluation data number and a date; [Its clock](session-key-service.md#its-clock)) |
 
 ## The bind
@@ -398,21 +402,38 @@ reach, no new HTTP method and no cloud metadata endpoint.
    certificate: the vendor's collateral, the image pins, the TCB status at
    each level ([An old TCB](session-threat-model.md#launch-and-measurement))
    and the instance key the quote binds. That quote is as old as the
-   certificate, since a guest quotes fresh only in a bind's answer or over
-   `Connect`. Then the binder signs a bind naming the TD's instance key, the
-   session, the disks (a fresh root, and the read-only images by root hash),
-   the policy, a nonce and a `notAfter` a minute away.
-4. The daemon calls `Bind`. The guest takes the bind, measures it, and starts
-   the sandbox on the root file system it made before any bind, under a key it
-   generated. The answer carries a fresh quote over the binder's nonce, with
-   the bind in the TD's measurements.
+   certificate, since a guest quotes fresh only for a bind or over `Connect`.
+   Then the binder signs a bind naming the TD's instance key, the session, the
+   disks (a fresh root, and the read-only images by root hash), the policy, a
+   nonce and a `notAfter` a minute away.
+4. The daemon calls `Bind`. The guest checks the bind, extends RTMR[3] with
+   its digest and then the sandbox's image, takes the credentials the bind
+   names and starts the sandbox on the root file system it made before any
+   bind, under a key it generated, while it takes the quote over the binder's
+   nonce. It answers with a receipt that its instance key signs over that
+   nonce: the bind's digest, the events it extended and the phase it reached.
+   The quote follows in the evidence it serves, and the binder holds it to the
+   receipt. A guest whose admission fails after it extended RTMR[3] ends and
+   gives no quote.
 
-A bind holds no secret, so a stale quote costs at most a wasted bind: keys
+A receipt is fresh because the nonce is the binder's, and it is worth what the
+instance key is worth: the binder checked the quote that binds that key to the
+measured TD before it signed the bind, and every channel to the session, the
+key service's among them, already rests on that key
+([Release](session-key-service.md#release)). What the receipt says of RTMR[3]
+is the measured agent's word until the quote confirms it. A quote that
+disagrees with its receipt fails the session, and the binder destroys it; the
+verdict that is kept rests on the quote alone; and a binder whose policy asks
+for the quote first waits for it before it sends anything.
+
+A bind holds no secret, so stale evidence costs at most a wasted bind: keys
 and credentials reach a session only after the key service, or the owner's
-client over `Connect`, has checked a fresh quote itself.
+client over `Connect`, has checked the instance key's evidence and that the
+key is live.
 
-No boot is on this path: a start is two round trips to the guest plus the
-binder's check.
+No boot is on this path: a start is two round trips to the guest, over a
+connection the daemon keeps to each ready guest so that neither pays a
+handshake, plus the binder's check.
 
 ### Hold and release
 

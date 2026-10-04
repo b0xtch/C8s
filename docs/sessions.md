@@ -57,9 +57,9 @@ guest that differs from Kata's in four ways, all kept here:
   underivable offline, so the Kata mode pinned MRTD alone.
 - **No boot on the user's path.** A pooled TD boots for nobody and becomes one
   session's only when a signed bind, measured and taken once, makes it so,
-  after a fence has closed every connection made before the claim. A start
-  is a few round trips rather than a boot, and the TD never returns to the
-  pool.
+  after a fence has closed every connection made before the claim but the
+  daemon's own. A start is a few round trips rather than a boot, and the TD
+  never returns to the pool.
 
 Sessions extend that guest with what agent platforms need:
 

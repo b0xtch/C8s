@@ -137,9 +137,13 @@ but not confidentiality.
   guest's measured image carries from its build or a launch document raised.
   The guest judges them again by the key service's time once it has it ([Its
   clock](session-key-service.md#its-clock)).
-- **Stale evidence.** Fresh quotes are made over the binder's nonce in a
-  bind's answer, or over a verifier's own nonce through `Connect`, and the
-  RA-TLS handshake proves that the key is live.
+- **Stale evidence.** A bind's answer is a receipt the instance key signs over
+  the binder's nonce, and the quote over the same nonce follows; a verifier
+  can ask for a quote over its own nonce through `Connect`; and the RA-TLS
+  handshake proves that the key is live. A receipt adds freshness, not trust:
+  it is worth what the quote that binds its key is worth, and what it says of
+  RTMR[3] is the measured agent's word until the quote confirms it, so the
+  verdict that is kept rests on the quote.
 - **A pooled TD carrying something from an earlier session.** A bound TD never
   returns to a pool, and a pooled TD holds no tenant data, code or keys before
   its bind.
