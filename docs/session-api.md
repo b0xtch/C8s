@@ -154,11 +154,10 @@ message BindRequest {
   string td = 2;
   bytes bind = 3;                      // c8s-bind/v1, canonical JSON
   bytes signature = 4;
-  bytes nonce = 5;                     // the verifier's, for fresh evidence
-  repeated DiskRef disks = 6;          // what the bind names, in its slots
+  repeated DiskRef disks = 5;          // what the bind names, in its slots
 }
 message Bound {
-  Evidence evidence = 1;               // now includes the bind
+  Evidence evidence = 1;               // includes the bind; fresh over its nonce
 }
 message Evidence {
   bytes certificate = 1;               // RA-TLS; report data binds the instance key
@@ -221,9 +220,8 @@ message SignBindRequest {
   string template = 6;
 }
 message SignBindResponse {
-  bytes bind = 1;
+  bytes bind = 1;                      // carries the binder's nonce
   bytes signature = 2;
-  bytes nonce = 3;
 }
 ```
 
@@ -233,7 +231,7 @@ What each call does, and what a daemon that cheats could do with it:
 |---|---|---|---|---|
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
 | `Claim` | orchestrator | fences a ready TD and returns its evidence; waits up to `wait`, then says when the next will be ready | nothing until a bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
-| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, posts the bind and the nonce to the guest, returns fresh evidence | checks and takes the bind, measures it, opens only the disks it names, restores if it names a seal | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
+| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, posts the bind to the guest, and returns the evidence the guest answers with, fresh over the bind's nonce | checks and takes the bind, measures it, opens only the disks it names, restores if it names a seal | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
 | `Connect` | anyone | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
@@ -243,29 +241,56 @@ What each call does, and what a daemon that cheats could do with it:
 | `GetStats` | orchestrator | reports what a host sees | nothing | nothing new: the host saw it anyway |
 | `Start`, `Restore`, `Fork` | orchestrator | `Claim`, then `SignBind` on the binder, then `Bind` | as for `Bind` | as for each step |
 
-## The bind
+## The launch document
 
-A bind is a canonical JSON document, `c8s-bind/v1`, signed by the owner's
-authority. The guest refuses a bind with a field it does not know, and each
-image's manifest lists the fields its agent accepts.
+Each pooled TD boots with a launch document, `c8s-session-launch/v1`, signed
+by its pool's launch key
+([sessions.md](sessions.md#identity-and-attestation)). It names no tenant,
+session or workload, so one document serves every TD of a pool, and a TD
+learns whose it is only from its bind.
 
 | Field | What it fixes |
 |---|---|
+| `pool`, `class` | the pool, and the class whose shape the TD was launched with |
+| `image` | the measured image the pool boots |
+| `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared |
+| `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own clock |
+| `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
+| `keyService` | the pins of the key service the pool's TDs open their sessions with |
+
+## The bind
+
+A bind is a canonical JSON document (RFC 8785), `c8s-bind/v1`, signed by the
+owner's authority. The guest refuses a bind with a field it does not know.
+The fields and purposes an agent accepts are its image's bind schema. The
+build writes it from the agent's own definitions, so it cannot drift from the
+code, and publishes it as it does the disclosure schema: on the image's
+verity root, and in the release log with the image's reference values
+([session-disclosure.md](session-disclosure.md#rules), rule 3).
+
+| Field | What it fixes |
+|---|---|
+| `authority` | the public key that signs the bind, in PEM, so the measured digest fixes it and verifiers read the session's authority from the evidence |
 | `instanceKey` | the digest of the TD's instance key, so the bind fits this TD alone |
 | `session`, `tenant` | the session's name, scoped by the authority that signs it |
 | `purpose` | `start`, `restore` or `fork`; with `generation` or `template` where they apply |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest, its egress allowlist, the inference endpoints it may reach and their pins, and the wall when the TD is a tenant VM |
+| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name and size (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; and the wall when the TD is a tenant VM |
 | `keyService` | the pins of the key service the guest may trust for this session |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
-| `nonce`, `notAfter` | the verifier's nonce, and a short validity, a minute by default |
+| `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default |
 
 The guest measures the bind's digest (rule 2 in
 [sessions.md](sessions.md#rules)), so the policy a session runs under is part
 of its evidence, and the browser or SDK that verifies it can show the owner
-exactly which images, egress and inference the session may use, and which
-review policy, if any, may report on it.
+exactly who may drive the session, which images, egress and inference it may
+use, and which review policy, if any, may report on it.
+
+[Milestone 1](sessions.md#milestones) needs `start` binds only. The other
+purposes, and the `disks`, `keyService`, `review` and `ownerKey` fields, come
+with the milestones that use them; until then an agent refuses them as fields
+it does not know.
 
 ## Flows
 

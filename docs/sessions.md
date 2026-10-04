@@ -143,7 +143,8 @@ Session TDs follow c8s's current launch-key and measurement contracts
   RTMR[2] from the image's published manifest, as they do for nodes, and pin
   the TD's attributes so that no debug or migratable TD passes.
 - **Pool launch key.** Each TD boots with a signed launch document for its
-  pool, naming its class and the key service it trusts. The document's public
+  pool, naming its class and the key service it trusts
+  ([its fields](session-api.md#the-launch-document)). The document's public
   key is bound to the guest as for nodes: the measured initrd extends RTMR[3]
   with it on TDX, and the launcher sets HOST_DATA to its hash on SEV-SNP. The
   agent then measures the document's digest too, into RTMR[3] on TDX and into
