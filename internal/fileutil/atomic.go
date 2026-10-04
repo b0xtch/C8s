@@ -37,6 +37,15 @@ func WriteAtomic(path string, data []byte, mode os.FileMode) error {
 // through the rename prevents a later replacement of its pathname from
 // redirecting the write.
 func WriteAtomicRoot(root *os.Root, name string, data []byte, mode os.FileMode) error {
+	return WriteAtomicRootOwned(root, name, data, mode, -1, -1)
+}
+
+// WriteAtomicRootOwned is WriteAtomicRoot for a file another user reads. The
+// temp file is handed to uid and gid before the rename, so the destination
+// never appears under an owner that cannot read it, and a failure to hand it
+// over leaves an earlier file of that name as it was. -1 leaves the user or
+// the group unchanged.
+func WriteAtomicRootOwned(root *os.Root, name string, data []byte, mode os.FileMode, uid, gid int) error {
 	if root == nil {
 		return fmt.Errorf("write atomically: nil directory root")
 	}
@@ -67,6 +76,12 @@ func WriteAtomicRoot(root *os.Root, name string, data []byte, mode os.FileMode) 
 	if err := tmp.Chmod(mode); err != nil {
 		_ = tmp.Close()
 		return err
+	}
+	if uid >= 0 || gid >= 0 {
+		if err := tmp.Chown(uid, gid); err != nil {
+			_ = tmp.Close()
+			return err
+		}
 	}
 	if err := tmp.Close(); err != nil {
 		return err

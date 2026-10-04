@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 )
@@ -52,5 +53,46 @@ func TestWriteAtomicWriteFailureCleansUpTemp(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("temp file not cleaned up, dir contains: %v", entries)
+	}
+}
+
+// The temp file is handed over before the rename: when that fails, the name
+// still holds what it held and no temp file is left behind.
+func TestWriteAtomicRootOwnedHandsOverBeforeTheRename(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root may hand a file to anyone")
+	}
+	dir := t.TempDir()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := WriteAtomicRootOwned(root, "out", []byte("mine"), 0o600, os.Getuid(), os.Getgid()); err != nil {
+		t.Fatalf("to this user: %v", err)
+	}
+	if err := WriteAtomicRootOwned(root, "out", []byte("also mine"), 0o600, -1, os.Getgid()); err != nil {
+		t.Fatalf("to this group alone: %v", err)
+	}
+	// A group this user is not in, to which it may hand nothing.
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := 0
+	for slices.Contains(groups, foreign) || foreign == os.Getgid() {
+		foreign++
+	}
+	for name, owner := range map[string][2]int{"root": {0, 0}, "the user alone": {0, -1}, "the group alone": {-1, foreign}} {
+		if err := WriteAtomicRootOwned(root, "out", []byte("another's"), 0o600, owner[0], owner[1]); err == nil {
+			t.Fatalf("%s: handed a file over without the right to", name)
+		}
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "out")); err != nil || string(got) != "also mine" {
+		t.Fatalf("the file holds %q, %v", got, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("the directory holds %v, %v", entries, err)
 	}
 }
