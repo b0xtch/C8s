@@ -193,7 +193,7 @@ launcher=(session-launcher run --platform tdx --vsock-cid auto)
 # session guest has no road to it: its launcher carries the connection.
 began=$(date +%s%N)
 sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$out/ks/opkeydata" --work-dir "$out/ks-vm" \
-    --name "c8s-key-service-$run" --vcpus 2 --memory 4G --scratch 2G --network user --port "127.0.0.1:$ks_port:8443" > "$out/ks.log" 2>&1 &
+    --name "c8s-key-service-$run" --vcpus 2 --memory 4G --low-memory 512M --scratch 2G --network user --port "127.0.0.1:$ks_port:8443" > "$out/ks.log" 2>&1 &
 ks_pid=$!
 ok=0
 deadline=$(( $(date +%s) + 240 ))
@@ -238,7 +238,7 @@ expect 3 "another key cannot store the tenant's credential" put-usurper \
     [ -n "$confine" ] && echo "  confine: \"$confine\""
     [ "$dev" = 1 ] && echo "  console: true"
     echo "classes:"
-    echo "  s-4x16: {vcpus: 4, memory: 16G, scratch: 4G}"
+    echo "  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}"
     echo "pools:"
     echo "  - imageDir: $IMG"
     echo "    launchDir: $out/bundle/opkeydata"
@@ -403,7 +403,7 @@ check "the restarted daemon took its TDs over" [ "$(grep -c '"msg":"took over a 
 # back until it gives up.
 stray_port=$((ks_port + 1))
 sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-b/opkeydata" --work-dir "$out/stray-vm" \
-    --name "c8s-session-stray-$run" --vcpus 4 --memory 16G --scratch 4G --network user --port "127.0.0.1:$stray_port:8443" \
+    --name "c8s-session-stray-$run" --vcpus 4 --memory 16G --low-memory 512M --scratch 4G --network user --port "127.0.0.1:$stray_port:8443" \
     ${store:+--image-store "$store"} > "$out/stray.log" 2>&1 &
 stray_pid=$!
 deadline=$(( $(date +%s) + 240 ))
