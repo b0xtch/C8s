@@ -88,6 +88,7 @@ func newRunCmd() *cobra.Command {
 	var acceptReserve int
 	var acceptRest bool
 	var guard RulesetGuard
+	var schemas SchemaGuard
 	image := ImageRunnerConfig{Pull: sandboxPullLimits, Unpack: sandboxUnpackLimits}
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -111,16 +112,23 @@ func newRunCmd() *cobra.Command {
 			if cfg.TEE, err = OpenTEE(cfg.Platform); err != nil {
 				return err
 			}
+			var checks []func(context.Context) error
+			// The schemas on the measured root are the ones this agent keeps
+			// to, or this is not the image that was published.
+			checks = append(checks, func(context.Context) error { return schemas.Check() })
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.
 				listeners := ListenerGuard{Proc: "/proc"}
-				cfg.Guard = func(ctx context.Context) error {
-					if err := guard.Check(ctx); err != nil {
+				checks = append(checks, guard.Check, listeners.Check)
+			}
+			cfg.Guard = func(ctx context.Context) error {
+				for _, check := range checks {
+					if err := check(ctx); err != nil {
 						return err
 					}
-					return listeners.Check(ctx)
 				}
+				return nil
 			}
 			// Unreadable reads as none, which a document with a bind deadline
 			// refuses.
@@ -182,6 +190,8 @@ func newRunCmd() *cobra.Command {
 	f.BoolVar(&cfg.Bare, "bare", false, "take a bind that names no sandbox image, and run its commands on the guest's own file system as --sandbox-user: a dev image's mode, for tests. Without it such a document is refused")
 	f.StringVar(&guard.Expected, "packet-filter", "", "nft JSON listing of the image's packet filter; the agent ends the guest if another is in force")
 	f.StringVar(&guard.Nft, "nft", "/usr/sbin/nft", "nft binary, for --packet-filter")
+	f.StringVar(&schemas.Disclosure, "disclosure-schema", "", "the image's disclosure schema, on its measured root; the agent ends the guest if it is not the one the agent keeps to")
+	f.StringVar(&schemas.Bind, "bind-schema", "", "the image's bind schema, on its measured root; the agent ends the guest if it is not the one the agent takes binds by")
 	f.StringVar(&image.Crun, "crun", "", "crun binary; set by guest images that can run a sandbox image")
 	f.StringVar(&image.StateDir, "sandbox-state-dir", defaultStateDir, "directory on the encrypted scratch volume for the sandbox image")
 	f.StringVar(&image.RunDir, "sandbox-runtime-dir", defaultRuntimeDir, "RAM-backed directory for the container runtime's state")

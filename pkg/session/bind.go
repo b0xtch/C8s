@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -169,8 +170,8 @@ func (b *Bind) Validate() error {
 	if errs := validation.IsDNS1123Label(b.Session); len(errs) > 0 {
 		return errors.New("session must be an RFC1123 label")
 	}
-	if b.Purpose != PurposeStart {
-		return fmt.Errorf("purpose must be %q", PurposeStart)
+	if !slices.Contains(BindPurposes, b.Purpose) {
+		return fmt.Errorf("purpose must be one of %q", BindPurposes)
 	}
 	if !bindNonceRE.MatchString(b.Nonce) {
 		return errors.New("nonce must be 64 lowercase hex characters")

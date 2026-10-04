@@ -55,6 +55,15 @@ if [ ! -s "$BUILDROOT/etc/c8s-session/firewall.json" ]; then
     exit 1
 fi
 
+# The agent holds these to the schemas it is compiled from, and ends the guest
+# if either is another. The build wrote them with the staged binary.
+for schema in disclosure-schema.json bind-schema.json; do
+    if [ ! -s "$BUILDROOT/etc/c8s-session/$schema" ]; then
+        echo "c8s-session finalize: FATAL /etc/c8s-session/$schema is not in the image (build with session-guest-image/build)" >&2
+        exit 1
+    fi
+done
+
 # The agent ends the guest if a UDP socket outside the guest's ports takes
 # datagrams from any sender, and an NTP client holds one for as long as it
 # has a server. The image has no time daemon; one that came back as some

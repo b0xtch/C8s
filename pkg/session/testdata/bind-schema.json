@@ -1,0 +1,206 @@
+{
+  "schemaVersion": "c8s-bind-schema/v1",
+  "bind": "c8s-bind/v1",
+  "purposes": [
+    "start"
+  ],
+  "members": [
+    {
+      "name": "schemaVersion",
+      "type": "string"
+    },
+    {
+      "name": "instanceKey",
+      "type": "string"
+    },
+    {
+      "name": "authority",
+      "type": "string"
+    },
+    {
+      "name": "tenant",
+      "type": "string"
+    },
+    {
+      "name": "session",
+      "type": "string"
+    },
+    {
+      "name": "purpose",
+      "type": "string"
+    },
+    {
+      "name": "nonce",
+      "type": "string"
+    },
+    {
+      "name": "notAfter",
+      "type": "string"
+    },
+    {
+      "name": "policy",
+      "type": "object",
+      "members": [
+        {
+          "name": "sandbox",
+          "type": "object",
+          "optional": true,
+          "members": [
+            {
+              "name": "image",
+              "type": "string"
+            },
+            {
+              "name": "command",
+              "type": "list",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "args",
+              "type": "list",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "env",
+              "type": "map",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "workingDir",
+              "type": "string",
+              "optional": true
+            }
+          ]
+        },
+        {
+          "name": "access",
+          "type": "object",
+          "members": [
+            {
+              "name": "exec",
+              "type": "list",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "credentials",
+              "type": "list",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            },
+            {
+              "name": "forward",
+              "type": "list",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "credentials",
+          "type": "list",
+          "optional": true,
+          "item": {
+            "type": "object",
+            "members": [
+              {
+                "name": "name",
+                "type": "string"
+              },
+              {
+                "name": "maxBytes",
+                "type": "integer",
+                "optional": true
+              },
+              {
+                "name": "source",
+                "type": "string",
+                "optional": true
+              }
+            ]
+          }
+        },
+        {
+          "name": "egress",
+          "type": "object",
+          "optional": true,
+          "members": [
+            {
+              "name": "allow",
+              "type": "list",
+              "item": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "forward",
+          "type": "object",
+          "optional": true,
+          "members": [
+            {
+              "name": "ports",
+              "type": "list",
+              "item": {
+                "type": "integer"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "keyService",
+      "type": "object",
+      "optional": true,
+      "members": [
+        {
+          "name": "url",
+          "type": "string"
+        },
+        {
+          "name": "image",
+          "type": "object",
+          "members": [
+            {
+              "name": "platform",
+              "type": "string"
+            },
+            {
+              "name": "measurement",
+              "type": "string"
+            },
+            {
+              "name": "rtmrs",
+              "type": "map",
+              "optional": true,
+              "item": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        {
+          "name": "launchKey",
+          "type": "string"
+        }
+      ]
+    }
+  ]
+}

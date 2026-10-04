@@ -64,8 +64,18 @@ fi
 echo "session-guest-image/build: staging $(sha256sum "$C8S_BINARY" | cut -d' ' -f1)  $C8S_BINARY"
 
 cd "$CONFOS_DIR"
-install -D -m 0755 "$C8S_BINARY" mkosi/base/mkosi.local/mkosi.extra/usr/local/bin/c8s
-exec bin/confos build "$C8S_NAME" \
+STAGE=mkosi/base/mkosi.local/mkosi.extra
+install -D -m 0755 "$C8S_BINARY" "$STAGE/usr/local/bin/c8s"
+# What the agent in this binary says to a caller without a key, and what it
+# takes in a bind, as the binary itself states them. Both go on the measured
+# root, where the agent holds them to its own definitions before it serves,
+# and beside the manifest, where a verifier reads them.
+install -d "$STAGE/etc/c8s-session"
+for schema in disclosure bind; do
+    "$C8S_BINARY" session schema "$schema" > "$STAGE/etc/c8s-session/$schema-schema.json" \
+        || { echo "session-guest-image/build: $C8S_BINARY did not print its $schema schema (it runs on this machine: linux/amd64)" >&2; exit 1; }
+done
+bin/confos build "$C8S_NAME" \
     ${DEV_PROFILE[@]+"${DEV_PROFILE[@]}"} \
     --profile-dir "$PGI_DIR/c8s-session" \
     --sync-input "platform=${C8S_PLATFORM}" \
@@ -75,3 +85,10 @@ exec bin/confos build "$C8S_NAME" \
     --platform "$C8S_PLATFORM" \
     --memory "${C8S_MEMORY:-1G}" \
     "$@"
+[ -f "output/$C8S_NAME/manifest.json" ] \
+    || { echo "session-guest-image/build: no output/$C8S_NAME/manifest.json to publish the schemas beside" >&2; exit 1; }
+# The builder clears its staging area. The binary prints the same bytes again.
+for schema in disclosure bind; do
+    "$C8S_BINARY" session schema "$schema" > "output/$C8S_NAME/$schema-schema.json"
+done
+echo "session-guest-image/build: published output/$C8S_NAME/disclosure-schema.json and bind-schema.json"

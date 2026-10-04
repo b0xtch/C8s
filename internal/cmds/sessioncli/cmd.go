@@ -72,7 +72,7 @@ See docs/sessions.md.`,
 	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
-	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd())
+	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd(), schemaCmd())
 	cmd.AddCommand(imageStoreCmds()...)
 	return cmd
 }

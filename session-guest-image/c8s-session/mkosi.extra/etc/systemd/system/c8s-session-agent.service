@@ -30,7 +30,7 @@ Type=simple
 # sets it. Unquoted and unbraced, an empty value adds no argument and a value
 # of several words adds one for each.
 Environment=C8S_SESSION_DEV_FLAGS=
-ExecStart=/usr/local/bin/c8s session-agent run --platform=${C8S_SESSION_PLATFORM} --crun=/usr/bin/crun --packet-filter=/etc/c8s-session/firewall.json $C8S_SESSION_DEV_FLAGS
+ExecStart=/usr/local/bin/c8s session-agent run --platform=${C8S_SESSION_PLATFORM} --crun=/usr/bin/crun --packet-filter=/etc/c8s-session/firewall.json --disclosure-schema=/etc/c8s-session/disclosure-schema.json --bind-schema=/etc/c8s-session/bind-schema.json $C8S_SESSION_DEV_FLAGS
 Restart=no
 # However the agent ended. Forced twice, systemctl asks nothing of the service
 # manager: it syncs and calls reboot(2) itself.
