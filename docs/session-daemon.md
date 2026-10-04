@@ -90,7 +90,7 @@ network:
   mode: tap
   guestCIDR: 10.213.0.0/22      # the daemon's alone: four addresses per TD
   egressInterface: eth0         # optional: without it a guest reaches nothing
-  reach: ["192.0.2.7:8443"]     # optional: open to every guest, as the key service is
+  reach: ["192.0.2.7:8443"]     # optional: open to every guest
   dns: [192.0.2.53]
 vmm:
   quoteSocket: /var/run/tdx-qgs/qgs.socket
@@ -140,6 +140,13 @@ Every drop is counted (`nft list table inet c8s_sessions`). The table stays
 when the daemon exits, because its TDs run on. `egressInterface` needs
 `net.ipv4.ip_forward=1`, which the daemon checks and does not set.
 
+The table only closes. Each of the host's own tables judges the same packets,
+and a drop in any of them is final, so `reach` and `egressInterface` open
+nothing that the host's own packet filter drops. A host that drops what
+arrives on an interface it does not know, as a default-deny filter does,
+drops what a guest starts until its operator lets `c8st*` through. The
+daemon changes no rule outside its own table.
+
 What a sandbox may reach is decided a second time inside the guest, by the
 egress policy of its bind, which the host cannot change. The host's rules are
 the outer wall: they keep a tenant's guest away from the host's own services
@@ -188,7 +195,28 @@ bind's tenant, and declares the credential. The release is sealed to a key
 of the guest's under a hybrid of ML-KEM-768 and X25519. Guests and owners
 hold the key service to its pin before they send it anything.
 
-In `tap` mode the key service's address and port go in `network.reach`.
+A guest has no road of its own to its key service. Its launcher carries the
+connection:
+
+```
+ TD of a session            its host                      key service's TD
+ +-----------+   vsock    +----------+       TCP         +---------------+
+ |   agent   |----------->| launcher |------------------>|  key service  |
+ +-----------+  port P    +----------+  the pin's url    +---------------+
+       |                                                         |
+       +------- one TLS channel, attested at both ends ----------+
+```
+
+The launcher listens on a vsock port of the host's, tells its guest the port
+in the unsigned `host.json`, and joins what its guest sends there to the
+address in the pin. It takes connections from its own guest's context id
+alone, a few at a time, and reads nothing of what it carries: the channel
+ends in the two TDs, and each holds the other to its evidence. So a session
+needs no address, no route and no opening in a packet filter to be given its
+keys, and its network stays as closed as its pool's configuration leaves it.
+A launcher that carries the connection elsewhere, or nowhere, has a guest
+that is never given a credential. A sandbox reaches none of this: its seccomp
+profile refuses the socket family.
 
 ## Restarts and draining
 

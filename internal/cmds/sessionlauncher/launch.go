@@ -48,7 +48,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	// The guest is the one that enforces this. Checking here only turns a
 	// bundle that could never boot into an immediate, legible failure.
-	platform, described, err := describe(pub, launch, string(signature))
+	platform, pinned, described, err := describe(pub, launch, string(signature))
 	if err != nil {
 		return fmt.Errorf("launch bundle in %s: %w", cfg.LaunchDir, err)
 	}
@@ -115,6 +115,16 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 			return fmt.Errorf("vsock: %w", err)
 		}
 		cfg.vsock = &vsockDevice{cid: cid, fd: inherit(device)}
+	}
+	// A guest with a vsock device reaches its key service through its
+	// launcher. One without dials the key service's address itself.
+	var carrier *relay
+	if cid := cfg.guestCID(); pinned != nil && cid != 0 {
+		if carrier, host.KeyServicePort, err = keyServiceRelay(pinned, cid, log); err != nil {
+			return fmt.Errorf("key service relay: %w", err)
+		}
+		defer carrier.ln.Close()
+		described = append(described, "key_service_port", host.KeyServicePort)
 	}
 	// Every file of the guest reaches QEMU open, so it is given no path into
 	// the image directory or the work directory and needs no right to enter
@@ -200,6 +210,11 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 			go feed.run(feeding)
 			defer stop()
 		}
+		if carrier != nil {
+			carrying, stop := context.WithCancel(ctx)
+			go carrier.run(carrying)
+			defer stop()
+		}
 		err = cmd.Wait()
 	}
 	// The scratch disk held only ciphertext under a key that died with the
@@ -219,16 +234,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 // describe reads a bundle's launch document: a session pool's, or a key
 // service's, which boots from a bundle of the same layout. It returns the
-// platform the document is for and what to log of it.
-func describe(pub, launch []byte, signature string) (platform string, described []any, err error) {
+// platform the document is for, the key service a pool's document pins, and
+// what to log of it.
+func describe(pub, launch []byte, signature string) (platform string, pinned *session.KeyService, described []any, err error) {
 	doc, err := session.VerifySigned(pub, launch, signature)
 	if err == nil {
-		return doc.Image.Platform, []any{"pool", doc.Pool, "class", doc.Class}, nil
+		return doc.Image.Platform, doc.KeyService, []any{"pool", doc.Pool, "class", doc.Class}, nil
 	}
 	if service, serviceErr := keyservice.VerifySigned(pub, launch, signature); serviceErr == nil {
-		return service.Image.Platform, []any{"key_service_pools", len(service.Pools)}, nil
+		return service.Image.Platform, nil, []any{"key_service_pools", len(service.Pools)}, nil
 	}
-	return "", nil, err
+	return "", nil, nil, err
 }
 
 // avoidCPUs lists the CPUs this guest's VMM is kept off: on TDX, the ones the

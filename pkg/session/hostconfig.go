@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/netip"
 )
 
 // HostConfigFile is the unsigned file the launcher places beside the signed
 // launch document. It carries only what the host decides anyway: how the guest
-// reaches the network. Nothing in it is trusted, and nothing in it can change
-// what the guest measures or who may drive it.
+// reaches the network and its key service. Nothing in it is trusted, and
+// nothing in it can change what the guest measures or who may drive it.
 const HostConfigFile = "host.json"
 
 const maxHostConfigSize = 16 * 1024
@@ -21,6 +22,10 @@ const maxHostConfigSize = 16 * 1024
 // HostConfig is the host-chosen runtime configuration of one guest.
 type HostConfig struct {
 	Network *HostNetwork `json:"network,omitempty"`
+	// KeyServicePort is the vsock port of the host on which the guest's
+	// launcher carries a connection to the key service the launch document
+	// pins. Zero is none: the guest dials the key service's address itself.
+	KeyServicePort uint32 `json:"key_service_port,omitempty"`
 }
 
 // HostNetwork is a static address for the guest's one interface. Absent, the
@@ -75,6 +80,10 @@ func ParseHostConfig(data []byte) (*HostConfig, error) {
 // parsed, never the string the host wrote: netip accepts any bytes after an
 // IPv6 zone's "%", a newline and a second directive included.
 func (c *HostConfig) Validate() error {
+	// The kernel reads this one as any port.
+	if c.KeyServicePort == math.MaxUint32 {
+		return fmt.Errorf("key_service_port %d is no port", c.KeyServicePort)
+	}
 	n := c.Network
 	if n == nil {
 		return nil

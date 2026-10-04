@@ -1,6 +1,7 @@
 package sessionagent
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"os"
@@ -45,8 +46,19 @@ func load(cfg LoadConfig) error {
 	if err != nil {
 		return err
 	}
-	// No host request: the image's DHCP default applies.
-	if host == nil || host.Network == nil {
+	if host == nil {
+		return nil
+	}
+	// The agent reads the host's request from here, as it was parsed.
+	staged, err := json.Marshal(host)
+	if err != nil {
+		return err
+	}
+	if err := fileutil.WriteAtomic(filepath.Join(cfg.LaunchDir, session.HostConfigFile), staged, 0o600); err != nil {
+		return err
+	}
+	// No network request: the image's DHCP default applies.
+	if host.Network == nil {
 		return nil
 	}
 	if err := os.MkdirAll(cfg.NetworkDir, 0o755); err != nil {

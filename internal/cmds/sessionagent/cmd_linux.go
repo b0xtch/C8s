@@ -101,14 +101,16 @@ func newRunCmd() *cobra.Command {
 				return errors.New("this guest can run a tenant's code nowhere: its image names no container runtime (--crun), and its agent is not a dev image's (--bare)")
 			}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
+			var err error
 			// For the key service a launch document may pin. The guest has no
 			// road to the vendor: its host hands it the vendor's documents.
 			cfg.Engine = session.NewEngine(session.EngineOptions{})
-			tee, err := OpenTEE(cfg.Platform)
-			if err != nil {
+			if cfg.KeyServiceDial, err = hostKeyServiceDial(cfg.LaunchDir); err != nil {
 				return err
 			}
-			cfg.TEE = tee
+			if cfg.TEE, err = OpenTEE(cfg.Platform); err != nil {
+				return err
+			}
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.

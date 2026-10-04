@@ -94,6 +94,50 @@ func TestLoadGivesALinkLocalAddressGlobalScope(t *testing.T) {
 	}
 }
 
+// The agent reads the host's request where load staged it, as load parsed
+// it: the port its launcher carries the key service's connection on.
+func TestLoadStagesTheHostsRequestForTheAgent(t *testing.T) {
+	cfg := loadFixture(t, `{"key_service_port": 70123, "network":{"address":"010.42.0.12/24"}}`)
+	if err := load(cfg); err == nil {
+		t.Fatal("an address with a leading zero was taken")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.LaunchDir, session.HostConfigFile)); err == nil {
+		t.Fatal("a refused request was staged")
+	}
+	for name, tc := range map[string]struct {
+		host string
+		port uint32
+		unit bool
+	}{
+		"a relay port alone":      {`{"key_service_port": 70123}`, 70123, false},
+		"a relay port and a link": {`{"network":{"address":"10.42.0.12/24"},"key_service_port":1024}`, 1024, true},
+		"a link alone":            {`{"network":{"address":"10.42.0.12/24"}}`, 0, true},
+	} {
+		cfg := loadFixture(t, tc.host)
+		if err := load(cfg); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		staged, err := session.ReadHostConfig(filepath.Join(cfg.LaunchDir, session.HostConfigFile))
+		if err != nil || staged == nil {
+			t.Fatalf("%s: the staged request: %v, %v", name, staged, err)
+		}
+		if staged.KeyServicePort != tc.port {
+			t.Errorf("%s: the agent would dial port %d, want %d", name, staged.KeyServicePort, tc.port)
+		}
+		if _, err := os.Stat(filepath.Join(cfg.NetworkDir, networkUnitName)); (err == nil) != tc.unit {
+			t.Errorf("%s: network unit written: %v", name, err == nil)
+		}
+	}
+	// A guest handed no request stages none.
+	cfg = loadFixture(t, "")
+	if err := load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if staged, err := session.ReadHostConfig(filepath.Join(cfg.LaunchDir, session.HostConfigFile)); err != nil || staged != nil {
+		t.Fatalf("no host.json staged %v, %v", staged, err)
+	}
+}
+
 func TestLoadWithoutANetworkRequestLeavesDHCP(t *testing.T) {
 	for name, host := range map[string]string{"no host.json": "", "empty request": `{}`} {
 		cfg := loadFixture(t, host)
@@ -125,6 +169,12 @@ func TestLoadRejectsHostileHostConfig(t *testing.T) {
 		"unknown field":                  `{"network":{"address":"10.0.0.2/24"},"exec":"/bin/sh"}`,
 		"trailing document":              `{}{"network":{"address":"10.0.0.2/24"}}`,
 		"multicast address":              `{"network":{"address":"224.0.0.1/24"}}`,
+		// The kernel reads the largest port as any port.
+		"relay port that is any port": `{"key_service_port":4294967295}`,
+		"relay port beyond the range": `{"key_service_port":4294967296}`,
+		"negative relay port":         `{"key_service_port":-1}`,
+		"relay port as text":          `{"key_service_port":"4050"}`,
+		"relay port with a fraction":  `{"key_service_port":4050.5}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := loadFixture(t, host)
@@ -133,6 +183,9 @@ func TestLoadRejectsHostileHostConfig(t *testing.T) {
 			}
 			if _, err := os.Stat(filepath.Join(cfg.NetworkDir, networkUnitName)); err == nil {
 				t.Fatal("a refused host config still wrote a network unit")
+			}
+			if _, err := os.Stat(filepath.Join(cfg.LaunchDir, session.HostConfigFile)); err == nil {
+				t.Fatal("a refused host config was still staged for the agent")
 			}
 		})
 	}
