@@ -12,9 +12,10 @@ import (
 )
 
 // RulesetGuard compares the packet filter the kernel holds with the one the
-// image was built to load. The sandbox shares the guest's network namespace,
-// so the filter is what keeps its ports off the guest's network. A unit of the
-// image loads it; this is the check that nothing replaced it since.
+// image was built to load. The filter is what keeps the guest's ports to the
+// agent's one from outside, and off a command that runs in the guest's own
+// network namespace. The guest's init loads it; this is the check that
+// nothing replaced it since.
 type RulesetGuard struct {
 	// Nft is the nft binary.
 	Nft string

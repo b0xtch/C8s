@@ -12,14 +12,11 @@ import (
 	"strings"
 )
 
-// guestPorts are the TCP ports the guest's own services may listen on, and
-// guestUDPPorts the UDP ports they may take datagrams on. The image's packet
-// filter closes exactly these to the sandbox on every local address, so the
-// two must agree, and a test holds them together.
-var (
-	guestPorts    = [][2]int{{1, 1023}, {8400, 8499}}
-	guestUDPPorts = [][2]int{{1, 1023}, {5353, 5353}, {5355, 5355}, {8400, 8499}}
-)
+// guestPorts are the ports the guest's own services may listen on, or take
+// datagrams on. The image's packet filter closes exactly these to the sandbox
+// on every local address, so the two must agree, and a test holds them
+// together.
+var guestPorts = [][2]int{{1, 1023}, {8400, 8499}}
 
 func isGuestPort(port int) bool { return portIn(guestPorts, port) }
 
@@ -33,11 +30,12 @@ func portIn(ranges [][2]int, port int) bool {
 }
 
 // ListenerGuard checks that the guest's own listeners are where the packet
-// filter assumes them. The sandbox shares the guest's network namespace, and
-// the filter keeps it off the guest's ports. That covers every guest service
-// only as long as none listens anywhere else, and nothing can cover a socket
-// on an abstract unix name, which no filter sees. Both are checked before any
-// tenant code runs, when every listener is still the guest's own.
+// filter assumes them. A command with no sandbox image runs in the guest's
+// network namespace, and the filter keeps it off the guest's ports. That
+// covers every guest service only as long as none listens anywhere else, and
+// nothing can cover a socket on an abstract unix name, which no filter sees.
+// Both are checked before any tenant code runs, when every listener is still
+// the guest's own.
 type ListenerGuard struct {
 	// Proc is where the proc filesystem is mounted.
 	Proc string
@@ -54,8 +52,8 @@ func (g ListenerGuard) Check(context.Context) error {
 	}{
 		{"net/tcp", "TCP", listeningPorts, guestPorts},
 		{"net/tcp6", "TCP", listeningPorts, guestPorts},
-		{"net/udp", "UDP", unconnectedPorts, guestUDPPorts},
-		{"net/udp6", "UDP", unconnectedPorts, guestUDPPorts},
+		{"net/udp", "UDP", unconnectedPorts, guestPorts},
+		{"net/udp6", "UDP", unconnectedPorts, guestPorts},
 	} {
 		ports, err := table.open(filepath.Join(g.Proc, table.name))
 		// A kernel without IPv6 has no tcp6 or udp6 table.

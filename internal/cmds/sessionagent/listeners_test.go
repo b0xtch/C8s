@@ -15,32 +15,20 @@ import (
 )
 
 // What a guest lists before any session's code runs, taken from one on TDX:
-// the resolver's two stubs and the agent, and no socket on an abstract name
-// that accepts connections.
+// the agent's listener and one connection to it. Nothing else in the guest
+// has a socket.
 const (
 	procTCP = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 3600007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989        0 1444 1 0000000000000000 100 0 0 10 5
-   1: 3500007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   989        0 1442 1 0000000000000000 100 0 0 10 5
-   2: 0211FEA9:20FB 0111FEA9:D2A4 01 00000000:00000000 02:000A1E0F 00000000     0        0 3190 2 0000000000000000 20 4 30 10 -1
 `
 	procTCP6 = `  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
-   0: 00000000000000000000000000000000:20FB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 3145 1 0000000000000000 100 0 0 10 0
+   0: 00000000000000000000000000000000:20FB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 747 1 0000000000000000 100 0 0 10 0
+   1: 0000000000000000FFFF00000F02000A:20FB 0000000000000000FFFF00000202000A:DD7E 01 00000000:00000000 02:000005D7 00000000     0        0 2072 3 0000000000000000 20 4 28 14 -1
 `
-	// The resolver's stubs, and a query of its own on its way upstream.
 	procUDP = `   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
-  935: 3600007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   989        0 1443 2 0000000000000000 0
-  935: 3500007F:0035 00000000:0000 07 00000000:00000000 00:00000000 00000000   989        0 1441 2 0000000000000000 0
- 4123: 0211FEA9:A1B2 0111FEA9:0035 01 00000000:00000000 00:00000000 00000000   989        0 3301 2 0000000000000000 0
 `
 	procUDP6 = `  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
 `
 	procUnix = `Num       RefCount Protocol Flags    Type St Inode Path
-0000000000000000: 00000003 00000000 00000000 0001 03  3172 /run/dbus/system_bus_socket
-0000000000000000: 00000002 00000000 00000000 0002 03   854
-0000000000000000: 00000002 00000000 00010000 0001 01  1176 /run/systemd/private
-0000000000000000: 00000002 00000000 00010000 0005 01   357 /run/udev/control
-0000000000000000: 00000003 00000000 00000000 0001 03  2396 @c50b0068cb5d5f80/bus/systemd/bus-api-system
-0000000000000000: 00000002 00000000 00000000 0002 01  1423 @10909561722113124532
 `
 )
 
@@ -104,6 +92,20 @@ func TestListenerGuard(t *testing.T) {
 		}
 	}
 
+	// A unix socket is the sandbox's to reach only by an abstract name it
+	// listens on: one bound to a path is behind the file system's modes, and
+	// one that is connected or takes datagrams accepts no connection.
+	for name, line := range map[string]string{
+		"a listener on a path":                   "0000000000000000: 00000002 00000000 00010000 0001 01  1176 /run/c8s-session/control\n",
+		"a connected socket on an abstract name": "0000000000000000: 00000003 00000000 00000000 0001 03  2396 @c50b0068cb5d5f80/bus\n",
+		"a datagram socket on an abstract name":  "0000000000000000: 00000002 00000000 00000000 0002 01  1423 @10909561722113124532\n",
+		"a socket with no name":                  "0000000000000000: 00000002 00000000 00000000 0002 03   854\n",
+	} {
+		if err := fakeProc(t, procTCP, procTCP6, procUnix+line).Check(context.Background()); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+
 	// Ports of the guest's own are fine wherever they are in its ranges, and a
 	// socket that is not listening is nobody's listener.
 	for _, port := range []string{"0016", "03FF", "20D0", "2133"} {
@@ -133,9 +135,12 @@ func TestListenerGuardUDP(t *testing.T) {
 	}{
 		"a service on an unprivileged port":     {fakeProcUDP(t, procTCP, procTCP6, procUDP+socket("2328", anyone), procUDP6, procUnix), "UDP port 9000"},
 		"a client that sends from a bound port": {fakeProcUDP(t, procTCP, procTCP6, procUDP+socket("D431", anyone), procUDP6, procUnix), "UDP port 54321"},
-		"one over IPv6 only":                    {fakeProcUDP(t, procTCP, procTCP6, procUDP, procUDP6+socket6, procUnix), "UDP port 54321"},
-		"no socket table":                       {fakeProcUDP(t, procTCP, procTCP6, "", procUDP6, procUnix), "list the guest's listeners"},
-		"a table it cannot read":                {fakeProcUDP(t, procTCP, procTCP6, procUDP+" 9000: 00000000:2328 nonsense 07\n", procUDP6, procUnix), "unexpected remote address"},
+		// A resolver's ports, which a guest that ran one once had open.
+		"multicast DNS":          {fakeProcUDP(t, procTCP, procTCP6, procUDP+socket("14E9", anyone), procUDP6, procUnix), "UDP port 5353"},
+		"LLMNR":                  {fakeProcUDP(t, procTCP, procTCP6, procUDP+socket("14EB", anyone), procUDP6, procUnix), "UDP port 5355"},
+		"one over IPv6 only":     {fakeProcUDP(t, procTCP, procTCP6, procUDP, procUDP6+socket6, procUnix), "UDP port 54321"},
+		"no socket table":        {fakeProcUDP(t, procTCP, procTCP6, "", procUDP6, procUnix), "list the guest's listeners"},
+		"a table it cannot read": {fakeProcUDP(t, procTCP, procTCP6, procUDP+" 9000: 00000000:2328 nonsense 07\n", procUDP6, procUnix), "unexpected remote address"},
 	} {
 		err := tc.guard.Check(context.Background())
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -147,9 +152,8 @@ func TestListenerGuardUDP(t *testing.T) {
 	if err := fakeProcUDP(t, procTCP, "", procUDP, "", procUnix).Check(context.Background()); err != nil {
 		t.Fatalf("with no IPv6 tables: %v", err)
 	}
-	// The guest's own ports, wherever they are in its ranges: its resolver,
-	// its DHCP client, multicast DNS and LLMNR.
-	for _, port := range []string{"0044", "03FF", "14E9", "14EB", "20D0", "2133"} {
+	// The guest's own ports, wherever they are in its ranges.
+	for _, port := range []string{"0044", "03FF", "20D0", "2133"} {
 		if err := fakeProcUDP(t, procTCP, procTCP6, procUDP+socket(port, anyone), procUDP6, procUnix).Check(context.Background()); err != nil {
 			t.Errorf("a guest service on UDP port 0x%s: %v", port, err)
 		}
@@ -236,9 +240,9 @@ func TestGuestPortsAreTheOnesThePacketFilterCloses(t *testing.T) {
 		}
 		return out
 	}
-	for protocol, allowed := range map[string][][2]int{"tcp": guestPorts, "udp": guestUDPPorts} {
-		if got := closed(protocol); !slices.Equal(got, allowed) {
-			t.Fatalf("the packet filter closes %s ports %v to the sandbox, the guard allows the guest %v", protocol, got, allowed)
+	for _, protocol := range []string{"tcp", "udp"} {
+		if got := closed(protocol); !slices.Equal(got, guestPorts) {
+			t.Fatalf("the packet filter closes %s ports %v to the sandbox, the guard allows the guest %v", protocol, got, guestPorts)
 		}
 	}
 	if !isGuestPort(session.AgentPort) {

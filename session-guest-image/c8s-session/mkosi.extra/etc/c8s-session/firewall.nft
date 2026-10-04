@@ -1,4 +1,5 @@
-# Packet filter of a session guest, loaded by c8s-session-firewall.service.
+# Packet filter of a session guest. The guest's init loads it before it
+# starts the agent.
 #
 # From outside, only the agent's attested endpoint is reachable. What the
 # guest sends, and the replies to it, pass.
@@ -17,8 +18,11 @@
 # where any later port of the agent's goes. Those ports are closed to the ids
 # above on every local address, so a new guest service starts out of their
 # reach. The agent checks before it serves, and again before a sandbox
-# starts, that nothing in the guest listens outside them. The one exception
-# is the resolver's stub, which is what the guest's resolv.conf names.
+# starts, that nothing in the guest listens outside them.
+#
+# The guest runs no resolver and no DHCP client, and its interface takes no
+# router advertisement: the host's network request is set once, by the load
+# step. So nothing here lets an answer to either in.
 flush ruleset
 
 table inet c8s_session {
@@ -33,19 +37,13 @@ table inet c8s_session {
 		# IPv6 has no ARP: without these the guest finds no neighbour.
 		icmpv6 type nd-neighbor-solicit accept
 		icmpv6 type nd-neighbor-advert accept
-		icmpv6 type nd-router-advert accept
-		# The answer to the guest's own DHCP request, when the host sends no
-		# address for it.
-		udp sport 67 udp dport 68 accept
 	}
 
 	chain output {
 		type filter hook output priority filter; policy accept;
 
 		# Traffic to any local address leaves through lo.
-		oif "lo" meta skuid { 2000, 100000-165535 } ip daddr 127.0.0.53 udp dport 53 accept
-		oif "lo" meta skuid { 2000, 100000-165535 } ip daddr 127.0.0.53 tcp dport 53 accept
 		oif "lo" meta skuid { 2000, 100000-165535 } tcp dport { 1-1023, 8400-8499 } reject with tcp reset
-		oif "lo" meta skuid { 2000, 100000-165535 } udp dport { 1-1023, 5353, 5355, 8400-8499 } reject
+		oif "lo" meta skuid { 2000, 100000-165535 } udp dport { 1-1023, 8400-8499 } reject
 	}
 }
