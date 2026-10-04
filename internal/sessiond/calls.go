@@ -301,7 +301,7 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 		return nil, status.Error(codes.Internal, "the bind could not be recorded")
 	}
 
-	evidence, err := d.relayBind(ctx, t, address, req)
+	evidence, receipt, err := d.relayBind(ctx, t, address, req)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	t.busy = false
@@ -323,7 +323,12 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 	if t.rec.State == StateEnded {
 		return nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
 	}
-	answer := &sessionv1alpha1.Bound{Evidence: evidence}
+	// The vendor's documents as the guest last handed them over: the binder's
+	// verifier may want them, and the guest is not asked again for them.
+	if len(evidence.GetCollateral()) == 0 {
+		evidence.Collateral = t.collateral
+	}
+	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: receipt}
 	if t.rec.Bind.Answer, err = proto.Marshal(answer); err != nil {
 		return nil, status.Error(codes.Internal, "the answer could not be kept")
 	}
@@ -339,20 +344,20 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 }
 
 // relayBind posts the bind until the guest answers it for good.
-func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest) (*sessionv1alpha1.Evidence, error) {
+func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest) (evidence *sessionv1alpha1.Evidence, receipt []byte, err error) {
 	ctx, cancel := context.WithTimeout(ctx, maxBindWait)
 	defer cancel()
 	// The TD's end ends the wait.
 	stop := context.AfterFunc(t.ctx, cancel)
 	defer stop()
 	for {
-		evidence, err := d.guests.bind(ctx, address, req.GetBind(), req.GetSignature())
+		evidence, receipt, err = d.guests.bind(ctx, address, req.GetBind(), req.GetSignature())
 		if !errors.Is(err, errBusy) {
-			return evidence, err
+			return evidence, receipt, err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		case <-time.After(busyRetry):
 		}
 	}

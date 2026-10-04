@@ -182,22 +182,30 @@ func WriteVerdict(dir string, v *Verdict) error {
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, VerdictFile+".*")
-	if err != nil {
+	if err := keepFile(dir, VerdictFile, append(data, '\n')); err != nil {
 		return fmt.Errorf("keep verdict: %w", err)
 	}
-	_, err = tmp.Write(append(data, '\n'))
+	return nil
+}
+
+// keepFile writes data as dir/name, in place of any file there. A reader
+// sees the old file or the new one, never a part of either.
+func keepFile(dir, name string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, name+".*")
+	if err != nil {
+		return err
+	}
+	_, err = tmp.Write(data)
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
 	}
 	if err == nil {
-		err = os.Rename(tmp.Name(), filepath.Join(dir, VerdictFile))
+		err = os.Rename(tmp.Name(), filepath.Join(dir, name))
 	}
 	if err != nil {
 		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("keep verdict: %w", err)
 	}
-	return nil
+	return err
 }
 
 // LoadVerdict reads the verdict kept in dir. A directory with none gives nil

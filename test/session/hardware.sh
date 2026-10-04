@@ -452,6 +452,10 @@ guest_logged() {
     td=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("td",""))' "$out/$1.out" 2>/dev/null)
     [ -n "$td" ] && sudo -n grep -a -q -E "$2" "$out/state/tds/$td/launcher.log"
 }
+# said <log> <field>: a field of the JSON a command printed.
+said() {
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$out/$1.out" "$2" 2>/dev/null
+}
 reason() { # reason <step> <start log> <pattern>
     [ "$dev" = 1 ] || return 0
     check "$1" guest_logged "$2" "$3"
@@ -494,6 +498,7 @@ expect 0 "start session s1" start-s1 start_session s1 "$out/s1" acme "$out/autho
 cat "$out/start-s1.out" >> "$out/records.jsonl"
 reason "its guest reached the key service through its launcher" start-s1 'opened a session with the key service'
 reason "its guest took the stored credential from the key service" start-s1 'took stored credentials from the key service'
+check "its guest answered the bind with a receipt that its quote confirmed" [ "$(said start-s1 receipt)" = True ]
 expect 0 "start session s2, another tenant's" start-s2 start_session s2 "$out/s2" globex "$out/other-authority.key" "$manifest" "$launch_key" "${sandbox[@]}" \
     --credential token:256
 cat "$out/start-s2.out" >> "$out/records.jsonl"
@@ -507,11 +512,25 @@ expect 0 "run a command in s1 that reads both credentials" exec "$C8S" session e
 check "it read the credential the owner stored" [ "$(sed -n 1p "$out/exec.out")" = "stored-secret-$run" ]
 check "it read the credential the access key released" [ "$(sed -n 2p "$out/exec.out")" = "released-secret-$run" ]
 expect 0 "verify s1 with a fresh quote" verify "$C8S" session verify "${s1[@]}" --timing -o json
+check "the fresh quote confirms the receipt kept with the binding" [ "$(said verify receipt)" = True ]
 expect 0 "verify s1 with collateral from Intel alone" verify-own "$C8S" session verify "${s1[@]}" --own-collateral-only --collateral-cache "$out/cache-own"
 expect 0 "a command under the kept verdict" exec-kept "$C8S" session exec "${s1[@]}" -- true
 
 # What a live session refuses.
 expect 2 "verify refuses another image" verify-image "$C8S" session verify --binding "$out/s1" --image-manifest "$out/manifest-other.json" "${accept[@]}"
+# A receipt is one guest's word on one bind. Another session's in its place,
+# or one that was changed after the guest signed it, is not s1's.
+cp -a "$out/s1" "$out/s1-receipt-other" && cp "$out/s2/receipt.json" "$out/s1-receipt-other/receipt.json"
+expect 2 "verify refuses another session's receipt" verify-receipt-other \
+    "$C8S" session verify --binding "$out/s1-receipt-other" --image-manifest "$manifest" "${accept[@]}" -o json
+check "it said the receipt is not this guest's" grep -q "receipt kept with the binding" "$out/verify-receipt-other.out"
+cp -a "$out/s1" "$out/s1-receipt-changed" && python3 -c '
+import base64, json, sys
+kept = json.load(open(sys.argv[1]))
+kept["receipt"] = base64.b64encode(base64.b64decode(kept["receipt"]).replace(b"running", b"bound")).decode()
+json.dump(kept, open(sys.argv[1], "w"))' "$out/s1-receipt-changed/receipt.json"
+expect 2 "verify refuses a receipt that was changed" verify-receipt-changed \
+    "$C8S" session verify --binding "$out/s1-receipt-changed" --image-manifest "$manifest" "${accept[@]}" -o json
 expect 124 "a stranger's key runs nothing" exec-stranger "$C8S" session exec "${s1[@]}" --key "$out/stranger.key" -- id
 "$C8S" session credential put api-token "${s1[@]}" --from-file "$out/released" > "$out/put-access.out" 2> "$out/put-access.err"
 code=$?

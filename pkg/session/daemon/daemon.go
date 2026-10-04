@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -104,7 +105,9 @@ func (c *Client) Claim(ctx context.Context, requestID, pool, name string, wait t
 }
 
 // Bind hands the claimed TD its bind and returns the guest's answer, relayed
-// and unjudged: evidence that should be fresh for the bind's nonce.
+// and unjudged: the guest's receipt for the bind, and its evidence, which
+// holds the quote over the bind's nonce if the guest had it by then.
+// Otherwise Evidence returns it once the guest has.
 func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.SignedBind) (*session.Relayed, error) {
 	answer, err := c.api.Bind(ctx, &sessionv1alpha1.BindRequest{
 		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature),
@@ -112,7 +115,16 @@ func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.S
 	if err != nil {
 		return nil, err
 	}
-	return relayed(answer.GetEvidence()), nil
+	out := relayed(answer.GetEvidence())
+	if raw := answer.GetReceipt(); len(raw) > 0 && len(raw) <= 2*session.MaxReceiptBytes {
+		var receipt session.SignedReceipt
+		// A receipt that does not parse is none: the binder then has the
+		// evidence alone to go by.
+		if json.Unmarshal(raw, &receipt) == nil {
+			out.Receipt = &receipt
+		}
+	}
+	return out, nil
 }
 
 // Destroy ends the session's TD.
@@ -127,6 +139,36 @@ func (c *Client) Evidence(ctx context.Context, td string) (*session.Relayed, err
 		return nil, err
 	}
 	return relayed(answer), nil
+}
+
+const (
+	// quotePause is how long BoundEvidence waits before it first looks
+	// again, and quotePauseMost the longest it waits between two looks. A
+	// quote takes a guest some ten milliseconds.
+	quotePause     = time.Millisecond
+	quotePauseMost = 50 * time.Millisecond
+)
+
+// BoundEvidence waits for the quote the TD's guest takes over its bind's
+// nonce, and returns the guest's evidence with it, relayed and unjudged. A
+// guest that takes none, because its ration of quotes had none to give or
+// its quoting service failed, is waited for until ctx ends: its binder then
+// asks it for an attestation itself.
+func (c *Client) BoundEvidence(ctx context.Context, td string) (*session.Relayed, error) {
+	for pause := quotePause; ; pause = min(2*pause, quotePauseMost) {
+		evidence, err := c.Evidence(ctx, td)
+		if err != nil {
+			return nil, err
+		}
+		if len(evidence.Evidence) > 0 {
+			return evidence, nil
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pause):
+		}
+	}
 }
 
 func relayed(e *sessionv1alpha1.Evidence) *session.Relayed {

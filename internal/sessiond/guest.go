@@ -162,13 +162,15 @@ func (g *guestClient) collateral(ctx context.Context, addr string) []byte {
 	return data
 }
 
-// evidence is what the guest serves to anyone, as the API's Evidence.
+// evidence is what the guest serves to anyone, as the API's Evidence: its
+// state, and with it the quote a bound guest took over its bind's nonce, once
+// it has that. Asking has no guest take a quote.
 func (g *guestClient) evidence(ctx context.Context, addr string) (*sessionv1alpha1.Evidence, error) {
 	state, leaf, err := g.state(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	return &sessionv1alpha1.Evidence{
+	evidence := &sessionv1alpha1.Evidence{
 		Certificate:     leaf,
 		LaunchDocument:  state.Launch,
 		LaunchSignature: []byte(state.Signature),
@@ -176,31 +178,19 @@ func (g *guestClient) evidence(ctx context.Context, addr string) (*sessionv1alph
 		Bind:            state.Bind,
 		BindSignature:   []byte(state.BindSignature),
 		Phase:           string(state.Phase),
-		Collateral:      g.collateral(ctx, addr),
-	}, nil
+	}
+	if att := state.Attestation; att != nil {
+		if evidence, err = attested(leaf, att); err != nil {
+			return nil, err
+		}
+	}
+	evidence.Collateral = g.collateral(ctx, addr)
+	return evidence, nil
 }
 
-// bind hands the guest its bind and returns the guest's answer as evidence:
-// the attestation the answer carries, which is one snapshot of the guest.
-func (g *guestClient) bind(ctx context.Context, addr string, bind, signature []byte) (*sessionv1alpha1.Evidence, error) {
-	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature)})
-	if err != nil {
-		return nil, err
-	}
-	data, leaf, err := g.do(ctx, addr, http.MethodPost, session.PathBind, body)
-	if err != nil {
-		return nil, err
-	}
-	var answer session.BindResponse
-	if err := json.Unmarshal(data, &answer); err != nil {
-		return nil, fmt.Errorf("the guest's answer to the bind: %w", err)
-	}
-	att := answer.Attestation
-	if att == nil {
-		// The guest had no quote to give right now. What it serves to anyone
-		// stands in, and the caller asks the guest for a quote itself.
-		return g.evidence(ctx, addr)
-	}
+// attested is the API's Evidence of a guest's attestation: the quote, and
+// what the guest measured as it said so with the quote.
+func attested(leaf []byte, att *session.AttestResponse) (*sessionv1alpha1.Evidence, error) {
 	quote, err := json.Marshal(att.Evidence)
 	if err != nil {
 		return nil, err
@@ -214,6 +204,35 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature []b
 		BindSignature:   []byte(att.BindSignature),
 		Phase:           string(att.Phase),
 		Quote:           quote,
-		Collateral:      g.collateral(ctx, addr),
 	}, nil
+}
+
+// bind hands the guest its bind and returns the guest's answer: its receipt
+// for the bind, as it sent it, and its evidence. The evidence holds the quote
+// over the bind's nonce if the guest had it by then. Otherwise it holds the
+// certificate and the phase alone: the receipt says the rest, and the quote
+// comes with the guest's evidence once the guest has it.
+func (g *guestClient) bind(ctx context.Context, addr string, bind, signature []byte) (evidence *sessionv1alpha1.Evidence, receipt []byte, err error) {
+	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature)})
+	if err != nil {
+		return nil, nil, err
+	}
+	data, leaf, err := g.do(ctx, addr, http.MethodPost, session.PathBind, body)
+	if err != nil {
+		return nil, nil, err
+	}
+	var answer session.BindResponse
+	if err := json.Unmarshal(data, &answer); err != nil {
+		return nil, nil, fmt.Errorf("the guest's answer to the bind: %w", err)
+	}
+	if answer.Receipt != nil {
+		if receipt, err = json.Marshal(answer.Receipt); err != nil {
+			return nil, nil, err
+		}
+	}
+	if answer.Attestation != nil {
+		evidence, err = attested(leaf, answer.Attestation)
+		return evidence, receipt, err
+	}
+	return &sessionv1alpha1.Evidence{Certificate: leaf, Phase: string(answer.Phase)}, receipt, nil
 }

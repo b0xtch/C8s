@@ -149,7 +149,20 @@ type startedSession struct {
 	ReadyCheckMillis int64 `json:"ready_check_ms"`
 	BindMillis       int64 `json:"bind_ms"`
 	AttestMillis     int64 `json:"attest_ms"`
+	// Receipt says the guest answered the bind with a receipt that its quote
+	// confirmed. Quote says where that quote came from: with the answer,
+	// with the guest's evidence after it, or from an attestation this
+	// command asked for.
+	Receipt bool   `json:"receipt"`
+	Quote   string `json:"quote,omitempty"`
 }
+
+// Where the quote that a start judged came from.
+const (
+	quoteWithAnswer   = "answer"
+	quoteWithEvidence = "evidence"
+	quoteAskedFor     = "attestation"
+)
 
 func newStartCmd() *cobra.Command {
 	var s startFlags
@@ -363,8 +376,14 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	bound := binding.Policy(identity)
 	bound.AcceptTCBStatus = s.acceptedTCB()
-	att, verdict, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
+	att, verdict, quote, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
 	if err != nil {
+		// A guest that took the bind and is refused is of no use to anyone.
+		// One that could not be judged, for want of a document, may be yet.
+		if exitCode(err) == ExitRefused {
+			release()
+			return finish(ExitRefused, fmt.Errorf("the bind was sent, but the guest does not verify as bound by it, and its session was ended: %w", err))
+		}
 		return finish(exitCode(err), fmt.Errorf("the bind was sent, but the guest does not verify as bound by it: %w", err))
 	}
 	result.AttestMillis = time.Since(began).Milliseconds()
@@ -374,20 +393,77 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 			fmt.Fprintf(stderr, "the next command will attest the guest again: %v\n", err)
 		}
 	}
+	// The guest's signed word that it took the bind, which its quote
+	// confirmed: 'c8s session verify' holds it to a fresh quote.
+	result.Quote = quote
+	if answer.Receipt != nil {
+		result.Receipt = true
+		if err := session.WriteReceipt(s.out, answer.Receipt); err != nil {
+			fmt.Fprintf(stderr, "the guest's receipt for the bind was not kept: %v\n", err)
+		}
+	}
 	result.Started, result.Tenant, result.Session, result.Phase = true, att.Tenant, att.Session, string(att.Phase)
 	if !asJSON {
 		fmt.Fprintf(stdout, "STARTED %s session\n  tenant        %s\n  session       %s\n  phase         %s\n  TD            %s on %s\n  launch doc    %s\n  bind          %s\n  events        %s\n  instance key  sha256:%s\n  binding       %s\n  timing        claim %d ms, ready check %d ms, bind %d ms, attest %d ms\n",
 			att.Result.Platform, att.Tenant, att.Session, att.Phase, claimed.TD, claimed.Host, result.LaunchDigest, result.BindDigest,
 			strings.Join(att.Events, " "), certutil.CertFingerprint(att.InstanceKey), s.out,
 			result.ClaimMillis, result.ReadyCheckMillis, result.BindMillis, result.AttestMillis)
+		if result.Receipt {
+			fmt.Fprintf(stdout, "  receipt       the guest's receipt for the bind, confirmed by its quote\n")
+		}
 	}
 	return finish(ExitOK, nil)
 }
 
+// quoteWait is how long this command waits for the quote its guest takes
+// over the bind's nonce before it asks the guest for an attestation itself.
+const quoteWait = 5 * time.Second
+
 // judgeBound judges the guest's answer to the bind, and gives the verdict to
-// keep on it. A guest whose answer carries no evidence, because its ration of
-// quotes had none to give, is asked for it over a connection of its own.
+// keep on it. This command keeps a verdict for the owner's next one, and a
+// verdict is made from a quote, so it waits for the quote before it says the
+// session started: the one over the bind's nonce, which comes with the answer
+// or with the guest's evidence a moment later. A receipt in the answer is
+// verified first, and the quote is held to it. A guest that gives no quote
+// for the bind's nonce, because its ration had none to give, is asked for an
+// attestation over a connection of its own.
 func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td string, bound session.Policy, engine session.Engine,
+	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, accessPEM []byte, stderr io.Writer,
+) (_ *session.Attestation, _ *session.Verdict, quote string, _ error) {
+	var receipt *session.BindReceipt
+	quote = quoteWithAnswer
+	if answer.Receipt != nil {
+		var err error
+		if receipt, err = session.VerifyBoundReceipt(bound, ready, bind, answer); err != nil {
+			return nil, nil, "", err
+		}
+		if len(answer.Evidence) == 0 {
+			waiting, cancel := context.WithTimeout(ctx, quoteWait)
+			quoted, err := host.BoundEvidence(waiting, td)
+			cancel()
+			if err == nil {
+				answer, quote = quoted, quoteWithEvidence
+			}
+		}
+	}
+	if len(answer.Evidence) == 0 {
+		quote = quoteAskedFor
+	}
+	att, verdict, err := judgeQuote(ctx, s, host, td, bound, engine, ready, bind, answer, accessPEM, stderr)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if receipt != nil {
+		if err := receipt.Confirmed(att); err != nil {
+			return nil, nil, "", err
+		}
+	}
+	return att, verdict, quote, nil
+}
+
+// judgeQuote judges the quote in the guest's evidence, or, with none there,
+// attests the guest over a connection of its own.
+func judgeQuote(ctx context.Context, s *startFlags, host *daemon.Client, td string, bound session.Policy, engine session.Engine,
 	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, accessPEM []byte, stderr io.Writer,
 ) (*session.Attestation, *session.Verdict, error) {
 	if len(answer.Evidence) > 0 {

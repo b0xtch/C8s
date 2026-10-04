@@ -190,6 +190,7 @@ const (
 	MessageFence       = "fence"
 	MessageBound       = "bound"
 	MessageAttestation = "attestation"
+	MessageReceipt     = "receipt"
 	MessageStep        = "step"
 	MessageRefusal     = "refusal"
 	MessagePlatform    = "platform"
@@ -230,6 +231,7 @@ const (
 	maxBind      = 256 << 10
 	maxSignature = 4096
 	maxEvidence  = 256 << 10
+	maxReceipt   = 8 << 10
 	maxEvents    = 8
 	// An admission step takes an hour at most, in microseconds.
 	maxMicros = 3600 * 1000 * 1000
@@ -254,10 +256,10 @@ func measured() []Field {
 // request that is no well-formed HTTP is answered by the HTTP library before
 // the agent sees it, with a status and a fixed text of the library's own.
 var Schema = []Message{
-	{Name: MessageState, Says: "to anyone who asks what the guest is", Fields: append([]Field{
+	{Name: MessageState, Says: "to anyone who asks what the guest is", Fields: append(append([]Field{
 		{Name: "instance_key", Kind: KindPublic, Max: maxKey},
 		{Name: "prepared", Kind: KindFlag, Optional: true},
-	}, measured()...)},
+	}, measured()...), Field{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true})},
 	{Name: MessageFence, Says: "to its host, which claims it for a session", Fields: []Field{
 		{Name: "phase", Kind: KindCode, Codes: phases},
 		{Name: "closed", Kind: KindCounter, Max: 1 << 16},
@@ -266,9 +268,14 @@ var Schema = []Message{
 		{Name: "phase", Kind: KindCode, Codes: phases},
 		{Name: "replayed", Kind: KindFlag, Optional: true},
 		{Name: "admission", Kind: KindList, Max: 16, Optional: true, Item: &Field{Kind: KindMessage, Message: MessageStep}},
+		{Name: "receipt", Kind: KindMessage, Message: MessageReceipt, Optional: true},
 		{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true},
 	}},
-	{Name: MessageAttestation, Says: "with its answer to a bind: evidence over the bind's nonce", Fields: append([]Field{
+	{Name: MessageReceipt, Says: "with its answer to a bind: its own word on the bind, signed by its instance key over the bind's nonce", Fields: []Field{
+		{Name: "receipt", Kind: KindPublic, Max: maxReceipt},
+		{Name: "signature", Kind: KindPublic, Max: maxSignature},
+	}},
+	{Name: MessageAttestation, Says: "with its answer to a bind, and with its state from then on: evidence over the bind's nonce", Fields: append([]Field{
 		{Name: "evidence", Kind: KindEvidence, Codes: platforms, Max: maxEvidence},
 	}, measured()...)},
 	{Name: MessageStep, Says: "in its answer to a bind: one step of admitting the sandbox, and how long it took", Fields: []Field{

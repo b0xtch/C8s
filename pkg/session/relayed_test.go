@@ -54,8 +54,9 @@ func relayedState(t *testing.T, s *served) *session.Relayed {
 	}
 }
 
-// relayedBind hands the guest its bind as a host does and returns the answer
-// as the host relays it.
+// relayedBind hands the guest its bind as a host does and returns what the
+// host relays: the guest's receipt, and the evidence the guest took over the
+// bind's nonce, from the answer or from the guest's state once it is there.
 func relayedBind(t *testing.T, s *served, bind *session.SignedBind) *session.Relayed {
 	t.Helper()
 	body, err := json.Marshal(session.BindRequest{Bind: bind.Raw, Signature: bind.Signature})
@@ -64,17 +65,25 @@ func relayedBind(t *testing.T, s *served, bind *session.SignedBind) *session.Rel
 	}
 	var answer session.BindResponse
 	leaf := relay(t, s, http.MethodPost, session.PathBind, body, &answer)
-	if answer.Attestation == nil {
-		t.Fatal("the guest answered its bind with no evidence")
+	if answer.Receipt == nil {
+		t.Fatal("the guest answered its bind with no receipt")
 	}
-	evidence, err := json.Marshal(answer.Attestation.Evidence)
+	att := answer.Attestation
+	for deadline := time.Now().Add(5 * time.Second); att == nil; time.Sleep(2 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the guest never served the evidence over its bind's nonce")
+		}
+		var state session.StateResponse
+		leaf = relay(t, s, http.MethodGet, session.PathState, nil, &state)
+		att = state.Attestation
+	}
+	evidence, err := json.Marshal(att.Evidence)
 	if err != nil {
 		t.Fatal(err)
 	}
-	att := answer.Attestation
 	return &session.Relayed{
 		Certificate: leaf, Phase: att.Phase, Launch: att.Launch, Signature: att.Signature,
-		Events: att.Events, Bind: att.Bind, BindSignature: att.BindSignature, Evidence: evidence,
+		Events: att.Events, Bind: att.Bind, BindSignature: att.BindSignature, Evidence: evidence, Receipt: answer.Receipt,
 	}
 }
 
@@ -103,12 +112,19 @@ func TestRelayedEvidenceIsJudgedLikeTheGuestsOwn(t *testing.T) {
 	bind := bindFor(t, s, ready)
 	answer := relayedBind(t, s, bind)
 	bound := (&session.Binding{LaunchKey: s.bundle.LaunchKey, Launch: ready.Launch, Bind: bind}).Policy(s.policy.Image)
+	receipt, err := session.VerifyBoundReceipt(bound, ready, bind, answer)
+	if err != nil {
+		t.Fatalf("VerifyBoundReceipt: %v", err)
+	}
 	att, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer)
 	if err != nil {
 		t.Fatalf("VerifyBound: %v", err)
 	}
 	if att.Tenant != "acme" || att.Session != "sbx-1" || att.Phase != session.PhaseRunning || len(att.Events) != 2 {
 		t.Fatalf("the attestation: %+v", att)
+	}
+	if err := receipt.Confirmed(att); err != nil {
+		t.Fatalf("the quote does not confirm the receipt: %v", err)
 	}
 	// The verdict on it is one the owner's next process takes: a client
 	// under the same policy asks the guest for no quote.

@@ -88,6 +88,8 @@ type Client struct {
 	now func() time.Time
 	// timing, when set, is told how long each step took.
 	timing Timing
+	// quoteWait is how long a bind's quote is waited for: see QuoteWait.
+	quoteWait time.Duration
 
 	// first is the connection the client talks on until the pin.
 	first firstConn
@@ -110,6 +112,10 @@ type Client struct {
 	// judgment is this client's last, or the one of the client that kept the
 	// verdict.
 	judgedUntil time.Time
+	// receipted says the pin is a receipt's, and no judgment of fresh
+	// evidence stands behind it yet: see Receipted. Such a client keeps no
+	// verdict.
+	receipted bool
 	// anotherKey says a guest presented another key than the pinned one.
 	anotherKey bool
 	// last is the fresh attestation this client last ran, and lastAt when.
@@ -165,9 +171,48 @@ func (f *firstConn) drop() {
 type ClientOption func(*clientOptions) error
 
 type clientOptions struct {
-	dial   Dialer
-	timing Timing
-	kept   *Verdict
+	dial      Dialer
+	timing    Timing
+	kept      *Verdict
+	quoteWait time.Duration
+	// receipted is the instance key a receipt was verified under, PKIX DER.
+	receipted []byte
+}
+
+// Receipted gives the client a guest whose answer to this owner's bind was
+// just verified by its receipt (VerifyBoundReceipt): it pins the instance
+// key the receipt is signed with, so that the client's first command waits
+// for no quote. Every connection is still held to that key, and its
+// certificate's evidence to the client's policy.
+//
+// Until the quote that follows the receipt has confirmed it, what the client
+// sends rests on the instance key's own word about the bind. Its owner
+// verifies that quote, tells the client (Confirmed), and ends the session if
+// the quote disagrees. Until then the client keeps no verdict and releases
+// no credential without attesting the guest itself.
+func Receipted(instanceKey crypto.PublicKey) ClientOption {
+	return func(o *clientOptions) error {
+		der, err := x509.MarshalPKIXPublicKey(instanceKey)
+		if err != nil {
+			return fmt.Errorf("the receipt's instance key: %w", err)
+		}
+		o.receipted = der
+		return nil
+	}
+}
+
+// QuoteWait is how long BindAttested waits for the quote its guest takes
+// over the bind's nonce before it asks the guest for an attestation itself.
+// The default is five seconds: a guest whose first attempt at the quote
+// failed tries again within that.
+func QuoteWait(wait time.Duration) ClientOption {
+	return func(o *clientOptions) error {
+		if wait <= 0 {
+			return errors.New("a client waits for its bind's quote for some time")
+		}
+		o.quoteWait = wait
+		return nil
+	}
 }
 
 // Kept gives the client a verdict an earlier process of the same owner
@@ -243,7 +288,7 @@ func NewClient(baseURL string, policy Policy, engine Engine, auth operatorauth.A
 	if err := policy.validate(); err != nil {
 		return nil, err
 	}
-	options := clientOptions{dial: (&net.Dialer{Timeout: 5 * time.Second}).DialContext}
+	options := clientOptions{dial: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, quoteWait: bindQuoteWait}
 	for _, opt := range opts {
 		if err := opt(&options); err != nil {
 			return nil, err
@@ -263,12 +308,16 @@ func NewClient(baseURL string, policy Policy, engine Engine, auth operatorauth.A
 	c := &Client{
 		base: "https://" + u.Host, policy: policy, engine: engine, auth: auth,
 		addr: net.JoinHostPort(u.Hostname(), port), dial: options.dial, now: time.Now,
-		timing:   options.timing,
+		timing: options.timing, quoteWait: options.quoteWait,
 		verdicts: map[[sha256.Size]byte]time.Time{},
 		scope:    scopeOf(policy, engine),
 	}
 	if options.kept.usable(c.scope, policy) {
 		c.instanceKey, c.judgedUntil = options.kept.InstanceKey, options.kept.Until
+	} else if options.receipted != nil {
+		// Pinned, and judged by nobody yet: the first handshake judges the
+		// certificate that carries the key.
+		c.instanceKey, c.receipted = options.receipted, true
 	}
 	c.tls = &tls.Config{
 		MinVersion:         tls.VersionTLS13,
@@ -469,7 +518,8 @@ func (c *Client) Renew(ctx context.Context) error {
 func (c *Client) Verdict() (_ *Verdict, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.scope == "" || c.instanceKey == nil {
+	// A verdict that is kept is made from a quote, never from a receipt.
+	if c.scope == "" || c.instanceKey == nil || c.receipted {
 		return nil, false
 	}
 	// The wall clock alone, as a file carries it.
@@ -477,8 +527,40 @@ func (c *Client) Verdict() (_ *Verdict, ok bool) {
 }
 
 // Pinned reports whether the client holds its guest's instance key: from an
-// attestation it ran, or from a kept verdict.
+// attestation it ran, from a kept verdict, or from a receipt.
 func (c *Client) Pinned() bool { return c.pinned() != nil }
+
+// Confirmed tells a client that was given its guest by a receipt (Receipted)
+// that the quote which followed is judged and agrees with the receipt: att is
+// that judgment, by VerifyBound under this client's policy and then
+// BindReceipt.Confirmed, and leaf the certificate the quote came with, or
+// nil. The quote is fresh evidence for the owner's own nonce under the pinned
+// key, so from here the client stands as one that attested its guest: it
+// keeps a verdict, and a credential may follow within the minute.
+func (c *Client) Confirmed(att *Attestation, leaf *x509.Certificate) error {
+	if att == nil || att.Result == nil {
+		return errors.New("a client is confirmed by a judged attestation")
+	}
+	now := c.now()
+	until := stands(now, leaf, att.Result)
+	if err := standsNot(now, until, leaf, att.Result); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.instanceKey == nil || !bytes.Equal(c.instanceKey, att.InstanceKey) {
+		return refuse("the quote that followed the receipt is under another instance key than the one this client holds")
+	}
+	if c.policy.Bind == nil || att.Bind == nil || !bytes.Equal(c.policy.Bind, att.Bind.Raw) {
+		return refuse("the quote that followed the receipt is not of a guest bound by this client's bind")
+	}
+	c.receipted = false
+	c.last, c.lastAt = att, now
+	if until.After(c.judgedUntil) {
+		c.judgedUntil = until
+	}
+	return nil
+}
 
 // AnotherKey reports whether a guest presented another key than the one this
 // client pinned. Its verdict did not hold for the guest at this address, and
@@ -831,7 +913,7 @@ func (c *Client) judge(ctx context.Context, evidence *Evidence) (*Attestation, e
 		c.mu.Unlock()
 		return nil, refuse("this client already attested another instance key; a second guest needs its own client")
 	}
-	c.instanceKey = att.InstanceKey
+	c.instanceKey, c.receipted = att.InstanceKey, false
 	c.last, c.lastAt = att, now
 	if until.After(c.judgedUntil) {
 		c.judgedUntil = until
@@ -1184,16 +1266,19 @@ func (c *Client) bind(ctx context.Context, bind *SignedBind) (*BindResponse, *tl
 // its session's from then on. bound is the policy a client of the bound guest
 // holds: the launch document and the bind pinned.
 //
-// The bind carries a nonce, and the guest answers with evidence that is fresh
-// for it, taken once it had measured the bind and admitted the sandbox. The
-// client judges that under bound, pins the guest's key and keeps bound as its
-// policy: what Attest on a new client for the bound guest does, without a
-// second connection and without a second request. A guest whose answer
-// carries no evidence is asked for it, on the same connection.
+// The bind carries a nonce, and the guest takes evidence that is fresh for
+// it once it has measured the bind and its sandbox's image. The client judges
+// that under bound, pins the guest's key and keeps bound as its policy: what
+// Attest on a new client for the bound guest does, without a second
+// connection and without a second quote. The evidence comes with the guest's
+// answer if the guest had it by then, and with its state a moment later
+// otherwise. A receipt in the answer is verified before anything else, and
+// the evidence is held to it. A guest that gives no evidence for the bind's
+// nonce is asked for an attestation, on the same connection.
 //
 // An error leaves the client fit for nothing but Close. With the guest's
 // answer beside the error, the guest took the bind and is not proven to be
-// what the policy asks for.
+// what the policy asks for: its owner ends it.
 func (c *Client) BindAttested(ctx context.Context, bind *SignedBind, bound Policy) (*BindResponse, *Attestation, error) {
 	if err := bound.validate(); err != nil {
 		return nil, nil, err
@@ -1213,24 +1298,75 @@ func (c *Client) BindAttested(ctx context.Context, bind *SignedBind, bound Polic
 	c.mu.Lock()
 	c.policy, c.scope = bound, scopeOf(bound, c.engine)
 	c.mu.Unlock()
-	if resp.Attestation == nil {
-		att, err := c.Attest(ctx)
-		return resp, att, err
-	}
 	if state == nil || len(state.PeerCertificates) == 0 {
 		return resp, nil, refuse("the bind's answer did not arrive over a verified TLS connection")
 	}
 	// As for an attestation request: the key of the connection that carried
 	// the answer is the one whose possession the handshake proved.
-	der, err := x509.MarshalPKIXPublicKey(state.PeerCertificates[0].PublicKey)
+	leaf := state.PeerCertificates[0]
+	der, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
 	if err != nil {
 		return resp, nil, fmt.Errorf("encode instance key: %w", err)
 	}
-	att, err := c.judge(ctx, &Evidence{Nonce: bind.Doc.EvidenceNonce(), InstanceKey: der, Response: *resp.Attestation, leaf: state.PeerCertificates[0]})
+	var receipt *BindReceipt
+	quote := resp.Attestation
+	if resp.Receipt != nil {
+		if receipt, err = VerifyBindReceipt(bound, leaf.PublicKey, bind, resp.Receipt); err != nil {
+			return resp, nil, err
+		}
+		if quote == nil {
+			quote = c.bindQuote(ctx)
+		}
+	}
+	var att *Attestation
+	if quote != nil {
+		att, err = c.judge(ctx, &Evidence{Nonce: bind.Doc.EvidenceNonce(), InstanceKey: der, Response: *quote, leaf: leaf})
+	} else {
+		att, err = c.Attest(ctx)
+	}
 	if err != nil {
 		return resp, nil, err
 	}
+	if receipt != nil {
+		if err := receipt.Confirmed(att); err != nil {
+			return resp, nil, err
+		}
+	}
 	return resp, att, nil
+}
+
+const (
+	// bindQuoteWait is how long a binder waits for the quote its guest takes
+	// over the bind's nonce before it asks for an attestation itself, unless
+	// it says otherwise (QuoteWait). A quote takes some ten milliseconds, and
+	// longer behind another guest's.
+	bindQuoteWait = 5 * time.Second
+	// bindQuotePause is how long it waits before it first looks again, and
+	// bindQuotePauseMost the longest it waits between two looks.
+	bindQuotePause     = time.Millisecond
+	bindQuotePauseMost = 50 * time.Millisecond
+)
+
+// bindQuote waits for the evidence the guest took over its bind's nonce and
+// serves with its state. Nil is a guest that gave none in time: its ration
+// of quotes had none, or its quoting service failed.
+func (c *Client) bindQuote(ctx context.Context) *AttestResponse {
+	ctx, cancel := context.WithTimeout(ctx, c.quoteWait)
+	defer cancel()
+	for pause := bindQuotePause; ; pause = min(2*pause, bindQuotePauseMost) {
+		var state StateResponse
+		if _, err := c.send(ctx, http.MethodGet, PathState, nil, &state, false); err != nil {
+			return nil
+		}
+		if state.Attestation != nil {
+			return state.Attestation
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(pause):
+		}
+	}
 }
 
 // do sends one signed request and decodes a 2xx JSON body into out. Only an

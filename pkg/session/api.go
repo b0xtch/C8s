@@ -125,6 +125,11 @@ type StateResponse struct {
 	// measured it.
 	Bind          []byte `json:"bind,omitempty"`
 	BindSignature string `json:"bind_signature,omitempty"`
+	// Attestation is the evidence a bound guest took over its bind's nonce,
+	// once it has it: what its answer to the bind held, or what followed the
+	// receipt in that answer. It is served as it was taken, and asking for
+	// the state has no guest take a quote.
+	Attestation *AttestResponse `json:"attestation,omitempty"`
 }
 
 // BindRequest hands a guest its one bind.
@@ -142,11 +147,18 @@ type BindResponse struct {
 	// Admission is how the guest spent the time between measuring the bind
 	// and running its sandbox, step by step in order.
 	Admission []AdmissionStep `json:"admission,omitempty"`
+	// Receipt is the guest's own word on the bind, signed by its instance key
+	// over the bind's nonce: see BindReceipt. The sender goes on with it,
+	// and holds the quote that follows to it.
+	Receipt *SignedReceipt `json:"receipt,omitempty"`
 	// Attestation is what an attestation request for the bind's nonce would
-	// have been answered, taken once the bind was measured and the sandbox
-	// admitted. It is missing when the guest's ration of quotes has none to
-	// give right now: then the sender asks. Nothing in it is trusted until
-	// its evidence verifies and binds it.
+	// have been answered, over the register as the bind left it. The guest
+	// begins to take it as soon as that register is final, and the answer
+	// carries it only if it is there by the time the sandbox runs: the answer
+	// does not wait for it. The guest then serves it with its state
+	// (StateResponse). It is missing for good when the guest's ration of
+	// quotes had none to give: then the sender asks. Nothing in it is trusted
+	// until its evidence verifies and binds it.
 	Attestation *AttestResponse `json:"attestation,omitempty"`
 }
 

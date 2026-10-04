@@ -713,7 +713,10 @@ type verdict struct {
 	Platform     string `json:"platform,omitempty"`
 	LaunchDigest string `json:"launch_digest,omitempty"`
 	// BindDigest is the bind the guest measured.
-	BindDigest        string   `json:"bind_digest,omitempty"`
+	BindDigest string `json:"bind_digest,omitempty"`
+	// Receipt says the binding keeps the guest's receipt for its bind, and
+	// that this attestation confirms it.
+	Receipt           bool     `json:"receipt"`
 	Events            []string `json:"events,omitempty"`
 	MRTD              string   `json:"mrtd,omitempty"`
 	InstanceKeySHA256 string   `json:"instance_key_sha256,omitempty"`
@@ -845,7 +848,20 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 	ctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 	att, err := client.Attest(ctx)
-	v := verdict{Verified: err == nil}
+	// A receipt kept with the binding is the guest's own word that it took
+	// the bind. The guest that was just attested must be the one that gave
+	// it, with the register the receipt lists.
+	var receipted bool
+	if err == nil && t.binding != "" {
+		var kept *session.SignedReceipt
+		if kept, err = session.LoadReceipt(t.binding); err == nil && kept != nil {
+			if _, err = session.ConfirmReceipt(kept, att); err != nil {
+				err = &session.VerificationError{Err: fmt.Errorf("the receipt kept with the binding is not this guest's word on its bind: %w", err)}
+			}
+			receipted = err == nil
+		}
+	}
+	v := verdict{Verified: err == nil, Receipt: receipted}
 	if err != nil {
 		v.Error = err.Error()
 	} else {
@@ -886,6 +902,9 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 			v.Platform, v.Tenant, v.Session, v.Phase, v.LaunchDigest)
 		if v.BindDigest != "" {
 			fmt.Fprintf(stdout, "  bind          %s\n", v.BindDigest)
+		}
+		if v.Receipt {
+			fmt.Fprintf(stdout, "  receipt       the guest's receipt for the bind, confirmed by this quote\n")
 		}
 		if v.Egress != nil {
 			fmt.Fprintf(stdout, "  egress        %s\n", v.Egress)
@@ -1117,6 +1136,13 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 		return finish(exitCode(err), fmt.Errorf("the bind was sent, but the guest does not verify as bound by it: %w", err))
 	}
 	result.Admission = answer.Admission
+	// The guest's signed word that it took the bind, which its quote
+	// confirmed: 'c8s session verify' holds it to a fresh quote.
+	if answer.Receipt != nil {
+		if err := session.WriteReceipt(b.out, answer.Receipt); err != nil {
+			fmt.Fprintf(stderr, "the guest's receipt for the bind was not kept: %v\n", err)
+		}
+	}
 	result.BindMillis = time.Duration(answered.Load()).Milliseconds()
 	result.AttestMillis = (time.Since(started) - time.Duration(answered.Load())).Milliseconds()
 	// For the owner's next command, which then asks the guest for no quote.

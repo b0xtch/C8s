@@ -116,6 +116,11 @@ type Agent struct {
 	// admitted: the sandbox this agent process started is running. Commands
 	// and credentials wait for it.
 	admitted bool
+	// receipt is the guest's signed word on its bind, from when the bind's
+	// sandbox runs. bindQuote is the evidence it took over the bind's nonce,
+	// from when it has it: what its state then serves.
+	receipt   *session.SignedReceipt
+	bindQuote *session.AttestResponse
 	// settling is set while a bind's sandbox is being admitted: the register
 	// already holds the sandbox's image, and the guest does not say so until
 	// the sandbox runs. It is closed when that is decided. A quote for anyone
@@ -404,81 +409,93 @@ func (a *Agent) Admit(ctx context.Context) error {
 	return nil
 }
 
-// admit prepares, measures and starts the sandbox, and returns the evidence
-// that answers the bind, if answer asks for it and the guest's ration of
-// quotes has one due.
+// admit prepares, measures and starts the sandbox, signs the receipt that
+// answers the bind, and takes the quote that follows it.
 //
 // The register is made final before the slow steps: the sandbox's image is
-// extended into it as soon as the image is in place. The quote that answers
-// the bind is then taken while the guest takes its credentials and starts
-// its sandbox, and is handed out only once the sandbox runs. A guest whose
-// admission fails after that ends, as it does on any other failure here, and
-// gives no quote on its way out.
-func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, answer bool) (*session.AttestResponse, error) {
+// extended into it as soon as the image is in place. The quote over the
+// bind's nonce is then taken while the guest takes its credentials and starts
+// its sandbox. Once the sandbox runs the guest signs its receipt, and the
+// bind is answered with it: with the quote too if that is there by then, and
+// otherwise the quote is served with the guest's state when it arrives. A
+// guest whose admission fails after the extend ends, as it does on any other
+// failure here, and gives no quote on its way out.
+func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.SignedReceipt, *session.AttestResponse, error) {
 	ctx, steps := withAdmission(ctx)
 	sandbox, egress := bind.Doc.Policy.Sandbox, bind.Doc.Policy.Egress
 	if sandbox != nil {
 		if err := a.cfg.Runner.Prepare(ctx, sandbox, egress); err != nil {
-			return nil, fmt.Errorf("prepare sandbox: %w", err)
+			return nil, nil, fmt.Errorf("prepare sandbox: %w", err)
 		}
 		// The image names the user it runs as, so the owner of its credentials
 		// is known only now. None can have been written: that waits on admission.
 		uid, gid := a.cfg.Runner.CredentialOwner()
 		if err := a.creds.setOwner(uid, gid); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// Asked before the image is measured: a guest that will not start
 		// its sandbox does not say it admitted one.
 		if a.cfg.Guard != nil {
 			if err := a.cfg.Guard(ctx); err != nil {
-				return nil, fmt.Errorf("before starting the sandbox: %w", err)
+				return nil, nil, fmt.Errorf("before starting the sandbox: %w", err)
 			}
 		}
 	}
 	events, err := a.settle(ctx, sandbox != nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var evidence chan *session.AttestResponse
-	if answer {
-		evidence = make(chan *session.AttestResponse, 1)
-		go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
-	}
+	evidence := make(chan *session.AttestResponse, 1)
+	go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
 	// What the bind has the key service hold for the session is in place
 	// before the sandbox starts, so the sandbox finds it at its first read.
 	if err := a.acquire(ctx, bind); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if sandbox != nil {
 		began := time.Now()
 		if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
-			return nil, fmt.Errorf("start sandbox: %w", err)
+			return nil, nil, fmt.Errorf("start sandbox: %w", err)
 		}
 		recordStep(ctx, stepStart, time.Since(began))
 	}
-	a.settled()
+	// What the guest extended after its launch document, which a quote from
+	// before the bind does not hold.
+	receipt, err := session.NewBindReceipt(a.key, bind, events[1:], session.PhaseRunning)
+	if err != nil {
+		return nil, nil, err
+	}
+	a.settled(receipt)
+	// The quote goes with the answer only if it is there. Otherwise it is
+	// served with the guest's state once it is, and nobody waits.
 	var resp *session.AttestResponse
-	if evidence != nil {
-		resp = <-evidence
+	attempted := false
+	select {
+	case resp = <-evidence:
+		attempted = true
+		a.keepBindQuote(resp)
+	default:
 	}
-	// The serving certificate's quote predates the last extend; reissue it so
-	// a handshake alone shows the final register. A certificate from before
-	// passes a verifier's handshake too, so nobody has to wait for this one:
-	// a bind's sender gets the evidence it asked for first, since the quoting
-	// service takes one request of a guest at a time, and its answer second.
-	reissue := func() {
-		if !a.certs.CertReady() {
-			return
+	go func() {
+		quote := resp
+		if !attempted {
+			quote = <-evidence
+			a.keepBindQuote(quote)
 		}
-		if err := a.certs.SwapProvider(ctx, &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}); err != nil {
-			a.log.Warn("reissue serving certificate after sandbox admission", "error", err)
+		// The serving certificate's quote predates the last extend; reissue
+		// it so a handshake alone shows the final register. A certificate
+		// from before passes a verifier's handshake too, so nobody waits for
+		// this one, and it follows the bind's quote: the quoting service
+		// takes one request of a guest at a time.
+		if a.certs.CertReady() {
+			if err := a.certs.SwapProvider(ctx, &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}); err != nil {
+				a.log.Warn("reissue serving certificate after sandbox admission", "error", err)
+			}
 		}
-	}
-	if answer {
-		go reissue()
-	} else {
-		reissue()
-	}
+		if quote == nil {
+			a.keepBindQuote(a.bindEvidenceAgain(ctx, bind, events))
+		}
+	}()
 	taken := steps.list()
 	a.measured.Lock()
 	a.admission = taken
@@ -487,7 +504,41 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, answer bool
 	// The guest has its sandbox. What it has not accepted of its memory is
 	// accepted behind it, for as long as the guest lives if it takes that.
 	go a.cfg.Memory.AcceptRest(context.WithoutCancel(ctx))
-	return resp, nil
+	return receipt, resp, nil
+}
+
+// bindQuotePauses are how long a guest that could not take the quote over
+// its bind's nonce waits before each further attempt. Together they stay
+// under the time a binder waits for the quote before it asks for an
+// attestation itself.
+var bindQuotePauses = []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
+
+// bindEvidenceAgain takes the quote over the bind's nonce for a guest whose
+// first attempt gave none: its ration had none due, or its quoting service
+// failed. Nil is a guest that got none in a few more attempts.
+func (a *Agent) bindEvidenceAgain(ctx context.Context, bind *session.SignedBind, events []string) *session.AttestResponse {
+	for _, pause := range bindQuotePauses {
+		select {
+		case <-time.After(pause):
+		case <-ctx.Done():
+			return nil
+		}
+		if resp := a.bindEvidence(ctx, bind, events); resp != nil {
+			return resp
+		}
+	}
+	return nil
+}
+
+// keepBindQuote keeps the evidence the guest took over its bind's nonce, for
+// its state to serve. Nil is an attempt that gave none.
+func (a *Agent) keepBindQuote(resp *session.AttestResponse) {
+	if resp == nil {
+		return
+	}
+	a.measured.Lock()
+	a.bindQuote = resp
+	a.measured.Unlock()
 }
 
 // settle makes the register final for the bind: with a sandbox, it extends
@@ -509,11 +560,12 @@ func (a *Agent) settle(ctx context.Context, sandbox bool) ([]string, error) {
 }
 
 // settled is the end of an admission that succeeded: the guest runs its
-// sandbox, says so, and gives quotes again.
-func (a *Agent) settled() {
+// sandbox, says so, keeps the receipt it answers its bind with, and gives
+// quotes again.
+func (a *Agent) settled(receipt *session.SignedReceipt) {
 	a.measured.Lock()
 	defer a.measured.Unlock()
-	a.staged, a.admitted = len(a.events), true
+	a.staged, a.admitted, a.receipt = len(a.events), true, receipt
 	close(a.settling)
 	a.settling = nil
 }
@@ -568,9 +620,9 @@ func refused(code disclosure.Code, err error) *bindRefusal { return &bindRefusal
 // The guest does not judge the authority that signed. Whoever relies on the
 // guest reads the bind from its evidence and checks that.
 //
-// The sender is given evidence for the bind's nonce with its answer, if the
-// guest's ration of quotes has one due: see bindEvidence.
-func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replayed bool, evidence *session.AttestResponse, err error) {
+// The sender is given the guest's receipt for the bind, and the evidence for
+// the bind's nonce with it if the guest has it by then: see admit.
+func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replayed bool, answer *BindAnswer, err error) {
 	a.binding.Lock()
 	a.measured.RLock()
 	current, retired := a.bind, a.retired
@@ -603,7 +655,11 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 		}
 		select {
 		case <-a.bound:
-			return true, a.repeatEvidence(ctx, current), nil
+			// As the first time: the receipt, and the quote if it is there.
+			a.measured.RLock()
+			again := &BindAnswer{Receipt: a.receipt, Attestation: a.bindQuote}
+			a.measured.RUnlock()
+			return true, again, nil
 		case <-ctx.Done():
 			return true, nil, ctx.Err()
 		}
@@ -639,12 +695,19 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	// The first bind is the only one, so a guest whose sandbox cannot be
 	// admitted is of no use to anyone and ends. The caller going away changes
 	// nothing about that.
-	evidence, err = a.admit(context.WithoutCancel(ctx), bind, true)
+	receipt, evidence, err := a.admit(context.WithoutCancel(ctx), bind)
 	close(a.bound)
 	if err != nil {
 		return false, nil, a.fail(err)
 	}
-	return false, evidence, nil
+	return false, &BindAnswer{Receipt: receipt, Attestation: evidence}, nil
+}
+
+// BindAnswer is what a guest answers a bind it took with: its receipt, and
+// the evidence over the bind's nonce if it has that already.
+type BindAnswer struct {
+	Receipt     *session.SignedReceipt
+	Attestation *session.AttestResponse
 }
 
 // acceptable checks a bind for this guest: well-formed, signed by the

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/sessiond"
 	"github.com/confidential-dot-ai/c8s/internal/sessiond/sessiondtest"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -63,10 +65,15 @@ func TestStartThenDriveThroughADaemon(t *testing.T) {
 	if !res.Started || res.Tenant != "acme" || res.Session != "sbx-1" || res.Phase != "running" || res.TD == "" || res.Host != "host-a" || res.Binding != s.out {
 		t.Fatalf("start result = %+v", res)
 	}
-	for _, name := range []string{session.BindFile, session.DocumentFile, session.PubkeyFile, session.AccessKeyFile, session.VerdictFile, daemon.RouteFile} {
+	for _, name := range []string{session.BindFile, session.DocumentFile, session.PubkeyFile, session.AccessKeyFile, session.VerdictFile, session.ReceiptFile, daemon.RouteFile} {
 		if _, err := os.Stat(filepath.Join(s.out, name)); err != nil {
 			t.Fatalf("binding directory: %v", err)
 		}
+	}
+	// The guest answered the bind with its receipt, and the quote the start
+	// judged confirmed it.
+	if !res.Receipt || (res.Quote != quoteWithAnswer && res.Quote != quoteWithEvidence) {
+		t.Fatalf("start result = %+v", res)
 	}
 	// The start judged the bind's answer, and asked the guest for no quote of
 	// its own. Its verdict spares the next commands theirs.
@@ -96,7 +103,7 @@ func TestStartThenDriveThroughADaemon(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &v); err != nil {
 		t.Fatal(err)
 	}
-	if !v.Verified || v.Tenant != "acme" || v.Session != "sbx-1" || v.BindDigest != res.BindDigest {
+	if !v.Verified || v.Tenant != "acme" || v.Session != "sbx-1" || v.BindDigest != res.BindDigest || !v.Receipt {
 		t.Fatalf("verdict = %+v", v)
 	}
 
@@ -147,6 +154,127 @@ func TestStartRefusesAGuestItDidNotPin(t *testing.T) {
 	// starts left none claimed.
 	if res := start(t, starting(t, host, "sbx-1")); !res.Started {
 		t.Fatalf("start after the refusals = %+v", res)
+	}
+}
+
+// The receipt a start keeps with the binding is the guest's signed word that
+// it took the bind. A verification holds it to the guest it attests: another
+// session's receipt in its place is refused, and so is one that was changed.
+// Without one, a verification says so and judges the guest alone.
+func TestVerifyHoldsTheKeptReceiptToItsGuest(t *testing.T) {
+	host := sessiondtest.NewHost(t, 2, nil)
+	s1, s2 := starting(t, host, "sbx-1"), starting(t, host, "sbx-2")
+	start(t, s1)
+	start(t, s2)
+	verify := func(binding string) (int, verdict) {
+		t.Helper()
+		var stdout, stderr bytes.Buffer
+		flags := &trust{binding: binding, manifest: s1.manifest, timeout: s1.timeout, engineForTest: &counting{}}
+		code := runVerify(context.Background(), flags, true, &stdout, &stderr)
+		var v verdict
+		if err := json.Unmarshal(stdout.Bytes(), &v); err != nil {
+			t.Fatalf("verify said %s%s", stdout.String(), stderr.String())
+		}
+		return code, v
+	}
+	if code, v := verify(s1.out); code != ExitOK || !v.Verified || !v.Receipt {
+		t.Fatalf("verify with the guest's own receipt: exit %d, %+v", code, v)
+	}
+	own, err := os.ReadFile(filepath.Join(s1.out, session.ReceiptFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	others, err := os.ReadFile(filepath.Join(s2.out, session.ReceiptFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var signed session.SignedReceipt
+	if err := json.Unmarshal(own, &signed); err != nil {
+		t.Fatal(err)
+	}
+	signed.Receipt = bytes.Replace(signed.Receipt, []byte(`"running"`), []byte(`"bound"`), 1)
+	changed, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, receipt := range map[string][]byte{
+		"another session's receipt":           others,
+		"a receipt changed after it was kept": changed,
+	} {
+		if err := os.WriteFile(filepath.Join(s1.out, session.ReceiptFile), receipt, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, v := verify(s1.out); code != ExitRefused || v.Verified || v.Receipt || !strings.Contains(v.Error, "receipt kept with the binding") {
+			t.Fatalf("verify with %s: exit %d, %+v", name, code, v)
+		}
+	}
+	if err := os.Remove(filepath.Join(s1.out, session.ReceiptFile)); err != nil {
+		t.Fatal(err)
+	}
+	if code, v := verify(s1.out); code != ExitOK || !v.Verified || v.Receipt {
+		t.Fatalf("verify with no receipt kept: exit %d, %+v", code, v)
+	}
+	if err := os.WriteFile(filepath.Join(s1.out, session.ReceiptFile), own, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, v := verify(s1.out); code != ExitOK || !v.Receipt {
+		t.Fatalf("verify with the guest's own receipt put back: exit %d, %+v", code, v)
+	}
+}
+
+// failingLater is an engine that judges its first evidence, the unbound
+// guest's, and fails every one after it with err.
+type failingLater struct {
+	counting
+	err error
+}
+
+func (e *failingLater) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	if e.calls.Add(1) > 1 {
+		return nil, e.err
+	}
+	return e.Engine.VerifyEvidence(ctx, env, reportData)
+}
+
+// A guest that took the bind and whose quote is then refused is of no use to
+// anyone: the start ends its session, and the host has its place again. A
+// quote that could not be judged leaves the session, which may verify yet.
+func TestStartEndsAGuestWhoseQuoteIsRefused(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
+	s := starting(t, host, "sbx-1")
+	s.engineForTest = &failingLater{err: &session.VerificationError{Err: errors.New("the quote is not the pinned guest's")}}
+	var stdout, stderr bytes.Buffer
+	if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitRefused {
+		t.Fatalf("a start whose guest's quote is refused: exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "its session was ended") {
+		t.Fatalf("the refused start said %s", stdout.String())
+	}
+	// The host has room for one TD, and the name is taken while a session
+	// of it lives: the next start succeeds only if the refused one is gone.
+	next := starting(t, host, "sbx-1")
+	if res := start(t, next); !res.Started {
+		t.Fatalf("start after the refused guest = %+v", res)
+	}
+	orchestrator := &daemonFlags{cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
+	stdout.Reset()
+	if code := runDestroy(context.Background(), orchestrator, next.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("destroy exit %d: %s", code, stderr.String())
+	}
+
+	// Intel's service being away says nothing about the guest.
+	away := starting(t, host, "sbx-2")
+	away.engineForTest = &failingLater{err: errors.New("collateral unavailable")}
+	stdout.Reset()
+	if code := runStart(context.Background(), away, true, &stdout, &stderr); code != ExitUnavailable {
+		t.Fatalf("a start whose guest's quote could not be judged: exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stdout.String(), "its session was ended") {
+		t.Fatalf("the start ended a session it could not judge: %s", stdout.String())
+	}
+	stdout.Reset()
+	if code := runDestroy(context.Background(), orchestrator, away.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK || !strings.Contains(stdout.String(), "DESTROYED session sbx-2") {
+		t.Fatalf("the session that could not be judged was not there to destroy: exit %d: %s%s", code, stdout.String(), stderr.String())
 	}
 }
 

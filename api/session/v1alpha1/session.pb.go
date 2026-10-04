@@ -295,7 +295,12 @@ func (x *BindRequest) GetSignature() []byte {
 type Bound struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The evidence now includes the bind.
-	Evidence      *Evidence `protobuf:"bytes,1,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	Evidence *Evidence `protobuf:"bytes,1,opt,name=evidence,proto3" json:"evidence,omitempty"`
+	// The guest's receipt for the bind (c8s-bind-receipt/v1), as the guest
+	// sent it: signed by its instance key over the bind's nonce. The quote
+	// over the same nonce is in the evidence if the guest had it by then, and
+	// in what GetEvidence returns once it has.
+	Receipt       []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -337,6 +342,13 @@ func (x *Bound) GetEvidence() *Evidence {
 	return nil
 }
 
+func (x *Bound) GetReceipt() []byte {
+	if x != nil {
+		return x.Receipt
+	}
+	return nil
+}
+
 // Evidence is what a guest says of itself, relayed unread. Each part is
 // checked by whoever acts on it.
 type Evidence struct {
@@ -349,8 +361,9 @@ type Evidence struct {
 	Events []string `protobuf:"bytes,4,rep,name=events,proto3" json:"events,omitempty"`
 	// When bound.
 	Bind []byte `protobuf:"bytes,5,opt,name=bind,proto3" json:"bind,omitempty"`
-	// The platform's evidence for the nonce of the bind this answers, in the
-	// guest's own encoding. Only an answer to Bind carries it.
+	// Once bound: the platform's evidence over the bind's nonce, in the
+	// guest's own encoding, from when the guest has taken it. Nothing here
+	// has a guest take a quote.
 	Quote []byte `protobuf:"bytes,6,opt,name=quote,proto3" json:"quote,omitempty"`
 	// The vendor's documents as the guest's host last handed them in.
 	Collateral    []byte `protobuf:"bytes,7,opt,name=collateral,proto3" json:"collateral,omitempty"`
@@ -709,9 +722,10 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x0e\n" +
 	"\x02td\x18\x02 \x01(\tR\x02td\x12\x12\n" +
 	"\x04bind\x18\x03 \x01(\fR\x04bind\x12\x1c\n" +
-	"\tsignature\x18\x04 \x01(\fR\tsignatureJ\x04\b\x05\x10\x06\"C\n" +
+	"\tsignature\x18\x04 \x01(\fR\tsignatureJ\x04\b\x05\x10\x06\"]\n" +
 	"\x05Bound\x12:\n" +
-	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\"\xa5\x02\n" +
+	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
+	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xa5\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +

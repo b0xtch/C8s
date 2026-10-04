@@ -231,13 +231,13 @@ func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, 
 func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 	a.measured.RLock()
 	phase, events := a.stateLocked()
-	bind := a.bind
+	bind, quote := a.bind, a.bindQuote
 	prepared := phase == session.PhaseReady && a.preparedLocked()
 	a.measured.RUnlock()
 
 	state := session.StateResponse{
 		Phase: phase, InstanceKey: a.keyDER, Prepared: prepared,
-		Launch: a.launch, Signature: a.signature, Events: events,
+		Launch: a.launch, Signature: a.signature, Events: events, Attestation: quote,
 	}
 	if bind != nil {
 		state.Bind, state.BindSignature = bind.Raw, bind.Signature
@@ -261,7 +261,7 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
 		return
 	}
-	replayed, evidence, err := a.Bind(r.Context(), req.Bind, req.Signature)
+	replayed, answer, err := a.Bind(r.Context(), req.Bind, req.Signature)
 	var refusal *bindRefusal
 	switch {
 	case errors.Is(err, errAlreadyBound):
@@ -290,20 +290,23 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		phase, _ := a.stateLocked()
 		admission := a.admission
 		a.measured.RUnlock()
-		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{Phase: phase, Replayed: replayed, Admission: admission, Attestation: evidence})
+		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{
+			Phase: phase, Replayed: replayed, Admission: admission, Receipt: answer.Receipt, Attestation: answer.Attestation,
+		})
 	}
 }
 
 // bindEvidence is the evidence a bind's sender would ask for next, taken for
-// the nonce the bind carries: the answer then holds it, and the sender asks
-// for nothing. It comes out of the guest's ration like any other quote. With
-// none due, the answer goes without and the sender asks in its turn.
+// the nonce the bind carries, so that the sender asks for nothing. It comes
+// out of the guest's ration like any other quote. Nil is an attempt that
+// gave none: the ration had none due, or the quoting service failed.
 //
 // It is taken while the bind's sandbox is admitted, over the events the
 // register holds from then on, and says the guest runs. The admission hands
 // it out only if that comes true.
 func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind, events []string) *session.AttestResponse {
 	if !a.quotes.take() {
+		a.log.Warn(noBindQuote, "error", "this guest's fresh quotes are rationed, and none is due")
 		return nil
 	}
 	reportData, err := session.ReportData(&a.key.PublicKey, bind.Doc.EvidenceNonce(), events)
@@ -318,23 +321,13 @@ func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind, even
 			}
 		}
 	}
-	a.log.Warn("a bind is answered without evidence", "error", err)
+	a.log.Warn(noBindQuote, "error", err)
 	return nil
 }
 
-// repeatEvidence is bindEvidence for a bind the guest took before: evidence
-// of the guest as it is now.
-func (a *Agent) repeatEvidence(ctx context.Context, bind *session.SignedBind) *session.AttestResponse {
-	if !a.quotes.take() {
-		return nil
-	}
-	resp, _, err := a.attestation(ctx, bind.Doc.EvidenceNonce())
-	if err != nil {
-		a.log.Warn("a bind is answered without evidence", "error", err)
-		return nil
-	}
-	return resp
-}
+// noBindQuote is what the guest logs for an attempt at the quote over its
+// bind's nonce that gave none.
+const noBindQuote = "no quote was taken over the bind's nonce"
 
 // attestation takes a quote bound to nonce and to what the guest has measured,
 // and says what that is. unavailable tells a quoting service that failed from

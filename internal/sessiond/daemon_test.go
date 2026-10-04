@@ -97,14 +97,18 @@ type started struct {
 	td    string
 	ready *session.ReadyTD
 	bind  *session.SignedBind
-	// answer is the guest's answer to the bind, as the daemon relayed it.
-	answer  *session.Relayed
+	// answer is the guest's evidence over the bind's nonce, as the daemon
+	// relayed it: with the bind's answer, or a moment after it.
+	answer *session.Relayed
+	// receipt is the guest's receipt for the bind, verified.
+	receipt *session.BindReceipt
 	policy  session.Policy
 	verdict *session.Verdict
 }
 
 // begin claims a TD for the session, verifies it as the pinned image, has
-// the owner's authority bind it and verifies the answer: what a binder does.
+// the owner's authority bind it, verifies the guest's receipt, and then the
+// quote that follows it: what a binder does.
 func (h *host) begin(c *daemon.Client, o *owner, name string) (*started, error) {
 	h.t.Helper()
 	claimed, err := c.Claim(ctx(h.t), requestID(h.t), sessiondtest.Pool, name, 10*time.Second)
@@ -138,8 +142,20 @@ func (h *host) bind(c *daemon.Client, o *owner, name string, claimed *daemon.Cla
 	}
 	binding := session.Binding{LaunchKey: h.LaunchKey, Launch: ready.Launch, Bind: bind}
 	policy := binding.Policy(h.Identity)
+	receipt, err := session.VerifyBoundReceipt(policy, ready, bind, answer)
+	if err != nil {
+		return nil, err
+	}
+	if len(answer.Evidence) == 0 {
+		if answer, err = c.BoundEvidence(ctx(h.t), claimed.TD); err != nil {
+			return nil, err
+		}
+	}
 	att, err := session.VerifyBound(ctx(h.t), policy, h.Engine, ready.InstanceKey, bind, answer)
 	if err != nil {
+		return nil, err
+	}
+	if err := receipt.Confirmed(att); err != nil {
 		return nil, err
 	}
 	leaf, err := x509.ParseCertificate(answer.Certificate)
@@ -150,7 +166,7 @@ func (h *host) bind(c *daemon.Client, o *owner, name string, claimed *daemon.Cla
 	if err != nil {
 		return nil, err
 	}
-	return &started{td: claimed.TD, ready: ready, bind: bind, answer: answer, policy: policy, verdict: verdict}, nil
+	return &started{td: claimed.TD, ready: ready, bind: bind, answer: answer, receipt: receipt, policy: policy, verdict: verdict}, nil
 }
 
 // drive is a client of the session's guest, reached through the daemon with
@@ -301,8 +317,9 @@ func TestRepeatedBindIsAnsweredAsTheFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the repeated bind: %v", err)
 	}
-	if !bytes.Equal(first.Evidence, again.Evidence) || len(first.Evidence) == 0 {
-		t.Fatal("the repeated bind was answered with other evidence")
+	if first.Receipt == nil || again.Receipt == nil || !bytes.Equal(first.Receipt.Receipt, again.Receipt.Receipt) ||
+		first.Receipt.Signature != again.Receipt.Signature || !bytes.Equal(first.Evidence, again.Evidence) {
+		t.Fatal("the repeated bind was answered with another receipt or other evidence")
 	}
 	other, err := session.NewBind(session.BindOptions{
 		Authority: o.authority, InstanceKey: ready.InstanceKey, Tenant: "acme", Session: "s1", NotAfter: time.Now().Add(time.Minute),
@@ -654,12 +671,33 @@ func TestBinderRefusesWhatItDidNotPin(t *testing.T) {
 	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, s2.answer); !errors.As(err, &refused) {
 		t.Fatalf("another guest's answer passed as this one's: %v", err)
 	}
-	// What a guest serves to anyone carries no quote, and answers no bind.
+	// What a bound guest serves to anyone is the quote it took over its
+	// bind's nonce. It verifies for the bind it answers and confirms that
+	// bind's receipt, and does neither for another session's.
 	public, err := h.Client(nil).Evidence(ctx(t), s.td)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, public); !errors.As(err, &refused) {
+	att, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, public)
+	if err != nil {
+		t.Fatalf("the quote a bound guest serves to anyone: %v", err)
+	}
+	if err := s.receipt.Confirmed(att); err != nil {
+		t.Fatalf("the quote a bound guest serves does not confirm its receipt: %v", err)
+	}
+	if err := s2.receipt.Confirmed(att); !errors.As(err, &refused) {
+		t.Fatalf("one guest's quote confirmed another's receipt: %v", err)
+	}
+	if _, err := session.VerifyBound(ctx(t), s2.policy, h.Engine, s2.ready.InstanceKey, s2.bind, public); !errors.As(err, &refused) {
+		t.Fatalf("one guest's served quote passed as another's answer: %v", err)
+	}
+	if _, err := session.VerifyBoundReceipt(s.policy, s.ready, s.bind, &session.Relayed{}); !errors.As(err, &refused) {
+		t.Fatalf("an answer with no receipt passed as receipted: %v", err)
+	}
+	// A quote with nothing but the state around it answers no bind.
+	bare := *public
+	bare.Evidence = nil
+	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, &bare); !errors.As(err, &refused) {
 		t.Fatalf("evidence with no quote passed as the answer to a bind: %v", err)
 	}
 	// The answer that was verified is still the one that verifies.

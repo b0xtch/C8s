@@ -27,9 +27,12 @@ type Relayed struct {
 	Events        []string
 	Bind          []byte
 	BindSignature string
-	// Evidence is the platform's evidence in the guest's encoding, when the
-	// guest answered a bind with it.
+	// Evidence is the platform's evidence over the bind's nonce in the
+	// guest's encoding, once a bound guest has taken it.
 	Evidence []byte
+	// Receipt is the guest's receipt for its bind, in an answer to a bind:
+	// see VerifyBoundReceipt.
+	Receipt *SignedReceipt
 	// Collateral is a CollateralResponse: the vendor's documents as the
 	// guest's host handed them in.
 	Collateral []byte
@@ -130,6 +133,30 @@ func VerifyBound(ctx context.Context, policy Policy, engine Engine, instanceKey 
 	}
 	// The root CA CRL under this verdict is one the verifier fetched itself.
 	return VerifyAttestation(WithCollateralSource(ctx, r.source), policy, engine, instanceKey, bind.Doc.EvidenceNonce(), resp)
+}
+
+// VerifyBoundReceipt judges a guest's relayed answer to a bind by its
+// receipt: the word of the instance key that VerifyReady found, fresh for the
+// bind's nonce, that the guest took this bind, extended what the bind's
+// documents imply and reached its phase. policy is the policy for the bound
+// guest and pins the bind.
+//
+// A binder may go on with a receipt at once. It still gets the quote over
+// the bind's nonce, from the same answer or from the guest's evidence a
+// moment later, judges it with VerifyBound and holds it to the receipt with
+// BindReceipt.Confirmed: a guest whose quote disagrees is ended. No verdict
+// is kept on a receipt.
+func VerifyBoundReceipt(policy Policy, ready *ReadyTD, bind *SignedBind, r *Relayed) (*BindReceipt, error) {
+	if !bytes.Equal(policy.Bind, bind.Raw) {
+		return nil, errors.New("the policy for the bound guest must pin the bind that was sent")
+	}
+	if err := policy.validate(); err != nil {
+		return nil, err
+	}
+	if policy.Launch != nil && !bytes.Equal(policy.Launch, ready.Launch) {
+		return nil, refuse("the guest that was verified measured launch document %s, policy pins %s", DocumentDigest(ready.Launch), DocumentDigest(policy.Launch))
+	}
+	return VerifyBindReceipt(policy, ready.InstanceKey, bind, r.Receipt)
 }
 
 // VerdictOn is the verdict a verifier may keep on att, which it judged at now

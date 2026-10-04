@@ -54,6 +54,12 @@
           "kind": "public",
           "max": 4096,
           "optional": true
+        },
+        {
+          "name": "attestation",
+          "kind": "message",
+          "message": "attestation",
+          "optional": true
         }
       ]
     },
@@ -107,6 +113,12 @@
           "optional": true
         },
         {
+          "name": "receipt",
+          "kind": "message",
+          "message": "receipt",
+          "optional": true
+        },
+        {
           "name": "attestation",
           "kind": "message",
           "message": "attestation",
@@ -115,8 +127,24 @@
       ]
     },
     {
+      "name": "receipt",
+      "says": "with its answer to a bind: its own word on the bind, signed by its instance key over the bind's nonce",
+      "fields": [
+        {
+          "name": "receipt",
+          "kind": "public",
+          "max": 8192
+        },
+        {
+          "name": "signature",
+          "kind": "public",
+          "max": 4096
+        }
+      ]
+    },
+    {
       "name": "attestation",
-      "says": "with its answer to a bind: evidence over the bind's nonce",
+      "says": "with its answer to a bind, and with its state from then on: evidence over the bind's nonce",
       "fields": [
         {
           "name": "evidence",
