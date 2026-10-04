@@ -12,8 +12,8 @@ import (
 
 const testBootConfig = `{
   "hostname": "session",
-  "steps": [["/usr/local/bin/c8s", "session-agent", "load"], ["/usr/sbin/nft", "-f", "/etc/c8s-session/firewall.nft"]],
-  "service": ["/usr/local/bin/c8s", "session-agent", "run", "--platform=tdx"]
+  "steps": [["/usr/local/bin/c8s-session-guest", "session-agent", "load"], ["/usr/sbin/nft", "-f", "/etc/c8s-session/firewall.nft"]],
+  "service": ["/usr/local/bin/c8s-session-guest", "session-agent", "run", "--platform=tdx"]
 }`
 
 func bootedGuest() *fakeGuest {
@@ -31,7 +31,7 @@ func bootedGuest() *fakeGuest {
 func TestRunGuest(t *testing.T) {
 	f := bootedGuest()
 	err := runGuest(f)
-	if err == nil || !strings.Contains(err.Error(), "/usr/local/bin/c8s ended with status 3") {
+	if err == nil || !strings.Contains(err.Error(), "/usr/local/bin/c8s-session-guest ended with status 3") {
 		t.Fatalf("the guest ended with %v", err)
 	}
 	if f.root != newRoot {
@@ -56,9 +56,9 @@ func TestRunGuest(t *testing.T) {
 		t.Fatalf("controllers: %q", got)
 	}
 	want := []started{
-		{[]string{"/usr/local/bin/c8s", "session-agent", "load"}, "", 0},
+		{[]string{"/usr/local/bin/c8s-session-guest", "session-agent", "load"}, "", 0},
 		{[]string{"/usr/sbin/nft", "-f", "/etc/c8s-session/firewall.nft"}, "", 0},
-		{[]string{"/usr/local/bin/c8s", "session-agent", "run", "--platform=tdx"}, serviceCgroup, serviceOOMScore},
+		{[]string{"/usr/local/bin/c8s-session-guest", "session-agent", "run", "--platform=tdx"}, serviceCgroup, serviceOOMScore},
 	}
 	if !reflect.DeepEqual(f.starts, want) {
 		t.Fatalf("started %+v", f.starts)
@@ -73,7 +73,7 @@ func TestRunGuestEndsOn(t *testing.T) {
 	}{
 		"a step that fails":             {func(f *fakeGuest) { f.exits = [][2]int{{101, 0}, {102, 1}} }, "nft -f /etc/c8s-session/firewall.nft ended with status 1", 2},
 		"a step that does not start":    {func(f *fakeGuest) { f.startErr["/usr/sbin/nft"] = errors.New("ENOENT") }, "/usr/sbin/nft: ENOENT", 1},
-		"a service that does not start": {func(f *fakeGuest) { f.startErr["/usr/local/bin/c8s"] = errors.New("ENOEXEC") }, "ENOEXEC", 0},
+		"a service that does not start": {func(f *fakeGuest) { f.startErr["/usr/local/bin/c8s-session-guest"] = errors.New("ENOEXEC") }, "ENOEXEC", 0},
 		"no boot configuration":         {func(f *fakeGuest) { delete(f.files, bootConfigPath) }, bootConfigPath, 0},
 		"a boot configuration with an unknown member": {func(f *fakeGuest) {
 			f.files[bootConfigPath] = []byte(`{"service":["/bin/a"],"extra":1}`)

@@ -12,8 +12,8 @@ case "$PLATFORM" in
     tdx|snp) ;;
     *) echo "c8s-session sync: FATAL platform sync-input must be tdx or snp, got '${PLATFORM}'" >&2; exit 1 ;;
 esac
-[ -x "$STAGE_DIR/usr/local/bin/c8s" ] \
-    || { echo "c8s-session sync: FATAL no c8s binary staged at usr/local/bin/c8s (build with session-guest-image/build)" >&2; exit 1; }
+[ -x "$STAGE_DIR/usr/local/bin/c8s-session-guest" ] \
+    || { echo "c8s-session sync: FATAL no guest program staged at usr/local/bin/c8s-session-guest (build with session-guest-image/build)" >&2; exit 1; }
 DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
 ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
 
@@ -21,7 +21,7 @@ ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
 # are part of the image: the root hash covers this file.
 case "$ROLE" in
     session)
-        SERVICE=(/usr/local/bin/c8s session-agent run "--platform=$PLATFORM" --crun=/usr/bin/crun
+        SERVICE=(/usr/local/bin/c8s-session-guest session-agent run "--platform=$PLATFORM" --crun=/usr/bin/crun
             --packet-filter=/etc/c8s-session/firewall.json
             --disclosure-schema=/etc/c8s-session/disclosure-schema.json
             --bind-schema=/etc/c8s-session/bind-schema.json)
@@ -39,7 +39,7 @@ case "$ROLE" in
         # The key service's image is this one with another measured service
         # where the agent is: the same boot, the same launch files, the same
         # inbound filter.
-        SERVICE=(/usr/local/bin/c8s session-key-service run "--platform=$PLATFORM")
+        SERVICE=(/usr/local/bin/c8s-session-guest session-key-service run "--platform=$PLATFORM")
         if [ "$DEV" = 1 ]; then
             SERVICE+=(--allow-console)
         fi
@@ -49,7 +49,7 @@ esac
 
 # The launch files and the host's network request. A dev build's guest has
 # a console device, which the step's check of the guest's devices allows.
-LOAD=(/usr/local/bin/c8s session-agent load)
+LOAD=(/usr/local/bin/c8s-session-guest session-agent load)
 if [ "$DEV" = 1 ]; then
     LOAD+=(--allow-console)
 fi

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionschema"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -443,5 +444,14 @@ func TestMachineOfAnUnboundGuest(t *testing.T) {
 		if code := runMachine(context.Background(), f, io.Discard, io.Discard); code != ExitUsage {
 			t.Errorf("%s: exit %d", name, code)
 		}
+	}
+}
+
+// The guest's program carries the schema command too, so the command has exit
+// codes of its own. They are this CLI's.
+func TestSchemaCommandKeepsTheExitCodes(t *testing.T) {
+	if sessionschema.ExitOK != ExitOK || sessionschema.ExitUsage != ExitUsage ||
+		sessionschema.ExitRefused != ExitRefused || sessionschema.ExitUnavailable != ExitUnavailable {
+		t.Fatal("the schema command's exit codes are not the session CLI's")
 	}
 }

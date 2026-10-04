@@ -91,7 +91,7 @@ func TestParseBootConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Hostname != "session" || len(cfg.Steps) != 2 || cfg.Service[0] != "/usr/local/bin/c8s" {
+	if cfg.Hostname != "session" || len(cfg.Steps) != 2 || cfg.Service[0] != "/usr/local/bin/c8s-session-guest" {
 		t.Fatalf("config %+v", cfg)
 	}
 	for name, data := range map[string]string{

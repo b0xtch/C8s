@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionschema"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -72,7 +73,7 @@ See docs/sessions.md.`,
 	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd(), newMachineCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
-	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd(), schemaCmd())
+	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd(), sessionschema.NewCmd())
 	cmd.AddCommand(imageStoreCmds()...)
 	return cmd
 }

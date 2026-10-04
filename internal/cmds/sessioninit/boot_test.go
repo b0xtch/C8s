@@ -67,7 +67,7 @@ func TestPrepareRootOnTDX(t *testing.T) {
 	}
 
 	// The programs the guest runs next are read ahead, each once.
-	if want := []string{newRoot + "/usr/local/bin/c8s", newRoot + "/usr/sbin/nft"}; !reflect.DeepEqual(f.warmed, want) {
+	if want := []string{newRoot + "/usr/local/bin/c8s-session-guest", newRoot + "/usr/sbin/nft"}; !reflect.DeepEqual(f.warmed, want) {
 		t.Errorf("read ahead: %v", f.warmed)
 	}
 
