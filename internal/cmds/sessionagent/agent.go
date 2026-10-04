@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,12 @@ type Config struct {
 	Logger *slog.Logger
 	// CertTTL bounds one serving certificate; the instance key outlives it.
 	CertTTL time.Duration
+	// Engine verifies the evidence of the key service a launch document
+	// pins. A guest with none refuses such a document.
+	Engine session.Engine
+	// KeyServiceDial opens the connection to the key service. Nil dials its
+	// address.
+	KeyServiceDial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // Agent is a staged guest: its launch document is authenticated and
@@ -136,6 +143,9 @@ type Agent struct {
 	platform atomic.Pointer[session.CollateralPlatform]
 	// collateral is what the host last handed in for PathCollateral, unread.
 	collateral atomic.Pointer[[]byte]
+	// keyService is the guest's session with the key service its launch
+	// document pins, or nil.
+	keyService *keyService
 }
 
 // Stage authenticates this boot's launch document and measures it. Nothing the
@@ -154,36 +164,9 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	family, err := teetypes.ParseFamily(cfg.Platform)
-	if err != nil {
-		return nil, fmt.Errorf("--platform: %w", err)
-	}
-	if cfg.TEE.Family() != family {
-		return nil, fmt.Errorf("image was built for %s but this guest is %s", family, cfg.TEE.Family())
-	}
-	pub, err := session.ReadBounded(cfg.PubkeyPath, 8192)
-	if err != nil {
-		return nil, fmt.Errorf("launch public key (was the VM launched with opkeydata?): %w", err)
-	}
-	launch, err := session.ReadBounded(filepath.Join(cfg.LaunchDir, session.DocumentFile), session.MaxDocumentSize)
+	pub, launch, signature, self, err := launchFiles(ctx, cfg.TEE, cfg.Platform, cfg.PubkeyPath, cfg.LaunchDir)
 	if err != nil {
 		return nil, err
-	}
-	signature, err := session.ReadBounded(filepath.Join(cfg.LaunchDir, session.SignatureFile), 4096)
-	if err != nil {
-		return nil, err
-	}
-	self, err := cfg.TEE.Measurements(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("read this guest's measurements: %w", err)
-	}
-	if self.Platform.Family() != family {
-		return nil, fmt.Errorf("hardware reports platform %q, image was built for %s", self.Platform, family)
-	}
-	// A debug guest's memory is readable by the host. No verifier would accept
-	// it, and nothing should be staged where the host can watch.
-	if debug, err := self.Claims.DebugEnabled(); err != nil || debug {
-		return nil, fmt.Errorf("refusing to run in a debuggable guest (debug=%v, %v)", debug, err)
 	}
 	doc, err := session.VerifySigned(pub, launch, string(signature))
 	if err != nil {
@@ -262,9 +245,94 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if doc.KeyService != nil {
+		if a.keyService, err = a.newKeyService(doc.KeyService); err != nil {
+			return nil, err
+		}
+	}
 	a.log.Info("launch document staged", "pool", doc.Pool, "class", doc.Class,
-		"launch_digest", session.DocumentDigest(launch))
+		"launch_digest", session.DocumentDigest(launch), "key_service", doc.KeyService != nil)
 	return a, nil
+}
+
+// launchFiles reads this boot's launch files and the guest's own
+// measurements, and refuses a guest of another platform than its image's or
+// one its host can debug. Nothing in the files is authenticated yet.
+func launchFiles(ctx context.Context, tee TEE, platform, pubkeyPath, launchDir string) (pub, launch, signature []byte, self *teetypes.VerificationResult, err error) {
+	family, err := teetypes.ParseFamily(platform)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("--platform: %w", err)
+	}
+	if tee.Family() != family {
+		return nil, nil, nil, nil, fmt.Errorf("image was built for %s but this guest is %s", family, tee.Family())
+	}
+	if pub, err = session.ReadBounded(pubkeyPath, 8192); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("launch public key (was the VM launched with opkeydata?): %w", err)
+	}
+	if launch, err = session.ReadBounded(filepath.Join(launchDir, session.DocumentFile), session.MaxDocumentSize); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if signature, err = session.ReadBounded(filepath.Join(launchDir, session.SignatureFile), 4096); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	if self, err = tee.Measurements(ctx); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("read this guest's measurements: %w", err)
+	}
+	if self.Platform.Family() != family {
+		return nil, nil, nil, nil, fmt.Errorf("hardware reports platform %q, image was built for %s", self.Platform, family)
+	}
+	// A debug guest's memory is readable by the host. No verifier would accept
+	// it, and nothing should be staged where the host can watch.
+	if debug, err := self.Claims.DebugEnabled(); err != nil || debug {
+		return nil, nil, nil, nil, fmt.Errorf("refusing to run in a debuggable guest (debug=%v, %v)", debug, err)
+	}
+	return pub, launch, signature, self, nil
+}
+
+// MeasuredDocument is a guest's own launch document, authenticated under the
+// key the hardware binds and measured.
+type MeasuredDocument struct {
+	Launch    []byte
+	Signature string
+	LaunchKey []byte
+}
+
+// MeasureDocument does for another measured service of a guest image what
+// Stage does for a session guest's agent: it authenticates this boot's launch
+// document under the key the hardware binds, holds it to this guest's own
+// image, and measures it before anything in it is acted on. verify checks
+// the document's signature and returns the image it was signed for.
+//
+// It needs a runtime register, so that the document is in the guest's
+// evidence: Intel TDX today.
+func MeasureDocument(ctx context.Context, tee TEE, platform, pubkeyPath, launchDir string,
+	verify func(pub, launch []byte, signature string) (session.Image, error),
+) (*MeasuredDocument, error) {
+	pub, launch, signature, self, err := launchFiles(ctx, tee, platform, pubkeyPath, launchDir)
+	if err != nil {
+		return nil, err
+	}
+	image, err := verify(pub, launch, string(signature))
+	if err != nil {
+		return nil, err
+	}
+	if err := checkOwnImage(self, image); err != nil {
+		return nil, err
+	}
+	reg, err := tee.Register()
+	if err != nil {
+		return nil, fmt.Errorf("measure launch document: %w", err)
+	}
+	// The pubkey file is not itself measured, only its digest: confirm the
+	// staged key is the one the hardware binds before trusting what it signed.
+	chain := newChain(reg, pub, []string{session.DocumentDigest(launch)})
+	if _, err := chain.position(); err != nil {
+		return nil, fmt.Errorf("launch key is not the one this guest was launched for: %w", err)
+	}
+	if err := chain.advance(1); err != nil {
+		return nil, fmt.Errorf("measure launch document: %w", err)
+	}
+	return &MeasuredDocument{Launch: launch, Signature: string(bytes.TrimSpace(signature)), LaunchKey: pub}, nil
 }
 
 // Admit begins what the guest does ahead of a bind: it unpacks the images its
@@ -300,8 +368,9 @@ func (a *Agent) Admit(ctx context.Context) error {
 // admit prepares, measures and starts the sandbox. admitted, when set, runs
 // once the register is final, and the serving certificate is then reissued
 // behind it and behind admit's return: that is a bind, whose sender waits.
-func (a *Agent) admit(ctx context.Context, sandbox *session.Sandbox, egress *session.Egress, admitted func()) error {
+func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, admitted func()) error {
 	ctx, steps := withAdmission(ctx)
+	sandbox, egress := bind.Doc.Policy.Sandbox, bind.Doc.Policy.Egress
 	if sandbox != nil {
 		if err := a.cfg.Runner.Prepare(ctx, sandbox, egress); err != nil {
 			return fmt.Errorf("prepare sandbox: %w", err)
@@ -312,6 +381,13 @@ func (a *Agent) admit(ctx context.Context, sandbox *session.Sandbox, egress *ses
 		if err := a.creds.setOwner(uid, gid); err != nil {
 			return err
 		}
+	}
+	// What the bind has the key service hold for the session is in place
+	// before the sandbox starts, so the sandbox finds it at its first read.
+	if err := a.acquire(ctx, bind); err != nil {
+		return err
+	}
+	if sandbox != nil {
 		if a.cfg.Guard != nil {
 			if err := a.cfg.Guard(ctx); err != nil {
 				return fmt.Errorf("before starting the sandbox: %w", err)
@@ -455,8 +531,7 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	// The first bind is the only one, so a guest whose sandbox cannot be
 	// admitted is of no use to anyone and ends. The caller going away changes
 	// nothing about that.
-	err = a.admit(context.WithoutCancel(ctx), bind.Doc.Policy.Sandbox, bind.Doc.Policy.Egress,
-		func() { evidence = a.bindEvidence(ctx, bind) })
+	err = a.admit(context.WithoutCancel(ctx), bind, func() { evidence = a.bindEvidence(ctx, bind) })
 	close(a.bound)
 	if err != nil {
 		return false, nil, a.fail(err)
@@ -486,6 +561,11 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 	}
 	if !a.cfg.Bare && bind.Doc.Policy.Sandbox == nil {
 		return nil, nil, errNoSandbox
+	}
+	// The guest holds one key service to a pin, its pool's, and opened its
+	// session with that one before it was anybody's.
+	if pin := bind.Doc.KeyService; pin != nil && !pin.Equal(a.doc.KeyService) {
+		return nil, nil, errors.New("the bind trusts a key service that this guest's launch document does not pin")
 	}
 	if time.Now().After(bind.Doc.Expiry().Add(tokenClockSkew)) {
 		return nil, nil, fmt.Errorf("bind expired at %s", bind.Doc.NotAfter)

@@ -57,6 +57,10 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 		go func() { _ = agent.TakeHandIns(hand) }()
 	}
 
+	// The key service judges this guest's evidence now, while the guest is
+	// nobody's, so that a bind costs it no quote.
+	go agent.OpenKeyService(ctx)
+
 	// The API is up while the image is fetched, so a verifier can already see
 	// a staged guest; exec and credentials stay refused until admission.
 	if err := agent.Admit(ctx); err != nil {

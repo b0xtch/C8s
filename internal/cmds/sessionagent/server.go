@@ -360,6 +360,10 @@ func (a *Agent) serveCredential(w http.ResponseWriter, r *http.Request, body []b
 		httputil.WriteError(w, http.StatusNotFound, types.ErrorCodeInvalidRequest, "the guest's bind declares no such credential")
 		return
 	}
+	if decl.Source == session.SourceKeyService {
+		httputil.WriteError(w, http.StatusForbidden, types.ErrorCodeInvalidRequest, "the bind has this credential come from its key service, and from nobody else")
+		return
+	}
 	var req session.CredentialRequest
 	if !decodeStrict(body, &req) || len(req.Value) == 0 || len(req.Value) > decl.Limit() {
 		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "credential value is missing or exceeds its declared size")

@@ -9,9 +9,13 @@ package sessionsim
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -20,6 +24,7 @@ import (
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
+	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
@@ -50,6 +55,9 @@ type Guest struct {
 	launchKey string
 	// pinned: the launch document lists the machine the guest runs on.
 	pinned bool
+	// keyService is the key service the pool's launch document pins, if any,
+	// and dial how the guest reaches it.
+	keyService *session.KeyService
 	// stop ends the guest.
 	stop func()
 }
@@ -100,7 +108,57 @@ func (e rootCRLEngine) Refetch(ctx context.Context) error { return e.refetch(ctx
 func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, false)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil)
+}
+
+// Pool is a pool before any guest of it has booted: its image and its launch
+// key, which is what a key service that serves the pool lists.
+type Pool struct {
+	// ManifestPath is the simulated image's manifest.json, and LaunchKeyPath
+	// the pool's public launch key.
+	ManifestPath  string
+	LaunchKeyPath string
+
+	td        *sessiontest.TD
+	launchKey string
+}
+
+// NewPool makes a pool: an image and a launch key of its own.
+func NewPool(t testing.TB) *Pool {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	private, err := certutil.MarshalECKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := session.PublicKeyPEM(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	td := sessiontest.NewTD()
+	pool := &Pool{
+		ManifestPath: td.WriteManifest(t), LaunchKeyPath: filepath.Join(dir, "launch.pub"),
+		td: td, launchKey: filepath.Join(dir, "launch.key"),
+	}
+	for path, data := range map[string][]byte{pool.launchKey: private, pool.LaunchKeyPath: public} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return pool
+}
+
+// Boot boots a guest of the pool, as NewGuest does. With a key service, the
+// pool's launch document pins it and the guest opens its session with it.
+func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyService) *Guest {
+	t.Helper()
+	td := sessiontest.NewTD()
+	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, false, keyService)
 }
 
 // NewPinnedGuest is NewGuest in a pool whose launch document lists the
@@ -109,7 +167,7 @@ func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 func NewPinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, true)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil)
 }
 
 // Twin boots another guest of the same pool: the same image, launched under
@@ -120,15 +178,15 @@ func (p *Guest) Twin(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned, p.keyService)
 }
 
 // boot launches one guest under launchKey, or under a new key when that is
 // empty, and serves its agent.
-func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox Sandbox, pinned bool) *Guest {
+func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox Sandbox, pinned bool, keyService *session.KeyService) *Guest {
 	t.Helper()
 	bundle := filepath.Join(t.TempDir(), "bundle")
-	opts := session.BundleOptions{Dir: bundle, ManifestPath: manifest, Pool: "sim", Class: "sim", KeyPath: launchKey}
+	opts := session.BundleOptions{Dir: bundle, ManifestPath: manifest, Pool: "sim", Class: "sim", KeyPath: launchKey, KeyService: keyService}
 	if pinned {
 		opts.Machines = []string{hex.EncodeToString(td.RTMR[0][:])}
 	}
@@ -160,6 +218,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	agent, err := sessionagent.Stage(ctx, sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(keys, session.PubkeyFile), LaunchDir: keys,
 		CredentialDir: credentials, TEE: sessiontest.TEE{TD: td}, Runner: runner, Bare: sandbox == nil,
+		Engine: sessiontest.Engine{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -176,6 +235,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	}
 	srv := agent.Server()
 	go func() { _ = agent.Serve(srv, ln) }()
+	go agent.OpenKeyService(ctx)
 	stop := sync.OnceFunc(func() {
 		_ = srv.Close()
 		cancel()
@@ -183,7 +243,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	t.Cleanup(stop)
 	return &Guest{
 		URL: "https://" + ln.Addr().String(), ManifestPath: manifest, LaunchKeyPath: filepath.Join(keys, session.PubkeyFile),
-		td: td, launchKey: launchKey, pinned: pinned, stop: stop,
+		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop,
 	}
 }
 
