@@ -3,93 +3,74 @@ set -euo pipefail
 
 # A session's commands run as an unprivileged user on this root. With no setuid or
 # setgid program left on it, that user has no way up, whatever a command does.
-# Nothing in the image needs one: every service starts as the user it runs as.
+# Nothing in the image needs one: the init starts everything as the user it runs as.
 find "$BUILDROOT" -xdev -type f -perm /6000 -exec chmod a-s {} +
 if [ -n "$(find "$BUILDROOT" -xdev -type f -perm /6000 -print -quit)" ]; then
     echo "c8s-session finalize: FATAL a setuid or setgid file survived" >&2
     exit 1
 fi
 
-# The units name these by path. Without crun the agent could not start a
-# sandbox image, and without nft the guest would power off on every boot.
-for bin in usr/bin/crun usr/sbin/nft; do
+# The init runs these by path, and the agent runs crun. Without one of them
+# the guest would power off on every boot.
+for bin in usr/local/bin/c8s usr/bin/crun usr/sbin/nft usr/sbin/mke2fs; do
     if [ ! -x "$BUILDROOT/$bin" ]; then
         echo "c8s-session finalize: FATAL /$bin is not in the image" >&2
         exit 1
     fi
 done
 
-# The distribution's nftables.service loads its own /etc/nftables.conf, which
-# flushes the ruleset and filters nothing. Started after this image's filter
-# it would remove it without a trace, so it is masked: it can never start.
-find "$BUILDROOT/etc/systemd/system" -mindepth 2 -name nftables.service -delete
-ln -sf /dev/null "$BUILDROOT/etc/systemd/system/nftables.service"
-if [ "$(readlink "$BUILDROOT/etc/systemd/system/nftables.service")" != /dev/null ]; then
-    echo "c8s-session finalize: FATAL nftables.service is not masked" >&2
-    exit 1
-fi
-
-# This image's unit is the only thing that may load packet filter rules:
-# anything else that does could replace the filter once it is in place. The
-# agent checks the live ruleset too, but a loader that runs later than its
-# check would get past that.
-loaders=$(grep -rlE '(^|[ /="])(nft|iptables|ip6tables|iptables-restore|ip6tables-restore|ebtables|arptables|firewall-cmd|firewalld|ufw|netfilter-persistent)( |$)' \
-    "$BUILDROOT/etc/systemd" "$BUILDROOT/usr/lib/systemd/system" "$BUILDROOT/usr/lib/systemd/system-generators" \
-    "$BUILDROOT/usr/lib/systemd/network" "$BUILDROOT/etc/network" 2>/dev/null \
-    | grep -v -x -e "$BUILDROOT/etc/systemd/system/c8s-session-firewall.service" -e "$BUILDROOT/usr/lib/systemd/system/nftables.service" || true)
-if [ -n "$loaders" ]; then
-    echo "c8s-session finalize: FATAL these would load packet filter rules of their own:" >&2
-    echo "$loaders" >&2
-    exit 1
-fi
-for tool in iptables ip6tables xtables-multi ebtables arptables ufw firewalld firewall-cmd netfilter-persistent; do
-    found=$(find "$BUILDROOT/usr/sbin" "$BUILDROOT/usr/bin" -name "$tool" -print -quit 2>/dev/null)
-    if [ -n "$found" ]; then
-        echo "c8s-session finalize: FATAL $found is a second way to change the packet filter" >&2
-        exit 1
-    fi
-done
-# The agent compares the live ruleset with this listing.
-if [ ! -s "$BUILDROOT/etc/c8s-session/firewall.json" ]; then
-    echo "c8s-session finalize: FATAL /etc/c8s-session/firewall.json is not in the image" >&2
-    exit 1
-fi
-
-# The agent holds these to the schemas it is compiled from, and ends the guest
-# if either is another. The build wrote them with the staged binary.
-for schema in disclosure-schema.json bind-schema.json; do
-    if [ ! -s "$BUILDROOT/etc/c8s-session/$schema" ]; then
-        echo "c8s-session finalize: FATAL /etc/c8s-session/$schema is not in the image (build with session-guest-image/build)" >&2
+# What the init runs, the filter the agent compares the live ruleset with,
+# and the schemas the agent holds to its own definitions before it serves.
+# The build wrote the schemas with the staged binary, and the sync hook the
+# init's configuration.
+for file in init.json firewall.nft firewall.json disclosure-schema.json bind-schema.json; do
+    if [ ! -s "$BUILDROOT/etc/c8s-session/$file" ]; then
+        echo "c8s-session finalize: FATAL /etc/c8s-session/$file is not in the image (build with session-guest-image/build)" >&2
         exit 1
     fi
 done
 
-# The agent ends the guest if a UDP socket outside the guest's ports takes
-# datagrams from any sender, and an NTP client holds one for as long as it
-# has a server. The image has no time daemon; one that came back as some
-# package's dependency would end every guest whose network reaches a server.
-for daemon in usr/lib/systemd/systemd-timesyncd usr/sbin/chronyd usr/sbin/ntpd; do
-    if [ -e "$BUILDROOT/$daemon" ]; then
-        echo "c8s-session finalize: FATAL /$daemon is in the image: a session guest runs no time daemon" >&2
-        exit 1
-    fi
-done
+# Their modes came with the build host's umask, which the root's hash must
+# not depend on.
+chmod 0755 "$BUILDROOT/etc/c8s-session"
+find "$BUILDROOT/etc/c8s-session" -xdev -type f -exec chmod 0644 {} +
 
-# A locked image offers no login. The sync hook masks every getty unit for
-# one; a dev build has a drop-in for its console instead.
-if [ ! -e "$BUILDROOT/etc/systemd/journald.conf.d/90-dev-console.conf" ]; then
-    for unit in getty@.service serial-getty@.service console-getty.service container-getty@.service autovt@.service; do
-        if [ "$(readlink "$BUILDROOT/etc/systemd/system/$unit" 2>/dev/null)" != /dev/null ]; then
-            echo "c8s-session finalize: FATAL $unit is not masked: a locked session guest would offer a login prompt" >&2
-            exit 1
-        fi
-    done
+# The init gives each of these a writable layer on the state volume and
+# refuses to boot an image that lists none.
+if ! grep -qsxE '(var|home)' "$BUILDROOT"/usr/lib/confai/state.d/*.conf; then
+    echo "c8s-session finalize: FATAL the image lists no writable state directories in /usr/lib/confai/state.d" >&2
+    exit 1
 fi
 
-# /etc is read-only at run time, so the account must exist now. sysusers
-# reports a user it could not create and carries on; the agent would then
-# refuse to start and the guest would power off on every boot.
-if ! grep -q '^sandbox:x:2000:2000:' "$BUILDROOT/etc/passwd"; then
-    echo "c8s-session finalize: FATAL the sandbox user (2000:2000) is not in /etc/passwd" >&2
+# A dev image runs a session's commands as this user, in its home. Nothing
+# makes directories when the guest boots, so the home is part of the image:
+# the writable layer over /home shows it with this owner and mode.
+if entry=$(grep -E '^sandbox:' "$BUILDROOT/etc/passwd"); then
+    IFS=: read -r _ _ uid gid _ home _ <<< "$entry"
+    # By number: the build host's tools know none of the image's users.
+    mkdir -p "$BUILDROOT$home"
+    chown "$uid:$gid" "$BUILDROOT$home"
+    chmod 0750 "$BUILDROOT$home"
+else
+    echo "c8s-session finalize: FATAL the image has no sandbox user (etc/sysusers.d/c8s-session.conf)" >&2
+    exit 1
+fi
+
+# The guest has no resolver of its own. The launch files' loader writes the
+# resolvers its host names to /run, and this is where a lookup finds them.
+ln -sfn /run/c8s-session/resolv.conf "$BUILDROOT/etc/resolv.conf"
+
+# The staged launch key is read through this link.
+if [ "$(readlink "$BUILDROOT/etc/confai")" != ../run/confai ] && [ "$(readlink "$BUILDROOT/etc/confai")" != /run/confai ]; then
+    echo "c8s-session finalize: FATAL /etc/confai does not point at /run/confai, where the init stages the launch key" >&2
+    exit 1
+fi
+
+# The builder's base disables cloud-init with this marker. A session guest
+# starts nothing but its own init, so cloud-init has no way to run; the
+# marker is held here so that an image that ever boots another way still
+# takes no configuration from its host.
+if [ ! -e "$BUILDROOT/etc/cloud/cloud-init.disabled" ] && [ -e "$BUILDROOT/usr/bin/cloud-init" ]; then
+    echo "c8s-session finalize: FATAL cloud-init is installed and /etc/cloud/cloud-init.disabled is missing" >&2
     exit 1
 fi

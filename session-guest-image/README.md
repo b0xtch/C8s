@@ -34,26 +34,45 @@ published file with a build.
 
 | Piece | Where | Why it is measured |
 |---|---|---|
+| `c8s-session-init` | the initramfs's `/init`, compiled from this checkout by `build` (`cmd/c8s-session-init`) | It is the guest's first and only init: it opens the verity root the command line names, makes the encrypted state volume, binds the launch key, and starts what `init.json` lists |
 | `c8s` binary | `/usr/local/bin/c8s`, compiled from this checkout by `build` | It is the agent: it verifies the launch document, takes the one bind, extends RTMR[3] and serves the attested API |
-| `c8s-session-load.service` | verity root | Copies the launch files off the `opkeydata` volume and renders the host's network request |
-| `c8s-session-agent.service` | verity root | Its flags are the agent's configuration, so they are part of the image identity |
-| `c8s-session-firewall.service` and `/etc/c8s-session/firewall.nft` | verity root | The inbound filter: only the agent's port may be reached from outside the guest |
+| `/etc/c8s-session/init.json` | verity root, written by `mkosi.sync` | Everything that runs in the guest: two steps and one service, by path, with their arguments. The agent's flags are its configuration, so they are part of the image identity |
+| `/etc/c8s-session/firewall.nft` | verity root | The inbound filter: only the agent's port may be reached from outside the guest |
 | `/etc/c8s-session/disclosure-schema.json`, `bind-schema.json` | verity root, written by `build` | What the agent says in plaintext and what it takes in a bind. The agent checks both against its own definitions before it serves |
 | `/etc/sysctl.d/50-c8s-session.conf` | verity root | No tunnel device in a new network namespace. The limit on user namespaces is the agent's to set: it makes the sandbox's and then has the kernel make no other |
-| `crun`, `nft` | distribution packages | crun runs the sandbox image a bind names, driven by the agent alone; nft loads the filter |
-| `sandbox` user (2000:2000) | `/etc/passwd`, written at build time | A session's commands run as this user in a dev image, when a bind names no sandbox image |
+| `crun`, `nft`, `mke2fs` | distribution packages | crun runs the sandbox image a bind names, driven by the agent alone; nft loads the filter; mke2fs makes the state volume's file system, each boot |
+| `sandbox` user (2000:2000) and its home | `/etc/passwd` and `/home/sandbox`, written at build time | A session's commands run as this user in a dev image, when a bind names no sandbox image |
 | `kernel/session.config` | merged into the guest kernel | Adds vsock, which the agent uses to reach the host's quoting service and its key service, user namespaces for the sandbox's container, nftables for the filter, and transparent huge pages on request. Removes every console but the one that discards |
 
-The base image contributes the kernel, the measured initrd that binds the
-launch key, the dm-verity root and the encrypted ephemeral state volume. This
-profile adds no attestation daemon, and nothing in it takes orders from the
-host.
+The builder contributes the kernel, the layout of the dm-verity root and the
+distribution's packages. The initramfs is this repository's: `build` packs
+the init into it alone and passes it with `--initrd`. This profile adds no
+attestation daemon, and nothing in it takes orders from the host.
 
 `mkosi.finalize` strips every setuid and setgid bit and fails the build if one
-survives, fails it if crun or nft is missing, and masks the distribution's
-`nftables.service`, which would replace the image's filter with an open one.
-The agent unit sets `NoNewPrivileges`, which the sandbox and every command run
-for a session inherit.
+survives, and fails it if a program the init runs, a file the agent checks or
+the sandbox user is missing.
+
+## What runs in the guest
+
+The kernel starts `c8s-session-init`, and nothing else is ever started that
+`init.json` does not name. There is no service manager, no shell initrd, no
+network daemon, no DHCP client, no resolver and no login program.
+
+| Order | What | By |
+|---|---|---|
+| 1 | The root: dm-verity over the root partition, under the hash on the measured command line, read-only. A block that fails its hash stops the guest | init |
+| 2 | The state volume: dm-crypt over the scratch disk under a key made this boot and kept nowhere, a fresh file system, and a writable layer over each directory listed in `/usr/lib/confai/state.d`. Without a scratch disk, a tmpfs | init |
+| 3 | The launch key: read from the `opkeydata` volume, staged read-only, and its digest extended into RTMR[3] (TDX) or checked against HOST_DATA (SEV-SNP). A guest with a key it cannot bind stops | init |
+| 4 | The kernel's file systems, the settings in `sysctl.d`, the loopback interface, a control group for the service | init |
+| 5 | `c8s session-agent load`: the launch files off the volume, and the host's network request set on the one interface | step |
+| 6 | `nft -f /etc/c8s-session/firewall.nft` | step |
+| 7 | The agent, or the key service in its image | service |
+
+The init sets `no_new_privs` before the first step, which the sandbox and
+every command run for a session inherit. It reaps what is orphaned, and it
+powers the guest off when a step fails or the service ends: a guest whose
+agent is gone can be neither verified nor controlled.
 
 ## Boot path
 
@@ -65,6 +84,8 @@ is no boot loader between them.
 | Firmware | TDVF, built by `firmware/build` from edk2 at a pinned commit: a release build without the UEFI shell | MRTD |
 | Kernel image | the UKI, installed as the boot partition's fallback application (`Bootloader=uki`) | RTMR[1], and its kernel, initrd and command line in RTMR[2] |
 | Kernel | the builder's hardened kernel with `kernel/session.config` and the patches in `kernel/patches/` | part of the UKI |
+| Init | `c8s-session-init`, the one file of the initramfs | part of the UKI |
+| Root | the verity root, under the hash on the command line | part of the UKI's command line |
 
 A boot loader would be one more measured program, would read a configuration
 file that nothing measures, and waits for a key nobody can press.
@@ -89,21 +110,25 @@ private to shared one page at a time during boot.
 | Variable | Meaning |
 |---|---|
 | `C8S_PLATFORM` | Required: `tdx` or `snp`. The agent refuses to stage on the other TEE. |
-| `C8S_DEV=1` | Debug image: console, root autologin on it, journal forwarded to it, a bind accepted with no sandbox image, and a sandbox image accepted from a plain-HTTP registry at `10.0.2.2:5000` for tests. A different measurement and host-readable logs. Never ship. |
+| `C8S_DEV=1` | Debug image: a console that the kernel, the init and the agent log to, a bind accepted with no sandbox image, and a sandbox image accepted from a plain-HTTP registry at `10.0.2.2:5000` for tests. A different measurement and host-readable logs. Never ship. |
 | `C8S_ROLE=key-service` | Build the [key service](../docs/session-key-service.md)'s image: this image with `c8s session-key-service run` as its measured service where the agent is. It has reference values of its own. |
 | `C8S_NAME` | Output name (default `c8s-session` or `c8s-key-service`, with `-dev` for a dev build) |
 | `C8S_MEMORY` | Default memory recorded in the manifest (default `1G`) |
 | `C8S_BINARY` | Stage this prebuilt linux/amd64 binary and skip the compile |
+| `C8S_INIT_BINARY` | Pack this prebuilt static linux/amd64 init and skip its compile |
 | `CONFOS_DIR` | confos checkout to build with (default: a sibling of this repository) |
 | `C8S_TDX_FIRMWARE` | Boot this TDX firmware file. Unset, `firmware/build` builds it from source into `build/session-firmware/` |
 
 ## Status
 
-The build needs two things of the builder that its main branch does not have
-yet: `--kernel-patch`, and a prediction of RTMR[1] for a boot partition whose
-fallback application is the UKI. `build` stops if the first is missing. With
-the second missing the manifest's RTMR[1] is wrong, and the agent refuses its
-launch document on the first boot.
+The build needs three things of the builder that its main branch does not
+have yet: `--kernel-patch`, `--initrd`, and a prediction of RTMR[1] for a
+boot partition whose fallback application is the UKI. `build` stops if one of
+the first two is missing. With the third missing the manifest's RTMR[1] is
+wrong, and the agent refuses its launch document on the first boot.
+
+The init's SEV-SNP path, which checks the launch key against HOST_DATA, is
+covered by unit tests and has not run on hardware.
 
 The firmware is built with the build machine's own compiler, outside the
 builder's pinned tools. Two machines agree on MRTD only if they agree on the
@@ -123,8 +148,9 @@ A locked build's kernel has no serial driver, no virtual terminal, no virtio
 console, no boot console and no network console, and reads no console from
 the host's ACPI tables. Its one console is the kernel's null device, which
 discards. The agent reads the kernel's list of consoles before it serves and
-ends a guest that has any other. Nobody logs in: every getty unit is masked.
-The guest's logs stay in its journal, inside the TD.
+ends a guest that has any other. Nobody logs in: the image starts no login
+program. What the init and the agent log goes to that null device, so a
+locked guest keeps no log.
 
 What a guest says before its kernel runs is outside this: the firmware and
 the boot stub can write to a serial port a host attaches. They run before the

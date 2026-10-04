@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# mkosi sync hook for the c8s-session profile. It renders the one platform
-# dependent bit, the agent's --platform, from the build's sync-input. There
-# is no default: an image that guessed its TEE would refuse to stage on the
-# other one, and that failure belongs at build time.
+# mkosi sync hook for the c8s-session profile. It writes what the guest's
+# init runs, /etc/c8s-session/init.json, from the build's sync-inputs: the
+# platform, the role and whether this is a dev build. There is no default
+# platform: an image that guessed its TEE would refuse to stage on the other
+# one, and that failure belongs at build time.
 set -euo pipefail
-
 STAGE_DIR="$SRCDIR/mkosi.local/mkosi.extra"
 SYNC_INPUTS="$SRCDIR/mkosi.local/.confos-sync-inputs"
 PLATFORM=$(cat "$SYNC_INPUTS/platform" 2>/dev/null || true)
@@ -14,52 +14,58 @@ case "$PLATFORM" in
 esac
 [ -x "$STAGE_DIR/usr/local/bin/c8s" ] \
     || { echo "c8s-session sync: FATAL no c8s binary staged at usr/local/bin/c8s (build with session-guest-image/build)" >&2; exit 1; }
-
-mkdir -p "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d"
-printf '[Service]\nEnvironment=C8S_SESSION_PLATFORM=%s\n' "$PLATFORM" \
-    > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/10-platform.conf"
-
-# The key service's image is this one with another measured service where the
-# agent is: the same boot, the same launch files, the same inbound filter.
+DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
 ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
-rm -f "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.conf"
+
+# The guest's one service. The agent's flags are its configuration, so they
+# are part of the image: the root hash covers this file.
 case "$ROLE" in
-    session) ;;
-    key-service)
-        # A dev build's kernel has a console, and its key service is told so.
-        KS_FLAGS=
-        if [ "$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)" = 1 ]; then
-            KS_FLAGS=' --allow-console'
+    session)
+        SERVICE=(/usr/local/bin/c8s session-agent run "--platform=$PLATFORM" --crun=/usr/bin/crun
+            --packet-filter=/etc/c8s-session/firewall.json
+            --disclosure-schema=/etc/c8s-session/disclosure-schema.json
+            --bind-schema=/etc/c8s-session/bind-schema.json)
+        if [ "$DEV" = 1 ]; then
+            # The hardware suite serves its sandbox image from the host over
+            # plain HTTP, and QEMU's user-mode network shows the guest its
+            # host at 10.0.2.2. --bare lets a document name no sandbox image
+            # at all: its commands then run on the guest's own file system.
+            # --allow-console has the agent serve in a guest whose kernel has
+            # a console, which a dev build's does.
+            SERVICE+=(--sandbox-plain-http=10.0.2.2:5000 --bare --allow-console)
         fi
-        printf '[Unit]\nDescription=Session key service\n[Service]\nExecStart=\nExecStart=/usr/local/bin/c8s session-key-service run --platform=${C8S_SESSION_PLATFORM}%s\n' "$KS_FLAGS" \
-            > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.conf"
+        ;;
+    key-service)
+        # The key service's image is this one with another measured service
+        # where the agent is: the same boot, the same launch files, the same
+        # inbound filter.
+        SERVICE=(/usr/local/bin/c8s session-key-service run "--platform=$PLATFORM")
+        if [ "$DEV" = 1 ]; then
+            SERVICE+=(--allow-console)
+        fi
         ;;
     *) echo "c8s-session sync: FATAL role sync-input must be session or key-service, got '${ROLE}'" >&2; exit 1 ;;
 esac
 
-# Nobody logs in to a session guest. A login prompt takes input from whatever
-# keyboard or serial port the host gives the VM, and reads it as root. A dev
-# build keeps its console, with its autologin.
-DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
-GETTYS="getty@.service serial-getty@.service console-getty.service container-getty@.service autovt@.service"
-for unit in $GETTYS; do
-    rm -f "$STAGE_DIR/etc/systemd/system/$unit"
-    if [ "$DEV" != 1 ]; then
-        ln -s /dev/null "$STAGE_DIR/etc/systemd/system/$unit"
-    fi
-done
-
-# Dev builds forward the journal to the console the launcher can attach.
-if [ "$DEV" = 1 ]; then
-    mkdir -p "$STAGE_DIR/etc/systemd/journald.conf.d"
-    printf '# DEV build: guest logs are host-visible. Never ship.\n[Journal]\nForwardToConsole=yes\nMaxLevelConsole=info\n' \
-        > "$STAGE_DIR/etc/systemd/journald.conf.d/90-dev-console.conf"
-    # The hardware suite serves its sandbox image from the host over plain
-    # HTTP. QEMU's user-mode network shows the guest its host at 10.0.2.2.
-    # --bare lets a document name no sandbox image at all: its commands then
-    # run on the guest's own file system, beside the guest's services.
-    # --allow-console has the agent serve in a guest whose kernel has a
-    # console, which a dev build's does.
-    printf '# DEV build: accepts a sandbox image from a local plain-HTTP registry, and a document with no sandbox image. Its kernel has a console.\n[Service]\nEnvironment="C8S_SESSION_DEV_FLAGS=--sandbox-plain-http=10.0.2.2:5000 --bare --allow-console"\n' \
-        > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/20-dev.conf"
-fi
+# Every word above is a fixed string or the validated platform: none needs
+# escaping in JSON.
+json_array() {
+    local out="" word
+    for word in "$@"; do
+        out+="${out:+, }\"$word\""
+    done
+    printf '[%s]' "$out"
+}
+mkdir -p "$STAGE_DIR/etc/c8s-session"
+{
+    printf '{\n'
+    printf '  "hostname": "c8s-session",\n'
+    printf '  "steps": [\n'
+    # The launch files and the host's network request, then the inbound
+    # filter: both before the service listens.
+    printf '    %s,\n' "$(json_array /usr/local/bin/c8s session-agent load)"
+    printf '    %s\n' "$(json_array /usr/sbin/nft -f /etc/c8s-session/firewall.nft)"
+    printf '  ],\n'
+    printf '  "service": %s\n' "$(json_array "${SERVICE[@]}")"
+    printf '}\n'
+} > "$STAGE_DIR/etc/c8s-session/init.json"
