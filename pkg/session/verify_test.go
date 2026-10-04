@@ -82,6 +82,14 @@ func TestVerifyAttestationRejects(t *testing.T) {
 			w.td.Debug = true
 			w.resp = w.g.attest(t, w.nonce)
 		}, "debug"},
+		"a TD its host may migrate": {func(t *testing.T, w *world) {
+			w.td.Attributes |= 1 << 29
+			w.resp = w.g.attest(t, w.nonce)
+		}, "migrate"},
+		"a TD its host may profile": {func(t *testing.T, w *world) {
+			w.td.Attributes |= 1 << 5
+			w.resp = w.g.attest(t, w.nonce)
+		}, "profile"},
 		"extra event extended after the sandbox": {func(t *testing.T, w *world) {
 			extra := runtimemeasure.Event("sha256:" + strings.Repeat("9", 64))
 			if err := w.td.Extend(extra[:]); err != nil {

@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -28,11 +29,14 @@ type TD struct {
 	MRTD  [48]byte
 	RTMR  [4][48]byte
 	Debug bool
+	// Attributes are the TD's attributes besides the debug bit.
+	Attributes uint64
 }
 
 // NewTD returns a guest with random image measurements and RTMR[3] at reset.
 func NewTD() *TD {
-	td := &TD{}
+	// What a VMM sets for a Linux guest: no #VE on a pending page.
+	td := &TD{Attributes: 1 << 28}
 	for _, reg := range [][]byte{td.MRTD[:], td.RTMR[0][:], td.RTMR[1][:], td.RTMR[2][:]} {
 		if _, err := rand.Read(reg); err != nil {
 			panic(err)
@@ -70,6 +74,7 @@ type fakeQuote struct {
 	MRTD       string    `json:"mrtd"`
 	RTMR       [4]string `json:"rtmr"`
 	Debug      bool      `json:"debug"`
+	Attributes uint64    `json:"attributes"`
 	ReportData string    `json:"report_data"`
 }
 
@@ -79,7 +84,7 @@ func (td *TD) Evidence(reportData []byte) teetypes.AttestationEvidence {
 	defer td.mu.Unlock()
 	padded := make([]byte, 64)
 	copy(padded, reportData)
-	q := fakeQuote{MRTD: hex.EncodeToString(td.MRTD[:]), Debug: td.Debug, ReportData: hex.EncodeToString(padded)}
+	q := fakeQuote{MRTD: hex.EncodeToString(td.MRTD[:]), Debug: td.Debug, Attributes: td.Attributes, ReportData: hex.EncodeToString(padded)}
 	for i := range td.RTMR {
 		q.RTMR[i] = hex.EncodeToString(td.RTMR[i][:])
 	}
@@ -190,6 +195,10 @@ func (Engine) VerifyEvidence(_ context.Context, env teetypes.AttestationEvidence
 	if q.Debug {
 		return nil, refuse("TD launched with debug attribute")
 	}
+	attributes := q.Attributes
+	if q.Debug {
+		attributes |= 1
+	}
 	return &teetypes.VerificationResult{
 		SignatureValid:  true,
 		Platform:        teetypes.PlatformTDX,
@@ -198,6 +207,7 @@ func (Engine) VerifyEvidence(_ context.Context, env teetypes.AttestationEvidence
 			LaunchDigest: q.MRTD,
 			PlatformData: map[string]any{
 				"rtmr_0": q.RTMR[0], "rtmr_1": q.RTMR[1], "rtmr_2": q.RTMR[2], "rtmr_3": q.RTMR[3],
+				"td_attributes":        hex.EncodeToString(binary.LittleEndian.AppendUint64(nil, attributes)),
 				"td_attributes_parsed": map[string]any{"debug": q.Debug},
 			},
 		},

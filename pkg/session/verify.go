@@ -6,6 +6,7 @@ import (
 	"crypto"
 	"crypto/sha512"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -616,6 +617,11 @@ func checkMeasuredIdentity(policy Policy, res *teetypes.VerificationResult, chai
 	if debug, err := res.Claims.DebugEnabled(); err != nil || debug {
 		return refuse("guest debug state is not provably off (debug=%v, %v)", debug, err)
 	}
+	if res.Platform.Family() == teetypes.FamilyTDX {
+		if err := checkTDAttributes(res); err != nil {
+			return err
+		}
+	}
 	if err := policy.Image.Verify(res); err != nil {
 		return &VerificationError{Err: err}
 	}
@@ -635,6 +641,28 @@ func checkMeasuredIdentity(policy Policy, res *teetypes.VerificationResult, chai
 		}
 	}
 	return &VerificationError{Err: last}
+}
+
+// TD attributes that hand a TD's host a way into it.
+const (
+	// tdAttrUnderDebug is the group a TD under debug or profiling sets.
+	tdAttrUnderDebug uint64 = 0xff
+	// tdAttrMigratable lets a migration TD of the host's choosing export it.
+	tdAttrMigratable uint64 = 1 << 29
+)
+
+// checkTDAttributes refuses a TD that its host can debug, profile or migrate.
+// The engine itself refuses the debug bit alone.
+func checkTDAttributes(res *teetypes.VerificationResult) error {
+	text, _ := res.Claims.PlatformData["td_attributes"].(string)
+	raw, err := hex.DecodeString(text)
+	if err != nil || len(raw) != 8 {
+		return refuse("the TD's attributes are not in its claims as eight bytes (%q)", text)
+	}
+	if attributes := binary.LittleEndian.Uint64(raw); attributes&(tdAttrUnderDebug|tdAttrMigratable) != 0 {
+		return refuse("the TD's attributes %#x let its host debug, profile or migrate it", attributes)
+	}
+	return nil
 }
 
 // imageMatchesDocument requires the signed document to name the pinned image,
