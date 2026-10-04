@@ -1,0 +1,4 @@
+# Presets are applied at image build time.
+enable c8s-session-load.service
+enable c8s-session-firewall.service
+enable c8s-session-agent.service

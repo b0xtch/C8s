@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# mkosi sync hook for the c8s-session profile. It renders the one platform
+# dependent bit, the agent's --platform, from the build's sync-input. There
+# is no default: an image that guessed its TEE would refuse to stage on the
+# other one, and that failure belongs at build time.
+set -euo pipefail
+
+STAGE_DIR="$SRCDIR/mkosi.local/mkosi.extra"
+SYNC_INPUTS="$SRCDIR/mkosi.local/.confos-sync-inputs"
+PLATFORM=$(cat "$SYNC_INPUTS/platform" 2>/dev/null || true)
+case "$PLATFORM" in
+    tdx|snp) ;;
+    *) echo "c8s-session sync: FATAL platform sync-input must be tdx or snp, got '${PLATFORM}'" >&2; exit 1 ;;
+esac
+[ -x "$STAGE_DIR/usr/local/bin/c8s" ] \
+    || { echo "c8s-session sync: FATAL no c8s binary staged at usr/local/bin/c8s (build with session-guest-image/build)" >&2; exit 1; }
+
+mkdir -p "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d"
+printf '[Service]\nEnvironment=C8S_SESSION_PLATFORM=%s\n' "$PLATFORM" \
+    > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/10-platform.conf"
+
+# Nobody logs in to a session guest. A login prompt takes input from whatever
+# keyboard or serial port the host gives the VM, and reads it as root. A dev
+# build keeps its console, with its autologin.
+DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
+GETTYS="getty@.service serial-getty@.service console-getty.service container-getty@.service autovt@.service"
+for unit in $GETTYS; do
+    rm -f "$STAGE_DIR/etc/systemd/system/$unit"
+    if [ "$DEV" != 1 ]; then
+        ln -s /dev/null "$STAGE_DIR/etc/systemd/system/$unit"
+    fi
+done
+
+# Dev builds forward the journal to the console the launcher can attach.
+if [ "$DEV" = 1 ]; then
+    mkdir -p "$STAGE_DIR/etc/systemd/journald.conf.d"
+    printf '# DEV build: guest logs are host-visible. Never ship.\n[Journal]\nForwardToConsole=yes\nMaxLevelConsole=info\n' \
+        > "$STAGE_DIR/etc/systemd/journald.conf.d/90-dev-console.conf"
+    # The hardware suite serves its sandbox image from the host over plain
+    # HTTP. QEMU's user-mode network shows the guest its host at 10.0.2.2.
+    # --bare lets a document name no sandbox image at all: its commands then
+    # run on the guest's own file system, beside the guest's services.
+    printf '# DEV build: accepts a sandbox image from a local plain-HTTP registry, and a document with no sandbox image.\n[Service]\nEnvironment="C8S_SESSION_DEV_FLAGS=--sandbox-plain-http=10.0.2.2:5000 --bare"\n' \
+        > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/20-dev.conf"
+fi

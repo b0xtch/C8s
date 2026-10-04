@@ -1,0 +1,51 @@
+# Packet filter of a session guest, loaded by c8s-session-firewall.service.
+#
+# From outside, only the agent's attested endpoint is reachable. What the
+# guest sends, and the replies to it, pass.
+#
+# A sandbox image runs in a network namespace of its own, which this ruleset
+# does not see and does not need to: that namespace holds a loopback interface
+# and the agent's proxy. The output rules are for what does run in the guest's
+# namespace without being the guest's: a command run with no sandbox image,
+# as the unprivileged user 2000 (sysusers.d/c8s-session.conf). They name the ids
+# of a sandbox's container too, 100000-165535 (imagestore.IDBase), so that a
+# container process that ever found itself in this namespace would meet the
+# same rules.
+#
+# The guest's own services listen only on the guest's ports: the well-known
+# range, and 8400-8499, which holds the agent's 8443 (session.AgentPort) and is
+# where any later port of the agent's goes. Those ports are closed to the ids
+# above on every local address, so a new guest service starts out of their
+# reach. The agent checks before it serves, and again before a sandbox
+# starts, that nothing in the guest listens outside them. The one exception
+# is the resolver's stub, which is what the guest's resolv.conf names.
+flush ruleset
+
+table inet c8s_session {
+	chain input {
+		type filter hook input priority filter; policy drop;
+
+		iif "lo" accept
+		ct state established,related accept
+		ct state invalid drop
+		tcp dport 8443 accept
+
+		# IPv6 has no ARP: without these the guest finds no neighbour.
+		icmpv6 type nd-neighbor-solicit accept
+		icmpv6 type nd-neighbor-advert accept
+		icmpv6 type nd-router-advert accept
+		# The answer to the guest's own DHCP request, when the host sends no
+		# address for it.
+		udp sport 67 udp dport 68 accept
+	}
+
+	chain output {
+		type filter hook output priority filter; policy accept;
+
+		# Traffic to any local address leaves through lo.
+		oif "lo" meta skuid { 2000, 100000-165535 } ip daddr 127.0.0.53 udp dport 53 accept
+		oif "lo" meta skuid { 2000, 100000-165535 } ip daddr 127.0.0.53 tcp dport 53 accept
+		oif "lo" meta skuid { 2000, 100000-165535 } tcp dport { 1-1023, 8400-8499 } reject with tcp reset
+		oif "lo" meta skuid { 2000, 100000-165535 } udp dport { 1-1023, 5353, 5355, 8400-8499 } reject
+	}
+}

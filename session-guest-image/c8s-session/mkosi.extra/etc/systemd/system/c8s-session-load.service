@@ -1,0 +1,21 @@
+[Unit]
+Description=Load the session guest launch files and the host's network request
+Documentation=https://github.com/confidential-dot-ai/c8s/blob/main/docs/sessions.md
+# Before networkd reads its configuration, so a static address applies on the
+# first link-up with no DHCP round trip.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target systemd-networkd.service
+Wants=network-pre.target
+# Without the launch files the agent never starts, and a guest with no agent
+# can be neither verified nor driven. Power off: whatever replaces the guest
+# is attested afresh.
+FailureAction=poweroff-immediate
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/c8s session-agent load
+
+[Install]
+WantedBy=multi-user.target

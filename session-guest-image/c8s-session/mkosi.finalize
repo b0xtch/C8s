@@ -1,0 +1,86 @@
+#!/bin/bash
+set -euo pipefail
+
+# A session's commands run as an unprivileged user on this root. With no setuid or
+# setgid program left on it, that user has no way up, whatever a command does.
+# Nothing in the image needs one: every service starts as the user it runs as.
+find "$BUILDROOT" -xdev -type f -perm /6000 -exec chmod a-s {} +
+if [ -n "$(find "$BUILDROOT" -xdev -type f -perm /6000 -print -quit)" ]; then
+    echo "c8s-session finalize: FATAL a setuid or setgid file survived" >&2
+    exit 1
+fi
+
+# The units name these by path. Without crun the agent could not start a
+# sandbox image, and without nft the guest would power off on every boot.
+for bin in usr/bin/crun usr/sbin/nft; do
+    if [ ! -x "$BUILDROOT/$bin" ]; then
+        echo "c8s-session finalize: FATAL /$bin is not in the image" >&2
+        exit 1
+    fi
+done
+
+# The distribution's nftables.service loads its own /etc/nftables.conf, which
+# flushes the ruleset and filters nothing. Started after this image's filter
+# it would remove it without a trace, so it is masked: it can never start.
+find "$BUILDROOT/etc/systemd/system" -mindepth 2 -name nftables.service -delete
+ln -sf /dev/null "$BUILDROOT/etc/systemd/system/nftables.service"
+if [ "$(readlink "$BUILDROOT/etc/systemd/system/nftables.service")" != /dev/null ]; then
+    echo "c8s-session finalize: FATAL nftables.service is not masked" >&2
+    exit 1
+fi
+
+# This image's unit is the only thing that may load packet filter rules:
+# anything else that does could replace the filter once it is in place. The
+# agent checks the live ruleset too, but a loader that runs later than its
+# check would get past that.
+loaders=$(grep -rlE '(^|[ /="])(nft|iptables|ip6tables|iptables-restore|ip6tables-restore|ebtables|arptables|firewall-cmd|firewalld|ufw|netfilter-persistent)( |$)' \
+    "$BUILDROOT/etc/systemd" "$BUILDROOT/usr/lib/systemd/system" "$BUILDROOT/usr/lib/systemd/system-generators" \
+    "$BUILDROOT/usr/lib/systemd/network" "$BUILDROOT/etc/network" 2>/dev/null \
+    | grep -v -x -e "$BUILDROOT/etc/systemd/system/c8s-session-firewall.service" -e "$BUILDROOT/usr/lib/systemd/system/nftables.service" || true)
+if [ -n "$loaders" ]; then
+    echo "c8s-session finalize: FATAL these would load packet filter rules of their own:" >&2
+    echo "$loaders" >&2
+    exit 1
+fi
+for tool in iptables ip6tables xtables-multi ebtables arptables ufw firewalld firewall-cmd netfilter-persistent; do
+    found=$(find "$BUILDROOT/usr/sbin" "$BUILDROOT/usr/bin" -name "$tool" -print -quit 2>/dev/null)
+    if [ -n "$found" ]; then
+        echo "c8s-session finalize: FATAL $found is a second way to change the packet filter" >&2
+        exit 1
+    fi
+done
+# The agent compares the live ruleset with this listing.
+if [ ! -s "$BUILDROOT/etc/c8s-session/firewall.json" ]; then
+    echo "c8s-session finalize: FATAL /etc/c8s-session/firewall.json is not in the image" >&2
+    exit 1
+fi
+
+# The agent ends the guest if a UDP socket outside the guest's ports takes
+# datagrams from any sender, and an NTP client holds one for as long as it
+# has a server. The image has no time daemon; one that came back as some
+# package's dependency would end every guest whose network reaches a server.
+for daemon in usr/lib/systemd/systemd-timesyncd usr/sbin/chronyd usr/sbin/ntpd; do
+    if [ -e "$BUILDROOT/$daemon" ]; then
+        echo "c8s-session finalize: FATAL /$daemon is in the image: a session guest runs no time daemon" >&2
+        exit 1
+    fi
+done
+
+# A locked image offers no login. The sync hook masks every getty unit for
+# one; a dev build has a drop-in for its console instead.
+if [ ! -e "$BUILDROOT/etc/systemd/journald.conf.d/90-dev-console.conf" ]; then
+    for unit in getty@.service serial-getty@.service console-getty.service container-getty@.service autovt@.service; do
+        if [ "$(readlink "$BUILDROOT/etc/systemd/system/$unit" 2>/dev/null)" != /dev/null ]; then
+            echo "c8s-session finalize: FATAL $unit is not masked: a locked session guest would offer a login prompt" >&2
+            exit 1
+        fi
+    done
+fi
+
+# /etc is read-only at run time, so the account must exist now. sysusers
+# reports a user it could not create and carries on; the agent would then
+# refuse to start and the guest would power off on every boot.
+if ! grep -q '^sandbox:x:2000:2000:' "$BUILDROOT/etc/passwd"; then
+    echo "c8s-session finalize: FATAL the sandbox user (2000:2000) is not in /etc/passwd" >&2
+    exit 1
+fi

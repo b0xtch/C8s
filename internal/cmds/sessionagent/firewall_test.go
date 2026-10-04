@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -121,5 +122,47 @@ func TestRulesetGuard(t *testing.T) {
 	}
 	if err := (RulesetGuard{Nft: fakeNft(t, asKernelLists(t, nil)), Expected: filepath.Join(t.TempDir(), "absent")}).Check(context.Background()); err == nil {
 		t.Error("a missing expectation passed the check")
+	}
+}
+
+// The rules the image loads, beside the listing the guard holds them to.
+const loadedRuleset = "../../../session-guest-image/c8s-session/mkosi.extra/etc/c8s-session/firewall.nft"
+
+// The guard compares a kernel's listing with a file, and the image loads its
+// rules from another: a guest whose two files name different tables refuses
+// to serve. This runs where no nft does.
+func TestExpectedRulesetNamesTheLoadedTable(t *testing.T) {
+	rules, err := os.ReadFile(loadedRuleset)
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Skip("needs the guest image profile: run from a checkout")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared := regexp.MustCompile(`(?m)^table (\S+) (\S+) \{`).FindAllSubmatch(rules, -1)
+	if len(declared) != 1 {
+		t.Fatalf("the image's rules declare %d tables, want one", len(declared))
+	}
+	data, err := os.ReadFile(expectedRuleset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listing struct {
+		Nftables []nftItem `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &listing); err != nil {
+		t.Fatal(err)
+	}
+	family, name := string(declared[0][1]), string(declared[0][2])
+	for i, item := range listing.Nftables {
+		for kind, object := range item {
+			table := object["table"]
+			if kind == "table" {
+				table = object["name"]
+			}
+			if object["family"] != family || table != name {
+				t.Errorf("item %d of the expected listing (%s) is in %v %v, and the image loads %s %s", i, kind, object["family"], table, family, name)
+			}
+		}
 	}
 }
