@@ -1,8 +1,11 @@
 # The session key service
 
-Status: design; nothing here is built yet. [session-state.md](session-state.md)
-says what sessions ask of the key service; this document is how it keeps its
-promises when the hosts it runs on are untrusted.
+Status: design. Milestone 1 built a first, single replica with what a start
+needs: pooled TDs' sessions, acquiring a session at its bind, tenants'
+authorities on first use, and stored credentials. The rest is not built yet.
+[session-state.md](session-state.md) says what sessions ask of the key
+service; this document is how it keeps its promises when the hosts it runs
+on are untrusted.
 
 The key service decides three things for every session: which generation is
 the latest, which TD holds the lease, and who may have the keys. A host that

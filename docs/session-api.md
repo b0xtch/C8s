@@ -1,6 +1,6 @@
 # The session API
 
-Status: design, with milestone 1 being built. The API is
+Status: design, with milestone 1 built. The API is
 `c8s.session.v1alpha1`; [session-daemon.md](session-daemon.md) lists the calls
 built so far, and [sessions.md](sessions.md) is the overview.
 
@@ -74,7 +74,9 @@ guest's own API on its TLS port.
 - **booting to ready.** The daemon launches the TD from the pool's bundle.
   The guest checks its launch document, makes its instance key and opens an
   attested session with the key service, which releases nothing until a bind
-  arrives. It is ready once it serves.
+  arrives. It is ready only once that session is open. Before then it refuses
+  a bind unread, as not ready, so a pool whose key service it cannot reach
+  offers no TD.
 - **ready to claimed.** `Claim` fences the TD, so that no connection opened
   before the claim survives it, and reserves the TD for a session. A claim
   nobody binds before the bind grace runs out returns the TD to ready, since
@@ -263,16 +265,16 @@ learns whose it is only from its bind.
 | `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared |
 | `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own clock |
 | `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
-| `keyService` | the pins of the key service the pool's TDs open their sessions with |
+| `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key |
 
 ## The bind
 
 A bind is a canonical JSON document (RFC 8785), `c8s-bind/v1`, signed by the
 owner's authority. The guest refuses a bind with a field it does not know.
 The fields and purposes an agent accepts are its image's bind schema. The
-build writes it from the agent's own definitions, so it cannot drift from the
-code, and publishes it as it does the disclosure schema: on the image's
-verity root, and in the release log with the image's reference values
+build writes it from the agent's own definitions, and publishes it as it does
+the disclosure schema: on the image's verity root, beside its manifest, and
+in the release log with its reference values
 ([session-disclosure.md](session-disclosure.md#rules), rule 3).
 
 | Field | What it fixes |
@@ -282,8 +284,8 @@ verity root, and in the release log with the image's reference values
 | `session`, `tenant` | the session's name, scoped by the authority that signs it |
 | `purpose` | `start`, `restore` or `fork`; with `generation` or `template` where they apply |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name and size (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; and the wall when the TD is a tenant VM |
-| `keyService` | the pins of the key service the guest may trust for this session |
+| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; and the wall when the TD is a tenant VM |
+| `keyService` | the key service the session trusts, pinned as in the launch document; a TD takes a bind only for the key service it opened its session with |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
 | `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default |
@@ -295,9 +297,9 @@ exactly who may drive the session, which images, egress and inference it may
 use, and which review policy, if any, may report on it.
 
 [Milestone 1](sessions.md#milestones) needs `start` binds only. The other
-purposes, and the `disks`, `keyService`, `review` and `ownerKey` fields, come
-with the milestones that use them; until then an agent refuses them as fields
-it does not know.
+purposes, and the `disks`, `review` and `ownerKey` fields, come with the
+milestones that use them; until then an agent refuses them as fields it does
+not know.
 
 ## Flows
 

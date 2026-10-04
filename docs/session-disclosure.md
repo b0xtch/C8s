@@ -1,7 +1,9 @@
 # What leaves a session
 
-Status: design; nothing here is built yet. [sessions.md](sessions.md) is the
-overview.
+Status: design, partly built. Milestone 1 built the schema, its encoder and
+a session image with no console. A guest's end code, logs for the owner,
+statistics and events, review, and a schema for the key service's answers
+are not built yet. [sessions.md](sessions.md) is the overview.
 
 A confidential session keeps the host out, but its guest still speaks to the
 world outside its TD. It answers the daemon, reports its phases, writes logs,
@@ -15,20 +17,31 @@ enforces its rules without reading a session.
 1. **Plaintext leaves by schema only.** Every message the guest itself sends
    in plaintext beyond the boundary, to the daemon, the platform or a
    console, has a type in its image's disclosure schema, and every field of a
-   type is bounded: a code from a list, a counter, a size, a time or a
-   digest. Everything else leaves encrypted, to the owner or to a peer whose
-   evidence the guest has verified. What the session sends where its egress
-   policy allows is its own, and the policy can require TLS everywhere.
+   type is bounded: a code from a list, a flag, a counter, a size, a time or
+   a digest, or evidence and documents that are public by design. Everything
+   else leaves encrypted, to the owner or to a peer whose evidence the guest
+   has verified. What the session sends where its egress policy allows is
+   its own, and the policy can require TLS everywhere.
 2. **No free text.** No field holds a string the session can choose, so no
    error message, path, host name or stack trace leaves in plaintext. A
    refusal or a crash is a code.
-3. **The schema is part of the image.** It sits on the image's verity root,
-   so the measurements cover it, and it is published with the image's
-   reference values in the release log ([Releases](sessions.md#releases)). A
-   guest that said more would be another image.
+3. **The schema is part of the image.** The build writes it from the agent
+   itself onto the image's verity root, so the measurements cover it, and
+   publishes it beside the image's manifest and with its reference values in
+   the release log ([Releases](sessions.md#releases)). The agent ends a guest
+   whose copy differs from the schema compiled into it, and a guest that said
+   more would be another image.
 4. **One encoder.** The agent writes every plaintext message through one
-   encoder generated from the schema. The sandbox has no path to the host but
-   the gateways, so nothing in it can add to what the guest says.
+   encoder, which checks it against the schema as it is written and holds
+   back whatever does not fit. The sandbox has no path to the host but the
+   gateways, so nothing in it can add to what the guest says.
+
+The schema does not cover answers on routes that need a key the bind grants,
+which travel only inside the TLS channel that ends in the guest, to that
+key's holder; the HTTP library's fixed refusal of a malformed request; what
+firmware and the boot stub print before the kernel runs; or the key
+service's answers, which will get a schema of their own. None of these lets
+a session put plaintext of its choosing where the host can read it.
 
 ## What the host sees
 
@@ -39,14 +52,17 @@ enforces its rules without reading a session.
 | answers to the daemon | phases; a bind taken, or a refusal code; a seal's generation, size and digest | the schema |
 | events and statistics | VM-level counters, sizes and times | the schema |
 | evidence | certificates, documents, events and quotes | public by design |
-| a console | nothing | the image ([Logs](#logs-consoles-and-crashes)) |
+| a console | nothing once the kernel runs; before that, the fixed messages of firmware and the boot stub | the image ([Logs](#logs-consoles-and-crashes)) |
 | review | a policy's signals, on its schedule, within its budget | [Private review](#private-review) |
 | the session's own traffic | what it sends where its egress policy allows | the owner's policy |
 
 ## Logs, consoles and crashes
 
-- **No console.** A session image's kernel writes to no console the host can
-  read, and boot's progress reaches the host only as phases from the schema.
+- **No console.** A session image's kernel is built without a console the
+  host could read (no virtual terminals, virtio console, netconsole or early
+  printk), with a null console as its default, and the agent and the key
+  service check that no console is registered before they serve. Boot's
+  progress reaches the host only as phases from the schema.
   A debug build keeps a console, at other measurements, which no verifier of
   real sessions accepts.
 - **Logs stay in the session.** The agent's, the sandbox's and the kernel's

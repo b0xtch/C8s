@@ -1,8 +1,8 @@
 # Confidential sessions
 
-Status: design, with milestone 1 being built.
-[session-daemon.md](session-daemon.md) describes what runs so far, and
-[Milestones](#milestones) orders the work.
+Status: design, with milestone 1 built.
+[session-daemon.md](session-daemon.md) describes what runs, and
+[Milestones](#milestones) orders the rest.
 
 An agent platform runs each of its users' sessions in a microVM of its own:
 the agent or a custom harness, the tools it calls, and a workspace holding
@@ -294,7 +294,7 @@ evidence.
    from it; its binder verifies the pinned image and the guest's key over
    fresh evidence; a test credential is released; one authenticated command
    runs; and nothing leaves the guest in plaintext but what its disclosure
-   schema allows.
+   schema allows. Built, with its hardware test in `test/session/hardware.sh`.
 2. **Hold, seal and restore.** Hold and release; a seal and a restore inside
    the TD; leases and generations at the key service; seal keys under dual
    control.

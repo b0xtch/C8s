@@ -61,6 +61,7 @@ Each lever must keep the rules in
 |---|---|---|
 | cold boot | Firecracker boot to a ready guest | TD launch to a ready, unbound guest |
 | warm activation | snapshot load to the first command | claim and bind to the first command |
+| a start, in parts | none | claim, ready check, bind (with the key service's answer and the sandbox's start inside it), the binder's check, and the first command |
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
 | a burst of 100 starts at once | median and tail latency, and success rate | the same |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release |
@@ -82,6 +83,9 @@ snapshot load to the first command; a restore's first instruction under
   separates the cost of confidentiality from the cost of the VMM.
 - **The same settings.** Power settings (governor, C-states, turbo) are pinned
   and recorded, versions are named, and runs of the two sides interleave.
+- **Like for like.** Both sides reach their first command the same way. A
+  baseline driven over a serial console, with no platform channel, is a
+  floor, and is labeled as one.
 - **Published records.** Every number comes with its raw records, the
   commands that made them, and the versions of the host kernel, VMM,
   firmware, TDX module and guest.
