@@ -38,7 +38,7 @@ func setupTap(cfg *Config) (_ *session.HostNetwork, mac string, tapFile, vhost *
 		return nil, "", nil, nil, err
 	}
 
-	tapFile, err = openTap(tapName)
+	tapFile, err = OpenTap(tapName)
 	if err != nil {
 		return nil, "", nil, nil, err
 	}
@@ -95,9 +95,10 @@ func reserveVsock() (*os.File, uint32, error) {
 	return device, cid, nil
 }
 
-// openTap creates a single-queue tap with virtio headers, the layout QEMU's
-// virtio-net expects of an inherited descriptor.
-func openTap(name string) (*os.File, error) {
+// OpenTap creates a single-queue tap with virtio headers, the layout QEMU's
+// virtio-net expects of an inherited descriptor. It is what --network fd
+// takes from a caller that gives each guest a tap of its own making.
+func OpenTap(name string) (*os.File, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /dev/net/tun: %w", err)
