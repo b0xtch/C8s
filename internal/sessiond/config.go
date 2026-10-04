@@ -84,6 +84,10 @@ type Network struct {
 	// leave the host on, under the host's address (NetworkTap). Unset, a
 	// guest reaches nothing.
 	EgressInterface string `yaml:"egressInterface,omitempty"`
+	// Reach lists what every guest may connect to whatever else is closed, as
+	// address:port over TCP: the key service of its pool, for one
+	// (NetworkTap).
+	Reach []string `yaml:"reach,omitempty"`
 	// DNS are the resolvers a guest is told, up to three.
 	DNS []string `yaml:"dns,omitempty"`
 	// FirstPort is the loopback port of the first TD (NetworkUser).
@@ -271,9 +275,15 @@ func (n *Network) validate(capacity int) error {
 		if n.FirstPort != 0 {
 			return errors.New("firstPort belongs to mode user")
 		}
+		if len(n.Reach) > maxReach {
+			return fmt.Errorf("reach lists more than %d destinations", maxReach)
+		}
+		if _, err := n.reach(); err != nil {
+			return err
+		}
 	case NetworkUser:
-		if n.GuestCIDR != "" || n.EgressInterface != "" {
-			return errors.New("guestCIDR and egressInterface belong to mode tap")
+		if n.GuestCIDR != "" || n.EgressInterface != "" || len(n.Reach) > 0 {
+			return errors.New("guestCIDR, egressInterface and reach belong to mode tap")
 		}
 		if n.FirstPort < 1024 || n.FirstPort+capacity > 65535 {
 			return fmt.Errorf("firstPort %d leaves no room for %d loopback ports above 1023", n.FirstPort, capacity)
@@ -282,6 +292,22 @@ func (n *Network) validate(capacity int) error {
 		return fmt.Errorf("mode %q is neither %s nor %s", n.Mode, NetworkTap, NetworkUser)
 	}
 	return nil
+}
+
+// maxReach bounds the destinations opened to every guest.
+const maxReach = 16
+
+// reach parses the destinations every guest may connect to.
+func (n *Network) reach() ([]netip.AddrPort, error) {
+	var out []netip.AddrPort
+	for _, entry := range n.Reach {
+		dest, err := netip.ParseAddrPort(entry)
+		if err != nil || !dest.Addr().Is4() || dest.Port() == 0 || dest.String() != entry {
+			return nil, fmt.Errorf("reach %q is not an IPv4 address:port", entry)
+		}
+		out = append(out, dest)
+	}
+	return out, nil
 }
 
 func (c Class) validate() error {

@@ -78,8 +78,12 @@ func NewQEMURunner(cfg *Config, log *slog.Logger) (Runner, error) {
 			return nil, errors.New("network.egressInterface needs net.ipv4.ip_forward=1 on this host")
 		}
 	}
+	reach, err := cfg.Network.reach()
+	if err != nil {
+		return nil, err
+	}
 	nft := exec.Command("nft", "-f", "-")
-	nft.Stdin = strings.NewReader(filterRuleset(egress))
+	nft.Stdin = strings.NewReader(filterRuleset(egress, reach))
 	if out, err := nft.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("load the guests' packet filter: %w: %s", err, bytes.TrimSpace(out))
 	}

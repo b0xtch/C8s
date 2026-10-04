@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -143,12 +144,12 @@ func (w *world) in(ns string, args ...string) {
 }
 
 // load puts the daemon's ruleset into the host's packet filter.
-func (w *world) load(egress string) {
+func (w *world) load(egress string, reach ...netip.AddrPort) {
 	w.t.Helper()
 	cmd := exec.Command("ip", "netns", "exec", w.ns("host"), "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(filterRuleset(egress))
+	cmd.Stdin = strings.NewReader(filterRuleset(egress, reach))
 	if out, err := cmd.CombinedOutput(); err != nil {
-		w.t.Fatalf("load the ruleset: %v: %s\n%s", err, out, filterRuleset(egress))
+		w.t.Fatalf("load the ruleset: %v: %s\n%s", err, out, filterRuleset(egress, reach))
 	}
 }
 
@@ -225,6 +226,23 @@ func TestFilterIsolatesGuests(t *testing.T) {
 	w.load("")
 	w.reaches("host", guest1+":8443", "the daemon's road after a reload")
 	w.blocked("g1", guest2+":8443", "two guests after a reload")
+}
+
+// What the configuration opens to every guest is reached, and nothing beside
+// it: another port of the same address stays closed, on the host and beyond.
+func TestFilterReach(t *testing.T) {
+	w := newWorld(t)
+	w.listen("host", "0.0.0.0:2223")
+	w.listen("up", "0.0.0.0:8081")
+	w.load("", netip.MustParseAddrPort(hostUp+":2222"), netip.MustParseAddrPort(upstream+":8080"))
+	w.reaches("g1", hostUp+":2222", "a guest and the host address and port opened to it")
+	w.reaches("g2", hostUp+":2222", "another guest and the same")
+	w.reaches("g1", upstream+":8080", "a guest and the destination beyond the host opened to it")
+	w.blocked("g1", hostUp+":2223", "a guest and another port of the opened host address")
+	w.blocked("g1", hostEnd1+":2222", "a guest and the same port on another host address")
+	w.blocked("g1", upstream+":8081", "a guest and another port of the opened destination")
+	w.blocked("g1", guest2+":8443", "a guest and another guest")
+	w.blocked("up", guest1+":8443", "the opened destination and a guest")
 }
 
 // With an egress interface a guest's traffic leaves there, under the host's

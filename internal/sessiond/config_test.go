@@ -96,6 +96,8 @@ func TestLoadConfigRefuses(t *testing.T) {
 		"an unknown network mode":           {"mode: tap", "mode: bridge"},
 		"a port in tap mode":                {"mode: tap", "firstPort: 30000, mode: tap"},
 		"four resolvers":                    {"dns: [192.0.2.53]", "dns: [192.0.2.1, 192.0.2.2, 192.0.2.3, 192.0.2.4]"},
+		"a destination with no port":        {"dns: [192.0.2.53]", "reach: [192.0.2.7]"},
+		"a destination by name":             {"dns: [192.0.2.53]", "reach: [\"keys.example:8443\"]"},
 		"a class the host does not offer":   {"  sim: {vcpus: 4", "  other: {vcpus: 4"},
 		"memory with no unit":               {"memory: 16G", "memory: \"16\""},
 		"no vCPU":                           {"vcpus: 4", "vcpus: 0"},
@@ -154,16 +156,17 @@ func TestSlotAddresses(t *testing.T) {
 }
 
 func TestFilterRuleset(t *testing.T) {
-	closed := filterRuleset("")
+	closed := filterRuleset("", nil)
 	if strings.Contains(closed, "masquerade") || strings.Contains(closed, "accept\n\t\tiifname \"c8st*\" counter drop\n\t}\n}") {
 		t.Errorf("with no egress interface a guest's traffic is let out:\n%s", closed)
 	}
-	open := filterRuleset("eth0")
+	open := filterRuleset("eth0", []netip.AddrPort{netip.MustParseAddrPort("192.0.2.7:8443")})
 	for _, rule := range []string{
 		`iifname "c8st*" oifname "eth0" accept`,
 		`iifname "c8st*" oifname "eth0" masquerade`,
 		`iifname "c8st*" oifname "c8st*" counter drop`,
 		`iifname "c8st*" fib saddr . iif oif missing counter drop`,
+		`iifname "c8st*" ip daddr 192.0.2.7 tcp dport 8443 accept`,
 	} {
 		if !strings.Contains(open, rule) {
 			t.Errorf("the ruleset lacks %q:\n%s", rule, open)

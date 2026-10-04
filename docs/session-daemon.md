@@ -90,6 +90,7 @@ network:
   mode: tap
   guestCIDR: 10.213.0.0/22      # the daemon's alone: four addresses per TD
   egressInterface: eth0         # optional: without it a guest reaches nothing
+  reach: ["192.0.2.7:8443"]     # optional: open to every guest, as the key service is
   dns: [192.0.2.53]
 vmm:
   quoteSocket: /var/run/tdx-qgs/qgs.socket
@@ -132,6 +133,7 @@ loaded:
 | a guest sending from an address its tap was not given | dropped |
 | anything from outside the host to a guest | dropped |
 | the daemon to a guest, and the answers | passes |
+| a guest to an address and port in `reach`, on the host or beyond it | passes |
 | a guest out through `egressInterface`, under the host's address | passes when one is configured; dropped otherwise |
 
 Every drop is counted (`nft list table inet c8s_sessions`). The table stays
@@ -146,6 +148,47 @@ and from other tenants whatever the guest does.
 `user` mode gives a guest the VMM's user-mode stack, with its TLS port
 forwarded to a loopback port. It needs no privilege and filters nothing. It
 is for development.
+
+## With a key service
+
+A pool whose launch document pins a [key service](session-key-service.md)
+gives its sessions stored credentials: a tenant stores a secret once, and a
+session of that tenant finds it in its sandbox at its first read, with its
+owner nowhere near. The key service is a guest of its own, built from the
+same profile (`C8S_ROLE=key-service session-guest-image/build`) and booted by
+the same launcher from a bundle of the same layout. What is built is one
+replica that keeps everything in memory.
+
+The pool's launch key comes first, because each document names the other
+side: the key service's lists the pool's public key, and the pool's pins the
+key service.
+
+```sh
+# The operator: a key for the pool, the key service's bundle and pin, the pool's bundle.
+c8s session launch-config key --out pool.key
+c8s session key-service launch-config new --out ks \
+    --image-manifest c8s-key-service/manifest.json \
+    --pool c8s-session/manifest.json:pool.key.pub
+c8s session key-service pin --bundle ks --url https://192.0.2.7:8443 --out ks-pin.json
+c8s session launch-config new --out pool --key pool.key --key-service ks-pin.json \
+    --image-manifest c8s-session/manifest.json --pool agents --class s-4x16
+
+# The owner: register the tenant's authority once, store a credential, start a session.
+c8s session key-service tenant register --key-service ks-pin.json --tenant acme --authority-key authority.key
+c8s session key-service credential put api-token --key-service ks-pin.json --tenant acme \
+    --authority-key authority.key < token
+c8s session start ... --key-service ks-pin.json --stored-credential api-token
+```
+
+A guest opens its session with the key service when it boots, while it is
+nobody's, so the key service has judged its evidence before any bind. At the
+bind the guest presents it, and the key service releases the credential only
+if the bind names that guest, is signed by the authority it holds for the
+bind's tenant, and declares the credential. The release is sealed to a key
+of the guest's under a hybrid of ML-KEM-768 and X25519. Guests and owners
+hold the key service to its pin before they send it anything.
+
+In `tap` mode the key service's address and port go in `network.reach`.
 
 ## Restarts and draining
 
@@ -179,3 +222,8 @@ until their memory is the host's again.
   image store.
 - A reload of the daemon's certificate without a restart.
 - IPv6 for guests.
+- Of the key service: leases and generations, more than one replica, the
+  ledger, recovery, a change of a tenant's authority, and deleting a stored
+  credential. A replica that stops has forgotten its tenants and their
+  credentials. A guest judges the key service by the vendor documents its own
+  host handed it, so the two share a platform for now.

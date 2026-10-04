@@ -46,8 +46,10 @@ func slotMAC(slot int) string {
 // other guest, and it sends only from the address its tap was given. Nothing
 // from outside the host reaches a guest: connections to one start at the
 // daemon. With an egress interface, a guest's traffic may leave on that
-// interface alone, under the host's address.
-func filterRuleset(egress string) string {
+// interface alone, under the host's address. reach lists the destinations
+// every guest may connect to whatever else is closed, on the host or beyond
+// it: a pool's key service.
+func filterRuleset(egress string, reach []netip.AddrPort) string {
 	taps := `"` + tapPrefix + `*"`
 	var b strings.Builder
 	fmt.Fprintf(&b, "table inet %s\ndelete table inet %s\ntable inet %s {\n", filterTable, filterTable, filterTable)
@@ -59,14 +61,14 @@ func filterRuleset(egress string) string {
 	chain input {
 		type filter hook input priority filter; policy accept;
 		iifname %[1]s ct state established,related accept
-		iifname %[1]s counter drop
+%[2]s		iifname %[1]s counter drop
 	}
 	chain forward {
 		type filter hook forward priority filter; policy accept;
 		iifname %[1]s oifname %[1]s counter drop
 		oifname %[1]s ct state established,related accept
 		oifname %[1]s counter drop
-`, taps)
+%[2]s`, taps, opened(taps, reach))
 	if egress != "" {
 		fmt.Fprintf(&b, "\t\tiifname %s oifname %q accept\n", taps, egress)
 	}
@@ -79,5 +81,14 @@ func filterRuleset(egress string) string {
 `, taps, egress)
 	}
 	b.WriteString("}\n")
+	return b.String()
+}
+
+// opened renders the rules that let a guest's connections to reach pass.
+func opened(taps string, reach []netip.AddrPort) string {
+	var b strings.Builder
+	for _, dest := range reach {
+		fmt.Fprintf(&b, "\t\tiifname %s ip daddr %s tcp dport %d accept\n", taps, dest.Addr(), dest.Port())
+	}
 	return b.String()
 }

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
+	"github.com/confidential-dot-ai/c8s/internal/keyservice/keyservicetest"
 	"github.com/confidential-dot-ai/c8s/internal/sessiond"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -149,6 +150,9 @@ type Host struct {
 	LaunchKeyPath string
 	// Engine verifies the simulated evidence.
 	Engine session.Engine
+	// KeyService is the key service the pool's launch document pins, on a
+	// host made with one.
+	KeyService *keyservicetest.Sim
 
 	t    testing.TB
 	stop func()
@@ -158,9 +162,28 @@ type Host struct {
 // running. mutate may change the daemon's configuration first.
 func NewHost(t testing.TB, depth int, mutate func(*sessiond.Config)) *Host {
 	t.Helper()
-	first := sessionsim.NewGuest(t, nil)
+	return newHost(t, depth, mutate, false)
+}
+
+// NewHostWithKeyService is NewHost for a pool whose launch document pins a
+// key service, which runs beside the host.
+func NewHostWithKeyService(t testing.TB, depth int, mutate func(*sessiond.Config)) *Host {
+	t.Helper()
+	return newHost(t, depth, mutate, true)
+}
+
+func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService bool) *Host {
+	t.Helper()
+	pool := sessionsim.NewPool(t)
+	var service *keyservicetest.Sim
+	var pin *session.KeyService
+	if keyService {
+		service = keyservicetest.New(t, pool)
+		pin = service.Pin
+	}
+	first := pool.Boot(t, nil, pin)
 	h := &Host{
-		t: t, Runner: &Runner{t: t, first: first}, Engine: sessionsim.Engine(),
+		t: t, Runner: &Runner{t: t, first: first}, Engine: sessionsim.Engine(), KeyService: service,
 		ManifestPath: first.ManifestPath, LaunchKeyPath: first.LaunchKeyPath,
 	}
 	var err error
