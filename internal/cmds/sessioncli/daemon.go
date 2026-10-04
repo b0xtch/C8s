@@ -264,6 +264,10 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	if err != nil {
 		return finish(ExitUsage, err)
 	}
+	keyService, err := s.w.pin()
+	if err != nil {
+		return finish(ExitUsage, err)
+	}
 	if _, err := os.Stat(s.out); err == nil {
 		return finish(ExitUsage, fmt.Errorf("--out %s already exists", s.out))
 	}
@@ -314,9 +318,13 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 		return finish(exitCode(err), fmt.Errorf("the guest the daemon offers is not what this session pins, and nothing was signed: %w", err))
 	}
 	result.ReadyCheckMillis = time.Since(began).Milliseconds()
+	if err := servedBy(keyService, ready.Document.KeyService); err != nil {
+		release()
+		return finish(ExitRefused, fmt.Errorf("nothing was signed: %w", err))
+	}
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: authority, InstanceKey: ready.InstanceKey,
-		Tenant: s.tenant, Session: s.session, NotAfter: time.Now().Add(s.ttl), Policy: policy,
+		Tenant: s.tenant, Session: s.session, NotAfter: time.Now().Add(s.ttl), Policy: policy, KeyService: keyService,
 	})
 	if err != nil {
 		release()

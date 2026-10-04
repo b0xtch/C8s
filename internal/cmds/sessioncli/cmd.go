@@ -69,10 +69,10 @@ at. 'destroy' ends a session.
 See docs/sessions.md.`,
 	}
 	launch := &cobra.Command{Use: "launch-config", Short: "Create a pool's signed launch bundle"}
-	launch.AddCommand(newBundleCmd())
+	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
-	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd())
+	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd())
 	cmd.AddCommand(imageStoreCmds()...)
 	return cmd
 }
@@ -83,6 +83,10 @@ type sandboxFlags struct {
 	image, workingDir                                                              string
 	command, args, env, egress, credentials, execKeys, credentialKeys, forwardKeys []string
 	forwardPorts                                                                   []int
+	// stored are the credentials the guest takes from its key service, and
+	// keyService the file that pins that key service.
+	stored     []string
+	keyService string
 }
 
 // egressNone is the --egress value that allows the sandbox no destination.
@@ -96,6 +100,8 @@ func (w *sandboxFlags) register(f *pflag.FlagSet, besides string) {
 	f.StringVar(&w.workingDir, "working-dir", "", "sandbox working directory")
 	f.StringArrayVar(&w.egress, "egress", nil, "destination the sandbox may connect to, as host:port, *.domain:port or address:port (repeatable); \"none\" allows none. Without it the sandbox may connect to any public destination. A private address is reached only if named here")
 	f.StringArrayVar(&w.credentials, "credential", nil, "credential NAME[:MAXBYTES] the sandbox may be handed after attestation")
+	f.StringArrayVar(&w.stored, "stored-credential", nil, "credential NAME[:MAXBYTES] the guest takes from the key service when it is bound: one the tenant stored there with 'c8s session key-service credential put' (needs --key-service)")
+	f.StringVar(&w.keyService, "key-service", "", "pin of the key service the session trusts, as 'c8s session key-service pin' writes it")
 	f.StringArrayVar(&w.execKeys, "exec-key", nil, "public key PEM file granted exec, in addition to "+besides)
 	f.StringArrayVar(&w.credentialKeys, "credential-key", nil, "public key PEM file granted credential release, in addition to "+besides)
 	f.IntSliceVar(&w.forwardPorts, "forward-port", nil, "TCP port of the sandbox, on its own loopback, that a holder of a forward key may open a stream to (repeatable). Without it nothing outside the guest connects to the sandbox")
@@ -149,19 +155,52 @@ func (w *sandboxFlags) forward() *session.Forward {
 
 func (w *sandboxFlags) declared() ([]session.Credential, error) {
 	var out []session.Credential
-	for _, spec := range w.credentials {
-		name, limit, _ := strings.Cut(spec, ":")
-		c := session.Credential{Name: name}
-		if limit != "" {
-			n, err := strconv.Atoi(limit)
-			if err != nil || n <= 0 {
-				return nil, fmt.Errorf("--credential %q: size must be a positive byte count", spec)
+	for flag, specs := range map[string][]string{"--credential": w.credentials, "--stored-credential": w.stored} {
+		for _, spec := range specs {
+			name, limit, _ := strings.Cut(spec, ":")
+			c := session.Credential{Name: name}
+			if flag == "--stored-credential" {
+				c.Source = session.SourceKeyService
 			}
-			c.MaxBytes = n
+			if limit != "" {
+				n, err := strconv.Atoi(limit)
+				if err != nil || n <= 0 {
+					return nil, fmt.Errorf("%s %q: size must be a positive byte count", flag, spec)
+				}
+				c.MaxBytes = n
+			}
+			out = append(out, c)
 		}
-		out = append(out, c)
 	}
+	// One order, whatever order the flags came in.
+	slices.SortFunc(out, func(a, b session.Credential) int { return strings.Compare(a.Name, b.Name) })
 	return out, nil
+}
+
+// pin is the key service the flags have the session trust, or nil.
+func (w *sandboxFlags) pin() (*session.KeyService, error) {
+	if w.keyService == "" {
+		if len(w.stored) > 0 {
+			return nil, errors.New("--stored-credential needs --key-service: the key service the session trusts")
+		}
+		return nil, nil
+	}
+	pin, err := session.LoadKeyServicePin(w.keyService)
+	if err != nil {
+		return nil, fmt.Errorf("--key-service: %w", err)
+	}
+	return pin, nil
+}
+
+// servedBy holds a pool to the key service the owner pins. A guest of a pool
+// that pins another one would refuse the bind, so the pool's own pin, from
+// the launch document the guest measured, is checked before anything is
+// signed.
+func servedBy(pin, pool *session.KeyService) error {
+	if pin != nil && !pin.Equal(pool) {
+		return &session.VerificationError{Err: errors.New("the pool's guests open their sessions with another key service than --key-service pins, or with none")}
+	}
+	return nil
 }
 
 func (w *sandboxFlags) keys() (access session.Access, err error) {
@@ -215,8 +254,61 @@ func (w *sandboxFlags) policy() (policy session.BindPolicy, accessPEM []byte, er
 	return policy, accessPEM, nil
 }
 
+// newLaunchKeyCmd returns `c8s session launch-config key`.
+func newLaunchKeyCmd() *cobra.Command {
+	var out string
+	cmd := &cobra.Command{
+		Use:   "key",
+		Short: "Make a launch key ahead of its bundle",
+		Long: `Write a new launch private key to --out and its public half to <out>.pub.
+A pool whose launch document pins a key service needs its key first: the key
+service's own launch document lists the pool's public key. Pass the private
+key to 'launch-config new' with --key.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+			if err != nil {
+				return err
+			}
+			private, err := certutil.MarshalECKeyPEM(key)
+			if err != nil {
+				return err
+			}
+			public, err := session.PublicKeyPEM(&key.PublicKey)
+			if err != nil {
+				return err
+			}
+			// Neither replaces a file that is there: a launch key is not
+			// one to lose to a second run.
+			for path, file := range map[string]struct {
+				data []byte
+				mode os.FileMode
+			}{out: {private, 0o600}, out + ".pub": {public, 0o644}} {
+				f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, file.mode)
+				if err != nil {
+					return err
+				}
+				_, err = f.Write(file.data)
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
+				if err != nil {
+					return err
+				}
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "wrote %s and %s.pub\n", out, out)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&out, "out", "", "file for the private key (must not exist)")
+	_ = cmd.MarkFlagRequired("out")
+	return cmd
+}
+
 func newBundleCmd() *cobra.Command {
 	var opts session.BundleOptions
+	var keyService string
 	cmd := &cobra.Command{
 		Use:   "new",
 		Short: "Write and sign a pool's launch document",
@@ -234,6 +326,13 @@ each guest waits for one bind, see 'c8s session bind'.`,
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if keyService != "" {
+				pin, err := session.LoadKeyServicePin(keyService)
+				if err != nil {
+					return fmt.Errorf("--key-service: %w", err)
+				}
+				opts.KeyService = pin
+			}
 			if err := session.NewBundle(opts); err != nil {
 				return err
 			}
@@ -256,6 +355,7 @@ each guest waits for one bind, see 'c8s session bind'.`,
 	f.DurationVar(&opts.AgeLimit, "age-limit", time.Hour, "how long a guest waits for its bind, on its own clock, before it ends; 0 sets no bound")
 	f.StringArrayVar(&opts.Machines, "machine", nil, "a machine the guest may be, as the value its RTMR[0] then holds (96 hex characters, as 'c8s session verify' prints it for a guest on that machine); repeatable. The guest's host can then launch it in no other shape. Without it the document pins no machine")
 	f.StringArrayVar(&opts.Prestage, "prestage", nil, "a public image, name@sha256:<digest>, that a guest unpacks from its host's image store before anybody binds it, so that a bind which names it starts it at once (repeatable)")
+	f.StringVar(&keyService, "key-service", "", "pin of the key service the pool's guests open their sessions with, as 'c8s session key-service pin' writes it. Without it a guest of the pool takes no credential from a key service")
 	for _, name := range []string{"out", "image-manifest", "pool", "class"} {
 		_ = cmd.MarkFlagRequired(name)
 	}
@@ -831,6 +931,10 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 	if err != nil {
 		return finish(ExitUsage, err)
 	}
+	keyService, err := b.w.pin()
+	if err != nil {
+		return finish(ExitUsage, err)
+	}
 	signer, err := operatorauth.NewSignerFromKeyPEM(accessPEM)
 	if err != nil {
 		return finish(ExitUsage, err)
@@ -865,9 +969,12 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 		return finish(exitCode(err), err)
 	}
 	result.ReadyCheckMillis = time.Since(started).Milliseconds()
+	if err := servedBy(keyService, ready.Document.KeyService); err != nil {
+		return finish(ExitRefused, err)
+	}
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: authority, InstanceKey: ready.InstanceKey,
-		Tenant: b.tenant, Session: b.session, NotAfter: time.Now().Add(b.ttl), Policy: policy,
+		Tenant: b.tenant, Session: b.session, NotAfter: time.Now().Add(b.ttl), Policy: policy, KeyService: keyService,
 	})
 	if err != nil {
 		return finish(ExitUsage, err)
