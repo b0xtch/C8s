@@ -66,7 +66,11 @@ replicated records, a ledger that cannot go back, and recovery.
   and stop any replica, but it cannot read or forge them inside the attested
   channels. Raft stays safe under exactly that, as long as every replica runs
   it as written, which attestation checks; liveness is the host's to deny, as
-  everywhere.
+  everywhere. From milestone 2 a replica has no network device: its launcher
+  listens on a port of the host and carries each connection over vsock, from
+  guests and clients, between replicas and out to the vendor's service, so the
+  host carries the same ciphertext it would on a network, and a replica's
+  kernel needs no network driver.
 - **No disk is trusted.** A replica keeps its log, term, vote and state in
   memory only. One that restarts comes back as a new member with a new
   instance key, joins as a learner, catches up from the leader's snapshot and
