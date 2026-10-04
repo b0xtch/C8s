@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/httputil"
 	"github.com/confidential-dot-ai/c8s/internal/readutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
@@ -296,9 +297,34 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 // bindEvidence is the evidence a bind's sender would ask for next, taken for
 // the nonce the bind carries: the answer then holds it, and the sender asks
 // for nothing. It comes out of the guest's ration like any other quote. With
-// none due, the answer goes without and the sender asks in its turn. Nobody
-// waits here.
-func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind) *session.AttestResponse {
+// none due, the answer goes without and the sender asks in its turn.
+//
+// It is taken while the bind's sandbox is admitted, over the events the
+// register holds from then on, and says the guest runs. The admission hands
+// it out only if that comes true.
+func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind, events []string) *session.AttestResponse {
+	if !a.quotes.take() {
+		return nil
+	}
+	reportData, err := session.ReportData(&a.key.PublicKey, bind.Doc.EvidenceNonce(), events)
+	if err == nil {
+		quoting, cancel := context.WithTimeout(ctx, attestTimeout)
+		defer cancel()
+		var evidence teetypes.AttestationEvidence
+		if evidence, err = a.tee.Evidence(quoting, reportData); err == nil {
+			return &session.AttestResponse{
+				Evidence: evidence, Launch: a.launch, Signature: a.signature, Events: events, Phase: session.PhaseRunning,
+				Bind: bind.Raw, BindSignature: bind.Signature,
+			}
+		}
+	}
+	a.log.Warn("a bind is answered without evidence", "error", err)
+	return nil
+}
+
+// repeatEvidence is bindEvidence for a bind the guest took before: evidence
+// of the guest as it is now.
+func (a *Agent) repeatEvidence(ctx context.Context, bind *session.SignedBind) *session.AttestResponse {
 	if !a.quotes.take() {
 		return nil
 	}
@@ -315,8 +341,20 @@ func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind) *ses
 // a guest that could not ask it.
 func (a *Agent) attestation(ctx context.Context, nonce []byte) (_ *session.AttestResponse, unavailable bool, _ error) {
 	// The register cannot move while the quote is taken, so the events this
-	// response reports are the ones the quote's register holds.
+	// response reports are the ones the quote's register holds. While a
+	// sandbox is being admitted the register is ahead of what the guest says,
+	// and the quote waits until the two agree again.
 	a.measured.RLock()
+	for a.settling != nil {
+		settling := a.settling
+		a.measured.RUnlock()
+		select {
+		case <-settling:
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		}
+		a.measured.RLock()
+	}
 	phase, events := a.stateLocked()
 	bind := a.bind
 	reportData, err := session.ReportData(&a.key.PublicKey, nonce, events)

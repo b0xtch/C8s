@@ -116,6 +116,12 @@ type Agent struct {
 	// admitted: the sandbox this agent process started is running. Commands
 	// and credentials wait for it.
 	admitted bool
+	// settling is set while a bind's sandbox is being admitted: the register
+	// already holds the sandbox's image, and the guest does not say so until
+	// the sandbox runs. It is closed when that is decided. A quote for anyone
+	// but the bind's sender waits for it, so that no quote shows a register
+	// its guest's state does not explain.
+	settling chan struct{}
 	// admission is how long each step of admitting the sandbox took.
 	admission []session.AdmissionStep
 	// prestaged is closed when the guest is done with what it does ahead of
@@ -398,37 +404,62 @@ func (a *Agent) Admit(ctx context.Context) error {
 	return nil
 }
 
-// admit prepares, measures and starts the sandbox. admitted, when set, runs
-// once the register is final, and the serving certificate is then reissued
-// behind it and behind admit's return: that is a bind, whose sender waits.
-func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, admitted func()) error {
+// admit prepares, measures and starts the sandbox, and returns the evidence
+// that answers the bind, if answer asks for it and the guest's ration of
+// quotes has one due.
+//
+// The register is made final before the slow steps: the sandbox's image is
+// extended into it as soon as the image is in place. The quote that answers
+// the bind is then taken while the guest takes its credentials and starts
+// its sandbox, and is handed out only once the sandbox runs. A guest whose
+// admission fails after that ends, as it does on any other failure here, and
+// gives no quote on its way out.
+func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, answer bool) (*session.AttestResponse, error) {
 	ctx, steps := withAdmission(ctx)
 	sandbox, egress := bind.Doc.Policy.Sandbox, bind.Doc.Policy.Egress
 	if sandbox != nil {
 		if err := a.cfg.Runner.Prepare(ctx, sandbox, egress); err != nil {
-			return fmt.Errorf("prepare sandbox: %w", err)
+			return nil, fmt.Errorf("prepare sandbox: %w", err)
 		}
 		// The image names the user it runs as, so the owner of its credentials
 		// is known only now. None can have been written: that waits on admission.
 		uid, gid := a.cfg.Runner.CredentialOwner()
 		if err := a.creds.setOwner(uid, gid); err != nil {
-			return err
+			return nil, err
 		}
+		// Asked before the image is measured: a guest that will not start
+		// its sandbox does not say it admitted one.
+		if a.cfg.Guard != nil {
+			if err := a.cfg.Guard(ctx); err != nil {
+				return nil, fmt.Errorf("before starting the sandbox: %w", err)
+			}
+		}
+	}
+	events, err := a.settle(ctx, sandbox != nil)
+	if err != nil {
+		return nil, err
+	}
+	var evidence chan *session.AttestResponse
+	if answer {
+		evidence = make(chan *session.AttestResponse, 1)
+		go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
 	}
 	// What the bind has the key service hold for the session is in place
 	// before the sandbox starts, so the sandbox finds it at its first read.
 	if err := a.acquire(ctx, bind); err != nil {
-		return err
+		return nil, err
 	}
 	if sandbox != nil {
-		if a.cfg.Guard != nil {
-			if err := a.cfg.Guard(ctx); err != nil {
-				return fmt.Errorf("before starting the sandbox: %w", err)
-			}
+		began := time.Now()
+		if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
+			return nil, fmt.Errorf("start sandbox: %w", err)
 		}
-		if err := a.measureAndStart(ctx); err != nil {
-			return err
-		}
+		recordStep(ctx, stepStart, time.Since(began))
+	}
+	a.settled()
+	var resp *session.AttestResponse
+	if evidence != nil {
+		resp = <-evidence
 	}
 	// The serving certificate's quote predates the last extend; reissue it so
 	// a handshake alone shows the final register. A certificate from before
@@ -443,11 +474,10 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, admitted fu
 			a.log.Warn("reissue serving certificate after sandbox admission", "error", err)
 		}
 	}
-	if admitted == nil {
-		reissue()
-	} else {
-		admitted()
+	if answer {
 		go reissue()
+	} else {
+		reissue()
 	}
 	taken := steps.list()
 	a.measured.Lock()
@@ -457,7 +487,35 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind, admitted fu
 	// The guest has its sandbox. What it has not accepted of its memory is
 	// accepted behind it, for as long as the guest lives if it takes that.
 	go a.cfg.Memory.AcceptRest(context.WithoutCancel(ctx))
-	return nil
+	return resp, nil
+}
+
+// settle makes the register final for the bind: with a sandbox, it extends
+// the sandbox's image into it. It returns the events the register then
+// holds. From here until settled, the guest still says it is bound and no
+// more, and a quote for anyone but the bind's sender waits.
+func (a *Agent) settle(ctx context.Context, sandbox bool) ([]string, error) {
+	a.measured.Lock()
+	defer a.measured.Unlock()
+	if sandbox && a.chain != nil {
+		began := time.Now()
+		if err := a.chain.advance(len(a.events)); err != nil {
+			return nil, fmt.Errorf("measure sandbox image: %w", err)
+		}
+		recordStep(ctx, stepMeasure, time.Since(began))
+	}
+	a.settling = make(chan struct{})
+	return append([]string(nil), a.events...), nil
+}
+
+// settled is the end of an admission that succeeded: the guest runs its
+// sandbox, says so, and gives quotes again.
+func (a *Agent) settled() {
+	a.measured.Lock()
+	defer a.measured.Unlock()
+	a.staged, a.admitted = len(a.events), true
+	close(a.settling)
+	a.settling = nil
 }
 
 // errNoSandbox refuses a bind that would have a session's commands run
@@ -545,7 +603,7 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 		}
 		select {
 		case <-a.bound:
-			return true, a.bindEvidence(ctx, current), nil
+			return true, a.repeatEvidence(ctx, current), nil
 		case <-ctx.Done():
 			return true, nil, ctx.Err()
 		}
@@ -581,7 +639,7 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	// The first bind is the only one, so a guest whose sandbox cannot be
 	// admitted is of no use to anyone and ends. The caller going away changes
 	// nothing about that.
-	err = a.admit(context.WithoutCancel(ctx), bind, func() { evidence = a.bindEvidence(ctx, bind) })
+	evidence, err = a.admit(context.WithoutCancel(ctx), bind, true)
 	close(a.bound)
 	if err != nil {
 		return false, nil, a.fail(err)
@@ -734,28 +792,6 @@ func (a *Agent) fail(err error) error {
 
 // Fatal delivers an error after which the guest must end.
 func (a *Agent) Fatal() <-chan error { return a.fatal }
-
-// measureAndStart extends the register with the sandbox image and starts the
-// sandbox, as one step no quote can fall inside.
-func (a *Agent) measureAndStart(ctx context.Context) error {
-	a.measured.Lock()
-	defer a.measured.Unlock()
-	if a.chain != nil {
-		began := time.Now()
-		if err := a.chain.advance(len(a.events)); err != nil {
-			return fmt.Errorf("measure sandbox image: %w", err)
-		}
-		recordStep(ctx, stepMeasure, time.Since(began))
-	}
-	a.staged = len(a.events)
-	began := time.Now()
-	if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
-		return fmt.Errorf("start sandbox: %w", err)
-	}
-	recordStep(ctx, stepStart, time.Since(began))
-	a.admitted = true
-	return nil
-}
 
 // WarmUp provisions the serving certificate before the first handshake.
 func (a *Agent) WarmUp(ctx context.Context) error { return a.certs.WarmUp(ctx) }

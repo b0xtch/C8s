@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -159,6 +160,9 @@ type recordingRunner struct {
 	unpacking chan struct{}
 	// gate, when set, holds Prepare until the test closes it.
 	gate chan struct{}
+	// starting, when set, is closed when Start is reached, and Start then
+	// waits until the test closes started.
+	starting, started chan struct{}
 }
 
 // preparedIn is how long the recording runner says its one step took.
@@ -214,10 +218,93 @@ func (r *recordingRunner) Prepare(ctx context.Context, w *session.Sandbox, egres
 
 func (r *recordingRunner) Start(context.Context, string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.steps = append(r.steps, "start")
 	r.atStart, _ = r.td.Extension()
+	starting, started := r.starting, r.started
+	r.mu.Unlock()
+	if starting != nil {
+		close(starting)
+		<-started
+	}
 	return nil
+}
+
+// While a bind's sandbox is admitted, the register already holds the
+// sandbox's image and the guest still says it is bound and no more. A quote
+// asked for in between waits until the sandbox runs: no quote shows a
+// register that the guest's account of itself does not explain. The bind's
+// own answer carries a quote taken meanwhile, of a guest that runs.
+func TestQuoteWaitsWhileTheSandboxIsAdmitted(t *testing.T) {
+	p := newPool(t)
+	p.runner.starting, p.runner.started = make(chan struct{}), make(chan struct{})
+	p.start(t)
+	client := p.client(t, p.access)
+	ready, err := client.Ready(ctxT(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := p.bindFor(t, ready, nil)
+	type answer struct {
+		resp *session.BindResponse
+		err  error
+	}
+	bound := make(chan answer, 1)
+	go func() {
+		resp, err := client.Bind(ctxT(t), bind)
+		bound <- answer{resp, err}
+	}()
+	select {
+	case <-p.runner.starting:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the sandbox was never started")
+	}
+	all, err := session.ExpectedEvents(p.bundle.Launch, bind, session.PhaseRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	final := runtimemeasure.FromDigestsSeeded(runtimemeasure.Seed(p.bundle.LaunchKey), all)
+	if !bytes.Equal(final[:], register(t, p.td)) {
+		t.Fatal("the register does not hold the sandbox's image while the sandbox starts")
+	}
+	if state := p.state(t); state.Phase != session.PhaseBound || len(state.Events) != 2 {
+		t.Fatalf("while its sandbox starts the guest says %s with %d events", state.Phase, len(state.Events))
+	}
+
+	p.pin(ready, bind)
+	asker := p.client(t, p.access)
+	type asked struct {
+		evidence *session.Evidence
+		err      error
+	}
+	quote := make(chan asked, 1)
+	go func() {
+		evidence, err := asker.FetchEvidence(ctxT(t))
+		quote <- asked{evidence, err}
+	}()
+	select {
+	case got := <-quote:
+		t.Fatalf("a quote was given while the sandbox was being admitted: %+v, %v", got.evidence, got.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(p.runner.started)
+	first := <-bound
+	if first.err != nil {
+		t.Fatal(first.err)
+	}
+	if att := first.resp.Attestation; att == nil || att.Phase != session.PhaseRunning || !slices.Equal(att.Events, all) {
+		t.Fatalf("the bind's answer carries %+v", att)
+	}
+	got := <-quote
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	if resp := got.evidence.Response; resp.Phase != session.PhaseRunning || !slices.Equal(resp.Events, all) {
+		t.Fatalf("the quote that waited is of a guest in phase %s with %d events", resp.Phase, len(resp.Events))
+	}
+	if _, err := got.evidence.Verify(ctxT(t), p.policy, sessiontest.Engine{}); err != nil {
+		t.Fatalf("the quote that waited: %v", err)
+	}
 }
 
 // The image names the user its sandbox runs as, so the agent asks who owns
