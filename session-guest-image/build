@@ -49,6 +49,17 @@ if [ "${C8S_DEV:-0}" = 1 ]; then
 fi
 : "${C8S_NAME:=$DEFAULT_NAME}"
 
+# Kernel source patches, applied in name order. Each one changes the kernel,
+# and so the measurement, and is named by hash in the image's manifest.
+PATCHES=()
+for patch in "$PGI_DIR"/kernel/patches/*.patch; do
+    [ -e "$patch" ] && PATCHES+=(--kernel-patch "$patch")
+done
+if [ "${#PATCHES[@]}" -gt 0 ] && ! (cd "$CONFOS_DIR" && bin/confos build --help 2>/dev/null | grep -q -- --kernel-patch); then
+    echo "session-guest-image/build: the confos checkout at $CONFOS_DIR cannot apply kernel patches (no --kernel-patch): a session kernel built without kernel/patches/ would be another kernel" >&2
+    exit 1
+fi
+
 if [ -z "${C8S_BINARY:-}" ]; then
     # -trimpath and an empty build id keep the binary a function of the
     # source and toolchain alone, so two builds of one commit measure alike.
@@ -82,6 +93,7 @@ bin/confos build "$C8S_NAME" \
     --sync-input "dev=${C8S_DEV:-0}" \
     --sync-input "role=${C8S_ROLE:-session}" \
     --kernel-config-fragment "$FRAGMENT" \
+    ${PATCHES[@]+"${PATCHES[@]}"} \
     --platform "$C8S_PLATFORM" \
     --memory "${C8S_MEMORY:-1G}" \
     "$@"

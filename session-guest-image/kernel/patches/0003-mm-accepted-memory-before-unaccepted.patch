@@ -1,0 +1,145 @@
+Subject: [PATCH] mm/page_alloc: use accepted memory in every zone before accepting more
+
+An allocation that prefers ZONE_NORMAL tops that zone up with newly accepted
+memory before it looks at the zone's watermark, and accepts again when the
+watermark fails, so it never falls back to a lower zone while its own zone
+holds unaccepted memory. A TDX guest's firmware accepts everything below
+4 GiB before the kernel starts. With the rest of its memory above 4 GiB,
+ZONE_DMA32 stays free for as long as ZONE_NORMAL has memory left to accept:
+an idle guest leaves nearly all of it unused, while it accepts memory
+above 4 GiB for everything it does use. The host backs
+both.
+
+get_page_from_freelist() now goes over the zonelist without accepting
+anything, lowmem reserves and watermarks as they are, and only when no zone
+gave a page does it go over them again and accept. A zonelist without
+unaccepted memory is scanned as before.
+
+alloc_pages_bulk() accepts nothing itself any more. It topped its preferred
+zone up to the promo watermark on every call, which kept that zone ahead of
+the lower ones for every other allocation too. A request that no zone meets
+from accepted memory takes the single-page path, as one that no zone meets
+at all already does, and that path accepts.
+
+Linux-Version: 6.18.49
+---
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -335,6 +335,7 @@
+ 		cond_accept_memory(zone, order, alloc_flags);
+ }
+ static bool __free_unaccepted(struct page *page);
++static bool zone_holds_unaccepted(struct zone *zone);
+ 
+ int page_group_by_mobility_disabled __read_mostly;
+ 
+@@ -3794,6 +3795,14 @@
+ 	bool no_fallback;
+ 	bool skip_kswapd_nodes = nr_online_nodes > 1;
+ 	bool skipped_kswapd_nodes = false;
++	/*
++	 * Accepted memory first. Accepting costs the guest time and its host
++	 * the memory for as long as the guest lives, so the zones are gone
++	 * over without accepting anything, and only an allocation that found
++	 * nothing in any zone it may use has memory accepted for it.
++	 */
++	bool accept = false;
++	bool unaccepted = false;
+ 
+ retry:
+ 	/*
+@@ -3869,7 +3878,10 @@
+ 			continue;
+ 		}
+ 
+-		accept_memory_ahead(zone, order, alloc_flags);
++		if (accept)
++			accept_memory_ahead(zone, order, alloc_flags);
++		else if (zone_holds_unaccepted(zone))
++			unaccepted = true;
+ 
+ 		/*
+ 		 * Detect whether the number of free pages is below high
+@@ -3896,7 +3908,7 @@
+ 				       gfp_mask)) {
+ 			int ret;
+ 
+-			if (cond_accept_memory(zone, order, alloc_flags))
++			if (accept && cond_accept_memory(zone, order, alloc_flags))
+ 				goto try_this_zone;
+ 
+ 			/*
+@@ -3949,7 +3961,7 @@
+ 
+ 			return page;
+ 		} else {
+-			if (cond_accept_memory(zone, order, alloc_flags))
++			if (accept && cond_accept_memory(zone, order, alloc_flags))
+ 				goto try_this_zone;
+ 
+ 			/* Try again if zone has deferred pages */
+@@ -3978,6 +3990,12 @@
+ 		goto retry;
+ 	}
+ 
++	/* No zone had accepted memory to give: go over them once more. */
++	if (!accept && unaccepted) {
++		accept = true;
++		goto retry;
++	}
++
+ 	return NULL;
+ }
+ 
+@@ -5133,7 +5151,6 @@
+ 			goto failed;
+ 		}
+ 
+-		accept_memory_ahead(zone, 0, alloc_flags);
+ retry_this_zone:
+ 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK) + nr_pages;
+ 		if (zone_watermark_fast(zone, 0,  mark,
+@@ -5142,9 +5159,6 @@
+ 			break;
+ 		}
+ 
+-		if (cond_accept_memory(zone, 0, alloc_flags))
+-			goto retry_this_zone;
+-
+ 		/* Try again if zone has deferred pages */
+ 		if (deferred_pages_enabled()) {
+ 			if (_deferred_grow_zone(zone, 0))
+@@ -5154,7 +5168,8 @@
+ 
+ 	/*
+ 	 * If there are no allowed local zones that meets the watermarks then
+-	 * try to allocate a single page and reclaim if necessary.
++	 * try to allocate a single page and reclaim if necessary. That path
++	 * accepts memory, once no zone has accepted memory to give.
+ 	 */
+ 	if (unlikely(!zone))
+ 		goto failed;
+@@ -7501,6 +7516,11 @@
+ 	return range_contains_unaccepted_memory(start, PAGE_SIZE << order);
+ }
+ 
++static bool zone_holds_unaccepted(struct zone *zone)
++{
++	return !list_empty(&zone->unaccepted_pages);
++}
++
+ static void __accept_page(struct zone *zone, unsigned long *flags,
+ 			  struct page *page)
+ {
+@@ -7648,6 +7668,11 @@
+ {
+ 	return false;
+ }
++
++static bool zone_holds_unaccepted(struct zone *zone)
++{
++	return false;
++}
+ 
+ static bool cond_accept_memory(struct zone *zone, unsigned int order,
+ 			       int alloc_flags)

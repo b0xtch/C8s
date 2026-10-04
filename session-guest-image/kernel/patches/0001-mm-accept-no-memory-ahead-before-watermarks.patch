@@ -1,0 +1,61 @@
+Subject: [PATCH] mm/page_alloc: accept no memory ahead of use before the watermarks are set
+
+get_page_from_freelist() and alloc_pages_bulk() call cond_accept_memory()
+for every allocation, before they look at the watermark, to keep accepted
+free memory at the promo watermark. Until init_per_zone_wmark_min() has
+run, a postcore initcall, that watermark is zero, and cond_accept_memory()
+then accepts one MAX_ORDER block per call "to ensure progress". Early boot
+makes hundreds of allocations before the initcall, so a guest with lazy
+acceptance accepts a block for each of them, out of whatever its firmware
+left unaccepted, before it has used any of it: boot time, and memory its
+host has to back for as long as the guest lives.
+
+The proactive calls now do nothing until the watermarks are set. The calls
+that follow a failed watermark check or an empty free list are unchanged,
+and they are the ones that ensure progress: an allocation that finds no
+accepted memory still accepts a block.
+
+Linux-Version: 6.18.49
+---
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -319,6 +319,21 @@
+ static bool page_contains_unaccepted(struct page *page, unsigned int order);
+ static bool cond_accept_memory(struct zone *zone, unsigned int order,
+ 			       int alloc_flags);
++
++/*
++ * Keep accepted memory ahead of the allocator. This runs for every
++ * allocation, before the watermark is looked at. Until the watermarks are
++ * set there is nothing to keep ahead of, and cond_accept_memory() would
++ * accept a block on every call: a zone's worth of memory in early boot, a
++ * block for each allocation. An allocation that finds no accepted memory
++ * still gets its block, from the callers that act on the result.
++ */
++static void accept_memory_ahead(struct zone *zone, unsigned int order,
++				int alloc_flags)
++{
++	if (promo_wmark_pages(zone))
++		cond_accept_memory(zone, order, alloc_flags);
++}
+ static bool __free_unaccepted(struct page *page);
+ 
+ int page_group_by_mobility_disabled __read_mostly;
+@@ -3854,7 +3869,7 @@
+ 			continue;
+ 		}
+ 
+-		cond_accept_memory(zone, order, alloc_flags);
++		accept_memory_ahead(zone, order, alloc_flags);
+ 
+ 		/*
+ 		 * Detect whether the number of free pages is below high
+@@ -5118,7 +5133,7 @@
+ 			goto failed;
+ 		}
+ 
+-		cond_accept_memory(zone, 0, alloc_flags);
++		accept_memory_ahead(zone, 0, alloc_flags);
+ retry_this_zone:
+ 		mark = wmark_pages(zone, alloc_flags & ALLOC_WMARK_MASK) + nr_pages;
+ 		if (zone_watermark_fast(zone, 0,  mark,

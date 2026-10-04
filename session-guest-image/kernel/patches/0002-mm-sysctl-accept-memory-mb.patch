@@ -1,0 +1,92 @@
+Subject: [PATCH] mm/page_alloc: a sysctl that accepts memory now, in the writer's context
+
+With lazy acceptance a guest accepts memory when an allocation first needs
+it, and the allocating task pays: on a TDX guest whose host maps private
+memory in 4 KiB pages, seconds for a gigabyte. A guest cannot move that
+cost to a time of its choosing. accept_memory=eager moves all of it to boot,
+and what boot accepted the host has to back for the life of the guest.
+
+vm.accept_memory_mb takes a number of megabytes and accepts that much of
+what is still unaccepted, block by block, in the context of the task that
+writes it. The writer's scheduling policy decides what the work may delay,
+the writer paces it by how much it asks for at a time, and a signal ends it.
+/proc/meminfo already says how much is left.
+
+A guest can then start small, keep a reserve accepted ahead of its
+workload, and accept the rest in the background once it knows it will be
+used.
+
+Linux-Version: 6.18.49
+---
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -6722,6 +6722,11 @@
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_UNACCEPTED_MEMORY
++static int accept_memory_mb_sysctl_handler(const struct ctl_table *table,
++		int write, void *buffer, size_t *length, loff_t *ppos);
++#endif
++
+ static const struct ctl_table page_alloc_sysctl_table[] = {
+ 	{
+ 		.procname	= "min_free_kbytes",
+@@ -6772,6 +6777,14 @@
+ 		.mode		= 0644,
+ 		.proc_handler	= lowmem_reserve_ratio_sysctl_handler,
+ 	},
++#ifdef CONFIG_UNACCEPTED_MEMORY
++	{
++		.procname	= "accept_memory_mb",
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0200,
++		.proc_handler	= accept_memory_mb_sysctl_handler,
++	},
++#endif
+ #ifdef CONFIG_NUMA
+ 	{
+ 		.procname	= "numa_zonelist_order",
+@@ -7575,6 +7588,42 @@
+ 	return ret;
+ }
+ 
++/*
++ * vm.accept_memory_mb: accept that many megabytes of the memory that is
++ * still unaccepted, now, in the writer's context. With lazy acceptance the
++ * task that first allocates past what is accepted pays for accepting it. A
++ * guest that knows when it has time can pay ahead, at the priority of the
++ * task it writes from. A signal ends the write early.
++ */
++static int accept_memory_mb_sysctl_handler(const struct ctl_table *table,
++		int write, void *buffer, size_t *length, loff_t *ppos)
++{
++	struct ctl_table parse = *table;
++	unsigned long megabytes = 0;
++	unsigned long pages;
++	struct zone *zone;
++	int ret;
++
++	if (!write)
++		return -EINVAL;
++	parse.data = &megabytes;
++	ret = proc_doulongvec_minmax(&parse, write, buffer, length, ppos);
++	if (ret)
++		return ret;
++
++	megabytes = min_t(unsigned long, megabytes, ULONG_MAX >> 20);
++	pages = (megabytes << 20) >> PAGE_SHIFT;
++	for_each_populated_zone(zone) {
++		while (pages && try_to_accept_memory_one(zone)) {
++			pages -= min_t(unsigned long, pages, MAX_ORDER_NR_PAGES);
++			if (signal_pending(current))
++				return -EINTR;
++			cond_resched();
++		}
++	}
++	return 0;
++}
++
+ static bool __free_unaccepted(struct page *page)
+ {
+ 	struct zone *zone = page_zone(page);
