@@ -69,7 +69,7 @@ at. 'destroy' ends a session.
 See docs/sessions.md.`,
 	}
 	launch := &cobra.Command{Use: "launch-config", Short: "Create a pool's signed launch bundle"}
-	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd())
+	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd(), newMachineCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
 	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd(), schemaCmd())
@@ -360,6 +360,93 @@ each guest waits for one bind, see 'c8s session bind'.`,
 		_ = cmd.MarkFlagRequired(name)
 	}
 	return cmd
+}
+
+// noToken is the authorizer of a command that asks a guest only what it
+// tells anyone.
+type noToken struct{}
+
+func (noToken) AuthorizationFor(string, string, string, []byte) (string, error) {
+	return "", errors.New("this command holds no key to sign a request with")
+}
+
+func newMachineCmd() *cobra.Command {
+	var m trust
+	cmd := &cobra.Command{
+		Use:   "machine",
+		Short: "Print the machine a pool's guest runs on, for its launch document to list",
+		Long: `Verify one guest that nobody has bound and print what its RTMR[0] holds: the
+machine its host built it.
+
+A launch document lists the machines its pool's guests may be ('launch-config
+new --machine'), and a TD whose document lists none takes no bind. So a
+pool's document is first written without --machine, one guest is launched
+from it in the pool's class, this command reads the value from that guest's
+evidence, and the document is written again with it.
+
+The value comes from evidence that verified for the pinned image under the
+pool's launch key. It is what one host declared to the firmware for one shape
+of VM: compare it with a second host of the same build before it is
+published as a class's reference value.
+
+Exit codes: 0 printed, 1 usage error, 2 the guest is not what was pinned,
+3 the guest could not be reached or judged.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			os.Exit(runMachine(cmd.Context(), &m, cmd.OutOrStdout(), cmd.ErrOrStderr()))
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&m.url, "url", "", "the guest's agent, as https://host:port")
+	f.StringVar(&m.manifest, "image-manifest", "", "manifest.json published with the session guest image")
+	f.StringVar(&m.launchKey, "launch-key", "", "the pool's public launch key, PEM")
+	m.collateralFlags(f)
+	f.DurationVar(&m.timeout, "timeout", 2*time.Minute, "overall deadline")
+	for _, name := range []string{"url", "image-manifest", "launch-key"} {
+		_ = cmd.MarkFlagRequired(name)
+	}
+	return cmd
+}
+
+// runMachine verifies one unbound guest of a pool and prints its machine.
+func runMachine(ctx context.Context, m *trust, stdout, stderr io.Writer) int {
+	identity, err := runtimemeasure.LoadImageManifest(m.manifest)
+	if err != nil {
+		fmt.Fprintf(stderr, "--image-manifest: %v\n", err)
+		return ExitUsage
+	}
+	launchKey, err := session.ReadBounded(m.launchKey, 8192)
+	if err != nil {
+		fmt.Fprintf(stderr, "--launch-key: %v\n", err)
+		return ExitUsage
+	}
+	// A policy that names no authority accepts a guest nobody has bound, and
+	// nothing else.
+	policy := session.Policy{Image: identity, LaunchKey: launchKey, AllowReady: true, AcceptTCBStatus: m.acceptedTCB()}
+	client, err := session.NewClient(m.url, policy, m.engine(), noToken{}, m.road(stderr)...)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(ctx, m.timeout)
+	defer cancel()
+	ready, err := client.Ready(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "NOT VERIFIED: %v\n", err)
+		return exitCode(err)
+	}
+	if len(ready.Machine) == 0 {
+		fmt.Fprintln(stderr, "the guest's evidence holds no register for its machine: only a TD has one")
+		return ExitRefused
+	}
+	fmt.Fprintln(stdout, hex.EncodeToString(ready.Machine))
+	if ready.Document.Machine != nil {
+		fmt.Fprintf(stderr, "the guest's launch document lists it among %d machines\n", len(ready.Document.Machine.RTMR0))
+	}
+	return ExitOK
 }
 
 func readKeys(paths []string) ([]string, error) {

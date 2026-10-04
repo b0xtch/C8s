@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net"
@@ -374,5 +375,73 @@ func TestAdmissionText(t *testing.T) {
 	steps := []session.AdmissionStep{{Name: "fetch", Micros: 1500}, {Name: "start", Micros: 250}}
 	if got := admissionText(steps); got != "fetch 1.5ms, start 300µs" {
 		t.Fatalf("admission text = %q", got)
+	}
+}
+
+// An operator reads a pool's machine from one guest nobody has bound, and
+// lists it in the pool's launch document. Until it is listed, a guest of the
+// pool takes no bind.
+func TestMachineOfAnUnboundGuest(t *testing.T) {
+	guest := sessionsim.NewUnpinnedGuest(t, nil)
+	flags := func(g *sessionsim.Guest) *trust {
+		return &trust{url: g.URL, manifest: g.ManifestPath, launchKey: g.LaunchKeyPath, timeout: 30 * time.Second, engineForTest: &counting{}}
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runMachine(context.Background(), flags(guest), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("launch-config machine exit %d: %s", code, stderr.String())
+	}
+	machine := guest.Machine()
+	if got := strings.TrimSpace(stdout.String()); got != hex.EncodeToString(machine[:]) {
+		t.Fatalf("printed %q, the guest's RTMR[0] is %x", got, machine)
+	}
+	if strings.Contains(stderr.String(), "lists it") {
+		t.Fatalf("a document that lists no machine is said to list one: %s", stderr.String())
+	}
+	// The value is what 'launch-config new --machine' takes.
+	out := filepath.Join(t.TempDir(), "bundle")
+	cmd := newBundleCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--out", out, "--image-manifest", guest.ManifestPath, "--pool", "agents", "--class", "s-4x16", "--machine", strings.TrimSpace(stdout.String())})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("launch-config new --machine: %v", err)
+	}
+
+	// The guest it was read from takes no bind, and says why.
+	var bindOut, bindErr bytes.Buffer
+	if code := runBind(context.Background(), unbound(t, guest), true, &bindOut, &bindErr); code == ExitOK ||
+		!strings.Contains(bindOut.String()+bindErr.String(), "lists no machine") {
+		t.Fatalf("bind exit %d: %s%s", code, bindOut.String(), bindErr.String())
+	}
+
+	// A guest whose document lists its machine prints the same way.
+	pinned := sessionsim.NewGuest(t, nil)
+	stdout.Reset()
+	stderr.Reset()
+	if code := runMachine(context.Background(), flags(pinned), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("launch-config machine of a pinned guest: exit %d: %s", code, stderr.String())
+	}
+	listed := pinned.Machine()
+	if strings.TrimSpace(stdout.String()) != hex.EncodeToString(listed[:]) || !strings.Contains(stderr.String(), "among 1 machines") {
+		t.Fatalf("printed %q, %q", stdout.String(), stderr.String())
+	}
+
+	// A guest of another image is refused, and bad flags are usage errors.
+	wrong := flags(guest)
+	wrong.manifest = pinned.ManifestPath
+	if code := runMachine(context.Background(), wrong, io.Discard, io.Discard); code != ExitRefused {
+		t.Errorf("a guest of another image: exit %d", code)
+	}
+	for name, mutate := range map[string]func(*trust){
+		"no manifest":                    func(f *trust) { f.manifest = filepath.Join(t.TempDir(), "absent.json") },
+		"no launch key":                  func(f *trust) { f.launchKey = filepath.Join(t.TempDir(), "absent.pub") },
+		"a URL that is none":             func(f *trust) { f.url = "http://127.0.0.1:1" },
+		"a TCB status nobody can accept": func(f *trust) { f.acceptTCB = []string{"Revoked"} },
+	} {
+		f := flags(guest)
+		mutate(f)
+		if code := runMachine(context.Background(), f, io.Discard, io.Discard); code != ExitUsage {
+			t.Errorf("%s: exit %d", name, code)
+		}
 	}
 }
