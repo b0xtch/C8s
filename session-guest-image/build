@@ -23,6 +23,9 @@
 #                   builds of one binary measure the same.
 #   CONFOS_DIR=...  confos checkout to build with (default: sibling of this
 #                   repo's checkout).
+#   C8S_TDX_FIRMWARE=...
+#                   boot this TDX firmware file. Unset, firmware/build builds
+#                   it from source, once, into build/session-firmware/.
 #
 # Extra args are passed through to `confos build`.
 set -euo pipefail
@@ -60,6 +63,19 @@ if [ "${#PATCHES[@]}" -gt 0 ] && ! (cd "$CONFOS_DIR" && bin/confos build --help 
     exit 1
 fi
 
+# The firmware a TDX guest boots is this image's own, built from source: its
+# measurement is MRTD. SEV-SNP boots the builder's IGVM files.
+FIRMWARE=()
+if [ "$C8S_PLATFORM" = tdx ]; then
+    if [ -z "${C8S_TDX_FIRMWARE:-}" ]; then
+        C8S_TDX_FIRMWARE="$REPO_DIR/build/session-firmware/OVMF.tdx.fd"
+        [ -f "$C8S_TDX_FIRMWARE" ] || "$PGI_DIR/firmware/build" "$C8S_TDX_FIRMWARE"
+    fi
+    [ -f "$C8S_TDX_FIRMWARE" ] || { echo "session-guest-image/build: C8S_TDX_FIRMWARE=$C8S_TDX_FIRMWARE is not a file" >&2; exit 1; }
+    FIRMWARE=(--tdx-firmware "$C8S_TDX_FIRMWARE")
+    echo "session-guest-image/build: firmware $(sha256sum "$C8S_TDX_FIRMWARE" | cut -d' ' -f1)  $C8S_TDX_FIRMWARE"
+fi
+
 if [ -z "${C8S_BINARY:-}" ]; then
     # -trimpath and an empty build id keep the binary a function of the
     # source and toolchain alone, so two builds of one commit measure alike.
@@ -94,6 +110,7 @@ bin/confos build "$C8S_NAME" \
     --sync-input "role=${C8S_ROLE:-session}" \
     --kernel-config-fragment "$FRAGMENT" \
     ${PATCHES[@]+"${PATCHES[@]}"} \
+    ${FIRMWARE[@]+"${FIRMWARE[@]}"} \
     --platform "$C8S_PLATFORM" \
     --memory "${C8S_MEMORY:-1G}" \
     "$@"

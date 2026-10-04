@@ -12,8 +12,9 @@ fragment live here, and a confos checkout is only the builder.
 C8S_PLATFORM=tdx session-guest-image/build     # -> <confos>/output/c8s-session/
 ```
 
-The output directory holds `disk.raw`, the firmware (`OVMF.tdx.fd` on TDX, one
-IGVM file per vCPU count on SEV-SNP) and `manifest.json`. The manifest carries
+The output directory holds `disk.raw`, the firmware (`OVMF.tdx.fd` on TDX,
+built from source by `firmware/build`; one IGVM file per vCPU count on
+SEV-SNP) and `manifest.json`. The manifest carries
 the reference values a verifier pins: MRTD, RTMR[1] and RTMR[2] on TDX.
 
 Beside the manifest the build publishes the image's two schemas, each printed
@@ -54,6 +55,35 @@ survives, fails it if crun or nft is missing, and masks the distribution's
 The agent unit sets `NoNewPrivileges`, which the sandbox and every command run
 for a session inherit.
 
+## Boot path
+
+The firmware starts the kernel image, and the kernel starts the image. There
+is no boot loader between them.
+
+| Step | What it is | Where it is measured |
+|---|---|---|
+| Firmware | TDVF, built by `firmware/build` from edk2 at a pinned commit: a release build without the UEFI shell | MRTD |
+| Kernel image | the UKI, installed as the boot partition's fallback application (`Bootloader=uki`) | RTMR[1], and its kernel, initrd and command line in RTMR[2] |
+| Kernel | the builder's hardened kernel with `kernel/session.config` and the patches in `kernel/patches/` | part of the UKI |
+
+A boot loader would be one more measured program, would read a configuration
+file that nothing measures, and waits for a key nobody can press.
+
+The kernel carries three source patches, applied in name order by the
+builder's `--kernel-patch`. Each is named by hash in the manifest
+(`kernel_patches_sha256`).
+
+| Patch | What it changes |
+|---|---|
+| `0001` | A confidential guest accepts its memory as it uses it. Before its watermarks are set, the kernel accepted a block for every page allocation, and so a guest held memory it had never touched. It now accepts only what an allocation needs. |
+| `0002` | `vm.accept_memory_mb`: the agent can accept memory ahead of a sandbox at a time of its choosing, where otherwise the first task to touch it pays. |
+| `0003` | Memory the firmware already accepted is used, in every zone, before more is accepted. |
+
+The bounce buffer that every virtio transfer goes through starts at 128 MiB
+and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=65536`). The kernel's
+own choice for a confidential guest is 6% of memory up to 1 GiB, turned from
+private to shared one page at a time during boot.
+
 ## Knobs
 
 | Variable | Meaning |
@@ -65,8 +95,19 @@ for a session inherit.
 | `C8S_MEMORY` | Default memory recorded in the manifest (default `1G`) |
 | `C8S_BINARY` | Stage this prebuilt linux/amd64 binary and skip the compile |
 | `CONFOS_DIR` | confos checkout to build with (default: a sibling of this repository) |
+| `C8S_TDX_FIRMWARE` | Boot this TDX firmware file. Unset, `firmware/build` builds it from source into `build/session-firmware/` |
 
 ## Status
+
+The build needs two things of the builder that its main branch does not have
+yet: `--kernel-patch`, and a prediction of RTMR[1] for a boot partition whose
+fallback application is the UKI. `build` stops if the first is missing. With
+the second missing the manifest's RTMR[1] is wrong, and the agent refuses its
+launch document on the first boot.
+
+The firmware is built with the build machine's own compiler, outside the
+builder's pinned tools. Two machines agree on MRTD only if they agree on the
+toolchain, and no check compares two builds yet.
 
 No reproducibility check runs for this image yet. The node image's check
 builds twice and compares measurements; this image needs the same, on a second
@@ -88,7 +129,8 @@ The guest's logs stay in its journal, inside the TD.
 What a guest says before its kernel runs is outside this: the firmware and
 the boot stub can write to a serial port a host attaches. They run before the
 guest has a launch document, a key or a session, so nothing of a session is
-theirs to say.
+theirs to say. The firmware is a release build, which prints none of the
+step-by-step log a debug build writes to its debug port.
 
 Of [session-disclosure.md](../docs/session-disclosure.md), three things are
 not built: a reason code that a guest leaves when it ends, the owner's way to

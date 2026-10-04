@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Build the TDX firmware a session guest boots (TDVF), from edk2 at the commit
+# pinned below. MRTD is this file's measurement, so what goes into it is
+# pinned here: the source, the platform description and the build options.
+#
+#   session-guest-image/firmware/build [output file]
+#
+# The default output is build/session-firmware/OVMF.tdx.fd in this checkout.
+#
+#   C8S_FIRMWARE_WORK=...  where edk2 is fetched and built (default: the
+#                          output file's directory)
+#   EDK2_DIR=...           build in this edk2 checkout, which must be at the
+#                          pinned commit, and fetch nothing
+#
+# A release build: a debug build asserts, and prints every step to a debug
+# port its host can attach. No UEFI shell: nothing boots it.
+#
+# Needs gcc, make, python3, nasm, iasl and the uuid headers. The compiler is
+# the build machine's own, so two machines agree on the file only if they
+# agree on the toolchain: build where the image is built.
+set -euo pipefail
+
+EDK2_URL=https://github.com/tianocore/edk2.git
+EDK2_TAG=edk2-stable202608
+EDK2_COMMIT=2970e5699ba6267f3384ffab20f96647578aebc8
+PLATFORM=OvmfPkg/IntelTdx/IntelTdxX64.dsc
+OPTIONS=(-D BUILD_SHELL=FALSE)
+# The submodules this platform compiles. edk2 has others, for platforms and
+# tests this build does not touch.
+SUBMODULES=(
+    CryptoPkg/Library/OpensslLib/openssl
+    CryptoPkg/Library/MbedTlsLib/mbedtls
+    MdeModulePkg/Library/BrotliCustomDecompressLib/brotli
+    BaseTools/Source/C/BrotliCompress/brotli
+    MdePkg/Library/MipiSysTLib/mipisyst
+    MdePkg/Library/BaseFdtLib/libfdt
+    SecurityPkg/DeviceSecurity/SpdmLib/libspdm
+)
+
+FW_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_DIR=$(cd "$FW_DIR/../.." && pwd)
+OUT=${1:-$REPO_DIR/build/session-firmware/OVMF.tdx.fd}
+case "$OUT" in /*) ;; *) OUT=$PWD/$OUT ;; esac
+WORK=${C8S_FIRMWARE_WORK:-$(dirname "$OUT")}
+fail() { echo "session-guest-image/firmware/build: $*" >&2; exit 1; }
+
+for tool in gcc make python3 nasm iasl git; do
+    command -v "$tool" >/dev/null 2>&1 || fail "$tool is not installed"
+done
+[ -f /usr/include/uuid/uuid.h ] || fail "the uuid headers are not installed (uuid-dev)"
+
+mkdir -p "$WORK" "$(dirname "$OUT")"
+if [ -n "${EDK2_DIR:-}" ]; then
+    SRC=$EDK2_DIR
+else
+    SRC=$WORK/edk2
+    if [ ! -d "$SRC/.git" ]; then
+        git clone -q --depth 1 --branch "$EDK2_TAG" "$EDK2_URL" "$SRC"
+    fi
+fi
+have=$(git -C "$SRC" rev-parse HEAD)
+[ "$have" = "$EDK2_COMMIT" ] || fail "$SRC is at $have, and this build pins $EDK2_COMMIT ($EDK2_TAG)"
+[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || fail "$SRC has local changes"
+if [ -z "${EDK2_DIR:-}" ]; then
+    git -C "$SRC" submodule update -q --init --depth 1 "${SUBMODULES[@]}"
+fi
+
+cd "$SRC"
+if [ ! -x BaseTools/Source/C/bin/GenFw ]; then
+    make -C BaseTools -j"$(nproc)" > "$WORK/basetools.log" 2>&1 \
+        || { tail -20 "$WORK/basetools.log" >&2; fail "edk2's build tools did not build"; }
+fi
+# edk2's setup script is written for an interactive shell: it trips errexit
+# and nounset on its own tests, and reads this script's arguments as its own.
+set --
+set +eu
+# shellcheck disable=SC1091
+. ./edksetup.sh > /dev/null
+set -eu
+command -v build >/dev/null || fail "edk2's setup left no build command"
+if ! build -a X64 -t GCC -b RELEASE -p "$PLATFORM" -n "$(nproc)" "${OPTIONS[@]}" > "$WORK/firmware-build.log" 2>&1; then
+    tail -20 "$WORK/firmware-build.log" >&2
+    fail "the firmware did not build: see $WORK/firmware-build.log"
+fi
+install -m 0644 Build/IntelTdx/RELEASE_GCC/FV/OVMF.fd "$OUT"
+echo "session-guest-image/firmware/build: $(sha256sum "$OUT" | cut -d' ' -f1)  $OUT"
+echo "session-guest-image/firmware/build: edk2 $EDK2_COMMIT, $(gcc --version | head -1), $(nasm -v)"
