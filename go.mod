@@ -19,6 +19,7 @@ require (
 	github.com/go-logr/logr v1.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-sev-guest v0.15.0
+	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d
 	github.com/klauspost/compress v1.20.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
@@ -90,7 +91,6 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.29.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/gnostic-models v0.7.1 // indirect
-	github.com/google/go-tdx-guest v0.3.2-0.20250814004405-ffb0869e6f4d // indirect
 	github.com/google/logger v1.1.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/hako/durafmt v0.0.0-20210608085754-5c1018a4e16b // indirect
