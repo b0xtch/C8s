@@ -26,27 +26,28 @@ var (
 
 const tdQEProdID = 2
 
-// parseTDQuote decodes the version 4 quote in bare-metal TDX evidence.
-func parseTDQuote(evidence json.RawMessage) (*pb.QuoteV4, error) {
+// parseTDQuote decodes the version 4 quote in bare-metal TDX evidence, and
+// returns its bytes with it.
+func parseTDQuote(evidence json.RawMessage) (*pb.QuoteV4, []byte, error) {
 	var envelope struct {
 		Quote string `json:"quote"`
 	}
 	if err := json.Unmarshal(evidence, &envelope); err != nil {
-		return nil, fmt.Errorf("TDX evidence: %w", err)
+		return nil, nil, fmt.Errorf("TDX evidence: %w", err)
 	}
 	raw, err := base64.StdEncoding.DecodeString(envelope.Quote)
 	if err != nil {
-		return nil, fmt.Errorf("TDX quote encoding: %w", err)
+		return nil, nil, fmt.Errorf("TDX quote encoding: %w", err)
 	}
 	parsed, err := abi.QuoteToProto(raw)
 	if err != nil {
-		return nil, fmt.Errorf("TDX quote: %w", err)
+		return nil, nil, fmt.Errorf("TDX quote: %w", err)
 	}
 	quote, ok := parsed.(*pb.QuoteV4)
 	if !ok {
-		return nil, fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
+		return nil, nil, fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
 	}
-	return quote, nil
+	return quote, raw, nil
 }
 
 // checkTDQuoteOrigin requires a TDX quote to come from Intel's TD quoting

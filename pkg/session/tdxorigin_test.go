@@ -15,7 +15,7 @@ import (
 func TestQuoteOriginIsPinned(t *testing.T) {
 	env, _ := fixture(t)
 	origin := func(env teetypes.AttestationEvidence) error {
-		quote, err := parseTDQuote(env.Evidence)
+		quote, _, err := parseTDQuote(env.Evidence)
 		if err != nil {
 			return err
 		}

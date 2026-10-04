@@ -31,7 +31,7 @@ type kept struct {
 	files          map[string]collateralFile
 }
 
-func keptCollateral(t *testing.T) *kept {
+func keptCollateral(t testing.TB) *kept {
 	t.Helper()
 	k := &kept{dir: t.TempDir(), files: map[string]collateralFile{}}
 	entries, err := keptFixture.ReadDir("testdata/collateral")
@@ -63,7 +63,7 @@ func keptCollateral(t *testing.T) *kept {
 }
 
 // write puts the documents into the directory, each changed by change.
-func (k *kept) write(t *testing.T, change func(*collateralFile)) {
+func (k *kept) write(t testing.TB, change func(*collateralFile)) {
 	t.Helper()
 	for name, file := range k.files {
 		change(&file)

@@ -140,6 +140,12 @@ func evaluateTDXTCB(quote *pb.QuoteV4, tcbInfoJSON, qeIdentityJSON []byte) (*TCB
 	if !strings.EqualFold(exts.FMSPC, info.TcbInfo.Fmspc) {
 		return nil, fmt.Errorf("TCB info is for FMSPC %s, the PCK certificate is %s", info.TcbInfo.Fmspc, exts.FMSPC)
 	}
+	if exts.PCEID != info.TcbInfo.PceID {
+		return nil, fmt.Errorf("TCB info is for PCE %s, the PCK certificate is %s", info.TcbInfo.PceID, exts.PCEID)
+	}
+	if err := checkTDXModule(quote.GetTdQuoteBody(), &info.TcbInfo); err != nil {
+		return nil, err
+	}
 	teeTCBSVN := quote.GetTdQuoteBody().GetTeeTcbSvn()
 	if len(teeTCBSVN) != 16 {
 		return nil, fmt.Errorf("TEE TCB SVN is %d bytes, want 16", len(teeTCBSVN))
@@ -168,7 +174,11 @@ func evaluateTDXTCB(quote *pb.QuoteV4, tcbInfoJSON, qeIdentityJSON []byte) (*TCB
 		}
 	}
 
-	qeSVN := quote.GetSignedData().GetCertificationData().GetQeReportCertificationData().GetQeReport().GetIsvSvn()
+	qeReport := quote.GetSignedData().GetCertificationData().GetQeReportCertificationData().GetQeReport()
+	if err := checkQuotingEnclave(qeReport, &identity.EnclaveIdentity); err != nil {
+		return nil, err
+	}
+	qeSVN := qeReport.GetIsvSvn()
 	qe, ok := matchQELevel(identity.EnclaveIdentity.TcbLevels, qeSVN)
 	if !ok {
 		return nil, fmt.Errorf("quoting enclave SVN %d matches no level Intel publishes", qeSVN)

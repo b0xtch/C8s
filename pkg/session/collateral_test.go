@@ -19,7 +19,7 @@ import (
 //go:embed testdata/tdx-evidence.json
 var fixtureTDXEvidence []byte
 
-func fixture(t *testing.T) (teetypes.AttestationEvidence, []byte) {
+func fixture(t testing.TB) (teetypes.AttestationEvidence, []byte) {
 	t.Helper()
 	var env teetypes.AttestationEvidence
 	if err := json.Unmarshal(fixtureTDXEvidence, &env); err != nil {

@@ -151,6 +151,9 @@ type dcapEngine struct {
 	fetch     trust.HTTPSGetter
 	freshOnly bool
 	ownOnly   bool
+	// chains keeps the outcome of the checks that are the same for every
+	// quote of a platform: see chainmemo.go.
+	chains chainMemos
 }
 
 // NewEngine returns the in-process verifier, built on attestation-go and
@@ -293,7 +296,7 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	quote, err := parseTDQuote(env.Evidence)
+	quote, raw, err := parseTDQuote(env.Evidence)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
@@ -303,16 +306,28 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 
 	// go-tdx-guest authenticates the collateral (Intel's signing chains, the
 	// validity windows, the CRLs) and checks the PCK chain against the CRLs.
-	// Its own TCB verdict is not used: see evaluateTDXTCB.
+	// Its own TCB verdict is not used: see evaluateTDXTCB. That pass depends
+	// on the platform and the documents, and on nothing in the quote's body
+	// that is not checked here as well, so its outcome is kept for a short
+	// while: see chainmemo.go.
 	roots, err := intelRoots()
 	if err != nil {
 		return nil, err
 	}
+	platform, onePlatform := platformOfTDQuote(raw)
 	fetches, err := e.withCollateral(ctx, func(fetches *fetchRecorder) error {
 		// One clock for how old a kept document is and for Intel's dates on it.
-		return tdxverify.TdxQuoteContext(ctx, quote, &tdxverify.Options{
-			GetCollateral: true, CheckRevocations: true, Getter: fetches, TrustedRoots: roots, Now: allAt(e.cache.now()),
+		now := e.cache.now()
+		if onePlatform && e.chains.stands(platform, now, fetches) {
+			return nil
+		}
+		err := tdxverify.TdxQuoteContext(ctx, quote, &tdxverify.Options{
+			GetCollateral: true, CheckRevocations: true, Getter: fetches, TrustedRoots: roots, Now: allAt(now),
 		})
+		if onePlatform && (err == nil || authenticCollateral(err)) {
+			e.chains.keep(platform, now, fetches)
+		}
+		return err
 	})
 	// Intel PCS being unreachable says nothing about the evidence.
 	if fetches.caused(err) {
