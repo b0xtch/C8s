@@ -248,7 +248,7 @@ func TestPinnedPoolListsItsMachine(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		policy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: []byte(authorityPub), AllowReady: true, RequireMachine: true}
+		policy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: []byte(authorityPub), AllowReady: true}
 		client, err := session.NewClient(guest.URL, policy, sessionsim.Engine(), signer)
 		if err != nil {
 			t.Fatal(err)
@@ -265,7 +265,7 @@ func TestPinnedPoolListsItsMachine(t *testing.T) {
 	}
 	plain := sessionsim.NewUnpinnedGuest(t, nil)
 	for name, guest := range map[string]*sessionsim.Guest{"a pool that pins none": plain, "its twin": plain.Twin(t, nil)} {
-		if _, err := unbound(guest); err == nil || !strings.Contains(err.Error(), "pins no machine") {
+		if _, err := unbound(guest); err == nil || !strings.Contains(err.Error(), "lists no machine") {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}

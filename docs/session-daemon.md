@@ -163,7 +163,9 @@ shape of the machine, which is a class's vCPUs, its memory and its split, and
 how many devices it has. A pool's launch document lists the values its guests
 may hold, and a TD ends at boot if its own is not among them. A TD whose
 document lists none boots and says what it is to anyone, and takes no bind:
-its host could have built it any machine.
+its host could have built it any machine. An owner's tool sends such a guest
+nothing, and a key service opens it no session. The one command that takes
+its evidence is the one that reads its machine.
 
 So a pool's document is written twice. The first lists no machine. One guest
 is launched from it in the pool's class, and its machine is read from its

@@ -54,9 +54,12 @@ type Policy struct {
 	// AllowBound accepts a guest that has measured its bind but not yet its
 	// sandbox image. Release a sandbox's credentials only when false.
 	AllowBound bool
-	// RequireMachine refuses a guest whose launch document pins no machine. A
-	// document that pins one is held to it either way.
-	RequireMachine bool
+	// AllowNoMachine accepts a TD whose launch document lists no machine it
+	// may be. Only the step that reads a machine's value from such a guest
+	// has a use for that: the guest takes no bind, and no other verifier
+	// should take its word. A document that lists machines is held to them
+	// either way.
+	AllowNoMachine bool
 	// AcceptTCBStatus names Intel TCB statuses, besides UpToDate, that the
 	// guest's platform, its TDX module or its quoting enclave may have:
 	// sorted, each once. Revoked cannot be accepted. The verdict's finding
@@ -627,8 +630,10 @@ func servingCertResult(ctx context.Context, policy Policy, engine Engine, leaf *
 // host handed it must hold one of the listed values.
 func checkMachine(policy Policy, doc *Document, res *teetypes.VerificationResult) error {
 	if doc.Machine == nil {
-		if policy.RequireMachine {
-			return refuse("the guest's launch document pins no machine, and this policy takes a guest only with one")
+		// A TD has a register for the machine its host built, and a document
+		// that lists no value for it leaves the host free to build any.
+		if doc.Image.HasMachineRegister() && !policy.AllowNoMachine {
+			return refuse("the guest's launch document lists no machine the guest may be")
 		}
 		return nil
 	}

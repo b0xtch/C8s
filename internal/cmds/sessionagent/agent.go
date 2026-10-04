@@ -222,7 +222,7 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 		// A TD has a register for what its host declared, and a document
 		// that lists no value for it leaves the host free to declare
 		// anything. Other TEEs measure the machine with the image.
-		unpinned: doc.Machine == nil && doc.Image.Platform == "tdx",
+		unpinned: doc.Machine == nil && doc.Image.HasMachineRegister(),
 	}
 	if a.unpinned {
 		cfg.Logger.Warn("the launch document lists no machine this guest may be: it takes no bind, and serves only what says which machine it is")

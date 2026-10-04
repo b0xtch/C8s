@@ -312,7 +312,7 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 
 	began = time.Now()
 	readyPolicy := session.Policy{
-		Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, RequireMachine: s.requireMachine,
+		Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true,
 		AcceptTCBStatus: s.acceptedTCB(),
 	}
 	ready, err := session.VerifyReady(ctx, readyPolicy, engine, claimed.Evidence, time.Now())
@@ -362,7 +362,7 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	began = time.Now()
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	bound := binding.Policy(identity)
-	bound.RequireMachine, bound.AcceptTCBStatus = s.requireMachine, s.acceptedTCB()
+	bound.AcceptTCBStatus = s.acceptedTCB()
 	att, verdict, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
 	if err != nil {
 		return finish(exitCode(err), fmt.Errorf("the bind was sent, but the guest does not verify as bound by it: %w", err))

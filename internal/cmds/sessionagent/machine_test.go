@@ -114,21 +114,23 @@ func TestReadyCheckRefusesAMachineTheLaunchDocumentDoesNotList(t *testing.T) {
 		t.Fatalf("the unbound check under a pinned pool document: %v", err)
 	}
 
-	// On the machine it lists, the guest is taken, and a policy that wants a
-	// pinned machine is content with it.
+	// On the machine it lists, the guest is taken.
 	good := newPoolWith(t, func(o *session.BundleOptions) { o.Machines = []string{hex.EncodeToString(listed)} })
 	copy(good.td.RTMR[0][:], listed)
-	good.policy.RequireMachine = true
 	good.start(t)
 	if ready, err := good.client(t, good.access).Ready(ctxT(t)); err != nil || ready.Document.Machine == nil {
 		t.Fatalf("the unbound check of a guest on its listed machine: %v", err)
 	}
-	// And one whose document pins none is refused by that policy.
+	// One whose document lists none is refused, except by the policy of
+	// whoever reads its machine to list it.
 	plain := newPoolWith(t, func(o *session.BundleOptions) { o.Machines = nil })
-	plain.policy.RequireMachine = true
 	plain.start(t)
-	if _, err := plain.client(t, plain.access).Ready(ctxT(t)); !errors.As(err, &verdict) || !strings.Contains(err.Error(), "pins no machine") {
-		t.Fatalf("the unbound check of a guest whose document pins no machine: %v", err)
+	if _, err := plain.client(t, plain.access).Ready(ctxT(t)); !errors.As(err, &verdict) || !strings.Contains(err.Error(), "lists no machine") {
+		t.Fatalf("the unbound check of a guest whose document lists no machine: %v", err)
+	}
+	plain.policy.AllowNoMachine = true
+	if ready, err := plain.client(t, plain.access).Ready(ctxT(t)); err != nil || !bytes.Equal(ready.Machine, plain.td.RTMR[0][:]) {
+		t.Fatalf("reading the machine of a guest whose document lists none: %v", err)
 	}
 }
 
@@ -143,7 +145,10 @@ func TestGuestWhoseDocumentListsNoMachineTakesNoBind(t *testing.T) {
 	if !p.agent.Unpinned() {
 		t.Fatal("a TD whose document lists no machine is taken for a pinned one")
 	}
-	// What it is, it says: its state, and evidence a verifier accepts.
+	// What it is, it says: its state, and evidence that verifies. Only a
+	// policy that reads a machine takes it, and this test sends a bind under
+	// that policy to see the guest itself refuse.
+	p.policy.AllowNoMachine = true
 	ready, err := p.client(t, p.access).Ready(ctxT(t))
 	if err != nil {
 		t.Fatalf("the unbound check: %v", err)

@@ -122,36 +122,33 @@ func TestVerifierHoldsAGuestToItsDocumentsMachines(t *testing.T) {
 	if err != nil || att.Document.Machine == nil {
 		t.Fatalf("a guest on a machine its document lists: %v", err)
 	}
-	// Required of it, it has one.
-	policy.RequireMachine = true
-	if _, err := session.VerifyAttestation(context.Background(), policy, sessiontest.Engine{}, &g.key.PublicKey, nonce, g.attest(t, nonce)); err != nil {
-		t.Fatalf("a pinned machine, required: %v", err)
-	}
 	// The same guest in every other respect, on a machine the document does
-	// not list.
+	// not list. A policy that takes a guest with no machine listed still
+	// holds one that lists them to its list.
 	td.RTMR[0][0] ^= 1
 	assertRefused(t, policy, &g.key.PublicKey, nonce, g.attest(t, nonce), "is none of the 2 its launch document lists")
-	policy.RequireMachine = false
+	policy.AllowNoMachine = true
 	assertRefused(t, policy, &g.key.PublicKey, nonce, g.attest(t, nonce), "is none of the 2 its launch document lists")
 }
 
-// A document that pins no machine is taken as before, unless the policy
-// wants one pinned.
-func TestVerifierMayRequireAPinnedMachine(t *testing.T) {
+// A TD whose launch document lists no machine gets no verdict: its host
+// could have built it any. The one policy that takes it is that of whoever
+// reads the machine's value to list it, and to that policy any machine will
+// do.
+func TestVerifierRefusesATDWithNoMachineListed(t *testing.T) {
 	td := sessiontest.NewTD()
 	_, bundle := newBundle(t, td, func(o *session.BundleOptions) { o.Machines = nil })
 	g := bootGuest(t, td, bundle, newKey(t), nil, session.PhaseReady)
 	policy := policyFor(t, td, bundle)
 	policy.AllowReady = true
 	nonce := freshNonce(t)
+	assertRefused(t, policy, &g.key.PublicKey, nonce, g.attest(t, nonce), "lists no machine")
+	policy.AllowNoMachine = true
 	if _, err := session.VerifyAttestation(context.Background(), policy, sessiontest.Engine{}, &g.key.PublicKey, nonce, g.attest(t, nonce)); err != nil {
 		t.Fatal(err)
 	}
-	// Any machine will do for it.
 	td.RTMR[0][0] ^= 1
 	if _, err := session.VerifyAttestation(context.Background(), policy, sessiontest.Engine{}, &g.key.PublicKey, nonce, g.attest(t, nonce)); err != nil {
-		t.Fatalf("a document that pins no machine, on another machine: %v", err)
+		t.Fatalf("a document that lists no machine, on another machine: %v", err)
 	}
-	policy.RequireMachine = true
-	assertRefused(t, policy, &g.key.PublicKey, nonce, g.attest(t, nonce), "pins no machine")
 }

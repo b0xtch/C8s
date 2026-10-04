@@ -412,19 +412,19 @@ func TestScopeCoversThePolicyAndTheEngine(t *testing.T) {
 		t.Fatal("two readings of one image have two scopes")
 	}
 	changes := map[string]func(p *session.Policy){
-		"another image":             func(p *session.Policy) { p.Image = identity(other) },
-		"another launch digest":     func(p *session.Policy) { p.Image = identity(launch) },
-		"another register":          func(p *session.Policy) { p.Image = identity(registers) },
-		"another launch key":        func(p *session.Policy) { p.LaunchKey = []byte("launch kez") },
-		"another launch document":   func(p *session.Policy) { p.Launch = []byte("launcg") },
-		"no launch document":        func(p *session.Policy) { p.Launch = nil },
-		"another authority":         func(p *session.Policy) { p.Authority = []byte("authoritz") },
-		"another bind":              func(p *session.Policy) { p.Bind = []byte("bine") },
-		"another tenant":            func(p *session.Policy) { p.Tenant = "tenanu" },
-		"another session":           func(p *session.Policy) { p.Session = "sandboy" },
-		"a staged guest allowed":    func(p *session.Policy) { p.AllowBound = true },
-		"an unbound guest allowed":  func(p *session.Policy) { p.AllowReady = true },
-		"a pinned machine required": func(p *session.Policy) { p.RequireMachine = true },
+		"another image":            func(p *session.Policy) { p.Image = identity(other) },
+		"another launch digest":    func(p *session.Policy) { p.Image = identity(launch) },
+		"another register":         func(p *session.Policy) { p.Image = identity(registers) },
+		"another launch key":       func(p *session.Policy) { p.LaunchKey = []byte("launch kez") },
+		"another launch document":  func(p *session.Policy) { p.Launch = []byte("launcg") },
+		"no launch document":       func(p *session.Policy) { p.Launch = nil },
+		"another authority":        func(p *session.Policy) { p.Authority = []byte("authoritz") },
+		"another bind":             func(p *session.Policy) { p.Bind = []byte("bine") },
+		"another tenant":           func(p *session.Policy) { p.Tenant = "tenanu" },
+		"another session":          func(p *session.Policy) { p.Session = "sandboy" },
+		"a staged guest allowed":   func(p *session.Policy) { p.AllowBound = true },
+		"an unbound guest allowed": func(p *session.Policy) { p.AllowReady = true },
+		"no machine required":      func(p *session.Policy) { p.AllowNoMachine = true },
 		// Two fields that would read alike if they ran into one another.
 		"the tenant's end in the session": func(p *session.Policy) { p.Tenant, p.Session = "tenan", "tsandbox" },
 	}
@@ -569,7 +569,7 @@ func TestScopeOfAFixedPolicy(t *testing.T) {
 		Image: identity, LaunchKey: []byte("launch key"), Launch: []byte("launch"), Authority: []byte("authority"),
 		Bind: []byte("bind"), Tenant: "tenant", Session: "session",
 	}
-	const want = "sha256:ffcbb228e723051c927fc15acea285deb0de63c5c8c18c9b5ccbcaaceb176f05"
+	const want = "sha256:f4d354d50e931d2880a6883c8332baacc66f9e38719300f04171f4d62c7473ac"
 	if got := session.ScopeOf(policy, sessiontest.Engine{}); got != want {
 		t.Fatalf("scope = %s, want %s", got, want)
 	}

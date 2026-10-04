@@ -100,11 +100,14 @@ func (m *Machine) Allows(rtmr0 []byte) bool {
 	return m == nil || slices.Contains(m.RTMR0, hex.EncodeToString(rtmr0))
 }
 
-func (m *Machine) validate(platform string) error {
+// Validate checks the list as part of a launch document for image.
+func (m *Machine) Validate(image Image) error { return m.validate(image) }
+
+func (m *Machine) validate(image Image) error {
 	if m == nil {
 		return nil
 	}
-	if platform != "tdx" {
+	if !image.HasMachineRegister() {
 		return fmt.Errorf("machine pins RTMR[0], which only a TDX guest has")
 	}
 	if len(m.RTMR0) == 0 || len(m.RTMR0) > MaxMachines {
@@ -256,7 +259,7 @@ func (d *Document) Validate() error {
 	if err := d.Image.validate(); err != nil {
 		return err
 	}
-	if err := d.Machine.validate(d.Image.Platform); err != nil {
+	if err := d.Machine.validate(d.Image); err != nil {
 		return err
 	}
 	if limit := d.AgeLimit(); d.AgeLimitSeconds != 0 && (limit < MinAgeLimit || limit > MaxAgeLimit) {
@@ -305,6 +308,11 @@ func (i Image) validate() error {
 	}
 	return nil
 }
+
+// HasMachineRegister reports whether a guest of the image has a register for
+// the machine its host built, which a TD has in RTMR[0]. A launch document
+// for such an image lists the values the register may hold: see Machine.
+func (i Image) HasMachineRegister() bool { return i.Platform == "tdx" }
 
 // Family is the TEE family the image pins describe.
 func (i Image) Family() teetypes.Family {
