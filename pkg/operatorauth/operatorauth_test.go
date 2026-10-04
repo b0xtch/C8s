@@ -120,6 +120,109 @@ func TestVerifyAcceptsAnyPinnedKey(t *testing.T) {
 	}
 }
 
+// A caller that treats its keys apart learns which one signed.
+func TestAuthorizedByNamesTheSigningKey(t *testing.T) {
+	body := []byte(`{"x":1}`)
+	var keys []*ecdsa.PublicKey
+	var signers []*Signer
+	for range 3 {
+		keyPEM, pub := genKey(t, elliptic.P256())
+		signer, err := NewSignerFromKeyPEM(keyPEM)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, signers = append(keys, pub), append(signers, signer)
+	}
+	v := Verifier{Keys: keys}
+	for want, signer := range signers {
+		auth, err := signer.Authorization(http.MethodPost, "/allowlist", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := v.AuthorizedBy(reqWith(auth), body); err != nil || got != want {
+			t.Errorf("a token signed by key %d was authorized by key %d, %v", want, got, err)
+		}
+	}
+	// A refusal names no key a caller could act on by mistake.
+	auth, err := signers[2].Authorization(http.MethodPost, "/allowlist", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v.AuthorizedBy(reqWith(auth), []byte("another body")); err == nil {
+		t.Error("a token for another body was authorized")
+	}
+	if _, err := (Verifier{Keys: keys[:2]}).AuthorizedBy(reqWith(auth), body); err == nil {
+		t.Error("a token signed by a key outside the set was authorized")
+	}
+}
+
+// A token names the verifier it is for. Two verifiers that pin the same key
+// then accept none of each other's tokens.
+func TestAudienceHoldsATokenToOneVerifier(t *testing.T) {
+	keyPEM, pub := genKey(t, elliptic.P256())
+	signer, err := NewSignerFromKeyPEM(keyPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"x":1}`)
+	keys := []*ecdsa.PublicKey{pub}
+	here, there, nowhere := Verifier{Keys: keys, Audience: "guest-a"}, Verifier{Keys: keys, Audience: "guest-b"}, Verifier{Keys: keys}
+
+	named, err := signer.AuthorizationFor("guest-a", http.MethodPost, "/allowlist", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := here.Authorize(reqWith(named), body); err != nil {
+		t.Errorf("the verifier a token names refused it: %v", err)
+	}
+	if err := there.Authorize(reqWith(named), body); err == nil {
+		t.Error("a verifier accepted a token that names another")
+	}
+	// RFC 7519, 4.1.3: who does not find itself in the audience rejects.
+	if err := nowhere.Authorize(reqWith(named), body); err == nil {
+		t.Error("a verifier with no audience accepted a token minted for one")
+	}
+
+	unnamed, err := signer.Authorization(http.MethodPost, "/allowlist", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := here.Authorize(reqWith(unnamed), body); err == nil {
+		t.Error("a verifier with an audience accepted a token that names none")
+	}
+	if err := nowhere.Authorize(reqWith(unnamed), body); err != nil {
+		t.Errorf("a verifier with no audience refused a token that names none: %v", err)
+	}
+	if _, err := signer.AuthorizationFor("", http.MethodPost, "/allowlist", body); err == nil {
+		t.Error("the signer minted a token for an empty audience")
+	}
+
+	for name, tc := range map[string]struct {
+		aud  any
+		want bool
+	}{
+		"a list of one":             {[]string{"guest-a"}, true},
+		"a list with another first": {[]string{"guest-b", "guest-a"}, false},
+		"a list with another after": {[]string{"guest-a", "guest-b"}, false},
+		"an empty list":             {[]string{}, false},
+		"an empty name":             {"", false},
+		"a longer name":             {"guest-a2", false},
+		"a number":                  {7, false},
+		"a nested list":             {[]any{[]string{"guest-a"}}, false},
+	} {
+		claims := baseClaims(body)
+		claims[claimAudience] = tc.aud
+		err := here.Authorize(reqWith(mintCustom(t, keyPEM, claims)), body)
+		if (err == nil) != tc.want {
+			t.Errorf("audience %s: accepted is %v, want %v (%v)", name, err == nil, tc.want, err)
+		}
+		// Whatever it names, a verifier with no audience is not it.
+		if err := nowhere.Authorize(reqWith(mintCustom(t, keyPEM, claims)), body); err == nil {
+			t.Errorf("audience %s: a verifier with no audience accepted it", name)
+		}
+	}
+}
+
 func TestVerifyRejectsUnpinnedKey(t *testing.T) {
 	keyPEM, _ := genKey(t, elliptic.P256())
 	_, otherPub := genKey(t, elliptic.P256()) // not the signer's key

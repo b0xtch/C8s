@@ -13,6 +13,26 @@ type Authorizer interface {
 	Authorization(method, path string, body []byte) (string, error)
 }
 
+// AudienceAuthorizer binds an Authorization header to the one verifier it is
+// for as well: see Verifier.Audience. Signer implements it.
+type AudienceAuthorizer interface {
+	AuthorizationFor(audience, method, path string, body []byte) (string, error)
+}
+
+// For is auth held to one audience.
+func For(auth AudienceAuthorizer, audience string) Authorizer {
+	return forAudience{auth: auth, audience: audience}
+}
+
+type forAudience struct {
+	auth     AudienceAuthorizer
+	audience string
+}
+
+func (a forAudience) Authorization(method, path string, body []byte) (string, error) {
+	return a.auth.AuthorizationFor(a.audience, method, path, body)
+}
+
 // NewRequest constructs a request and authorizes its actual method, parsed URL
 // path, and body. It owns a copy of body so later changes to the input cannot
 // invalidate the token. Callers must not change the returned method, path, or

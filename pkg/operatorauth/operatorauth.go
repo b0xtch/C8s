@@ -50,6 +50,9 @@ const (
 	claimHTTPPath   = "htu"
 )
 
+// claimAudience names the one verifier a token is for (RFC 7519 "aud").
+const claimAudience = "aud"
+
 // DefaultTokenTTL is the lifetime the Signer stamps on minted tokens. A write is
 // a single request, so the token only needs to outlive the round trip plus
 // clock skew; keeping it short bounds the replay window.
@@ -109,6 +112,20 @@ func NewSignerFromKeyPEM(keyPEM []byte) (*Signer, error) {
 // allowlistclient.Authorizer; the caller must pass the exact method, URL path,
 // and body bytes it will send so the htm/htu/pbh claims match server-side.
 func (s *Signer) Authorization(method, path string, body []byte) (string, error) {
+	return s.authorization("", method, path, body)
+}
+
+// AuthorizationFor is Authorization for a token that names the verifier it is
+// for. Only a Verifier with that Audience accepts it, so a token one verifier
+// has seen is of no use at another that pins the same key.
+func (s *Signer) AuthorizationFor(audience, method, path string, body []byte) (string, error) {
+	if audience == "" {
+		return "", fmt.Errorf("operator token audience is empty")
+	}
+	return s.authorization(audience, method, path, body)
+}
+
+func (s *Signer) authorization(audience, method, path string, body []byte) (string, error) {
 	now := time.Now()
 	sum := sha256.Sum256(body)
 	claims := jwt.MapClaims{
@@ -117,6 +134,9 @@ func (s *Signer) Authorization(method, path string, body []byte) (string, error)
 		claimHTTPMethod:      method,
 		claimHTTPPath:        path,
 		claimPayloadBodyHash: base64.RawURLEncoding.EncodeToString(sum[:]),
+	}
+	if audience != "" {
+		claims[claimAudience] = audience
 	}
 	signed, err := jwt.NewWithClaims(s.method, claims).SignedString(s.key)
 	if err != nil {
@@ -127,33 +147,45 @@ func (s *Signer) Authorization(method, path string, body []byte) (string, error)
 
 // Verifier authorizes an allowlist mutation by validating the operator token on
 // the request against a set of pinned operator public keys: signature, exp−iat
-// within MaxTokenValidity, htm/htu against the request's method and path, and
-// pbh against the body. It satisfies allowlist.WriteAuthorizer via Authorize.
+// within MaxTokenValidity, the audience, htm/htu against the request's method
+// and path, and pbh against the body. It satisfies allowlist.WriteAuthorizer
+// via Authorize.
 type Verifier struct {
 	// Keys are the pinned operator public keys; a token is authorized if it
 	// verifies under any one of them. An empty set rejects every request.
 	Keys []*ecdsa.PublicKey
 	// ClockSkew is the leeway applied to exp/nbf/iat validation.
 	ClockSkew time.Duration
+	// Audience, when set, is this verifier's own name: a token must name it,
+	// and it alone, as its audience. Unset, a token that names any audience is
+	// refused, because it was minted for someone else (RFC 7519, 4.1.3).
+	Audience string
 }
 
 // Authorize returns nil when the request carries a valid, body-bound operator
 // token signed by one of the pinned keys. Any failure returns a non-nil error
 // and the caller must reject the mutation.
 func (v Verifier) Authorize(r *http.Request, body []byte) error {
+	_, err := v.AuthorizedBy(r, body)
+	return err
+}
+
+// AuthorizedBy is Authorize for a caller that treats its keys apart: it
+// returns the index in Keys of the key that signed the request's token.
+func (v Verifier) AuthorizedBy(r *http.Request, body []byte) (int, error) {
 	if len(v.Keys) == 0 {
-		return fmt.Errorf("no operator keys configured")
+		return 0, fmt.Errorf("no operator keys configured")
 	}
 	tokenStr, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || tokenStr == "" {
-		return fmt.Errorf("missing operator bearer token")
+		return 0, fmt.Errorf("missing operator bearer token")
 	}
 
 	// Try each pinned key. A signature made by key N fails verification under
 	// the others, so at most one key yields a valid token; once one does, its
 	// result (including the body-binding check) is authoritative.
 	var lastErr error
-	for _, pub := range v.Keys {
+	for i, pub := range v.Keys {
 		claims := jwt.MapClaims{}
 		token, err := jwt.ParseWithClaims(tokenStr, claims, func(t *jwt.Token) (any, error) {
 			if _, ok := t.Method.(*jwt.SigningMethodECDSA); !ok {
@@ -181,20 +213,23 @@ func (v Verifier) Authorize(r *http.Request, body []byte) error {
 		// tooling minted the token.
 		iat, err := claims.GetIssuedAt()
 		if err != nil || iat == nil {
-			return fmt.Errorf("operator token missing iat claim")
+			return 0, fmt.Errorf("operator token missing iat claim")
 		}
 		exp, err := claims.GetExpirationTime()
 		if err != nil || exp == nil {
-			return fmt.Errorf("operator token missing exp claim")
+			return 0, fmt.Errorf("operator token missing exp claim")
 		}
 		if validity := exp.Sub(iat.Time); validity <= 0 || validity > MaxTokenValidity {
-			return fmt.Errorf("operator token validity %s outside (0, %s]", validity, MaxTokenValidity)
+			return 0, fmt.Errorf("operator token validity %s outside (0, %s]", validity, MaxTokenValidity)
+		}
+		if err := v.checkAudience(claims); err != nil {
+			return 0, err
 		}
 		if htm, _ := claims[claimHTTPMethod].(string); htm != r.Method {
-			return fmt.Errorf("operator token %s %q does not match request method %q", claimHTTPMethod, htm, r.Method)
+			return 0, fmt.Errorf("operator token %s %q does not match request method %q", claimHTTPMethod, htm, r.Method)
 		}
 		if htu, _ := claims[claimHTTPPath].(string); htu != r.URL.Path {
-			return fmt.Errorf("operator token %s %q does not match request path %q", claimHTTPPath, htu, r.URL.Path)
+			return 0, fmt.Errorf("operator token %s %q does not match request path %q", claimHTTPPath, htu, r.URL.Path)
 		}
 
 		// Body binding: the token's pbh must equal SHA-256 of the body the
@@ -202,19 +237,37 @@ func (v Verifier) Authorize(r *http.Request, body []byte) error {
 		// timing.
 		pbh, _ := claims[claimPayloadBodyHash].(string)
 		if pbh == "" {
-			return fmt.Errorf("operator token missing %s claim", claimPayloadBodyHash)
+			return 0, fmt.Errorf("operator token missing %s claim", claimPayloadBodyHash)
 		}
 		sum := sha256.Sum256(body)
 		want := base64.RawURLEncoding.EncodeToString(sum[:])
 		if subtle.ConstantTimeCompare([]byte(pbh), []byte(want)) != 1 {
-			return fmt.Errorf("operator token %s does not match request body", claimPayloadBodyHash)
+			return 0, fmt.Errorf("operator token %s does not match request body", claimPayloadBodyHash)
 		}
-		return nil
+		return i, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("token not signed by any pinned operator key")
 	}
-	return fmt.Errorf("operator token invalid: %w", lastErr)
+	return 0, fmt.Errorf("operator token invalid: %w", lastErr)
+}
+
+// checkAudience holds a token to the verifier it was minted for. A token for
+// several audiences is refused even when this verifier is among them: each of
+// the others could replay it here.
+func (v Verifier) checkAudience(claims jwt.MapClaims) error {
+	if v.Audience == "" {
+		if _, present := claims[claimAudience]; present {
+			return fmt.Errorf("operator token names an audience, and this verifier has none")
+		}
+		return nil
+	}
+	// One name, as a string or as a list of one.
+	aud, err := claims.GetAudience()
+	if err != nil || len(aud) != 1 || subtle.ConstantTimeCompare([]byte(aud[0]), []byte(v.Audience)) != 1 {
+		return fmt.Errorf("operator token is not for audience %q alone", v.Audience)
+	}
+	return nil
 }
 
 // ParsePublicKeysPEM parses one or more PEM "PUBLIC KEY" (PKIX/SubjectPublicKeyInfo)

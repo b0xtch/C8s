@@ -103,3 +103,24 @@ func TestNewRequestErrors(t *testing.T) {
 		})
 	}
 }
+
+// A request authorized through For carries a token for that audience.
+func TestNewRequestForAnAudience(t *testing.T) {
+	key, pub := genKey(t, elliptic.P256())
+	signer, err := NewSignerFromKeyPEM(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"x":1}`)
+	req, err := NewRequest(t.Context(), http.MethodPost, "https://guest/v1/exec", body, For(signer, "guest-a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []*ecdsa.PublicKey{pub}
+	if err := (Verifier{Keys: keys, Audience: "guest-a"}).Authorize(req, body); err != nil {
+		t.Errorf("the audience the request was authorized for refused it: %v", err)
+	}
+	if err := (Verifier{Keys: keys, Audience: "guest-b"}).Authorize(req, body); err == nil {
+		t.Error("another audience accepted the request")
+	}
+}
