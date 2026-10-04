@@ -79,8 +79,8 @@ builder's `--kernel-patch`. Each is named by hash in the manifest
 | `0002` | `vm.accept_memory_mb`: the agent can accept memory ahead of a sandbox at a time of its choosing, where otherwise the first task to touch it pays. |
 | `0003` | Memory the firmware already accepted is used, in every zone, before more is accepted. |
 
-The bounce buffer that every virtio transfer goes through starts at 128 MiB
-and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=65536`). The kernel's
+The bounce buffer that every virtio transfer goes through starts at 32 MiB
+and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=16384`). The kernel's
 own choice for a confidential guest is 6% of memory up to 1 GiB, turned from
 private to shared one page at a time during boot.
 
