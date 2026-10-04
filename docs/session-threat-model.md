@@ -28,7 +28,11 @@ Non-goals, stated so that nobody assumes otherwise:
 - **A session's own code.** An agent that leaks its own secrets, through
   prompt injection for example, leaks them over whatever egress its policy
   allows. Egress policy limits this, and it is a control for owners, not a
-  guarantee from c8s.
+  guarantee from c8s. Credentials are the exception the gateways close: the
+  sandbox holds only placeholders unless the policy marks a credential for it,
+  so a hijacked agent can misuse one only at the endpoints it names and cannot
+  copy it out ([Credentials and
+  egress](session-api.md#credentials-and-egress)).
 - **Physical attacks on the memory bus**, which Intel and AMD leave out of
   their threat models.
 
@@ -105,6 +109,11 @@ but not confidentiality.
   of the one TD it fits.
 - **The host rebinds a bound TD.** Binding is one way, and a refused bind
   ends the guest.
+- **A revision the owner did not make, or one beyond the bind.** A revision of
+  a session's egress or credential rules is signed by the bind's authority,
+  must lie inside the bind's boundary, and is measured before it takes effect,
+  so a verifier sees every rule a session has run under ([Policy
+  revisions](session-api.md#policy-revisions)).
 - **An outsider binds a pooled TD for itself**, to run on the platform's
   compute. An unbound guest takes the first valid bind it is sent, so the
   daemon lets nothing reach it but its own requests and the bind of its
@@ -174,8 +183,11 @@ but not confidentiality.
   names, numbered inside the seal, under a header the encryption
   authenticates, so a gap, a replay, an expired envelope or one moved from
   another session is seen.
-- **Egress** leaves only through the guest's proxy, under the allowlist in the
-  bind.
+- **Egress** leaves only through the guest's proxy, under the bind's egress
+  rules and any revision measured since ([Credentials and
+  egress](session-api.md#credentials-and-egress)). Where a rule reads requests
+  or a credential is used, the proxy ends TLS inside the TD, so the host sees
+  ciphertext either way.
 - **A session reaching the host or another session.** Each TD has its own
   tap device and /30 network, with no bridge, and the host's packet filter
   drops what a guest sends to the host or to another guest, spoofed sources
@@ -306,3 +318,6 @@ the verifier code the browser runs.
 7. **Allowances by advisory.** Whether a policy should accept a status other
    than UpToDate only for the vendor's advisory ids it names, so that an
    allowance made for one advisory does not admit the next.
+8. **The egress schema.** Whether the bind's egress and credential rules take
+   OpenShell's network policy schema at a pinned version, so that its policies
+   run unchanged, or translate from it.

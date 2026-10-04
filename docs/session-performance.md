@@ -93,6 +93,7 @@ Each lever must keep the rules in
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
 | a burst of 100 starts at once | median and tail latency, and success rate | the same |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |
+| a request through the egress gateway | the same request through OpenShell's proxy, with TLS ended and a credential put in | the time the gateway adds, with and without a credential, and with a program to attribute |
 | snapshot and restore at 1, 4 and 16 GiB | snapshot create and load, and gVisor's checkpoint and restore | seal and restore, to the first instruction |
 | a seal, in parts | none | drain, pre-dump, freeze, checkpoint, layer writes, store and commit, at the same sizes |
 | a restore, in parts | none | the claim, placing the stack by reflink, by mapping and by copy, the key service's answer, opening the layers, and the first instruction, at the same sizes |

@@ -316,15 +316,18 @@ existing system for it, with the hardware floors beside them
    checkpoint and restore, and QEMU's live migration and COLO, with
    confidential computing off, and the guest's cold boot against Firecracker's
    and a Kata Containers TDX guest's.
-3. **Templates and forks**, measured against many Firecracker VMs loaded
-   from one snapshot.
+3. **Templates and forks**, with credentials that the sandbox sees only as
+   placeholders, so that no template carries one; measured against many
+   Firecracker VMs loaded from one snapshot.
 4. **The other doors**: the Firecracker-compatible adapter, measured against
    Firecracker behind the same API, and sessions as pods on Kubernetes
    (pod-as-CVM), measured against Kata Containers' confidential pods.
 5. **Inference, review and the browser**: a verified channel to inference;
-   private review within a budget; the release log and its witnesses; then
-   browser verification of the session, its inference identity and its
-   review policy.
+   egress rules by method, path and program, and revisions measured as they
+   take effect, against OpenShell's for what they can express and what they
+   add to a request; private review within a budget; the release log and its
+   witnesses; then browser verification of the session, its inference
+   identity, its review policy and the rules in force.
 6. **The whole platform at scale** against the baselines in
    [session-performance.md](session-performance.md): bursts, density and the
    work inside, and optimized from the results.

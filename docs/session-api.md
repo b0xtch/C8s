@@ -299,7 +299,7 @@ in the release log with its reference values
 | `session`, `tenant` | the session's name, scoped by the authority that signs it |
 | `purpose` | `start`, `restore`, `fork` or `template`; with the `generation` a restore expects, or the `template` a fork comes from |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
+| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from, with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`; with none, any public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
 | `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
@@ -314,8 +314,67 @@ report on it.
 
 [Milestone 1](sessions.md#milestones) needs `start` binds only, and milestone
 2 adds `restore`, the `seal` and `commit` policies and `ownerKey`. The other
-purposes, and the `disks` and `review` fields, come with the milestones that
-use them; until then an agent refuses them as fields it does not know.
+purposes, and the `disks`, `review` and `boundary` fields, come with the
+milestones that use them; until then an agent refuses them as fields it does
+not know.
+
+### Credentials and egress
+
+Every effect leaves through the guest's gateways
+([session-state.md](session-state.md#lease-timing)), and the bind's policy
+says what each may pass.
+
+- **Credentials are placeholders by default.** A credential reaches the guest
+  from the key service, or from a holder of a credential key over `Connect`,
+  and stays in the egress gateway: the sandbox sees only a placeholder for it.
+  The gateway ends TLS for the endpoints the credential names, under a
+  certificate authority of the session's own that the sandbox trusts, and puts
+  the real value in place of the placeholder only in requests to those
+  endpoints; where a protocol signs requests with the credential, as AWS's
+  SigV4 does, the gateway signs them. Only a credential the policy marks for
+  the sandbox is handed into it, for a tool that must hold one itself. So a
+  hijacked agent can use a credential only where its owner allowed it and
+  cannot copy it out, and a template carries none. Milestone 1 hands every
+  credential into the sandbox; placeholders come with templates in milestone
+  3.
+- **Egress rules deny what they do not allow.** A rule allows a host and port,
+  and where the gateway reads the request, a method and a path. In a container
+  sandbox a rule may also name the program that connects: the agent catches
+  each connection and name lookup through seccomp's user notification,
+  attributes it to the calling executable, by path and digest, and to the
+  programs that started it, and denies one it cannot attribute. A gVisor
+  sandbox's processes never reach the guest's kernel, so its rules name no
+  program until gVisor can say which one connected. A bind with no egress
+  rules lets the sandbox reach any public destination.
+- **The host sees ciphertext either way.** The gateway is part of the measured
+  agent and ends TLS inside the TD, and the rules are part of the evidence, so
+  the browser or SDK that verifies a session can show the rules it runs under.
+
+These follow NVIDIA's OpenShell, whose supervisor applies the same kinds of
+rules and placeholders from outside the sandbox, in a container or pod of its
+own or as a process on the host. There the host can read every request and
+credential, and nothing attests the rules the supervisor applies.
+
+### Policy revisions
+
+A running session's egress and credential rules can change by a revision: a
+canonical JSON document, `c8s-bind-revision/v1`, signed by the bind's
+authority, that names the session, the digest of the rules it replaces and the
+new rules. Its signature, not its carrier, authorizes it, so anyone may bring
+it to the guest's API over `Connect`, and since it names the rules it
+replaces, an old one cannot be replayed. The guest checks the signature, and
+that every rule in the revision lies inside the bind's `boundary` by
+containment of hosts, ports, methods, paths, programs and credential
+endpoints, a check that needs no solver. It then extends RTMR[3] with the
+revision's digest before the new rules take effect, so a fresh quote always
+names the rules in force, and the evidence carries the revisions, so a
+verifier can replay RTMR[3] through them. Nothing else in a bind changes while
+its TD runs, and a restore's or a fork's bind carries the rules in force at
+the time.
+
+A binder may check a revision with a prover before it signs it, as OpenShell
+does with Z3, and approve on its own only a revision that adds no credentialed
+reach, no new HTTP method and no cloud metadata endpoint.
 
 ## Flows
 
@@ -486,3 +545,6 @@ template sealed before any secret, and each fork makes its own keys.
    owner's client, which in an attested service of the owner's, and what a
    platform-run binder should show in the evidence.
 3. **Quotas per tenant** as well as per orchestrator.
+4. **The gateway's authority across forks.** A fork's warm processes trust the
+   template's certificate authority, so either a template's forks share it, or
+   a template's processes load their trust only after the fork.

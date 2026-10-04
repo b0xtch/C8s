@@ -298,9 +298,11 @@ spends nothing, since its own outputs wait for its own commits.
 
 1. **A template is a sealed session.** The binder starts a session whose bind
    has the purpose `template`, and it does its setup: clones repositories,
-   installs dependencies, perhaps warms a language server. Credentials stay
-   in the guest's gateways, outside the sandbox, so a template taken after a
-   clone carries the checkout but not the token.
+   installs dependencies, perhaps warms a language server. Credentials stay in
+   the guest's gateways, outside the sandbox, which sees them only as
+   placeholders ([Credentials and
+   egress](session-api.md#credentials-and-egress)), so a template taken after
+   a clone carries the checkout but not the token.
 2. `Seal(session, TEMPLATE)` writes the sandbox's files as one full EROFS
    layer, compact and reproducible, and a process layer if processes are to
    be kept. The agent refuses it once any secret has entered the sandbox
