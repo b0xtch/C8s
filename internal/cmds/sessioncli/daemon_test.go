@@ -1,0 +1,194 @@
+package sessioncli
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/confidential-dot-ai/c8s/internal/sessiond"
+	"github.com/confidential-dot-ai/c8s/internal/sessiond/sessiondtest"
+	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
+	"github.com/confidential-dot-ai/c8s/pkg/session/sessionsim"
+)
+
+// starting is the flags an owner starts a session with on host, as its own
+// orchestrator.
+func starting(t *testing.T, host *sessiondtest.Host, name string) *startFlags {
+	t.Helper()
+	authority, err := certutil.MarshalECKeyPEM(newKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := filepath.Join(t.TempDir(), "authority.key")
+	if err := os.WriteFile(key, authority, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := &startFlags{pool: sessiondtest.Pool, wait: 10 * time.Second}
+	s.authorityKey, s.out, s.ttl = key, filepath.Join(t.TempDir(), "binding"), time.Minute
+	s.daemon = daemonFlags{address: host.Addr, ca: host.CAFile, cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
+	s.manifest, s.launchKey = host.ManifestPath, host.LaunchKeyPath
+	s.tenant, s.session = "acme", name
+	s.timeout, s.engineForTest = 30*time.Second, &counting{}
+	s.w.credentials = []string{"test-token:64"}
+	return s
+}
+
+func start(t *testing.T, s *startFlags) startedSession {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("start exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	var res startedSession
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	return res
+}
+
+// The owner's whole path through a daemon, with the commands alone: start,
+// verify, release a credential, run a command, destroy. After the start, the
+// binding directory is all the later commands are given.
+func TestStartThenDriveThroughADaemon(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	s := starting(t, host, "sbx-1")
+	res := start(t, s)
+	if !res.Started || res.Tenant != "acme" || res.Session != "sbx-1" || res.Phase != "running" || res.TD == "" || res.Host != "host-a" || res.Binding != s.out {
+		t.Fatalf("start result = %+v", res)
+	}
+	for _, name := range []string{session.BindFile, session.DocumentFile, session.PubkeyFile, session.AccessKeyFile, session.VerdictFile, daemon.RouteFile} {
+		if _, err := os.Stat(filepath.Join(s.out, name)); err != nil {
+			t.Fatalf("binding directory: %v", err)
+		}
+	}
+	// The start judged the bind's answer, and asked the guest for no quote of
+	// its own. Its verdict spares the next commands theirs.
+	engine := s.engineForTest.(*counting)
+	judged := engine.calls.Load()
+
+	flags := &trust{binding: s.out, manifest: s.manifest, timeout: s.timeout, engineForTest: engine}
+	var stdout, stderr bytes.Buffer
+	if code := runCredentialPut(context.Background(), flags, "test-token", []byte("hunter2"), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("credential put exit %d: %s", code, stderr.String())
+	}
+	stdout.Reset()
+	show := session.ExecRequest{Argv: []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/test-token"`}}
+	flags = &trust{binding: s.out, manifest: s.manifest, timeout: s.timeout, engineForTest: engine}
+	if code := runExec(context.Background(), flags, show, &stdout, &stderr); code != 0 || stdout.String() != "hunter2" {
+		t.Fatalf("exec exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+	if now := engine.calls.Load(); now > judged+2 {
+		t.Fatalf("the commands after the start judged evidence %d times", now-judged)
+	}
+	stdout.Reset()
+	flags = &trust{binding: s.out, manifest: s.manifest, timeout: s.timeout, engineForTest: engine}
+	if code := runVerify(context.Background(), flags, true, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("verify exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	var v verdict
+	if err := json.Unmarshal(stdout.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	if !v.Verified || v.Tenant != "acme" || v.Session != "sbx-1" || v.BindDigest != res.BindDigest {
+		t.Fatalf("verdict = %+v", v)
+	}
+
+	// A second session of the same name is refused while the first lives.
+	second := starting(t, host, "sbx-1")
+	stdout.Reset()
+	if code := runStart(context.Background(), second, true, &stdout, &stderr); code != ExitUnavailable {
+		t.Fatalf("a second start of a live session: exit %d: %s", code, stdout.String())
+	}
+	if _, err := os.Stat(second.out); !os.IsNotExist(err) {
+		t.Fatal("the refused start wrote a binding")
+	}
+
+	orchestrator := &daemonFlags{cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
+	stdout.Reset()
+	if code := runDestroy(context.Background(), orchestrator, s.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("destroy exit %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "DESTROYED session sbx-1") || !strings.Contains(stdout.String(), res.TD) {
+		t.Fatalf("destroy said %q", stdout.String())
+	}
+	flags = &trust{binding: s.out, manifest: s.manifest, timeout: 10 * time.Second, engineForTest: engine}
+	if code := runExec(context.Background(), flags, session.ExecRequest{Argv: []string{"true"}}, &stdout, &stderr); code != ExitExecUnavailable {
+		t.Fatalf("a command on a destroyed session: exit %d", code)
+	}
+}
+
+// A start that pins another image, or another pool's launch key, signs
+// nothing, writes nothing, and gives its claim back at once.
+func TestStartRefusesAGuestItDidNotPin(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
+	other := sessionsim.NewGuest(t, nil)
+	for name, mutate := range map[string]func(*startFlags){
+		"another image":             func(s *startFlags) { s.manifest = other.ManifestPath },
+		"another pool's launch key": func(s *startFlags) { s.launchKey = other.LaunchKeyPath },
+	} {
+		s := starting(t, host, "sbx-1")
+		mutate(s)
+		var stdout, stderr bytes.Buffer
+		if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitRefused {
+			t.Fatalf("%s: start exit %d: %s%s", name, code, stdout.String(), stderr.String())
+		}
+		if _, err := os.Stat(s.out); !os.IsNotExist(err) {
+			t.Fatalf("%s: the refused start wrote a binding", name)
+		}
+	}
+	// The host has room for one TD: the session starts only if the refused
+	// starts left none claimed.
+	if res := start(t, starting(t, host, "sbx-1")); !res.Started {
+		t.Fatalf("start after the refusals = %+v", res)
+	}
+}
+
+// Without an orchestrator's certificate nothing starts, and a destroy needs
+// one too.
+func TestStartAndDestroyNeedACertificate(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	s := starting(t, host, "sbx-1")
+	s.daemon.cert, s.daemon.key = "", ""
+	var stdout, stderr bytes.Buffer
+	if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitUnavailable || !strings.Contains(stdout.String(), "certificate") {
+		t.Fatalf("start with no certificate: exit %d: %s", code, stdout.String())
+	}
+	res := start(t, starting(t, host, "sbx-1"))
+	anyone := &daemonFlags{address: host.Addr, ca: host.CAFile}
+	if code := runDestroy(context.Background(), anyone, "", "sbx-1", 10*time.Second, &stdout, &stderr); code != ExitUnavailable {
+		t.Fatalf("destroy with no certificate: exit %d", code)
+	}
+	_ = res
+	for name, run := range map[string]func() int{
+		"no daemon and no binding": func() int {
+			return runDestroy(context.Background(), &daemonFlags{}, "", "sbx-1", time.Second, &stdout, &stderr)
+		},
+		"no session": func() int {
+			return runDestroy(context.Background(), anyone, "", "", time.Second, &stdout, &stderr)
+		},
+	} {
+		if code := run(); code != ExitUsage {
+			t.Errorf("destroy with %s: exit %d", name, code)
+		}
+	}
+}
+
+// The flags that say where a guest is reached exclude each other.
+func TestReachUsageErrors(t *testing.T) {
+	for name, flags := range map[string]*trust{
+		"neither an address nor a daemon": {},
+		"an address and a daemon":         {url: "https://127.0.0.1:8443", daemon: daemonFlags{address: "127.0.0.1:7443"}, td: "td-1"},
+		"a daemon and no TD":              {daemon: daemonFlags{address: "127.0.0.1:7443"}},
+	} {
+		if _, _, err := flags.reach(); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

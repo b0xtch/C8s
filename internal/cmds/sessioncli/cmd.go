@@ -32,6 +32,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
 )
 
 // Exit codes are a CI contract, shared with `c8s verify` where they overlap.
@@ -58,18 +59,20 @@ func NewCmd() *cobra.Command {
 		Short: "Launch, bind, verify and drive confidential sessions",
 		Long: `A confidential session runs in a confidential VM of its own. A pool's guests
 boot from one signed launch document, which 'launch-config new' writes and
-which names no tenant. 'bind' makes one guest a session's, once, under its
-owner's authority. 'verify', 'credential put' and 'exec' talk to the bound
-guest, and each one first proves from hardware evidence that the guest is the
-pinned image, launched for the pool's key, bound by exactly that bind, and
-that it holds the key the connection ends at.
+which names no tenant. 'start' takes a guest from a pool that a c8s daemon
+keeps and makes it a session's, once, under its owner's authority. 'bind'
+does the same to a guest reached by its address. 'verify', 'credential put'
+and 'exec' talk to the bound guest, and each one first proves from hardware
+evidence that the guest is the pinned image, launched for the pool's key,
+bound by exactly that bind, and that it holds the key the connection ends
+at. 'destroy' ends a session.
 See docs/sessions.md.`,
 	}
 	launch := &cobra.Command{Use: "launch-config", Short: "Create a pool's signed launch bundle"}
 	launch.AddCommand(newBundleCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
-	cmd.AddCommand(launch, newBindCmd(), newVerifyCmd(), credential, newExecCmd())
+	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd())
 	cmd.AddCommand(imageStoreCmds()...)
 	return cmd
 }
@@ -174,6 +177,44 @@ func (w *sandboxFlags) keys() (access session.Access, err error) {
 	return access, nil
 }
 
+// policy is what the flags have a bind decide, with a key made for this one
+// session granted every area the bind opens. The authority signs binds and
+// nothing else: that key drives the session.
+func (w *sandboxFlags) policy() (policy session.BindPolicy, accessPEM []byte, err error) {
+	if policy.Sandbox, err = w.sandbox(); err != nil {
+		return policy, nil, err
+	}
+	if policy.Egress, err = w.egressPolicy(); err != nil {
+		return policy, nil, err
+	}
+	if policy.Credentials, err = w.declared(); err != nil {
+		return policy, nil, err
+	}
+	if policy.Access, err = w.keys(); err != nil {
+		return policy, nil, err
+	}
+	policy.Forward = w.forward()
+	access, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return policy, nil, fmt.Errorf("generate access key: %w", err)
+	}
+	if accessPEM, err = certutil.MarshalECKeyPEM(access); err != nil {
+		return policy, nil, err
+	}
+	accessPub, err := session.PublicKeyPEM(&access.PublicKey)
+	if err != nil {
+		return policy, nil, err
+	}
+	policy.Access.Exec = append([]string{string(accessPub)}, policy.Access.Exec...)
+	policy.Access.Credentials = append([]string{string(accessPub)}, policy.Access.Credentials...)
+	// Streams only where the bind opens a port: a key with nothing to open is
+	// not written into a document.
+	if policy.Forward != nil {
+		policy.Access.Forward = append([]string{string(accessPub)}, policy.Access.Forward...)
+	}
+	return policy, accessPEM, nil
+}
+
 func newBundleCmd() *cobra.Command {
 	var opts session.BundleOptions
 	cmd := &cobra.Command{
@@ -264,6 +305,19 @@ type trust struct {
 	allowBound    bool
 	timeout       time.Duration
 	engineForTest session.Engine
+	// daemon is how the guest's host is reached when the guest is, and td
+	// the guest's TD there. A binding that 'start' wrote names both.
+	daemon daemonFlags
+	td     string
+	// through is the daemon the client's connections run through, if any.
+	through *daemon.Client
+}
+
+// close ends what client opened besides the client.
+func (t *trust) close() {
+	if t.through != nil {
+		_ = t.through.Close()
+	}
 }
 
 // collateralFlags are the flags every command that judges evidence takes.
@@ -301,8 +355,10 @@ func (t *trust) steps(stderr io.Writer) session.Timing {
 
 func (t *trust) register(cmd *cobra.Command) {
 	f := cmd.Flags()
-	f.StringVar(&t.url, "url", "", "the guest agent, https://<address>:8443")
-	f.StringVar(&t.binding, "binding", "", "binding directory written by 'c8s session bind': pins the guest's launch document and bind and supplies the access key")
+	f.StringVar(&t.url, "url", "", "the guest agent, https://<address>:8443, for a guest reached by its address")
+	t.daemon.register(f, false)
+	f.StringVar(&t.td, "td", "", "the guest's TD at --daemon (default: the one --binding names)")
+	f.StringVar(&t.binding, "binding", "", "binding directory written by 'c8s session start' or 'c8s session bind': pins the guest's launch document and bind, supplies the access key and, from 'start', says where the guest is reached")
 	f.StringVar(&t.authority, "authority", "", "authority public key PEM the guest must be bound under (default: the one that signed --binding)")
 	f.StringVar(&t.manifest, "image-manifest", "", "manifest.json published with the session guest image")
 	f.StringVar(&t.launchKey, "launch-key", "", "the pool's launch public key PEM, when no --binding is at hand (then --authority, --tenant and --session are required)")
@@ -312,9 +368,7 @@ func (t *trust) register(cmd *cobra.Command) {
 	f.BoolVar(&t.fresh, "fresh", false, "ask the guest for a fresh quote and judge it, where a verdict kept in --binding within the last hour would spare both")
 	t.collateralFlags(f)
 	f.DurationVar(&t.timeout, "timeout", 2*time.Minute, "overall deadline")
-	for _, name := range []string{"url", "image-manifest"} {
-		_ = cmd.MarkFlagRequired(name)
-	}
+	_ = cmd.MarkFlagRequired("image-manifest")
 }
 
 // client turns the flags into a verifying client. Every failure here is a
@@ -373,6 +427,13 @@ func (t *trust) client(stderr io.Writer) (*session.Client, error) {
 		return nil, err
 	}
 	road := t.road(stderr)
+	url, through, err := t.reach()
+	if err != nil {
+		return nil, err
+	}
+	if through != nil {
+		road = append(road, through)
+	}
 	if t.binding != "" && !t.fresh {
 		// A file that is no verdict is none: the command attests, and keeps
 		// its own in the file's place.
@@ -383,7 +444,7 @@ func (t *trust) client(stderr io.Writer) (*session.Client, error) {
 		t.kept = kept
 		road = append(road, session.Kept(t.kept))
 	}
-	return session.NewClient(t.url, policy, t.engine(), signer, road...)
+	return session.NewClient(url, policy, t.engine(), signer, road...)
 }
 
 // keep leaves the client's verdict in the binding for the next command, when
@@ -575,6 +636,7 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, err)
 		return ExitUsage
 	}
+	defer t.close()
 	defer client.Close()
 	defer t.keep(client, stderr)
 	ctx, cancel := context.WithTimeout(ctx, t.timeout)
@@ -765,40 +827,9 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 	if err != nil {
 		return finish(ExitUsage, err)
 	}
-	policy := session.BindPolicy{}
-	if policy.Sandbox, err = b.w.sandbox(); err != nil {
-		return finish(ExitUsage, err)
-	}
-	if policy.Egress, err = b.w.egressPolicy(); err != nil {
-		return finish(ExitUsage, err)
-	}
-	if policy.Credentials, err = b.w.declared(); err != nil {
-		return finish(ExitUsage, err)
-	}
-	if policy.Access, err = b.w.keys(); err != nil {
-		return finish(ExitUsage, err)
-	}
-	policy.Forward = b.w.forward()
-	// The authority signs binds and nothing else. A key made for this one
-	// session drives it.
-	access, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return finish(ExitUsage, fmt.Errorf("generate access key: %w", err))
-	}
-	accessPEM, err := certutil.MarshalECKeyPEM(access)
+	policy, accessPEM, err := b.w.policy()
 	if err != nil {
 		return finish(ExitUsage, err)
-	}
-	accessPub, err := session.PublicKeyPEM(&access.PublicKey)
-	if err != nil {
-		return finish(ExitUsage, err)
-	}
-	policy.Access.Exec = append([]string{string(accessPub)}, policy.Access.Exec...)
-	policy.Access.Credentials = append([]string{string(accessPub)}, policy.Access.Credentials...)
-	// Streams only where the bind opens a port: a key with nothing to open is
-	// not written into a document.
-	if policy.Forward != nil {
-		policy.Access.Forward = append([]string{string(accessPub)}, policy.Access.Forward...)
 	}
 	signer, err := operatorauth.NewSignerFromKeyPEM(accessPEM)
 	if err != nil {
@@ -929,6 +960,7 @@ func runCredentialPut(ctx context.Context, t *trust, name string, value []byte, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
+	defer t.close()
 	defer client.Close()
 	defer t.keep(client, stderr)
 	att, err := client.PutCredential(ctx, name, value)
@@ -988,6 +1020,7 @@ func runExec(ctx context.Context, t *trust, req session.ExecRequest, stdout, std
 	}
 	ctx, cancel := context.WithTimeout(ctx, t.timeout+time.Duration(req.TimeoutSeconds)*time.Second)
 	defer cancel()
+	defer t.close()
 	defer client.Close()
 	defer t.keep(client, stderr)
 	resp, err := client.Exec(ctx, req)
