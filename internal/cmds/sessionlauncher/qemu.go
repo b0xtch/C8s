@@ -352,10 +352,17 @@ func (c *Config) validate() error {
 // minLowMemoryMiB is the least memory below 4 GiB the launcher will ask for.
 const minLowMemoryMiB = 384
 
-// machine is the -machine value: the q35 chipset with what the platform adds,
-// and the memory split if one is set.
+// bareBoard turns off the devices a q35 board has by default and a session
+// guest has no use for: the SATA controller, the SMBus, the keyboard
+// controller, the HPET, USB and the VMware port. Each is a device its host
+// emulates for the guest to probe: time at every boot, and code on both
+// sides that nothing needs.
+const bareBoard = "sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off"
+
+// machine is the -machine value: the q35 chipset stripped to what a guest
+// uses, with what the platform adds, and the memory split if one is set.
 func (c *Config) machine(platform string) string {
-	machine := "q35,confidential-guest-support=tee0," + platform + "kernel-irqchip=split"
+	machine := "q35,confidential-guest-support=tee0," + platform + "kernel-irqchip=split," + bareBoard
 	if c.LowMemoryMiB != 0 {
 		machine += fmt.Sprintf(",max-ram-below-4g=%dM", c.LowMemoryMiB)
 	}

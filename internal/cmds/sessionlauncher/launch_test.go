@@ -40,7 +40,7 @@ func TestQEMUArgsTDX(t *testing.T) {
 		"-accel", "kvm", "-smp", "2", "-m", "2048M", "-monitor", "none", "-serial", "none",
 		"-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 		"-cpu", "host",
-		"-machine", "q35,confidential-guest-support=tee0,kernel-irqchip=split",
+		"-machine", "q35,confidential-guest-support=tee0,kernel-irqchip=split,sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off",
 		"-object", `{"id":"tee0","qom-type":"tdx-guest","quote-generation-socket":{"path":"/run/tdx-qgs/qgs.socket","type":"unix"}}`,
 		"-bios", "/proc/self/fd/3",
 		"-add-fd", "fd=4,set=1",
@@ -97,8 +97,8 @@ func TestQEMUArgsTDX(t *testing.T) {
 // machine unless it is asked for.
 func TestQEMUArgsLowMemory(t *testing.T) {
 	for platform, machine := range map[string]string{
-		"tdx": "-machine q35,confidential-guest-support=tee0,kernel-irqchip=split",
-		"snp": "-machine q35,confidential-guest-support=tee0,igvm-cfg=igvm0,memory-backend=ram0,kernel-irqchip=split",
+		"tdx": "-machine q35,confidential-guest-support=tee0,kernel-irqchip=split,sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off",
+		"snp": "-machine q35,confidential-guest-support=tee0,igvm-cfg=igvm0,memory-backend=ram0,kernel-irqchip=split,sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off",
 	} {
 		cfg := baseConfig()
 		cfg.Platform = platform
@@ -347,7 +347,7 @@ func TestQEMUArgsSNPCommitsLaunchKey(t *testing.T) {
 		"-object igvm-cfg,id=igvm0,file=/proc/self/fd/3",
 		"-object memory-backend-memfd,id=ram0,size=2048M,share=true",
 		"host-data=" + base64.StdEncoding.EncodeToString(digest[:]),
-		"-machine q35,confidential-guest-support=tee0,igvm-cfg=igvm0,memory-backend=ram0,kernel-irqchip=split",
+		"-machine q35,confidential-guest-support=tee0,igvm-cfg=igvm0,memory-backend=ram0,kernel-irqchip=split,sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off",
 	} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("argv lacks %q:\n%s", want, args)
