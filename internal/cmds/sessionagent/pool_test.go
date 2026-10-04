@@ -25,10 +25,12 @@ import (
 
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
+	"github.com/confidential-dot-ai/c8s/internal/keyservice/keyservicetest"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
+	"github.com/confidential-dot-ai/c8s/pkg/session/sessionsim"
 )
 
 // pool is a harness whose guest nobody has bound yet, with the owner who will
@@ -685,6 +687,45 @@ func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
 }
 
 // countingReader counts the bytes read through it.
+// A guest whose pool has a key service takes no bind until the key service
+// has judged it. A bind that comes sooner is refused on its headers, through
+// the server and for a caller that hands it to the agent directly: the guest
+// reads none of it, stays as it was booted, and does not end over it.
+func TestBindBeforeTheGuestTakesAnyIsRefusedUnread(t *testing.T) {
+	pin := keyservicetest.New(t, sessionsim.NewPool(t)).Pin
+	p := newPoolWith(t, func(o *session.BundleOptions) { o.KeyService = pin })
+	p.cfg.Engine = sessiontest.Engine{}
+	// Started, with no road to its key service: nothing opens its session.
+	p.start(t)
+	if state := p.state(t); state.Phase != session.PhaseReady || state.Prestaged {
+		t.Fatalf("a guest its key service has not judged says %+v", state)
+	}
+	const garbage = `{"bind":"e30=","signature":"c2ln"}`
+	unread := &countingReader{Reader: strings.NewReader(garbage)}
+	rec := httptest.NewRecorder()
+	p.agent.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, session.PathBind, unread))
+	if rec.Code != http.StatusServiceUnavailable || refusalCode(rec.Body.Bytes()) != disclosure.NotReady {
+		t.Fatalf("a bind before the guest takes any: %d %s", rec.Code, rec.Body)
+	}
+	if unread.n != 0 {
+		t.Fatalf("the agent read %d bytes of a bind it refused", unread.n)
+	}
+	if rec.Header().Get("Connection") != "close" || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("the refusal's headers: %v", rec.Header())
+	}
+	if _, _, err := p.agent.Bind(ctxT(t), []byte("{}"), "c2ln"); err == nil {
+		t.Fatal("the agent took a bind handed to it directly")
+	}
+	select {
+	case err := <-p.agent.Fatal():
+		t.Fatalf("the guest ended over a bind it did not read: %v", err)
+	default:
+	}
+	if state := p.state(t); state.Phase != session.PhaseReady {
+		t.Fatalf("the guest after the refusals: %+v", state)
+	}
+}
+
 type countingReader struct {
 	io.Reader
 	n int

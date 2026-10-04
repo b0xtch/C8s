@@ -1157,11 +1157,23 @@ func (c *Client) bind(ctx context.Context, bind *SignedBind) (*BindResponse, *tl
 		return nil, nil, err
 	}
 	var resp BindResponse
-	state, err := c.send(ctx, http.MethodPost, PathBind, body, &resp, false)
-	if err != nil {
-		return nil, nil, err
+	for {
+		state, err := c.send(ctx, http.MethodPost, PathBind, body, &resp, false)
+		if err == nil {
+			return &resp, state, nil
+		}
+		// A guest that takes no bind yet has not read this one: it may be
+		// sent again, for as long as ctx allows.
+		var early *StatusError
+		if !errors.As(err, &early) || early.Code != string(disclosure.NotReady) || early.RetryAfter == 0 {
+			return nil, nil, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, fmt.Errorf("%w (gave up waiting: %w)", err, ctx.Err())
+		case <-time.After(early.RetryAfter):
+		}
 	}
-	return &resp, state, nil
 }
 
 // BindAttested hands the guest its bind, as Bind does, and takes the guest as

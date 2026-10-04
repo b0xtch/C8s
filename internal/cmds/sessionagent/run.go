@@ -50,16 +50,25 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 	// The host may hand in Intel's documents for this guest's platform, which
 	// the guest passes on unread. A guest it cannot reach this way serves
 	// none, and its verifiers ask Intel.
+	handIns := false
 	if hand, err := ListenHost(session.CollateralVsockPort); err != nil {
 		cfg.Logger.Info("the host can hand this guest nothing", "error", err)
 	} else {
 		defer hand.Close()
 		go func() { _ = agent.TakeHandIns(hand) }()
+		handIns = true
 	}
 
 	// The key service judges this guest's evidence now, while the guest is
-	// nobody's, so that a bind costs it no quote.
-	go agent.OpenKeyService(ctx)
+	// nobody's, so that a bind costs it no quote. A TD judges the key service
+	// by the vendor's documents its host hands in, and has nothing to judge
+	// by until the first hand-in.
+	go func() {
+		if handIns && cfg.Platform == "tdx" {
+			agent.AwaitHandIn(ctx, HandInWait)
+		}
+		agent.OpenKeyService(ctx)
+	}()
 
 	// The API is up while the image is fetched, so a verifier can already see
 	// a staged guest; exec and credentials stay refused until admission.

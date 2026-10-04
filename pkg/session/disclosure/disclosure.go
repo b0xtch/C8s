@@ -46,6 +46,9 @@ const (
 	MethodNotAllowed Code = "method_not_allowed"
 	// Fenced: the connection was opened before the guest was claimed.
 	Fenced Code = "fenced"
+	// NotReady: the guest takes no bind yet. Its key service has not judged
+	// it. Try again.
+	NotReady Code = "not_ready"
 	// AlreadyBound: the guest is bound by another bind.
 	AlreadyBound Code = "already_bound"
 	// Retired: the guest takes no bind any more and is ending.
@@ -85,7 +88,7 @@ const (
 
 // Refusals lists every refusal code, in the order the schema prints them.
 var Refusals = []Code{
-	Busy, TooLarge, Malformed, Unauthorized, NotFound, MethodNotAllowed, Fenced, AlreadyBound, Retired,
+	Busy, TooLarge, Malformed, Unauthorized, NotFound, MethodNotAllowed, Fenced, NotReady, AlreadyBound, Retired,
 	BindInFlight, BindTooLate, BindClock, BindInvalid, BindSignature, BindOtherGuest, BindExpired,
 	BindNoSandbox, BindKeyService, BindIncomplete, BindFailed, NoCollateral, Internal,
 }
@@ -100,6 +103,7 @@ var describe = map[Code]string{
 	NotFound:         "the guest serves no such route",
 	MethodNotAllowed: "the guest serves that route by another method",
 	Fenced:           "the connection was opened before the guest was claimed, and the guest takes no bind from it",
+	NotReady:         "the guest takes no bind yet: its key service has not judged it",
 	AlreadyBound:     "the guest is already bound by another bind",
 	Retired:          "the guest takes no bind any more and is shutting down",
 	BindInFlight:     "the guest is reading a bind: it is not as it was booted",

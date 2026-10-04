@@ -114,7 +114,19 @@ type EngineOptions struct {
 	// within two hours of Intel's own date on it, and the finding says so:
 	// see WithCollateralSource and CollateralFinding.Stapled.
 	OwnCollateralOnly bool
+	// HandedCollateralOnly never asks Intel's service: the engine of a
+	// verifier with no road to it, such as a guest. It judges by the
+	// documents somebody hands over, and one nobody handed over is a fetch
+	// that failed, at once.
+	HandedCollateralOnly bool
 }
+
+// noRoad is Intel's service as a verifier with no road to it finds it.
+type noRoad struct{}
+
+var errNoRoad = errors.New("this verifier asks Intel's service for nothing, and nobody handed the document over")
+
+func (noRoad) Get(string) (map[string][]string, []byte, error) { return nil, nil, errNoRoad }
 
 type dcapEngine struct {
 	cache     *collateralCache
@@ -128,11 +140,15 @@ type dcapEngine struct {
 // the TCB info, the quoting enclave's identity and the revocation lists. A
 // verdict it cannot fetch the collateral for is no verdict.
 func NewEngine(opts EngineOptions) Engine {
+	var fetch trust.HTTPSGetter = &trust.RetryHTTPSGetter{
+		Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: pcsGetter{},
+	}
+	if opts.HandedCollateralOnly {
+		fetch = noRoad{}
+	}
 	return &dcapEngine{
-		cache: newCollateralCache(opts.CollateralCacheDir),
-		fetch: &trust.RetryHTTPSGetter{
-			Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: pcsGetter{},
-		},
+		cache:     newCollateralCache(opts.CollateralCacheDir),
+		fetch:     fetch,
 		freshOnly: opts.FreshCollateralOnly,
 		ownOnly:   opts.OwnCollateralOnly,
 	}

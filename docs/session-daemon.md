@@ -218,6 +218,12 @@ A launcher that carries the connection elsewhere, or nowhere, has a guest
 that is never given a credential. A sandbox reaches none of this: its seccomp
 profile refuses the socket family.
 
+A TD judges the key service by the vendor's documents its host hands in, so
+it opens its session once the first hand-in has arrived. Until the session is
+open the guest refuses a bind on its headers, unread, and says it is not
+ready; the daemon offers it to no claim. A pool whose key service is out of
+reach therefore fills with TDs that boot and are never ready.
+
 ## Restarts and draining
 
 A TD's launcher runs in a session of its own and outlives the daemon. The

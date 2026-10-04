@@ -144,6 +144,9 @@ type Agent struct {
 	platform atomic.Pointer[session.CollateralPlatform]
 	// collateral is what the host last handed in for PathCollateral, unread.
 	collateral atomic.Pointer[[]byte]
+	// handed is closed at the first hand-in.
+	handed     chan struct{}
+	handedOnce sync.Once
 	// keyService is the guest's session with the key service its launch
 	// document pins, or nil.
 	keyService *keyService
@@ -194,6 +197,7 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 		signature: string(bytes.TrimSpace(signature)), launchPub: pub, events: events,
 		stagedAt: cfg.Now(),
 		bound:    make(chan struct{}),
+		handed:   make(chan struct{}),
 		fatal:    make(chan error, 1),
 		attests:  make(chan struct{}, maxConcurrentAttests),
 		quotes:   newQuoteBudget(cfg.Now),
@@ -436,6 +440,7 @@ var (
 	errAlreadyBound = errors.New("this guest is already bound by another bind")
 	errRetired      = errors.New("this guest takes no bind any more and is shutting down")
 	errFenced       = errors.New("this connection was opened before the guest was claimed, and the guest takes no bind from it")
+	errNotReady     = errors.New("this guest takes no bind yet: its key service has not judged it")
 	errBindInFlight = errors.New("this guest is reading a bind: it is not as it was booted")
 	errBindTooLate  = errors.New("this guest waited for a bind longer than its launch document allows")
 	errClockLeft    = errors.New("this guest's kernel left the " + ownClockSource + " clocksource, so it cannot tell how long it waited for a bind")
@@ -490,6 +495,11 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	if current == nil && !retired && !a.fence.admits(connOf(ctx)) {
 		a.binding.Unlock()
 		return false, nil, errFenced
+	}
+	// The same for a bind that comes before the guest takes any.
+	if current == nil && !retired && !a.takesBinds() {
+		a.binding.Unlock()
+		return false, nil, errNotReady
 	}
 	if current != nil || retired {
 		a.binding.Unlock()
@@ -588,9 +598,21 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 	return bind, events, nil
 }
 
+// takesBinds reports whether the guest takes a bind yet. One whose launch
+// document pins a key service takes none until the key service has judged
+// it: the evidence the key service judges is of a guest that is nobody's.
+func (a *Agent) takesBinds() bool {
+	return a.keyService == nil || a.keyService.isOpen()
+}
+
 // prestagedLocked reports whether the guest is done with what it does ahead
-// of a bind: it has nothing to do, or what Admit began has ended.
+// of a bind: its session with its key service is open, if its launch document
+// pins one, and what Admit began has ended.
 func (a *Agent) prestagedLocked() bool {
+	// A host offers a guest to a session once it takes a bind.
+	if !a.takesBinds() {
+		return false
+	}
 	if len(a.doc.Prestage) == 0 && a.cfg.Memory == nil {
 		return true
 	}

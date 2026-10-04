@@ -212,6 +212,7 @@
             "not_found",
             "method_not_allowed",
             "fenced",
+            "not_ready",
             "already_bound",
             "retired",
             "bind_in_flight",

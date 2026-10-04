@@ -144,6 +144,28 @@ func TestCollateralOutageIsNotAVerdict(t *testing.T) {
 	}
 }
 
+// An engine with no road to Intel says at once that it has nothing to judge
+// by. A guest has such an engine: it waits on no fetch that cannot arrive.
+func TestEngineWithNoRoadToIntelFailsAtOnce(t *testing.T) {
+	env, reportData := fixture(t)
+	engine := NewEngine(EngineOptions{HandedCollateralOnly: true})
+	began := time.Now()
+	res, err := engine.VerifyEvidence(context.Background(), env, reportData)
+	if err == nil {
+		t.Fatalf("verified with no collateral: %+v", res)
+	}
+	var verdict *VerificationError
+	if errors.As(err, &verdict) {
+		t.Fatalf("a missing document was reported as a verdict on the evidence: %v", err)
+	}
+	if !strings.Contains(err.Error(), errNoRoad.Error()) {
+		t.Fatalf("the failure does not say why: %v", err)
+	}
+	if waited := time.Since(began); waited > 2*time.Second {
+		t.Fatalf("the engine waited %s for a document it does not ask for", waited)
+	}
+}
+
 // A quote that does not verify offline is refused before anything is fetched.
 // The lookup is keyed on fields of the PCK certificate, so fetching first would
 // let a forged quote choose the request and turn its refusal into an outage.

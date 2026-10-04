@@ -105,7 +105,7 @@ func newRunCmd() *cobra.Command {
 			var err error
 			// For the key service a launch document may pin. The guest has no
 			// road to the vendor: its host hands it the vendor's documents.
-			cfg.Engine = session.NewEngine(session.EngineOptions{})
+			cfg.Engine = session.NewEngine(session.EngineOptions{HandedCollateralOnly: true})
 			if cfg.KeyServiceDial, err = hostKeyServiceDial(cfg.LaunchDir); err != nil {
 				return err
 			}

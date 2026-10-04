@@ -1,8 +1,10 @@
 package sessionagent
 
 import (
+	"context"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/readutil"
@@ -76,7 +78,25 @@ func (a *Agent) takeHandIn(conn io.ReadWriteCloser) {
 
 // KeepCollateral keeps blob as the guest's answer to PathCollateral: what its
 // host handed in, unread.
-func (a *Agent) KeepCollateral(blob []byte) { a.collateral.Store(&blob) }
+func (a *Agent) KeepCollateral(blob []byte) {
+	a.collateral.Store(&blob)
+	a.handedOnce.Do(func() {
+		// Stage makes the channel; an agent made any other way has no waiter.
+		if a.handed != nil {
+			close(a.handed)
+		}
+	})
+}
+
+// AwaitHandIn returns at the host's first hand-in, or after limit without
+// one.
+func (a *Agent) AwaitHandIn(ctx context.Context, limit time.Duration) {
+	select {
+	case <-a.handed:
+	case <-time.After(limit):
+	case <-ctx.Done():
+	}
+}
 
 // serveCollateral answers with what the host last handed in, byte for byte:
 // see session.CollateralResponse. Anyone may ask. Intel publishes these

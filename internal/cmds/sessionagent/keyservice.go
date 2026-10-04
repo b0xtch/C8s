@@ -15,8 +15,12 @@ import (
 
 const (
 	// keyServiceRetry bounds the pause between attempts to open the guest's
-	// session with its key service.
-	keyServiceRetry = 30 * time.Second
+	// session with its key service, which starts at keyServiceFirstRetry.
+	keyServiceRetry      = 30 * time.Second
+	keyServiceFirstRetry = 250 * time.Millisecond
+	// HandInWait is how long a guest waits for its host's first hand-in of
+	// the vendor's documents before it tries its key service without them.
+	HandInWait = 15 * time.Second
 	// keyServiceTimeout bounds one call to the key service.
 	keyServiceTimeout = time.Minute
 	// certRenewAhead is how long before its end the certificate the guest
@@ -33,8 +37,10 @@ type keyService struct {
 	key       *keyservice.EncryptionKey
 	signature string
 
-	mu     sync.Mutex
-	opened bool
+	// mu makes one attempt to open the session at a time.
+	mu sync.Mutex
+	// open is closed once the session is open.
+	open chan struct{}
 	// cert is the certificate the guest presents to the key service: its
 	// instance key, with evidence of it.
 	certMu sync.Mutex
@@ -47,7 +53,7 @@ func (a *Agent) newKeyService(pin *session.KeyService) (*keyService, error) {
 	if a.cfg.Engine == nil {
 		return nil, errors.New("the launch document pins a key service, and this image has nothing to verify one with")
 	}
-	ks := &keyService{}
+	ks := &keyService{open: make(chan struct{})}
 	var err error
 	if ks.key, err = keyservice.NewEncryptionKey(); err != nil {
 		return nil, err
@@ -108,12 +114,22 @@ func (a *Agent) handedCollateral(context.Context) []session.CollateralDocument {
 	return answer.Documents
 }
 
-// open opens the guest's session with its key service, once.
+// isOpen reports whether the guest's session with its key service is open.
+func (ks *keyService) isOpen() bool {
+	select {
+	case <-ks.open:
+		return true
+	default:
+		return false
+	}
+}
+
+// openKeyService opens the guest's session with its key service, once.
 func (a *Agent) openKeyService(ctx context.Context) error {
 	ks := a.keyService
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
-	if ks.opened {
+	if ks.isOpen() {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
@@ -121,7 +137,7 @@ func (a *Agent) openKeyService(ctx context.Context) error {
 	if err := ks.client.Open(ctx, a.launch, a.signature); err != nil {
 		return fmt.Errorf("open a session with the key service: %w", err)
 	}
-	ks.opened = true
+	close(ks.open)
 	a.log.Info("opened a session with the key service")
 	return nil
 }
@@ -135,7 +151,7 @@ func (a *Agent) OpenKeyService(ctx context.Context) {
 	if a.keyService == nil {
 		return
 	}
-	for pause := time.Second; ; pause = min(2*pause, keyServiceRetry) {
+	for pause := keyServiceFirstRetry; ; pause = min(2*pause, keyServiceRetry) {
 		err := a.openKeyService(ctx)
 		if err == nil {
 			return
@@ -166,8 +182,9 @@ func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind) error {
 	// The bind passed acceptable, so the guest has a key service and the
 	// bind's is that one.
 	ks := a.keyService
-	if err := a.openKeyService(ctx); err != nil {
-		return err
+	// No bind is taken before the session is open.
+	if !ks.isOpen() {
+		return errNotReady
 	}
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
 	defer cancel()

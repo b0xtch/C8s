@@ -8,9 +8,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,12 +228,10 @@ func newWorld(t *testing.T) *world {
 	return w
 }
 
-// The whole of milestone 1's path with a key service: the owner stores a
-// credential, a pooled guest opens its session before it is anybody's, and
-// the bind that makes it the owner's brings the credential into the sandbox.
-func TestStoredCredentialReachesABoundGuest(t *testing.T) {
-	w := newWorld(t)
-	g := w.pool.Boot(t, nil, w.ks.Pin)
+// start makes g the tenant's session s1, under a bind that declares the
+// stored credential, and returns the client of a key the bind grants.
+func (w *world) start(t *testing.T, g *sessionsim.Guest) (*session.Client, error) {
+	t.Helper()
 	access := newOwner(t)
 	identity, err := runtimemeasure.LoadImageManifest(g.ManifestPath)
 	if err != nil {
@@ -243,7 +245,7 @@ func TestStoredCredentialReachesABoundGuest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer binder.Close()
+	t.Cleanup(binder.Close)
 	ready, err := binder.Ready(within(t))
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +265,135 @@ func TestStoredCredentialReachesABoundGuest(t *testing.T) {
 		t.Fatal(err)
 	}
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
-	if _, _, err := binder.BindAttested(within(t), bind, binding.Policy(identity)); err != nil {
+	_, _, err = binder.BindAttested(within(t), bind, binding.Policy(identity))
+	return binder, err
+}
+
+// road is the way a pool's guests reach their key service, which a test
+// opens when it chooses.
+type road struct{ open atomic.Bool }
+
+func (r *road) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if !r.open.Load() {
+		return nil, errors.New("no road to the key service yet")
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
+// offered reports what a guest tells its host: whether it may be given to a
+// session.
+func offered(t *testing.T, g *sessionsim.Guest) bool {
+	t.Helper()
+	// The state is public, and nothing here relies on it.
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // an unjudged look at public state
+	defer transport.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(within(t), http.MethodGet, g.URL+session.PathState, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var state session.StateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	return state.Phase == session.PhaseReady && state.Prestaged
+}
+
+// A guest whose pool has a key service is offered to a session once the key
+// service has judged it, and not before: a host that waits for that gives a
+// session a guest whose bind costs one round trip to the key service.
+func TestGuestIsOfferedOnceItsKeyServiceSessionIsOpen(t *testing.T) {
+	w := newWorld(t)
+	way := &road{}
+	w.pool.KeyServiceDial = way.dial
+	g := w.pool.Boot(t, nil, w.ks.Pin)
+	for range 6 {
+		if offered(t, g) {
+			t.Fatal("a guest the key service has not judged says it may be given to a session")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	way.open.Store(true)
+	for deadline := time.Now().Add(10 * time.Second); !offered(t, g); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the guest never said it may be given to a session")
+		}
+	}
+	// A pool with no key service waits for none.
+	if bare := sessionsim.NewPool(t).Boot(t, nil, nil); !offered(t, bare) {
+		t.Fatal("a guest of a pool with no key service is not offered")
+	}
+}
+
+// A bind that reaches a guest before its key service has judged it is refused
+// on its headers: the guest reads none of it and stays as it was booted. The
+// sender sends it again, and it is taken once the guest is ready.
+func TestBindBeforeTheKeyServiceHasJudgedTheGuest(t *testing.T) {
+	w := newWorld(t)
+	way := &road{}
+	w.pool.KeyServiceDial = way.dial
+	g := w.pool.Boot(t, nil, w.ks.Pin)
+
+	transport := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // the refusal is read, not relied on
+	defer transport.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(within(t), http.MethodPost, g.URL+session.PathBind, strings.NewReader(`{"bind":"e30=","signature":"c2ln"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var refusal struct{ Error string }
+	_ = json.NewDecoder(resp.Body).Decode(&refusal)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || refusal.Error != "not_ready" || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("a bind before the guest is ready: %d %q, retry after %q", resp.StatusCode, refusal.Error, resp.Header.Get("Retry-After"))
+	}
+
+	type started struct {
+		binder *session.Client
+		err    error
+	}
+	done := make(chan started, 1)
+	go func() {
+		binder, err := w.start(t, g)
+		done <- started{binder, err}
+	}()
+	select {
+	case early := <-done:
+		t.Fatalf("the bind was answered with no road to the key service: %v", early.err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	way.open.Store(true)
+	select {
+	case s := <-done:
+		// The guest read neither bind it refused: it is still there to take
+		// this one.
+		if s.err != nil {
+			t.Fatalf("bind: %v", s.err)
+		}
+		result, err := s.binder.Exec(within(t), session.ExecRequest{Argv: []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/token"`}})
+		if err != nil || string(result.Stdout) != "s3cret" {
+			t.Fatalf("the sandbox read %q, %v", result.Stdout, err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the bind never returned once the road was open")
+	}
+}
+
+// The whole of milestone 1's path with a key service: the owner stores a
+// credential, a pooled guest opens its session before it is anybody's, and
+// the bind that makes it the owner's brings the credential into the sandbox.
+func TestStoredCredentialReachesABoundGuest(t *testing.T) {
+	w := newWorld(t)
+	g := w.pool.Boot(t, nil, w.ks.Pin)
+	binder, err := w.start(t, g)
+	if err != nil {
 		t.Fatalf("bind: %v", err)
 	}
 	result, err := binder.Exec(within(t), session.ExecRequest{Argv: []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/token"`}})

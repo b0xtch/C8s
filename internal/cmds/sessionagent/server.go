@@ -106,12 +106,23 @@ func (a *Agent) refuse(w http.ResponseWriter, status int, code disclosure.Code) 
 }
 
 // letIn admits a bind by the connection it came on, before any of its body is
-// read. One from a connection the fence ended is refused on its headers: the
-// guest has taken in nothing of the caller's and stays as it was booted. One
+// read. One from a connection the fence ended, or to a guest that takes none
+// yet, is refused on its headers: the guest has taken in nothing of the
+// caller's and stays as it was booted. One
 // that is let in counts as in flight, which the fence respects, until the
 // agent has answered it.
 func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// A guest whose pool has a key service takes no bind until the key
+		// service has judged it. Refused on its headers, the bind was not
+		// read, and its sender may send it again.
+		if !a.takesBinds() {
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Retry-After", "1")
+			a.refuse(w, http.StatusServiceUnavailable, disclosure.NotReady)
+			return
+		}
 		if !a.fence.enter(connOf(r.Context())) {
 			// Closing keeps the server from reading the body to reuse the
 			// connection.
@@ -250,6 +261,9 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		a.refuse(w, http.StatusGone, disclosure.Retired)
 	case errors.Is(err, errFenced):
 		a.refuse(w, http.StatusConflict, disclosure.Fenced)
+	case errors.Is(err, errNotReady):
+		w.Header().Set("Retry-After", "1")
+		a.refuse(w, http.StatusServiceUnavailable, disclosure.NotReady)
 	case errors.As(err, &refusal):
 		// Why, in the guest's own words, stays in the guest's log.
 		a.log.Warn("a bind was refused", "code", refusal.code, "error", refusal.err)

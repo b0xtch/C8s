@@ -108,7 +108,7 @@ func (e rootCRLEngine) Refetch(ctx context.Context) error { return e.refetch(ctx
 func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil, nil)
 }
 
 // Pool is a pool before any guest of it has booted: its image and its launch
@@ -118,6 +118,9 @@ type Pool struct {
 	// the pool's public launch key.
 	ManifestPath  string
 	LaunchKeyPath string
+	// KeyServiceDial, when set, is the road the pool's guests take to their
+	// key service: a test's stand-in for the one their host gives them.
+	KeyServiceDial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	td        *sessiontest.TD
 	launchKey string
@@ -158,7 +161,7 @@ func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyServic
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, false, keyService)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, false, keyService, p.KeyServiceDial)
 }
 
 // NewPinnedGuest is NewGuest in a pool whose launch document lists the
@@ -167,7 +170,7 @@ func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyServic
 func NewPinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil)
 }
 
 // Twin boots another guest of the same pool: the same image, launched under
@@ -178,12 +181,14 @@ func (p *Guest) Twin(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned, p.keyService)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned, p.keyService, nil)
 }
 
 // boot launches one guest under launchKey, or under a new key when that is
 // empty, and serves its agent.
-func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox Sandbox, pinned bool, keyService *session.KeyService) *Guest {
+func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox Sandbox, pinned bool, keyService *session.KeyService,
+	dial func(ctx context.Context, network, addr string) (net.Conn, error),
+) *Guest {
 	t.Helper()
 	bundle := filepath.Join(t.TempDir(), "bundle")
 	opts := session.BundleOptions{Dir: bundle, ManifestPath: manifest, Pool: "sim", Class: "sim", KeyPath: launchKey, KeyService: keyService}
@@ -218,7 +223,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	agent, err := sessionagent.Stage(ctx, sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(keys, session.PubkeyFile), LaunchDir: keys,
 		CredentialDir: credentials, TEE: sessiontest.TEE{TD: td}, Runner: runner, Bare: sandbox == nil,
-		Engine: sessiontest.Engine{},
+		Engine: sessiontest.Engine{}, KeyServiceDial: dial,
 	})
 	if err != nil {
 		t.Fatal(err)
