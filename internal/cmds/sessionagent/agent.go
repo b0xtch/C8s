@@ -605,10 +605,10 @@ func (a *Agent) takesBinds() bool {
 	return a.keyService == nil || a.keyService.isOpen()
 }
 
-// prestagedLocked reports whether the guest is done with what it does ahead
+// preparedLocked reports whether the guest is done with what it does ahead
 // of a bind: its session with its key service is open, if its launch document
 // pins one, and what Admit began has ended.
-func (a *Agent) prestagedLocked() bool {
+func (a *Agent) preparedLocked() bool {
 	// A host offers a guest to a session once it takes a bind.
 	if !a.takesBinds() {
 		return false

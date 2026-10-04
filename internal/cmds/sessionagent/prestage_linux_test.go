@@ -192,11 +192,11 @@ func TestGuestSaysWhenItsImagesAreUnpacked(t *testing.T) {
 	// Whatever happens, the guest is let go before it is torn down.
 	defer release()
 	s := newStaged(t, stagedOptions{stored: []string{"a", "b"}, prestage: []string{"a", "b"}, hold: hold})
-	if s.state(t).Prestaged {
+	if s.state(t).Prepared {
 		t.Fatal("the guest says it is done with images its host has not let it read")
 	}
 	release()
-	for deadline := time.Now().Add(30 * time.Second); !s.state(t).Prestaged; time.Sleep(5 * time.Millisecond) {
+	for deadline := time.Now().Add(30 * time.Second); !s.state(t).Prepared; time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("the guest never said it was done with its images")
 		}

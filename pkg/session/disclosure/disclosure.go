@@ -252,7 +252,7 @@ func measured() []Field {
 var Schema = []Message{
 	{Name: MessageState, Says: "to anyone who asks what the guest is", Fields: append([]Field{
 		{Name: "instance_key", Kind: KindPublic, Max: maxKey},
-		{Name: "prestaged", Kind: KindFlag, Optional: true},
+		{Name: "prepared", Kind: KindFlag, Optional: true},
 	}, measured()...)},
 	{Name: MessageFence, Says: "to its host, which claims it for a session", Fields: []Field{
 		{Name: "phase", Kind: KindCode, Codes: phases},

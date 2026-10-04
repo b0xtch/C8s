@@ -11,7 +11,7 @@
           "max": 1024
         },
         {
-          "name": "prestaged",
+          "name": "prepared",
           "kind": "flag",
           "optional": true
         },

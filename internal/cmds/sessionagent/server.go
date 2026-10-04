@@ -223,11 +223,11 @@ func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 	a.measured.RLock()
 	phase, events := a.stateLocked()
 	bind := a.bind
-	prestaged := phase == session.PhaseReady && a.prestagedLocked()
+	prepared := phase == session.PhaseReady && a.preparedLocked()
 	a.measured.RUnlock()
 
 	state := session.StateResponse{
-		Phase: phase, InstanceKey: a.keyDER, Prestaged: prestaged,
+		Phase: phase, InstanceKey: a.keyDER, Prepared: prepared,
 		Launch: a.launch, Signature: a.signature, Events: events,
 	}
 	if bind != nil {

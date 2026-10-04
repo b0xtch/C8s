@@ -114,12 +114,14 @@ type StateResponse struct {
 	Phase Phase `json:"phase"`
 	// InstanceKey is the PKIX DER of the key the guest serves under.
 	InstanceKey []byte `json:"instance_key"`
-	// Prestaged is set by an unbound guest once it is done with the images its
-	// launch document lists: each unpacked, or given up on. A document that
-	// lists none is done at once. Until then a bind that names a listed image
-	// waits for it, so a host offers the guest to a session only when this
-	// says so.
-	Prestaged bool `json:"prestaged,omitempty"`
+	// Prepared is set by an unbound guest once it is done with everything it
+	// does ahead of a bind: the images its launch document lists are unpacked
+	// or given up on, its memory reserve is accepted, and its session with
+	// the key service its launch document pins is open. A host offers the
+	// guest to a session only when this says so. Until then a bind that names
+	// a listed image waits for it, and a guest that still waits for its key
+	// service takes no bind at all.
+	Prepared bool `json:"prepared,omitempty"`
 	// Launch and Signature are the launch document the guest measured.
 	Launch    []byte `json:"launch"`
 	Signature string `json:"signature"`

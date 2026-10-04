@@ -40,7 +40,7 @@ func TestEncodeTakesWhatAGuestSays(t *testing.T) {
 		value   any
 	}{
 		"an unbound guest's state": {disclosure.MessageState, session.StateResponse{
-			Phase: session.PhaseReady, InstanceKey: []byte("key"), Prestaged: true,
+			Phase: session.PhaseReady, InstanceKey: []byte("key"), Prepared: true,
 			Launch: []byte("launch"), Signature: "c2ln", Events: []string{digest},
 		}},
 		"a bound guest's state": {disclosure.MessageState, session.StateResponse{

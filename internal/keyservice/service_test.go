@@ -300,7 +300,7 @@ func offered(t *testing.T, g *sessionsim.Guest) bool {
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
 		t.Fatal(err)
 	}
-	return state.Phase == session.PhaseReady && state.Prestaged
+	return state.Phase == session.PhaseReady && state.Prepared
 }
 
 // A guest whose pool has a key service is offered to a session once the key

@@ -111,7 +111,7 @@ func (g *guestClient) state(ctx context.Context, addr string) (*session.StateRes
 // its launch document has it prepare done.
 func (g *guestClient) ready(ctx context.Context, addr string) bool {
 	state, _, err := g.state(ctx, addr)
-	return err == nil && state.Phase == session.PhaseReady && state.Prestaged
+	return err == nil && state.Phase == session.PhaseReady && state.Prepared
 }
 
 // fence has a ready guest cut every connection it accepted so far. The answer

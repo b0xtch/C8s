@@ -697,7 +697,7 @@ func TestBindBeforeTheGuestTakesAnyIsRefusedUnread(t *testing.T) {
 	p.cfg.Engine = sessiontest.Engine{}
 	// Started, with no road to its key service: nothing opens its session.
 	p.start(t)
-	if state := p.state(t); state.Phase != session.PhaseReady || state.Prestaged {
+	if state := p.state(t); state.Phase != session.PhaseReady || state.Prepared {
 		t.Fatalf("a guest its key service has not judged says %+v", state)
 	}
 	const garbage = `{"bind":"e30=","signature":"c2ln"}`
@@ -979,7 +979,7 @@ func TestStateIsPublic(t *testing.T) {
 	outsider, _ := newSigner(t)
 	for name, signer := range map[string]*operatorauth.Signer{"no key": nil, "the pool's launch key": p.launchSigner(t), "another key": outsider, "the owner's access key": p.access} {
 		state := stateAs(t, p.url, signer)
-		if state.Phase != session.PhaseRunning || !bytes.Equal(state.InstanceKey, unbound.InstanceKey) || state.Prestaged {
+		if state.Phase != session.PhaseRunning || !bytes.Equal(state.InstanceKey, unbound.InstanceKey) || state.Prepared {
 			t.Errorf("%s: a bound guest's state: %+v", name, state)
 		}
 		if !bytes.Equal(state.Bind, bind.Raw) || state.BindSignature != bind.Signature || len(state.Events) != 3 ||
@@ -1041,18 +1041,18 @@ func TestGuestUnpacksItsDocumentsImagesAhead(t *testing.T) {
 	}
 	// The guest says when it is done with them, to anyone: its host offers
 	// it to a tenant only then.
-	if p.state(t).Prestaged {
+	if p.state(t).Prepared {
 		t.Fatal("the guest says it is done with images it is still unpacking")
 	}
 	close(p.runner.unpacking)
-	if !p.state(t).Prestaged {
+	if !p.state(t).Prepared {
 		t.Fatal("the guest does not say it is done with its images")
 	}
 	// Bound, it is somebody's, and says nothing of the kind any more.
 	if _, err := p.client(t, p.access).Bind(ctxT(t), p.bindFor(t, ready, nil)); err != nil {
 		t.Fatal(err)
 	}
-	if p.state(t).Prestaged || stateAs(t, p.url, p.access).Prestaged {
+	if p.state(t).Prepared || stateAs(t, p.url, p.access).Prepared {
 		t.Fatal("a bound guest still reports on the images it unpacked ahead")
 	}
 
@@ -1062,14 +1062,14 @@ func TestGuestUnpacksItsDocumentsImagesAhead(t *testing.T) {
 		t.Fatalf("a pool document with no list drove its runner: %q", got)
 	}
 	// Nothing to unpack is done at once.
-	if !plain.state(t).Prestaged {
+	if !plain.state(t).Prepared {
 		t.Fatal("a guest with no list does not say it is ready")
 	}
 }
 
 // Until the guest has begun on its list it is not done with it: its API is
 // up before it admits anything.
-func TestGuestIsNotPrestagedBeforeItBegan(t *testing.T) {
+func TestGuestIsNotPreparedBeforeItBegan(t *testing.T) {
 	p := newPoolWith(t, func(o *session.BundleOptions) { o.Prestage = []string{sandboxImage} })
 	agent, err := sessionagent.Stage(context.Background(), p.cfg)
 	if err != nil {
@@ -1085,7 +1085,7 @@ func TestGuestIsNotPrestagedBeforeItBegan(t *testing.T) {
 	srv := agent.Server()
 	go func() { _ = agent.Serve(srv, ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
-	if stateAs(t, "https://"+ln.Addr().String(), nil).Prestaged {
+	if stateAs(t, "https://"+ln.Addr().String(), nil).Prepared {
 		t.Fatal("a guest that has not begun on its list says it is done with it")
 	}
 }
@@ -1155,16 +1155,16 @@ func TestGuestIsReadyOnceItHoldsItsMemoryReserve(t *testing.T) {
 	p.cfg.Memory = sessionagent.NewTestMemory(128, true, guest.read, guest.accept)
 	p.start(t)
 	time.Sleep(20 * time.Millisecond)
-	if asked := guest.asked(); len(asked) != 0 || p.state(t).Prestaged {
-		t.Fatalf("while its images are being unpacked the guest accepted %v, ready %v", asked, p.state(t).Prestaged)
+	if asked := guest.asked(); len(asked) != 0 || p.state(t).Prepared {
+		t.Fatalf("while its images are being unpacked the guest accepted %v, ready %v", asked, p.state(t).Prepared)
 	}
 	close(p.runner.unpacking)
 	until(t, "the reserve is asked for", func() bool { return len(guest.asked()) == 1 })
-	if p.state(t).Prestaged {
+	if p.state(t).Prepared {
 		t.Fatal("the guest says it is ready while its reserve is being accepted")
 	}
 	close(guest.hold)
-	until(t, "the guest is ready", func() bool { return p.state(t).Prestaged })
+	until(t, "the guest is ready", func() bool { return p.state(t).Prepared })
 	// Unbound, it holds the reserve and accepts no more.
 	time.Sleep(20 * time.Millisecond)
 	if asked := guest.asked(); !slices.Equal(asked, []int{128}) {
@@ -1192,11 +1192,11 @@ func TestGuestWithNoImagesStillWaitsForItsReserve(t *testing.T) {
 	p.cfg.Memory = sessionagent.NewTestMemory(64, false, guest.read, guest.accept)
 	p.start(t)
 	until(t, "the reserve is asked for", func() bool { return len(guest.asked()) == 1 })
-	if p.state(t).Prestaged {
+	if p.state(t).Prepared {
 		t.Fatal("the guest says it is ready while its reserve is being accepted")
 	}
 	close(guest.hold)
-	until(t, "the guest is ready", func() bool { return p.state(t).Prestaged })
+	until(t, "the guest is ready", func() bool { return p.state(t).Prepared })
 
 	// Bound with the rest left alone: the sandbox accepts what it grows into.
 	ready, err := p.client(t, p.access).Ready(ctxT(t))
