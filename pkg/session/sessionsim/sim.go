@@ -13,6 +13,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,7 +50,13 @@ type Guest struct {
 	launchKey string
 	// pinned: the launch document lists the machine the guest runs on.
 	pinned bool
+	// stop ends the guest.
+	stop func()
 }
+
+// Close ends the guest before its test does, as a host ends a guest: its
+// agent serves nothing more, and its connections are cut.
+func (p *Guest) Close() { p.stop() }
 
 // Engine verifies the simulated evidence. A test passes it where production
 // passes the engine of session.NewEngine.
@@ -169,10 +176,14 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	}
 	srv := agent.Server()
 	go func() { _ = agent.Serve(srv, ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
+	stop := sync.OnceFunc(func() {
+		_ = srv.Close()
+		cancel()
+	})
+	t.Cleanup(stop)
 	return &Guest{
 		URL: "https://" + ln.Addr().String(), ManifestPath: manifest, LaunchKeyPath: filepath.Join(keys, session.PubkeyFile),
-		td: td, launchKey: launchKey, pinned: pinned,
+		td: td, launchKey: launchKey, pinned: pinned, stop: stop,
 	}
 }
 

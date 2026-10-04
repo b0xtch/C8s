@@ -18,7 +18,6 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1134,25 +1133,13 @@ func (c *Client) Ready(ctx context.Context) (*ReadyTD, error) {
 	if tlsState == nil || len(tlsState.PeerCertificates) == 0 {
 		return nil, refuse("the guest's state did not arrive over a verified TLS connection")
 	}
-	policy := c.required()
-	doc, err := VerifySigned(policy.LaunchKey, state.Launch, state.Signature)
-	if err != nil {
-		return nil, &VerificationError{Err: err}
-	}
-	if err := imageMatchesDocument(policy.Image, doc.Image); err != nil {
-		return nil, &VerificationError{Err: err}
-	}
-	events := []string{DocumentDigest(state.Launch)}
-	if state.Phase != PhaseReady || len(state.Bind) > 0 || !slices.Equal(state.Events, events) {
-		return nil, refuse("guest is bound already, or on its way to be (phase %s, events %v)", state.Phase, state.Events)
-	}
-	leaf := tlsState.PeerCertificates[0]
 	began := time.Now()
-	if err := verifyServingCert(c.judging(ctx, false), policy, c.engine, leaf, time.Now(), doc, [][]string{events}); err != nil {
+	ready, err := verifyReady(c.judging(ctx, false), c.required(), c.engine, tlsState.PeerCertificates[0], &state, time.Now())
+	if err != nil {
 		return nil, err
 	}
 	c.timed(TimedJudgment, began)
-	return &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey}, nil
+	return ready, nil
 }
 
 // Bind hands the guest its bind and waits for its sandbox to be admitted. A
