@@ -65,7 +65,7 @@ network daemon, no DHCP client, no resolver and no login program.
 | 2 | The state volume: dm-crypt over the scratch disk under a key made this boot and kept nowhere, a fresh file system, and a writable layer over each directory listed in `/usr/lib/confai/state.d`. Without a scratch disk, a tmpfs | init |
 | 3 | The launch key: read from the `opkeydata` volume, staged read-only, and its digest extended into RTMR[3] (TDX) or checked against HOST_DATA (SEV-SNP). A guest with a key it cannot bind stops | init |
 | 4 | The kernel's file systems, the settings in `sysctl.d`, the loopback interface, a control group for the service | init |
-| 5 | `c8s session-agent load`: the launch files off the volume, and the host's network request set on the one interface | step |
+| 5 | `c8s session-agent load`: a check of the guest's devices, then the launch files off the volume and the host's network request set on the one interface | step |
 | 6 | `nft -f /etc/c8s-session/firewall.nft` | step |
 | 7 | The agent, or the key service in its image | service |
 
@@ -73,6 +73,22 @@ The init sets `no_new_privs` before the first step, which the sandbox and
 every command run for a session inherit. It reaps what is orphaned, and it
 powers the guest off when a step fails or the service ends: a guest whose
 agent is gone can be neither verified nor controlled.
+
+## The machine
+
+A session guest's launcher builds it a network device, block devices and a
+socket to the host, all virtio of the current kind, on a board with no disk
+controller, no keyboard controller, no USB and no timer but the CPU's own.
+The kernel has drivers for those devices and for no other: no network card,
+no SCSI or ATA, no input, no sensor, and no code that takes a device plugged
+in later.
+
+Before the guest reads a file its host handed it, `c8s session-agent load`
+lists the functions on its PCI bus and ends the guest if one is of another
+kind. The agent does the same before it serves. A TD's RTMR[0] records the
+shape its host declared, which the launch document lists and the agent
+checks, and a TD whose document lists no machine takes no bind
+([session-daemon.md](../docs/session-daemon.md#the-pools-machine)).
 
 ## Boot path
 

@@ -38,6 +38,8 @@ const (
 	clockSourcePath = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
 	// consolesPath lists the consoles the kernel registered.
 	consolesPath = "/proc/consoles"
+	// pciDevicesPath lists the functions on the guest's PCI bus.
+	pciDevicesPath = "/sys/bus/pci/devices"
 )
 
 // Bounds on one sandbox image. The scratch volume is the real limit; these
@@ -72,17 +74,25 @@ func newHoldCmd() *cobra.Command {
 
 func newLoadCmd() *cobra.Command {
 	cfg := LoadConfig{}
+	var allowConsole bool
 	cmd := &cobra.Command{
 		Use:   "load",
 		Short: "Copy this boot's launch files off the opkeydata volume and apply the host's network request",
 		Args:  cobra.NoArgs, SilenceUsage: true,
 		RunE: func(*cobra.Command, []string) error {
+			// The first thing the guest does with what its host built: before
+			// it reads a file the host handed it or sets an address the host
+			// asked for, the machine is one a session guest is given.
+			if err := (DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}).Check(); err != nil {
+				return err
+			}
 			cfg.Network = applyNetwork
 			return Load(cfg)
 		},
 	}
 	cmd.Flags().StringVar(&cfg.LaunchDir, "launch-dir", defaultLaunchDir, "where launch.yaml and its signature are staged for the agent")
 	cmd.Flags().StringVar(&cfg.ResolvConf, "resolv-conf", defaultResolvConf, "where the host's resolvers are written; the image's /etc/resolv.conf links to it")
+	cmd.Flags().BoolVar(&allowConsole, "allow-console", false, "take a virtio console among the guest's devices (dev images)")
 	return cmd
 }
 
@@ -128,6 +138,10 @@ func newRunCmd() *cobra.Command {
 				consoles := ConsoleGuard{Consoles: consolesPath}
 				checks = append(checks, func(context.Context) error { return consoles.Check() })
 			}
+			// The machine is the one a session guest is given, device by
+			// device, or the guest ends before it stages anything.
+			devices := DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}
+			checks = append(checks, func(context.Context) error { return devices.Check() })
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.

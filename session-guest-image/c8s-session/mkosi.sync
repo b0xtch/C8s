@@ -47,6 +47,13 @@ case "$ROLE" in
     *) echo "c8s-session sync: FATAL role sync-input must be session or key-service, got '${ROLE}'" >&2; exit 1 ;;
 esac
 
+# The launch files and the host's network request. A dev build's guest has
+# a console device, which the step's check of the guest's devices allows.
+LOAD=(/usr/local/bin/c8s session-agent load)
+if [ "$DEV" = 1 ]; then
+    LOAD+=(--allow-console)
+fi
+
 # Every word above is a fixed string or the validated platform: none needs
 # escaping in JSON.
 json_array() {
@@ -63,7 +70,7 @@ mkdir -p "$STAGE_DIR/etc/c8s-session"
     printf '  "steps": [\n'
     # The launch files and the host's network request, then the inbound
     # filter: both before the service listens.
-    printf '    %s,\n' "$(json_array /usr/local/bin/c8s session-agent load)"
+    printf '    %s,\n' "$(json_array "${LOAD[@]}")"
     printf '    %s\n' "$(json_array /usr/sbin/nft -f /etc/c8s-session/firewall.nft)"
     printf '  ],\n'
     printf '  "service": %s\n' "$(json_array "${SERVICE[@]}")"
