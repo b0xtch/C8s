@@ -12,6 +12,10 @@
 #   C8S_DEV=1       debug build: serial console, root autologin on it, and the
 #                   journal forwarded to the console. Different measurement,
 #                   host-readable logs. Never ship. Default name: c8s-session-dev.
+#   C8S_ROLE=key-service
+#                   build the key service's image: this image with the key
+#                   service as its measured service where the agent is. Its
+#                   own measurement. Default name: c8s-key-service[-dev].
 #   C8S_NAME=...    output name (default c8s-session -> output/c8s-session/)
 #   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
 #   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s binary and skip the
@@ -31,13 +35,19 @@ REPO_DIR=$(cd "$PGI_DIR/.." && pwd)
 CONFOS_DIR=${CONFOS_DIR:-"$REPO_DIR/../confidential-os-builder"}
 [ -x "$CONFOS_DIR/bin/confos" ] || { echo "session-guest-image/build: confos checkout not found at $CONFOS_DIR (set CONFOS_DIR)" >&2; exit 1; }
 
+case "${C8S_ROLE:-session}" in
+session) DEFAULT_NAME=c8s-session ;;
+key-service) DEFAULT_NAME=c8s-key-service ;;
+*)  echo "session-guest-image/build: C8S_ROLE must be session or key-service, got '${C8S_ROLE}'" >&2; exit 1 ;;
+esac
 FRAGMENT="$PGI_DIR/kernel/session.config"
 DEV_PROFILE=()
 if [ "${C8S_DEV:-0}" = 1 ]; then
     FRAGMENT="$PGI_DIR/kernel/session-dev.config"
     DEV_PROFILE=(--profile dev)
-    : "${C8S_NAME:=c8s-session-dev}"
+    DEFAULT_NAME=$DEFAULT_NAME-dev
 fi
+: "${C8S_NAME:=$DEFAULT_NAME}"
 
 if [ -z "${C8S_BINARY:-}" ]; then
     # -trimpath and an empty build id keep the binary a function of the
@@ -55,11 +65,12 @@ echo "session-guest-image/build: staging $(sha256sum "$C8S_BINARY" | cut -d' ' -
 
 cd "$CONFOS_DIR"
 install -D -m 0755 "$C8S_BINARY" mkosi/base/mkosi.local/mkosi.extra/usr/local/bin/c8s
-exec bin/confos build "${C8S_NAME:-c8s-session}" \
+exec bin/confos build "$C8S_NAME" \
     ${DEV_PROFILE[@]+"${DEV_PROFILE[@]}"} \
     --profile-dir "$PGI_DIR/c8s-session" \
     --sync-input "platform=${C8S_PLATFORM}" \
     --sync-input "dev=${C8S_DEV:-0}" \
+    --sync-input "role=${C8S_ROLE:-session}" \
     --kernel-config-fragment "$FRAGMENT" \
     --platform "$C8S_PLATFORM" \
     --memory "${C8S_MEMORY:-1G}" \

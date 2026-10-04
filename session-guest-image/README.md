@@ -46,7 +46,8 @@ for a session inherit.
 |---|---|
 | `C8S_PLATFORM` | Required: `tdx` or `snp`. The agent refuses to stage on the other TEE. |
 | `C8S_DEV=1` | Debug image: console, root autologin on it, journal forwarded to it, a bind accepted with no sandbox image, and a sandbox image accepted from a plain-HTTP registry at `10.0.2.2:5000` for tests. A different measurement and host-readable logs. Never ship. |
-| `C8S_NAME` | Output name (default `c8s-session`, or `c8s-session-dev`) |
+| `C8S_ROLE=key-service` | Build the [key service](../docs/session-key-service.md)'s image: this image with `c8s session-key-service run` as its measured service where the agent is. It has reference values of its own. |
+| `C8S_NAME` | Output name (default `c8s-session` or `c8s-key-service`, with `-dev` for a dev build) |
 | `C8S_MEMORY` | Default memory recorded in the manifest (default `1G`) |
 | `C8S_BINARY` | Stage this prebuilt linux/amd64 binary and skip the compile |
 | `CONFOS_DIR` | confos checkout to build with (default: a sibling of this repository) |
@@ -56,6 +57,10 @@ for a session inherit.
 No reproducibility check runs for this image yet. The node image's check
 builds twice and compares measurements; this image needs the same, on a second
 builder, before its manifest is worth pinning in production.
+
+The key service's image is this profile with another service on its verity
+root, so it also carries crun and the sandbox user, which a key service has
+no use for. A profile of its own comes with the key service's replication.
 
 The design calls for a session image with no console, whose every plaintext
 message has a type in a disclosure schema

@@ -19,6 +19,19 @@ mkdir -p "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d"
 printf '[Service]\nEnvironment=C8S_SESSION_PLATFORM=%s\n' "$PLATFORM" \
     > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/10-platform.conf"
 
+# The key service's image is this one with another measured service where the
+# agent is: the same boot, the same launch files, the same inbound filter.
+ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
+rm -f "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.conf"
+case "$ROLE" in
+    session) ;;
+    key-service)
+        printf '[Unit]\nDescription=Session key service\n[Service]\nExecStart=\nExecStart=/usr/local/bin/c8s session-key-service run --platform=${C8S_SESSION_PLATFORM}\n' \
+            > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.conf"
+        ;;
+    *) echo "c8s-session sync: FATAL role sync-input must be session or key-service, got '${ROLE}'" >&2; exit 1 ;;
+esac
+
 # Nobody logs in to a session guest. A login prompt takes input from whatever
 # keyboard or serial port the host gives the VM, and reads it as root. A dev
 # build keeps its console, with its autologin.
