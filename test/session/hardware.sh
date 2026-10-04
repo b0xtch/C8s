@@ -37,6 +37,14 @@
 #   C8S_QUOTE_SOCKET         the host's quoting service (default:
 #                            /var/run/tdx-qgs/qgs.socket)
 #   C8S_SESSION_CONFINE      run each VMM as this numeric user id
+#   C8S_ACCEPT_TCB           Intel TCB statuses, besides UpToDate, that this
+#                            host's platform has, comma-separated (OutOfDate
+#                            on a host whose microcode is behind). Every
+#                            verifier in the test then accepts them by name:
+#                            the owner, the key service of its pool's guests,
+#                            and a guest of its key service. Unset, a host
+#                            that is behind fails the test at its first
+#                            verdict, which names the status.
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -53,6 +61,8 @@ dev=${C8S_SESSION_DEV:-0}
 store_dir=${C8S_SANDBOX_STORE:-}
 quote_socket=${C8S_QUOTE_SOCKET:-/var/run/tdx-qgs/qgs.socket}
 confine=${C8S_SESSION_CONFINE:-}
+accept=()
+[ -n "${C8S_ACCEPT_TCB:-}" ] && accept=(--accept-tcb-status "$C8S_ACCEPT_TCB")
 port=${C8S_SESSION_PORT:-7443}
 ks_port=${C8S_KEY_SERVICE_PORT:-18543}
 cidr=${C8S_SESSION_CIDR:-10.213.0.0/24}
@@ -146,8 +156,8 @@ openssl req -x509 -new -key "$out/stranger.key" -subj "/CN=stranger" -days 2 -ou
 pin=$out/ks-pin.json
 expect 0 "the pool's launch key" pool-key "$C8S" session launch-config key --out "$out/pool.key"
 expect 0 "the key service's launch bundle" ks-bundle "$C8S" session key-service launch-config new --out "$out/ks" \
-    --image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub"
-expect 0 "the key service's pin" ks-pin "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin"
+    --image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub" "${accept[@]}"
+expect 0 "the key service's pin" ks-pin "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}"
 expect 0 "the pool's launch bundle, which pins the key service" bundle "$C8S" session launch-config new --out "$out/bundle" \
     --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16
 expect 0 "a bundle for a pool the key service does not list" bundle-b "$C8S" session launch-config new --out "$out/bundle-b" \
@@ -273,7 +283,7 @@ start_session() {
     local name=$1 dir=$2 who=$3 auth=$4 man=$5 key=$6
     shift 6
     "$C8S" session start "${orchestrator[@]}" --pool agents --wait 120s --image-manifest "$man" --launch-key "$key" \
-        --authority-key "$auth" --tenant "$who" --session "$name" --out "$dir" -o json "$@"
+        --authority-key "$auth" --tenant "$who" --session "$name" --out "$dir" -o json "${accept[@]}" "$@"
 }
 stored=(--key-service "$pin" --stored-credential api-token:256)
 # guest_logged <start log> <pattern>: the console of the TD that start was
@@ -331,7 +341,7 @@ cat "$out/start-s2.out" >> "$out/records.jsonl"
 expect 3 "a second start of a live session is refused" start-s1-again \
     start_session s1 "$out/s1-again" acme "$out/authority.key" "$manifest" "$launch_key" "${sandbox[@]}"
 
-s1=(--binding "$out/s1" --image-manifest "$manifest")
+s1=(--binding "$out/s1" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "release a credential to s1" credential "$C8S" session credential put token "${s1[@]}" --from-file "$out/released"
 expect 0 "run a command in s1 that reads both credentials" exec "$C8S" session exec "${s1[@]}" -- \
     sh -c 'cat "$C8S_CREDENTIALS_DIR/api-token"; echo; cat "$C8S_CREDENTIALS_DIR/token"; echo'
@@ -342,13 +352,13 @@ expect 0 "verify s1 with collateral from Intel alone" verify-own "$C8S" session 
 expect 0 "a command under the kept verdict" exec-kept "$C8S" session exec "${s1[@]}" -- true
 
 # What a live session refuses.
-expect 2 "verify refuses another image" verify-image "$C8S" session verify --binding "$out/s1" --image-manifest "$out/manifest-other.json"
+expect 2 "verify refuses another image" verify-image "$C8S" session verify --binding "$out/s1" --image-manifest "$out/manifest-other.json" "${accept[@]}"
 expect 124 "a stranger's key runs nothing" exec-stranger "$C8S" session exec "${s1[@]}" --key "$out/stranger.key" -- id
 "$C8S" session credential put api-token "${s1[@]}" --from-file "$out/released" > "$out/put-access.out" 2> "$out/put-access.err"
 code=$?
 if [ "$code" != 0 ]; then record PASS "no access key hands over what the key service holds" "exit $code"; else record FAIL "no access key hands over what the key service holds" "exit 0"; fi
 td2=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["td"])' "$out/s2/route.json")
-"$C8S" session exec --binding "$out/s1" --td "$td2" --image-manifest "$manifest" -- id > "$out/exec-cross.out" 2> "$out/exec-cross.err"
+"$C8S" session exec --binding "$out/s1" --td "$td2" --image-manifest "$manifest" "${accept[@]}" -- id > "$out/exec-cross.out" 2> "$out/exec-cross.err"
 code=$?
 if [ "$code" = 125 ] || [ "$code" = 124 ]; then
     record PASS "s1's binding runs nothing on s2's TD" "exit $code"
@@ -414,7 +424,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 expect 3 "a guest of a pool the key service does not serve takes no bind" bind-stray \
     "$C8S" session bind --url "https://127.0.0.1:$stray_port" --image-manifest "$manifest" --launch-key "$out/bundle-b/opkeydata/pubkey" \
-    --authority-key "$out/authority.key" --tenant acme --session s9 --out "$out/s9" --timeout 20s "${sandbox[@]}" "${stored[@]}"
+    --authority-key "$out/authority.key" --tenant acme --session s9 --out "$out/s9" --timeout 20s "${accept[@]}" "${sandbox[@]}" "${stored[@]}"
 check "it said its key service had not judged it" grep -q not_ready "$out/bind-stray.err" "$out/bind-stray.out"
 if [ "$dev" = 1 ]; then
     check "the key service refused it: a pool it does not serve" \
@@ -425,7 +435,7 @@ stop_pid "$stray_pid"; stray_pid=""
 # Destroy, drain, and what is left on the host.
 expect 0 "destroy s1" destroy "$C8S" session destroy --binding "$out/s1" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
 expect 124 "a destroyed session runs nothing" exec-gone "$C8S" session exec "${s1[@]}" --timeout 20s -- true
-expect 0 "s2 is untouched" exec-s2 "$C8S" session exec --binding "$out/s2" --image-manifest "$manifest" -- true
+expect 0 "s2 is untouched" exec-s2 "$C8S" session exec --binding "$out/s2" --image-manifest "$manifest" "${accept[@]}" -- true
 stop_pid "$daemon_pid"; daemon_pid=""
 drain
 check "drain ends every TD" [ "$(guests td-)" = 0 ]
