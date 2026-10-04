@@ -7,13 +7,19 @@
 # the key service and a second one by a key its bind grants, and runs one
 # authenticated command that reads both.
 #
-# Then what must be refused: evidence of another image, of a pool under
-# another launch key, a key service that is not the one pinned, a tenant
-# nobody registered, a bind under another authority, a credential nobody
-# stored, a sandbox image whose content was changed, a stranger's key, one
-# session's binding on another session's TD, a guest of a pool the key
-# service does not serve. With a dev image it also probes what a guest can
-# reach on its host and on other guests, which must be nothing.
+# Before that it reads the class's machine (RTMR[0]) from the evidence of one
+# guest, and the pool's launch document lists it.
+#
+# Then what must be refused: a bind to a guest whose launch document lists no
+# machine, a guest on a machine its document does not list, a guest with a
+# device its class does not have, evidence of
+# another image, of a pool under another launch key, a key service that is
+# not the one pinned, a tenant nobody registered, a bind under another
+# authority, a credential nobody stored, a sandbox image whose content was
+# changed, a stranger's key, one session's binding on another session's TD, a
+# guest of a pool the key service does not serve. With a dev image it also
+# probes what a guest can reach on its host and on other guests, which must
+# be nothing.
 #
 # It runs real TDs, so it needs a TDX host with QEMU, a quoting service and
 # passwordless sudo, and two guest images from session-guest-image/build: a
@@ -158,25 +164,8 @@ expect 0 "the pool's launch key" pool-key "$C8S" session launch-config key --out
 expect 0 "the key service's launch bundle" ks-bundle "$C8S" session key-service launch-config new --out "$out/ks" \
     --image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub" "${accept[@]}"
 expect 0 "the key service's pin" ks-pin "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}"
-expect 0 "the pool's launch bundle, which pins the key service" bundle "$C8S" session launch-config new --out "$out/bundle" \
-    --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16
-expect 0 "a bundle for a pool the key service does not list" bundle-b "$C8S" session launch-config new --out "$out/bundle-b" \
-    --key-service "$pin" --image-manifest "$manifest" --pool strangers --class s-4x16
-launch_key=$out/bundle/opkeydata/pubkey
-# Reference values and a pin that differ from the real ones in one digit.
-python3 - "$manifest" "$out/manifest-other.json" "$pin" "$out/ks-pin-other.json" <<'EOF'
-import json, sys
-def flip(v):
-    return ("0" if v[0] != "0" else "1") + v[1:]
-m = json.load(open(sys.argv[1]))
-m["tdx"]["mrtd"] = flip(m["tdx"]["mrtd"])
-json.dump(m, open(sys.argv[2], "w"))
-p = json.load(open(sys.argv[3]))
-p["image"]["measurement"] = flip(p["image"]["measurement"])
-json.dump(p, open(sys.argv[4], "w"))
-EOF
 
-ks_pid="" daemon_pid="" stray_pid=""
+ks_pid="" daemon_pid="" stray_pid="" probe_pid=""
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
@@ -190,6 +179,7 @@ cleanup() {
     drain
     sudo -n nft delete table inet c8s_sessions 2>/dev/null
     stop_pid "$stray_pid"; stray_pid=""
+    stop_pid "$probe_pid"; probe_pid=""
     stop_pid "$ks_pid"; ks_pid=""
 }
 trap cleanup EXIT
@@ -198,6 +188,131 @@ launcher=(session-launcher run --platform tdx --vsock-cid auto)
 [ -S "$quote_socket" ] && launcher+=(--quote-socket "$quote_socket")
 [ -n "$confine" ] && launcher+=(--confine "$confine")
 [ "$dev" = 1 ] && launcher+=(--console)
+# The shape of the one class: what the daemon launches each of its TDs with,
+# and so what every guest launched by hand here is given too.
+shape=(--vcpus 4 --memory 16G --low-memory 512M --scratch 4G ${store:+--image-store "$store"})
+# serving <pid> <port>: wait until the guest of that launcher serves.
+serving() {
+    local deadline=$(( $(date +%s) + 240 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        kill -0 "$1" 2>/dev/null || return 1
+        [ "$(curl -sk --max-time 2 "https://127.0.0.1:$2/healthz" 2>/dev/null)" = ok ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# A launch document lists the machines its guests may be, as values of
+# RTMR[0], and a TD whose document lists none takes no bind. The class's value
+# is read from the evidence of one guest launched in that shape under a
+# document that lists nothing.
+probe_port=$((ks_port + 2))
+expect 0 "a launch bundle that lists no machine" bundle-probe "$C8S" session launch-config new --out "$out/bundle-probe" \
+    --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16
+sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
+    --name "c8s-session-probe-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/probe.log" 2>&1 &
+probe_pid=$!
+if ! serving "$probe_pid" "$probe_port"; then
+    record FAIL "a guest whose document lists no machine serves" "$(tail -c 600 "$out/probe.log" | tr '\n' ' ')"
+    finish
+fi
+record PASS "a guest whose document lists no machine serves"
+expect 0 "its machine is read from its evidence" machine "$C8S" session launch-config machine --url "https://127.0.0.1:$probe_port" \
+    --image-manifest "$manifest" --launch-key "$out/pool.key.pub" "${accept[@]}"
+machine=$(tr -d '[:space:]' < "$out/machine.out")
+if ! [[ $machine =~ ^[0-9a-f]{96}$ ]]; then
+    record FAIL "the machine is a register's value" "$machine"
+    finish
+fi
+expect 3 "a guest whose document lists no machine takes no bind" bind-unpinned \
+    "$C8S" session bind --url "https://127.0.0.1:$probe_port" --image-manifest "$manifest" --launch-key "$out/pool.key.pub" \
+    --authority-key "$out/authority.key" --tenant acme --session s8 --out "$out/s8" --timeout 20s "${accept[@]}" "${sandbox[@]}"
+check "it said its document lists no machine" grep -q bind_no_machine "$out/bind-unpinned.err" "$out/bind-unpinned.out"
+stop_pid "$probe_pid"; probe_pid=""
+
+expect 0 "the pool's launch bundle, which pins the key service and lists the machine" bundle "$C8S" session launch-config new --out "$out/bundle" \
+    --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --machine "$machine"
+expect 0 "a bundle for a pool the key service does not list" bundle-b "$C8S" session launch-config new --out "$out/bundle-b" \
+    --key-service "$pin" --image-manifest "$manifest" --pool strangers --class s-4x16 --machine "$machine"
+launch_key=$out/bundle/opkeydata/pubkey
+
+# A guest on a machine its document does not list serves nothing: its agent
+# ends it before it listens. The document here lists the class's value with
+# one digit changed, which stands for a host that built another machine.
+other_machine=$( [ "${machine:0:1}" = 0 ] && echo 1 || echo 0 )${machine:1}
+expect 0 "a bundle that lists another machine" bundle-other "$C8S" session launch-config new --out "$out/bundle-other" \
+    --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --machine "$other_machine"
+began=$(date +%s%N)
+sudo -n timeout 120 "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-other/opkeydata" --work-dir "$out/other-vm" \
+    --name "c8s-session-other-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/other.log" 2>&1 &
+probe_pid=$!
+served=0
+while kill -0 "$probe_pid" 2>/dev/null; do
+    [ "$(curl -sk --max-time 1 "https://127.0.0.1:$probe_port/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
+    sleep 0.1
+done
+wait "$probe_pid" 2>/dev/null
+code=$?
+probe_pid=""
+printf '{"step":"other-machine","exit":%d,"ms":%d}\n' "$code" $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
+if [ "$served" = 0 ] && [ "$code" != 124 ] && grep -q "guest exited on its own" "$out/other.log"; then
+    record PASS "a guest on a machine its document does not list ends before it serves"
+else
+    record FAIL "a guest on a machine its document does not list ends before it serves" "served $served, exit $code: $(tail -c 300 "$out/other.log" | tr '\n' ' ')"
+fi
+
+# A host that keeps the shape and puts another device in a slot: the network
+# card of its choosing where the class has a virtio one. The guest's kernel
+# has no driver for it, and the guest ends before it reads a file of its
+# host's. The document is the pool's own, which lists this shape's machine.
+wrapper=/tmp/c8s-session-$run-qemu.sh
+cat > "$wrapper" <<'WRAP'
+#!/bin/sh
+# QEMU, with the guest's network device replaced by an e1000e.
+for arg; do
+    shift
+    case "$arg" in
+    virtio-net-pci,*) arg=$(printf '%s' "$arg" | sed -e 's/^virtio-net-pci,/e1000e,/' -e 's/,disable-legacy=on//') ;;
+    esac
+    set -- "$@" "$arg"
+done
+exec qemu-system-x86_64 "$@"
+WRAP
+chmod 0755 "$wrapper"
+began=$(date +%s%N)
+sudo -n timeout 120 "$C8S" "${launcher[@]}" --qemu "$wrapper" --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/swapped-vm" \
+    --name "c8s-session-swapped-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/swapped.log" 2>&1 &
+probe_pid=$!
+served=0
+while kill -0 "$probe_pid" 2>/dev/null; do
+    [ "$(curl -sk --max-time 1 "https://127.0.0.1:$probe_port/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
+    sleep 0.1
+done
+wait "$probe_pid" 2>/dev/null
+code=$?
+probe_pid=""
+rm -f "$wrapper"
+printf '{"step":"swapped-device","exit":%d,"ms":%d}\n' "$code" $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
+if [ "$served" = 0 ] && [ "$code" != 124 ] && grep -q "guest exited on its own" "$out/swapped.log"; then
+    record PASS "a guest with a device its class does not have ends before it serves"
+else
+    record FAIL "a guest with a device its class does not have ends before it serves" "served $served, exit $code: $(tail -c 300 "$out/swapped.log" | tr '\n' ' ')"
+fi
+if [ "$dev" = 1 ]; then
+    check "it said which device" grep -a -q "8086:10d3.*is none a session guest is given" "$out/swapped.log"
+fi
+# Reference values and a pin that differ from the real ones in one digit.
+python3 - "$manifest" "$out/manifest-other.json" "$pin" "$out/ks-pin-other.json" <<'EOF'
+import json, sys
+def flip(v):
+    return ("0" if v[0] != "0" else "1") + v[1:]
+m = json.load(open(sys.argv[1]))
+m["tdx"]["mrtd"] = flip(m["tdx"]["mrtd"])
+json.dump(m, open(sys.argv[2], "w"))
+p = json.load(open(sys.argv[3]))
+p["image"]["measurement"] = flip(p["image"]["measurement"])
+json.dump(p, open(sys.argv[4], "w"))
+EOF
 
 # The key service, in a TD of its own, on a loopback port of this host. A
 # session guest has no road to it: its launcher carries the connection.
@@ -413,15 +528,9 @@ check "the restarted daemon took its TDs over" [ "$(grep -c '"msg":"took over a 
 # back until it gives up.
 stray_port=$((ks_port + 1))
 sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-b/opkeydata" --work-dir "$out/stray-vm" \
-    --name "c8s-session-stray-$run" --vcpus 4 --memory 16G --low-memory 512M --scratch 4G --network user --port "127.0.0.1:$stray_port:8443" \
-    ${store:+--image-store "$store"} > "$out/stray.log" 2>&1 &
+    --name "c8s-session-stray-$run" "${shape[@]}" --network user --port "127.0.0.1:$stray_port:8443" > "$out/stray.log" 2>&1 &
 stray_pid=$!
-deadline=$(( $(date +%s) + 240 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    kill -0 "$stray_pid" 2>/dev/null || break
-    [ "$(curl -sk --max-time 2 "https://127.0.0.1:$stray_port/healthz" 2>/dev/null)" = ok ] && break
-    sleep 0.2
-done
+serving "$stray_pid" "$stray_port"
 expect 3 "a guest of a pool the key service does not serve takes no bind" bind-stray \
     "$C8S" session bind --url "https://127.0.0.1:$stray_port" --image-manifest "$manifest" --launch-key "$out/bundle-b/opkeydata/pubkey" \
     --authority-key "$out/authority.key" --tenant acme --session s9 --out "$out/s9" --timeout 20s "${accept[@]}" "${sandbox[@]}" "${stored[@]}"

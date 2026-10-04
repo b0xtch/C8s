@@ -156,6 +156,40 @@ and from other tenants whatever the guest does.
 forwarded to a loopback port. It needs no privilege and filters nothing. It
 is for development.
 
+## The pool's machine
+
+A TD has a register, RTMR[0], for what its host declared to the firmware: the
+shape of the machine, which is a class's vCPUs, its memory and its split, and
+how many devices it has. A pool's launch document lists the values its guests
+may hold, and a TD ends at boot if its own is not among them. A TD whose
+document lists none boots and says what it is to anyone, and takes no bind:
+its host could have built it any machine.
+
+So a pool's document is written twice. The first lists no machine. One guest
+is launched from it in the pool's class, and its machine is read from its
+evidence:
+
+```sh
+c8s session launch-config new --out probe --key pool.key \
+    --image-manifest c8s-session/manifest.json --pool agents --class s-4x16
+c8s session-launcher run --platform tdx --image-dir c8s-session --launch-dir probe/opkeydata \
+    --work-dir /run/c8s/probe --vcpus 4 --memory 16G --low-memory 512M --scratch 4G \
+    --vsock-cid auto --network user --port 127.0.0.1:8443:8443 &
+c8s session launch-config machine --url https://127.0.0.1:8443 \
+    --image-manifest c8s-session/manifest.json --launch-key pool.key.pub
+```
+
+The second document lists the value that printed (`--machine`), and the pool
+is configured with it. The value is of one shape on one build of the VMM and
+the firmware: a class with an image store has one more disk than a class
+without, and another value. A document lists up to eight.
+
+What RTMR[0] does not record is what stands in each slot. The agent checks
+that itself before it reads anything its host handed it: the guest's PCI bus
+must hold its board's two bridges and virtio devices for its network, its
+disks and its socket to the host, and nothing else. The guest's kernel has
+drivers for those alone.
+
 ## With a key service
 
 A pool whose launch document pins a [key service](session-key-service.md)
@@ -178,7 +212,8 @@ c8s session key-service launch-config new --out ks \
     --pool c8s-session/manifest.json:pool.key.pub
 c8s session key-service pin --bundle ks --url https://192.0.2.7:8443 --out ks-pin.json
 c8s session launch-config new --out pool --key pool.key --key-service ks-pin.json \
-    --image-manifest c8s-session/manifest.json --pool agents --class s-4x16
+    --image-manifest c8s-session/manifest.json --pool agents --class s-4x16 \
+    --machine "$machine"
 
 # The owner: register the tenant's authority once, store a credential, start a session.
 c8s session key-service tenant register --key-service ks-pin.json --tenant acme --authority-key authority.key
@@ -249,11 +284,15 @@ until their memory is the host's again.
 `test/session/hardware.sh` (`make test-session-hardware`) runs all of the
 above on one TDX host with real TDs: a key service, a daemon with one pool
 that pins it, an owner who stores a credential, and two sessions of two
-tenants. It checks that a session's command reads the stored credential and
-one that a key of its bind released, and then what must be refused:
+tenants. It reads the class's machine from one guest's evidence and lists it
+in the pool's document. It checks that a session's command reads the stored
+credential and one that a key of its bind released, and then what must be
+refused:
 
 | Refused | By whom |
 |---|---|
+| a bind to a guest whose launch document lists no machine | the guest |
+| a machine the launch document does not list; a device the class does not have | the guest, which ends before it serves |
 | evidence of another image, of a pool under another launch key, of a pool that pins another key service | the owner's client, before it signs a bind |
 | a key service that is not the one pinned | the owner's client, before it sends anything |
 | a bind for a tenant nobody registered, or under another authority; a credential nobody stored | the key service |
