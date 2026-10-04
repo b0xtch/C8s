@@ -29,7 +29,7 @@ type HostConfig struct {
 }
 
 // HostNetwork is a static address for the guest's one interface. Absent, the
-// guest falls back to DHCP.
+// guest configures no interface: it has no DHCP client.
 type HostNetwork struct {
 	// Address is the interface address in CIDR form.
 	Address string `json:"address"`

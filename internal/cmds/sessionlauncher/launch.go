@@ -83,6 +83,10 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		return 2 + len(inherited)
 	}
 	switch cfg.Network {
+	case NetworkUser:
+		// A session guest has no DHCP client: the launcher says outright
+		// what QEMU's user-mode stack would have answered.
+		host.Network = userNetwork()
 	case NetworkTap:
 		network, mac, tap, vhost, err := setupTap(&cfg)
 		if err != nil {

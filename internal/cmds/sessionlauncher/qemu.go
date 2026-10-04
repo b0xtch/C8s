@@ -43,6 +43,21 @@ const (
 	NetworkFD = "fd"
 )
 
+// The addresses of QEMU's user-mode network, said to QEMU and to the guest
+// alike. They are QEMU's defaults, written out so that neither side depends
+// on the other's.
+const (
+	userNetdev  = "net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15"
+	userAddress = "10.0.2.15/24"
+	userGateway = "10.0.2.2"
+	userDNS     = "10.0.2.3"
+)
+
+// userNetwork is the guest's side of the user-mode network.
+func userNetwork() *session.HostNetwork {
+	return &session.HostNetwork{Address: userAddress, Gateway: userGateway, DNS: []string{userDNS}}
+}
+
 // Config describes one guest. Nothing in it is trusted by the guest or by a
 // verifier: a wrong value yields a guest that fails to boot or fails to verify.
 type Config struct {
@@ -457,7 +472,7 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 			"-device", "virtio-net-pci,netdev=net0,mac="+c.tap.mac+",romfile=",
 		)
 	case NetworkUser:
-		netdev := "user,id=net0"
+		netdev := "user,id=net0," + userNetdev
 		for _, forward := range c.Forwards {
 			netdev += fmt.Sprintf(",hostfwd=tcp:%s:%d-:%d", forward.Address, forward.Host, forward.Guest)
 		}

@@ -25,7 +25,7 @@ import (
 const (
 	defaultPubkeyPath    = "/etc/confai/operator-pubkey"
 	defaultLaunchDir     = "/run/c8s-session/launch"
-	defaultNetworkDir    = "/run/systemd/network"
+	defaultResolvConf    = "/run/c8s-session/resolv.conf"
 	defaultCredentialDir = "/run/c8s/credentials"
 	defaultSandboxUser   = "sandbox"
 	// /var is a writable overlay on the encrypted scratch volume.
@@ -74,12 +74,15 @@ func newLoadCmd() *cobra.Command {
 	cfg := LoadConfig{}
 	cmd := &cobra.Command{
 		Use:   "load",
-		Short: "Copy this boot's launch files off the opkeydata volume and render the host's network request",
+		Short: "Copy this boot's launch files off the opkeydata volume and apply the host's network request",
 		Args:  cobra.NoArgs, SilenceUsage: true,
-		RunE: func(*cobra.Command, []string) error { return Load(cfg) },
+		RunE: func(*cobra.Command, []string) error {
+			cfg.Network = applyNetwork
+			return Load(cfg)
+		},
 	}
 	cmd.Flags().StringVar(&cfg.LaunchDir, "launch-dir", defaultLaunchDir, "where launch.yaml and its signature are staged for the agent")
-	cmd.Flags().StringVar(&cfg.NetworkDir, "network-dir", defaultNetworkDir, "systemd-networkd runtime configuration directory")
+	cmd.Flags().StringVar(&cfg.ResolvConf, "resolv-conf", defaultResolvConf, "where the host's resolvers are written; the image's /etc/resolv.conf links to it")
 	return cmd
 }
 

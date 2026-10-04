@@ -52,7 +52,7 @@ func TestQEMUArgsTDX(t *testing.T) {
 		"-add-fd", "fd=5,set=3",
 		"-drive", "file=/dev/fdset/3,format=raw,if=none,id=opkey0,readonly=on",
 		"-device", "virtio-blk-pci,drive=opkey0",
-		"-netdev", "user,id=net0,hostfwd=tcp::8443-:8443",
+		"-netdev", "user,id=net0,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,hostfwd=tcp::8443-:8443",
 		"-device", "virtio-net-pci,netdev=net0,romfile=",
 		"-device", "vhost-vsock-pci,guest-cid=7",
 	}
@@ -317,7 +317,7 @@ func TestParseForward(t *testing.T) {
 	}
 	cfg := baseConfig()
 	cfg.Forwards = []Forward{{Address: "127.0.0.1", Host: 18443, Guest: 8443}}
-	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.Contains(args, "-netdev user,id=net0,hostfwd=tcp:127.0.0.1:18443-:8443 ") {
+	if args := strings.Join(mustArgs(t, &cfg, nil), " "); !strings.Contains(args, "-netdev user,id=net0,"+userNetdev+",hostfwd=tcp:127.0.0.1:18443-:8443 ") {
 		t.Fatalf("forward not rendered:\n%s", args)
 	}
 }
@@ -711,5 +711,19 @@ func TestRunRefusesBeforeStartingQEMU(t *testing.T) {
 				t.Fatal("QEMU was started for a launch that should have been refused")
 			}
 		})
+	}
+}
+
+// A user-mode guest has no DHCP client. What the launcher tells it is what
+// the launcher tells QEMU, and it is a request the guest's loader accepts.
+func TestUserNetworkMatchesQEMU(t *testing.T) {
+	n := userNetwork()
+	if err := (&session.HostConfig{Network: n}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"host=" + n.Gateway, "dns=" + n.DNS[0], "dhcpstart=" + strings.TrimSuffix(n.Address, "/24"), "net=10.0.2.0/24"} {
+		if !strings.Contains(userNetdev, want) {
+			t.Errorf("QEMU is told %q, which lacks %q", userNetdev, want)
+		}
 	}
 }
