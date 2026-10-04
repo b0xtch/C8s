@@ -41,7 +41,7 @@ published file with a build.
 | `/etc/sysctl.d/50-c8s-session.conf` | verity root | No tunnel device in a new network namespace. The limit on user namespaces is the agent's to set: it makes the sandbox's and then has the kernel make no other |
 | `crun`, `nft` | distribution packages | crun runs the sandbox image a bind names, driven by the agent alone; nft loads the filter |
 | `sandbox` user (2000:2000) | `/etc/passwd`, written at build time | A session's commands run as this user in a dev image, when a bind names no sandbox image |
-| `kernel/session.config` | merged into the guest kernel | Adds vsock, which the agent uses to reach the host's quoting service and its key service, user namespaces for the sandbox's container, nftables for the filter, and transparent huge pages on request. |
+| `kernel/session.config` | merged into the guest kernel | Adds vsock, which the agent uses to reach the host's quoting service and its key service, user namespaces for the sandbox's container, nftables for the filter, and transparent huge pages on request. Removes every console but the one that discards |
 
 The base image contributes the kernel, the measured initrd that binds the
 launch key, the dm-verity root and the encrypted ephemeral state volume. This
@@ -76,10 +76,24 @@ The key service's image is this profile with another service on its verity
 root, so it also carries crun and the sandbox user, which a key service has
 no use for. A profile of its own comes with the key service's replication.
 
-The design calls for a session image with no console
-([session-disclosure.md](../docs/session-disclosure.md)). This profile's
-locked build offers no login and attaches no console getty; the kernel's own
-console is still to come.
+## No console
+
+A locked build's kernel has no serial driver, no virtual terminal, no virtio
+console, no boot console and no network console, and reads no console from
+the host's ACPI tables. Its one console is the kernel's null device, which
+discards. The agent reads the kernel's list of consoles before it serves and
+ends a guest that has any other. Nobody logs in: every getty unit is masked.
+The guest's logs stay in its journal, inside the TD.
+
+What a guest says before its kernel runs is outside this: the firmware and
+the boot stub can write to a serial port a host attaches. They run before the
+guest has a launch document, a key or a session, so nothing of a session is
+theirs to say.
+
+Of [session-disclosure.md](../docs/session-disclosure.md), three things are
+not built: a reason code that a guest leaves when it ends, the owner's way to
+read a session's logs, and a schema for what the key service answers. A
+guest that ends is known to its host as ended and no more.
 
 `bin/setup` in confos installs host packages from a pinned snapshot and allows
 downgrades. Build in a throwaway VM or container: on a host you care about it

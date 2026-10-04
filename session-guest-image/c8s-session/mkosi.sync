@@ -26,7 +26,12 @@ rm -f "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.
 case "$ROLE" in
     session) ;;
     key-service)
-        printf '[Unit]\nDescription=Session key service\n[Service]\nExecStart=\nExecStart=/usr/local/bin/c8s session-key-service run --platform=${C8S_SESSION_PLATFORM}\n' \
+        # A dev build's kernel has a console, and its key service is told so.
+        KS_FLAGS=
+        if [ "$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)" = 1 ]; then
+            KS_FLAGS=' --allow-console'
+        fi
+        printf '[Unit]\nDescription=Session key service\n[Service]\nExecStart=\nExecStart=/usr/local/bin/c8s session-key-service run --platform=${C8S_SESSION_PLATFORM}%s\n' "$KS_FLAGS" \
             > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/30-key-service.conf"
         ;;
     *) echo "c8s-session sync: FATAL role sync-input must be session or key-service, got '${ROLE}'" >&2; exit 1 ;;
@@ -53,6 +58,8 @@ if [ "$DEV" = 1 ]; then
     # HTTP. QEMU's user-mode network shows the guest its host at 10.0.2.2.
     # --bare lets a document name no sandbox image at all: its commands then
     # run on the guest's own file system, beside the guest's services.
-    printf '# DEV build: accepts a sandbox image from a local plain-HTTP registry, and a document with no sandbox image.\n[Service]\nEnvironment="C8S_SESSION_DEV_FLAGS=--sandbox-plain-http=10.0.2.2:5000 --bare"\n' \
+    # --allow-console has the agent serve in a guest whose kernel has a
+    # console, which a dev build's does.
+    printf '# DEV build: accepts a sandbox image from a local plain-HTTP registry, and a document with no sandbox image. Its kernel has a console.\n[Service]\nEnvironment="C8S_SESSION_DEV_FLAGS=--sandbox-plain-http=10.0.2.2:5000 --bare --allow-console"\n' \
         > "$STAGE_DIR/etc/systemd/system/c8s-session-agent.service.d/20-dev.conf"
 fi

@@ -36,6 +36,8 @@ const (
 	defaultPidsMax = 4096
 	// clockSourcePath names the clocksource the kernel settled on.
 	clockSourcePath = "/sys/devices/system/clocksource/clocksource0/current_clocksource"
+	// consolesPath lists the consoles the kernel registered.
+	consolesPath = "/proc/consoles"
 )
 
 // Bounds on one sandbox image. The scratch volume is the real limit; these
@@ -89,6 +91,7 @@ func newRunCmd() *cobra.Command {
 	var acceptRest bool
 	var guard RulesetGuard
 	var schemas SchemaGuard
+	var allowConsole bool
 	image := ImageRunnerConfig{Pull: sandboxPullLimits, Unpack: sandboxUnpackLimits}
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -116,6 +119,10 @@ func newRunCmd() *cobra.Command {
 			// The schemas on the measured root are the ones this agent keeps
 			// to, or this is not the image that was published.
 			checks = append(checks, func(context.Context) error { return schemas.Check() })
+			if !allowConsole {
+				consoles := ConsoleGuard{Consoles: consolesPath}
+				checks = append(checks, func(context.Context) error { return consoles.Check() })
+			}
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.
@@ -192,6 +199,7 @@ func newRunCmd() *cobra.Command {
 	f.StringVar(&guard.Nft, "nft", "/usr/sbin/nft", "nft binary, for --packet-filter")
 	f.StringVar(&schemas.Disclosure, "disclosure-schema", "", "the image's disclosure schema, on its measured root; the agent ends the guest if it is not the one the agent keeps to")
 	f.StringVar(&schemas.Bind, "bind-schema", "", "the image's bind schema, on its measured root; the agent ends the guest if it is not the one the agent takes binds by")
+	f.BoolVar(&allowConsole, "allow-console", false, "serve in a guest whose kernel has a console its host can read: a dev image's mode. Without it the agent ends such a guest")
 	f.StringVar(&image.Crun, "crun", "", "crun binary; set by guest images that can run a sandbox image")
 	f.StringVar(&image.StateDir, "sandbox-state-dir", defaultStateDir, "directory on the encrypted scratch volume for the sandbox image")
 	f.StringVar(&image.RunDir, "sandbox-runtime-dir", defaultRuntimeDir, "RAM-backed directory for the container runtime's state")

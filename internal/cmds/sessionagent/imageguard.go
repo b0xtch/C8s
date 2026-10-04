@@ -1,8 +1,11 @@
 package sessionagent
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
@@ -34,6 +37,41 @@ func (g SchemaGuard) Check() error {
 		if !bytes.Equal(onImage, schema.render()) {
 			return fmt.Errorf("the image's %s schema at %s is not this agent's", schema.name, schema.path)
 		}
+	}
+	return nil
+}
+
+// nullConsole is the kernel's console that discards what is written to it.
+const nullConsole = "ttynull"
+
+// ConsoleGuard checks that the kernel writes to no console a host could
+// read. A session image's kernel is built with no console driver but the one
+// that discards, so a guest with any other is not that image.
+type ConsoleGuard struct {
+	// Consoles is the kernel's list of registered consoles, /proc/consoles.
+	Consoles string
+}
+
+// Check fails if the kernel has a console that leads anywhere.
+func (g ConsoleGuard) Check() error {
+	list, err := os.Open(g.Consoles)
+	if err != nil {
+		return fmt.Errorf("the kernel's consoles: %w", err)
+	}
+	defer list.Close()
+	lines := bufio.NewScanner(list)
+	for lines.Scan() {
+		fields := strings.Fields(lines.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		// A name and the index the kernel gave it: ttynull0.
+		if strings.TrimRight(fields[0], "0123456789") != nullConsole {
+			return fmt.Errorf("the kernel has console %s: a session guest writes to none its host could read", fields[0])
+		}
+	}
+	if err := lines.Err(); err != nil {
+		return fmt.Errorf("the kernel's consoles: %w", err)
 	}
 	return nil
 }

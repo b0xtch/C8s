@@ -43,6 +43,7 @@ func NewCmd() *cobra.Command {
 
 func newRunCmd() *cobra.Command {
 	var platform, pubkey, launchDir, listen, collateral string
+	var allowConsole bool
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Authenticate and measure the launch document, then serve the key service",
@@ -56,6 +57,13 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 		Args: cobra.NoArgs, SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+			// What a replica logs names tenants and sessions. Its kernel
+			// writes to no console its host could read, or it does not serve.
+			if !allowConsole {
+				if err := (sessionagent.ConsoleGuard{Consoles: "/proc/consoles"}).Check(); err != nil {
+					return err
+				}
+			}
 			tee, err := sessionagent.OpenTEE(platform)
 			if err != nil {
 				return err
@@ -98,6 +106,7 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 	f.StringVar(&pubkey, "pubkey", defaultPubkeyPath, "launch public key staged by the measured initrd")
 	f.StringVar(&launchDir, "launch-dir", defaultLaunchDir, "directory holding launch.yaml and launch.yaml.sig")
 	f.StringVar(&collateral, "collateral-cache", defaultCollateralDir, "RAM-backed directory that keeps the vendor's documents between judgments")
+	f.BoolVar(&allowConsole, "allow-console", false, "serve in a guest whose kernel has a console its host can read: a dev image's mode")
 	_ = cmd.MarkFlagRequired("platform")
 	return cmd
 }

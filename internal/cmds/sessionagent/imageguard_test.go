@@ -1,6 +1,7 @@
 package sessionagent
 
 import (
+	"bufio"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,5 +37,98 @@ func TestSchemaGuard(t *testing.T) {
 		if err := guard.Check(); err == nil {
 			t.Errorf("%s: the agent would serve", name)
 		}
+	}
+}
+
+func TestConsoleGuard(t *testing.T) {
+	for name, tc := range map[string]struct {
+		consoles string
+		serves   bool
+	}{
+		"no console at all":        {"", true},
+		"the null console":         {"ttynull0             -W- (EC    )  242:0\n", true},
+		"a serial console":         {"ttyS0                -W- (EC p a)    4:64\n", false},
+		"a virtio console":         {"hvc0                 -W- (EC p  )  229:0\n", false},
+		"the virtual terminal":     {"tty0                 -WU (EC    )    4:1\n", false},
+		"a network console":        {"netcon0              -W- (E     )\n", false},
+		"the null console and one": {"ttynull0             -W- (EC    )  242:0\nhvc0                 -W- (E  p  )  229:0\n", false},
+		"a name that begins alike": {"ttynullx0            -W- (EC    )  242:0\n", false},
+	} {
+		path := filepath.Join(t.TempDir(), "consoles")
+		if err := os.WriteFile(path, []byte(tc.consoles), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := (ConsoleGuard{Consoles: path}).Check(); (err == nil) != tc.serves {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if err := (ConsoleGuard{Consoles: filepath.Join(t.TempDir(), "absent")}).Check(); err == nil {
+		t.Error("a guest that cannot list its consoles would serve")
+	}
+}
+
+// kernelConfig reads a resolved kernel configuration: every symbol that is
+// set, without its CONFIG_ prefix.
+func kernelConfig(t *testing.T, path string) map[string]string {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	config := map[string]string{}
+	lines := bufio.NewScanner(file)
+	for lines.Scan() {
+		if symbol, value, ok := strings.Cut(lines.Text(), "="); ok && strings.HasPrefix(symbol, "CONFIG_") {
+			config[strings.TrimPrefix(symbol, "CONFIG_")] = value
+		}
+	}
+	if err := lines.Err(); err != nil || len(config) < 1000 {
+		t.Fatalf("%s holds %d symbols: %v", path, len(config), err)
+	}
+	return config
+}
+
+// A locked image's kernel has one console, the one that discards. The
+// snapshot is that kernel's whole configuration as the image builder
+// resolved it from this profile's fragment, and an image's manifest carries
+// its digest. The agent checks the running kernel's consoles too: this holds
+// the build to the same rule, drivers that register no console until a host
+// attaches a device included.
+func TestLockedKernelHasNoConsole(t *testing.T) {
+	const kernels = "../../../session-guest-image/kernel/"
+	locked := kernelConfig(t, kernels+"config-x86_64-session.snapshot")
+	for _, symbol := range []string{
+		"VT", "VT_CONSOLE", "VGA_CONSOLE", "FRAMEBUFFER_CONSOLE", "FB", "DRM",
+		"VIRTIO_CONSOLE", "HVC_DRIVER", "SERIAL_8250", "SERIAL_CORE", "TTY_PRINTK",
+		"EARLY_PRINTK", "SERIAL_EARLYCON", "EFI_EARLYCON", "X86_VERBOSE_BOOTUP",
+		"NETCONSOLE", "ACPI_SPCR_TABLE", "PSTORE", "KGDB",
+	} {
+		if value, set := locked[symbol]; set {
+			t.Errorf("the locked kernel has CONFIG_%s=%s", symbol, value)
+		}
+	}
+	for _, symbol := range []string{"NULL_TTY", "NULL_TTY_DEFAULT_CONSOLE"} {
+		if locked[symbol] != "y" {
+			t.Errorf("the locked kernel has CONFIG_%s=%q, want y: with no console at all a program cannot open /dev/console", symbol, locked[symbol])
+		}
+	}
+	// A console driver this test has not heard of names itself one. Of the
+	// four that do and are none: the null console, two log levels, and a slot
+	// in the fixed map that x86 always reserves and nothing here fills.
+	known := map[string]bool{
+		"NULL_TTY_DEFAULT_CONSOLE": true, "CONSOLE_LOGLEVEL_DEFAULT": true, "CONSOLE_LOGLEVEL_QUIET": true, "FIX_EARLYCON_MEM": true,
+	}
+	for symbol, value := range locked {
+		for _, word := range []string{"CONSOLE", "EARLYCON", "EARLY_PRINTK"} {
+			if strings.Contains(symbol, word) && !known[symbol] {
+				t.Errorf("the locked kernel has CONFIG_%s=%s: is it a console a host could read?", symbol, value)
+			}
+		}
+	}
+	// The dev kernel is the one with a console, which is what tells the two
+	// snapshots apart.
+	if dev := kernelConfig(t, kernels+"config-x86_64-session-dev.snapshot"); dev["VIRTIO_CONSOLE"] != "y" || dev["SERIAL_8250_CONSOLE"] != "y" {
+		t.Error("the dev kernel has no console: the two snapshots are no longer told apart")
 	}
 }
