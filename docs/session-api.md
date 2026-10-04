@@ -285,7 +285,7 @@ in the release log with its reference values
 | `purpose` | `start`, `restore` or `fork`; with `generation` or `template` where they apply |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
 | `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; and the wall when the TD is a tenant VM |
-| `keyService` | the key service the session trusts, pinned as in the launch document; a TD takes a bind only for the key service it opened its session with |
+| `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
 | `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default |

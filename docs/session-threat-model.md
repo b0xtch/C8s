@@ -148,11 +148,11 @@ but not confidentiality.
   and every connection from outside; egress leaves through one named
   interface only. The host enforces this, so it guards the platform and
   other sessions from a session, not a session from the host.
-- **The path to the key service.** A guest reaches its key service only
-  through its launcher, which relays one vsock port, for its own guest only,
-  to the key service's address. The relay carries the attested channel's
-  ciphertext, so like any host part it can only delay or drop it, and the
-  sandbox cannot open vsock at all.
+- **The path to the key service.** A TD the daemon launches reaches its key
+  service only through its launcher, which relays one vsock port, for its
+  own guest only, to the key service's address. The relay carries the
+  attested channel's ciphertext, so like any host part it can only delay or
+  drop it, and the sandbox cannot open vsock at all.
 - **Inference** leaves only through the guest's gateway, which verifies the
   inference service's attestation before it sends anything.
 - **Recorded traffic.** Attested channels use hybrid key exchange, and

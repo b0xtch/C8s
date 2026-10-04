@@ -37,11 +37,14 @@ enforces its rules without reading a session.
    gateways, so nothing in it can add to what the guest says.
 
 The schema does not cover answers on routes that need a key the bind grants,
-which travel only inside the TLS channel that ends in the guest, to that
-key's holder; the HTTP library's fixed refusal of a malformed request; what
-firmware and the boot stub print before the kernel runs; or the key
-service's answers, which will get a schema of their own. None of these lets
-a session put plaintext of its choosing where the host can read it.
+once the guest has accepted the key: they travel only inside the TLS channel
+that ends in the guest, to that key's holder, and the host sees only their
+sizes and timing. A refusal before the key is accepted goes through the
+encoder like any other answer. Nor does the schema cover the HTTP library's
+fixed refusal of a malformed request, what firmware and the boot stub print
+before the kernel runs, or the key service's answers, which will get a
+schema of their own. None of these lets a session put plaintext of its
+choosing where the host can read it.
 
 ## What the host sees
 
@@ -61,8 +64,8 @@ a session put plaintext of its choosing where the host can read it.
 - **No console.** A session image's kernel is built without a console the
   host could read (no virtual terminals, virtio console, netconsole or early
   printk), with a null console as its default, and the agent and the key
-  service check that no console is registered before they serve. Boot's
-  progress reaches the host only as phases from the schema.
+  service check that no console but the null one is registered before they
+  serve. Boot's progress reaches the host only as phases from the schema.
   A debug build keeps a console, at other measurements, which no verifier of
   real sessions accepts.
 - **Logs stay in the session.** The agent's, the sandbox's and the kernel's
