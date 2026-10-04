@@ -96,7 +96,12 @@ but not confidentiality.
   of the one TD it fits.
 - **The host rebinds a bound TD.** Binding is one way, and a refused bind
   ends the guest.
-- **Stale evidence.** Fresh quotes are made over the verifier's nonce, and the
+- **An outsider binds a pooled TD for itself**, to run on the platform's
+  compute. An unbound guest takes the first valid bind it is sent, so the
+  daemon lets nothing reach it but its own requests and the bind of its
+  claim, and refuses `Connect` to it; TD names are random besides.
+- **Stale evidence.** Fresh quotes are made over the binder's nonce in a
+  bind's answer, or over a verifier's own nonce through `Connect`, and the
   RA-TLS handshake proves that the key is live.
 - **A pooled TD carrying something from an earlier session.** A bound TD never
   returns to a pool, and a pooled TD holds no tenant data, code or keys before
@@ -137,6 +142,12 @@ but not confidentiality.
   another session is seen.
 - **Egress** leaves only through the guest's proxy, under the allowlist in the
   bind.
+- **A session reaching the host or another session.** Each TD has its own
+  tap device and /30 network, with no bridge, and the host's packet filter
+  drops what a guest sends to the host or to another guest, spoofed sources
+  and every connection from outside; egress leaves through one named
+  interface only. The host enforces this, so it guards the platform and
+  other sessions from a session, not a session from the host.
 - **Inference** leaves only through the guest's gateway, which verifies the
   inference service's attestation before it sends anything.
 - **Recorded traffic.** Attested channels use hybrid key exchange, and

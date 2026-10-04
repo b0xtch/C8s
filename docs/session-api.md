@@ -1,7 +1,8 @@
 # The session API
 
-Status: design. The API is `c8s.session.v1alpha1`, and nothing in it is built
-yet. [sessions.md](sessions.md) is the overview.
+Status: design, with milestone 1 being built. The API is
+`c8s.session.v1alpha1`; [session-daemon.md](session-daemon.md) lists the calls
+built so far, and [sessions.md](sessions.md) is the overview.
 
 The session API is how an agent platform creates, holds, seals, restores,
 forks and ends confidential sessions. The c8s daemon that serves it runs on
@@ -18,7 +19,7 @@ every call that changes what a TD is returns evidence that the caller checks.
 | verifiers: SDKs, browsers, the key service, the binder | their own checks | `GetEvidence`, `Connect` | none for evidence, which is public; `Connect` carries the verifier's own channel |
 | senders and readers of envelopes | their own messages | `Deliver`, `Collect` | the orchestrator's identity or a per-session token; envelopes are sealed and signed inside |
 | the platform's review service | the signals its review policy allows | `Collect`, for review batches | the orchestrator's identity; batches are encrypted to its review key |
-| guest agent | everything inside its TD | none: it reaches the daemon only over channels it opens, and answers one host request, to seal | its instance key |
+| guest agent | everything inside its TD | none: it reaches the daemon only over channels it opens, and answers only the host requests the calls below need: fence, bind, evidence and seal | its instance key |
 
 **Who holds the binder decides who can direct a TD.** If the platform runs
 the binder, the platform chooses what each TD becomes, and the evidence shows
@@ -65,7 +66,7 @@ guest's own API on its TLS port.
  booting --> ready --> claimed --> bound --> running <--> held
                ^          |                     |
                +----------+                     +--> sealing --> ended
-          claim lapsed, never bound             +--------------> ended
+     claim lapsed, or destroyed before a bind   +--------------> ended
  any state --> ended: destroyed, refused bind, age limit, crash, host lost,
                       lease lost
 ```
@@ -77,9 +78,13 @@ guest's own API on its TLS port.
 - **ready to claimed.** `Claim` fences the TD, so that no connection opened
   before the claim survives it, and reserves the TD for a session. A claim
   nobody binds before the bind grace runs out returns the TD to ready, since
-  nothing of a tenant has entered it.
+  nothing of a tenant has entered it, and so does a `Destroy` of a claimed TD
+  that was never sent a bind.
 - **claimed to bound.** The guest takes one bind, measures it and refuses
-  every other. A refused bind ends the guest.
+  every other. A refused bind ends the guest. Since an unbound guest takes
+  the first valid bind it is sent, the daemon lets nothing reach it before
+  then but its own requests and the bind of its claim, and refuses `Connect`
+  to it.
 - **running and held.** `Hold` stops the TD's vCPUs, and `Release` starts
   them again.
 - **sealing to ended.** The guest writes its seal, records it at the key
@@ -163,11 +168,13 @@ message Evidence {
   bytes certificate = 1;               // RA-TLS; report data binds the instance key
   bytes launch_document = 2;
   bytes launch_signature = 3;
-  repeated bytes events = 4;           // the runtime register's event log
+  repeated string events = 4;          // the digests the guest extended, in order
   bytes bind = 5;                      // when bound
-  bytes quote = 6;                     // when fresh; report data binds the nonce
+  bytes quote = 6;                     // only in Bound: the guest's evidence envelope (JSON), fresh over the bind's nonce
   bytes collateral = 7;                // the vendor's documents, stapled
   repeated bytes release_proofs = 8;   // the release log's proofs for the image, class and policies, stapled
+  bytes bind_signature = 9;            // when bound; a verifier holds the bind to it
+  string phase = 10;                   // as the guest reports it
 }
 message DiskRef {
   string slot = 1;                     // root, ro, in or out
@@ -232,12 +239,12 @@ What each call does, and what a daemon that cheats could do with it:
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
 | `Claim` | orchestrator | fences a ready TD and returns its evidence; waits up to `wait`, then says when the next will be ready | nothing until a bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
 | `Bind` | orchestrator or binder | places what the bind names on the TD's slots, posts the bind to the guest, and returns the evidence the guest answers with, fresh over the bind's nonce | checks and takes the bind, measures it, opens only the disks it names, restores if it names a seal | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
-| `Connect` | anyone | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
+| `Connect` | anyone, once the TD is bound | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored; refuses a TD that is not bound yet | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
 | `Seal` | orchestrator | makes room on the TD's `out` slot and asks the guest to seal | checkpoints onto the slot under a new key, records the generation at the key service, ends | it loses the seal, and the key service refuses any older one in its place |
-| `Destroy` | orchestrator | ends the TD and deletes the session's ciphertext | nothing: ending a TD needs no cooperation | the same as any host stopping a guest |
-| `GetEvidence` | anyone | returns what the guest serves | serves its certificate, documents and events | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
+| `Destroy` | orchestrator | ends the TD and deletes the session's ciphertext; returns a claimed TD that was never sent a bind to its pool, as a lapsed claim does | nothing: ending a TD needs no cooperation | the same as any host stopping a guest |
+| `GetEvidence` | anyone | returns what the guest serves, with no fresh quote | serves its certificate, documents, events, bind and phase; it quotes fresh only in a bind's answer or over `Connect` | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
 | `GetStats` | orchestrator | reports what a host sees | nothing | nothing new: the host saw it anyway |
 | `Start`, `Restore`, `Fork` | orchestrator | `Claim`, then `SignBind` on the binder, then `Bind` | as for `Bind` | as for each step |
 
@@ -299,14 +306,21 @@ it does not know.
 1. The orchestrator calls `Start(session, pool, tenant)`.
 2. The daemon claims a ready TD, fencing it.
 3. The daemon sends the TD's evidence to the tenant's binder in `SignBind`.
-   The binder checks it as any verifier does: the quote and the vendor's
-   collateral, the image pins, the TCB level and the instance key. Then it
-   signs a bind naming the TD's instance key, the session, the disks (a fresh
-   root, and the read-only images by root hash), the policy, a nonce and a
-   `notAfter` a minute away.
+   The binder checks it as any verifier does, on the quote in the TD's RA-TLS
+   certificate: the vendor's collateral, the image pins, the TCB level and
+   the instance key the quote binds. That quote is as old as the certificate,
+   since a guest quotes fresh only in a bind's answer or over `Connect`. Then
+   the binder signs a bind naming the TD's instance key, the session, the
+   disks (a fresh root, and the read-only images by root hash), the policy, a
+   nonce and a `notAfter` a minute away.
 4. The daemon calls `Bind`. The guest takes the bind, measures it, makes its
    root file system under a key it generates, and starts the sandbox. The
-   answer carries fresh evidence over the binder's nonce.
+   answer carries a fresh quote over the binder's nonce, with the bind in the
+   TD's measurements.
+
+A bind holds no secret, so a stale quote costs at most a wasted bind: keys
+and credentials reach a session only after the key service, or the owner's
+client over `Connect`, has checked a fresh quote itself.
 
 No boot is on this path: a start is two round trips to the guest plus the
 binder's check.
@@ -358,14 +372,18 @@ upgrade, seals every live session and restores each elsewhere.
   for a call in the wrong state, such as a bind on a TD claimed for another
   session; `ABORTED` when the key service refuses a compare-and-swap;
   `RESOURCE_EXHAUSTED` when no TD is ready within `wait` or a quota is
-  reached, with the expected wait. `UNAVAILABLE` means a lost host or an
+  reached, with the expected wait in gRPC's `RetryInfo` (for an empty pool,
+  how long its last boot took). `UNAVAILABLE` means a lost host or an
   unreachable key service, and is worth a retry. A guest's own refusal comes
   back as a separate detail, so a caller can tell the guest's decision from a
   daemon fault; a daemon could forge one, which only denies service.
 - **Retries.** A request id is kept for 24 hours, and a repeat returns the
-  stored answer. `Seal` and the flows return an operation with a phase
-  (claimed, bound, restoring, done) that the caller polls or waits on. A flow
-  can be cancelled until its bind, and after that only by `Destroy`.
+  stored answer, across a restart too: the daemon keeps the first answers of
+  `Claim` and `Bind` in each TD's record on disk, and TDs outlive it, each
+  under a launcher process of its own, so a new daemon takes them over.
+  `Seal` and the flows return an operation with a phase (claimed, bound,
+  restoring, done) that the caller polls or waits on. A flow can be cancelled
+  until its bind, and after that only by `Destroy`.
 - **Versions.** The package is `c8s.session.v1alpha1`, and fields are only
   ever added. The bind keeps its own schema version, `c8s-bind/v1`.
 - **Limits**, per orchestrator: pools, live TDs, held TDs, seal bytes and

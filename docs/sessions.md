@@ -1,7 +1,8 @@
 # Confidential sessions
 
-Status: design. Nothing described here is built yet; [Milestones](#milestones)
-orders the work.
+Status: design, with milestone 1 being built.
+[session-daemon.md](session-daemon.md) describes what runs so far, and
+[Milestones](#milestones) orders the work.
 
 An agent platform runs each of its users' sessions in a microVM of its own:
 the agent or a custom harness, the tools it calls, and a workspace holding
@@ -23,6 +24,7 @@ This document is the overview. The details are in:
 | Document | Covers |
 |---|---|
 | [session-api.md](session-api.md) | the calls a platform makes, the flows built from them, and the other doors |
+| [session-daemon.md](session-daemon.md) | for operators, the daemon as built: its calls, configuration and host network, restarts, drains, and what is missing |
 | [session-state.md](session-state.md) | holding, sealing, restoring and forking a session; leases, keys and disks |
 | [session-key-service.md](session-key-service.md) | the key service: its replicas, leases across leaders, its ledger and witnesses, recovery and release |
 | [session-disclosure.md](session-disclosure.md) | what a session says in plaintext, its logs and crashes, and private review of its use |

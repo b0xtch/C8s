@@ -1,7 +1,8 @@
 # Session performance
 
-Status: design. Nothing in this design has been measured yet; this document
-sets the bar, names the floors, and fixes how the numbers will be taken.
+Status: design. No number here has been taken under these rules yet; this
+document sets the bar, names the floors, and fixes how the numbers will be
+taken.
 
 ## The bar
 
