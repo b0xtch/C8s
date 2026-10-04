@@ -80,12 +80,20 @@ but not confidentiality.
 
 - **The host boots another image.** MRTD, RTMR[1] or RTMR[2] differ from the
   published pins, and every verifier refuses the evidence.
-- **The host declares another VM shape or device set.** RTMR[0] records what
-  the host declared to the firmware, and each class publishes its expected
-  value, which the launch document lists and the guest checks at boot. It does
-  not record everything the guest later finds behind emulated devices, so the
-  guest also checks its own device set against its class's fixed slots and
-  treats every byte from a device as untrusted.
+- **The host declares another machine.** RTMR[0] records the machine the host
+  declared to the firmware: its vCPUs, its memory and how that is split, how
+  many PCI functions it has, and the builds of its VMM and firmware. It does
+  not record what kind each device is: with milestone 1's QEMU and TDVF, an
+  e1000e in the network slot gives the same value as virtio. So a pool's
+  launch document lists the values its class may have, and a TD on any other
+  machine ends before it serves; verifiers hold a TD to the same list, from
+  its measured document, and take the evidence of a TD whose document lists
+  none only to read its value. And the guest checks its devices itself, first
+  in its load step, before it reads anything its host handed it, and again
+  before the agent serves: every PCI function must be of a kind its class has
+  (the board's two bridges, and modern-only virtio for its network, its disks
+  and its socket to the host, with a console only in a development image), or
+  the TD ends.
 - **A debug or migratable TD.** Verifiers pin the TD's attributes, so neither
   passes.
 - **An old TCB, or a quote from the wrong enclave.** A verifier holds a
@@ -224,8 +232,11 @@ but not confidentiality.
 - **Device emulation is untrusted.** Virtio traffic goes through bounce
   buffers in shared memory, and the guest's drivers treat every value from a
   device as hostile. The guest's kernel has drivers only for its class's
-  devices, and the agent ends the TD if it finds any other PCI function, so a
-  device the host adds meets no driver.
+  devices, and the guest ends if any PCI function is of another kind, so a
+  device the host adds or swaps meets no driver. The kernel also leaves out
+  what would read more from the host: PCI hot plug, legacy virtio, the DMI
+  tables, EFI variables and runtime services, and the console's magic keys
+  (sysrq).
 
 ### Disclosure
 
@@ -303,10 +314,12 @@ the verifier code the browser runs.
 
 ## Open questions
 
-1. **RTMR[0] per class.** Milestone 2 records each class's value from its own
-   launcher and pins it in the hardware test; deriving it from the class's
-   machine description, so that an auditor needs no host to check it, is still
-   to be built. And how much the guest's own device check adds to it.
+1. **RTMR[0] per class.** A class's value is read today from the evidence of a
+   probe TD launched under a document that lists none, which trusts the host
+   that launched the probe to have built the class's machine. Deriving the
+   value from the class's machine description, so that an auditor needs no
+   host and a TD under a document that lists none can end at boot, is still to
+   be built.
 2. **Where the binder runs**, and what a platform-run binder should show.
 3. **The access pattern of a lazy restore**, which the host sees.
 4. **The key service's witnesses and escrow holders**: who they are

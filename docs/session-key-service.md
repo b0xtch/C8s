@@ -53,6 +53,15 @@ replicated records, a ledger that cannot go back, and recovery.
   like the guest's, with reference values of its own, and guests and clients
   check a replica's evidence against them. Replicas run Raft, with etcd's
   library, over channels on which each attests the other.
+- **Its own machine.** A replica boots with the key service's launch document,
+  `c8s-key-service-launch/v1`, which is its policy, signed by the launch key
+  that guests and clients pin, and measured at boot. It lists the RTMR[0]
+  values the replicas' class may have, under the pools' rule ([The launch
+  document](session-api.md#the-launch-document)): a replica on any other
+  machine ends before it serves, and under a document that lists none it
+  serves its evidence and releases nothing. Guests and clients hold a
+  replica's RTMR[0] to that list, and a replica checks its own devices as a
+  guest does.
 - **The host is the network.** It can drop, delay, reorder or replay messages
   and stop any replica, but it cannot read or forge them inside the attested
   channels. Raft stays safe under exactly that, as long as every replica runs

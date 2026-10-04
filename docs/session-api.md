@@ -277,7 +277,7 @@ learns whose it is only from its bind.
 |---|---|
 | `pool`, `class` | the pool, and the class whose shape the TD was launched with |
 | `image` | the measured image the pool boots |
-| `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared; a TD whose RTMR[0] is not among them ends, and a document that lists none is refused |
+| `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the machine the host declared but not what kind each device is, which the guest checks itself ([The host declares another machine](session-threat-model.md#launch-and-measurement)); a TD whose RTMR[0] is not among them ends before it serves. Under a document that lists none, a TD serves its state and evidence, so that the value can be read from its own evidence, and nothing more: it takes no bind (`bind_no_machine`), is never ready and opens no session with the key service |
 | `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own monotonic clock |
 | `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
 | `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key, and the TCB statuses besides UpToDate that a TD accepts of the key service's platform, by name (`acceptTCBStatus`, none by default; [An old TCB](session-threat-model.md#launch-and-measurement)); and floors above its image's own for the vendor's documents on that platform (`floor`: a TCB evaluation data number and a date; [Its clock](session-key-service.md#its-clock)) |
