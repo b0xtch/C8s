@@ -39,7 +39,7 @@ Non-goals, stated so that nobody assumes otherwise:
 | Part | Why it is trusted | How it is checked |
 |---|---|---|
 | CPU, microcode and TDX module (or the AMD secure processor's firmware) | the hardware root | the quote's signature to the vendor's root, and the TCB status in the vendor's collateral |
-| guest firmware | in MRTD (or the SEV-SNP launch measurement) | pinned |
+| guest firmware | in MRTD (or the SEV-SNP launch measurement) | pinned, and built from source with the image, so that auditors can rebuild it |
 | guest kernel, initrd, command line, and the root file system with the agent | in RTMR[1], RTMR[2] and the dm-verity root | the image's published manifest |
 | the launch key, the bind and later runtime events | the RTMR[3] chain on TDX; HOST_DATA and report data on SEV-SNP | replayed by the verifier |
 | the agent and its gateways (egress, inference, the message box) | on the verity root | the same pins |
@@ -78,9 +78,10 @@ but not confidentiality.
   published pins, and every verifier refuses the evidence.
 - **The host declares another VM shape or device set.** RTMR[0] records what
   the host declared to the firmware, and each class publishes its expected
-  value. It does not record everything the guest later finds behind emulated
-  devices, so the guest also checks its own device set against its class's
-  fixed slots and treats every byte from a device as untrusted.
+  value, which the launch document lists and the guest checks at boot. It does
+  not record everything the guest later finds behind emulated devices, so the
+  guest also checks its own device set against its class's fixed slots and
+  treats every byte from a device as untrusted.
 - **A debug or migratable TD.** Verifiers pin the TD's attributes, so neither
   passes.
 - **An old TCB.** The vendor's collateral states the platform's TCB status,
@@ -100,6 +101,17 @@ but not confidentiality.
   compute. An unbound guest takes the first valid bind it is sent, so the
   daemon lets nothing reach it but its own requests and the bind of its
   claim, and refuses `Connect` to it; TD names are random besides.
+- **A host that sets the guest's clock.** A guest's wall clock is its host's,
+  so no check rests on it: durations run on the TD's monotonic clock, which
+  the host can stop but not slow, and dates such as a bind's `notAfter` are
+  judged by the key service's time ([Lease
+  timing](session-state.md#lease-timing)). The guest's check of the key
+  service itself comes before it has that time, so it uses floors instead: the
+  vendor's documents for the key service's platform must carry at least the
+  TCB evaluation data number, and stay valid to at least the date, that the
+  guest's measured image carries from its build or a launch document raised.
+  The guest judges them again by the key service's time once it has it ([Its
+  clock](session-key-service.md#its-clock)).
 - **Stale evidence.** Fresh quotes are made over the binder's nonce in a
   bind's answer, or over a verifier's own nonce through `Connect`, and the
   RA-TLS handshake proves that the key is live.
@@ -121,16 +133,30 @@ but not confidentiality.
 
 ### Seals, restores and forks
 
-- **Rollback.** Generations move only forward, by compare-and-swap, and
-  older seals' keys are never released again.
+- **Rollback.** Generations move only forward, by compare-and-swap. The key
+  service releases only the latest generation's stack, and the guest opens
+  every layer it lists and no other, so no older state can be put together
+  from layers the host kept.
 - **Two copies.** The lease, enforced at the guest's gateways, stops a
-  session's effects before another TD can take it.
-- **A crash replayed.** A process image is restored at most once, so a dead
-  TD's generator state never drives new effects.
+  session's effects before another TD can take it, and a TD whose lease is
+  stale answers its own API with `lease_stale`, so a client the host steers
+  to an old copy learns that it is old. In continuous mode an output leaves
+  only once the key service has committed the epoch that produced it, so two
+  copies' outputs never both leave, whatever their clocks say.
+- **A crash replayed.** In commit mode a session's process image is restored
+  at most once, and in continuous mode nothing a restored image's processes
+  did after it ever left, so a dead TD's generator state never drives new
+  effects. What a restored TD sends carries a new grant number, so it never
+  reuses a number the dead TD sent.
 - **Secrets in forks.** A template is sealed before any secret enters the
   sandbox, and each fork makes its own keys and entropy.
-- **The host reads a seal.** A seal is under a key of its own, with dm-verity
-  and dm-crypt. The host sees its size and which units a restore reads.
+- **The host reads or changes a seal.** Each layer of a seal is under a key
+  of its own, with dm-verity inside dm-crypt, and its key and root hash live
+  only in the key service, so the host can neither read a layer nor change a
+  block of it undetected. A journal's records are sealed and chained, with
+  the last one's hash at the key service. The host sees the layers' sizes,
+  each journal record's size class, which layers forks of one template
+  share, and which blocks a restore reads.
 
 ### Data plane
 
@@ -153,6 +179,12 @@ but not confidentiality.
   own guest only, to the key service's address. The relay carries the
   attested channel's ciphertext, so like any host part it can only delay or
   drop it, and the sandbox cannot open vsock at all.
+- **What a pooled TD reaches.** Before its bind, the agent answers only the
+  daemon's requests and talks only to the key service. Even the vendor's
+  documents for its own quotes come from the key service, which checked the
+  quote against them and judged their dates by its own clock. So a pooled TD
+  fetches nothing from outside the platform, and every verifier still judges
+  the documents' dates by its own clock.
 - **Inference** leaves only through the guest's gateway, which verifies the
   inference service's attestation before it sends anything.
 - **Recorded traffic.** Attested channels use hybrid key exchange, and
@@ -164,11 +196,16 @@ but not confidentiality.
 ### Disks and devices
 
 - **Disk contents are untrusted.** Read-only images are checked by digest or
-  dm-verity root hash from the bind; seals by their own verity root and key;
-  the root file system is under a key the TD makes for its own life.
+  dm-verity root hash from the bind, and seals by each layer's key and root
+  hash. The root file system is btrfs with strong checksums, under a key the
+  TD makes for its own life, and the roots of its trees never leave the TD's
+  memory, so a block the host changes or puts back from earlier fails a
+  check ([session-state.md](session-state.md#disks)).
 - **Device emulation is untrusted.** Virtio traffic goes through bounce
   buffers in shared memory, and the guest's drivers treat every value from a
-  device as hostile.
+  device as hostile. The guest's kernel has drivers only for its class's
+  devices, and the agent ends the TD if it finds any other PCI function, so a
+  device the host adds meets no driver.
 
 ### Disclosure
 
@@ -205,6 +242,10 @@ but not confidentiality.
 | hold | memory stays encrypted; the TSC keeps running, so a released TD renews its lease before any effect |
 | host caches of images | public images only, checked in the guest by digest or verity root before anything parses them |
 | memory snapshots and clones | only inside the guest and encrypted, never by the host; templates hold no secrets |
+| incremental seals and commits | each layer under its own key and root hash, which only the key service holds; no layer is shared across sessions but a template's, among its own forks |
+| placing layers by reflink or by mapping | the host shares ciphertext blocks between its own files or maps them into a slot; the guest checks every block it reads against the layer's root hash |
+| continuous mode | outputs wait for their epoch's commit; each record is sealed, chained to the one before and padded to a size class, and the last one's hash lives in the key service |
+| snapshots for commits | btrfs snapshots inside the TD, under the root's key; the host sees only the layer that leaves |
 | deduplication across tenants | not allowed: it reveals whether two tenants hold the same data |
 | skipping attestation on a hot path | never; a verdict may be cached per instance key, since a bind is one way, but it is never skipped |
 | sending review signals as they happen | not allowed: they leave on the policy's schedule, padded to one size |
@@ -219,9 +260,9 @@ but not confidentiality.
   verifiers can restrict the platforms they accept to known machines.
 - **Interrupts and single-stepping.** Published attacks inject interrupts into
   confidential guests or step them instruction by instruction. The guest uses
-  constant-time cryptography and a kernel with the published fixes, verifiers
-  require current TDX module and microcode levels, and no SMT core is shared
-  between tenants.
+  constant-time cryptography and a kernel with the published fixes and no
+  32-bit system call entry, verifiers require current TDX module and microcode
+  levels, and no SMT core is shared between tenants.
 - **Firmware flaws** are tracked by TCB levels, and verifiers require fixed
   versions.
 
@@ -242,11 +283,15 @@ the verifier code the browser runs.
 
 ## Open questions
 
-1. **RTMR[0] per class**, and how much the guest's own device check adds to
-   it.
+1. **RTMR[0] per class.** Milestone 2 records each class's value from its own
+   launcher and pins it in the hardware test; deriving it from the class's
+   machine description, so that an auditor needs no host to check it, is still
+   to be built. And how much the guest's own device check adds to it.
 2. **Where the binder runs**, and what a platform-run binder should show.
 3. **The access pattern of a lazy restore**, which the host sees.
 4. **The key service's witnesses and escrow holders**: who they are
    ([session-key-service.md](session-key-service.md#open-questions)).
 5. **Review budgets and signal schemas**: what a platform's rules need
    ([session-disclosure.md](session-disclosure.md#open-questions)).
+6. **What a journal record's size says** about a session, and which size
+   classes hide it ([session-state.md](session-state.md#open-questions)).

@@ -25,7 +25,7 @@ This document is the overview. The details are in:
 |---|---|
 | [session-api.md](session-api.md) | the calls a platform makes, the flows built from them, and the other doors |
 | [session-daemon.md](session-daemon.md) | for operators, the daemon as built: its calls, configuration and host network, restarts, drains, and what is missing |
-| [session-state.md](session-state.md) | holding, sealing, restoring and forking a session; leases, keys and disks |
+| [session-state.md](session-state.md) | holding, committing, sealing, restoring and forking a session, and keeping its processes across the loss of a host; layers, journals, leases, keys and disks |
 | [session-key-service.md](session-key-service.md) | the key service: its replicas, leases across leaders, its ledger and witnesses, recovery and release |
 | [session-disclosure.md](session-disclosure.md) | what a session says in plaintext, its logs and crashes, and private review of its use |
 | [session-threat-model.md](session-threat-model.md) | what each party can and cannot do, and what is out of scope |
@@ -141,9 +141,12 @@ cannot read one, change one undetected or run one twice.
 Session TDs follow c8s's current launch-key and measurement contracts
 ([operator.md](operator.md#authenticated-launch-configuration)):
 
-- **Image.** A pool boots one measured image. Verifiers pin MRTD, RTMR[1] and
-  RTMR[2] from the image's published manifest, as they do for nodes, and pin
-  the TD's attributes so that no debug or migratable TD passes.
+- **Image.** A pool boots one measured image: firmware built from source,
+  which starts the unified kernel image (kernel, initrd and command line in
+  one file) from the image's own disk, with no boot loader between them.
+  Verifiers pin MRTD, RTMR[1] and RTMR[2] from the image's published manifest,
+  which its build computes, as they do for nodes, and pin the TD's attributes
+  so that no debug or migratable TD passes.
 - **Pool launch key.** Each TD boots with a signed launch document for its
   pool, naming its class and the key service it trusts
   ([its fields](session-api.md#the-launch-document)). The document's public
@@ -248,7 +251,12 @@ that is acceptable is the owner's choice, made per tenant.
 - **Start.** The daemon claims a ready TD; the owner's binder checks its
   evidence and signs a bind; the guest takes the bind and starts the sandbox.
 - **Hold and release** stop and restart the TD's vCPUs, keeping its memory.
-- **Seal** checkpoints the sandbox inside the TD onto an encrypted disk,
+- **Commit** records the session's files as a new layer while it runs,
+  without stopping it. In **continuous mode** the guest commits the
+  sandbox's processes and files every epoch and holds each output until its
+  epoch is committed, so a session survives the loss of its host with its
+  processes, and nothing that left is repeated.
+- **Seal** checkpoints the sandbox inside the TD into encrypted layers,
   records the new generation at the key service, and ends the TD.
 - **Restore** brings the latest seal back into a new TD, with new keys.
 - **Fork** starts many sessions from one template.
@@ -288,23 +296,35 @@ All three are later milestones; this section fixes only where they attach.
 ## Milestones
 
 Each ends on a repeatable hardware test, with rejection tests for invalid
-evidence.
+evidence, and on measurements that place what it delivers against the best
+existing system for it, with the hardware floors beside them
+([The bar](session-performance.md#the-bar)).
 
 1. **One session on one host.** The daemon keeps a pool; a session starts
    from it; its binder verifies the pinned image and the guest's key over
    fresh evidence; a test credential is released; one authenticated command
    runs; and nothing leaves the guest in plaintext but what its disclosure
-   schema allows. Built, with its hardware test in `test/session/hardware.sh`.
-2. **Hold, seal and restore.** Hold and release; a seal and a restore inside
-   the TD; leases and generations at the key service; seal keys under dual
-   control.
-3. **Templates and forks.**
-4. **The other doors**: the Firecracker-compatible adapter, and sessions as
-   pods on Kubernetes (pod-as-CVM).
+   schema allows. Built, with its hardware test in `test/session/hardware.sh`;
+   next, its measurement against Firecracker's snapshot load to the first
+   command.
+2. **Hold, seal and restore.** Hold and release; commits, continuous mode,
+   seals and restores inside the TD, as stacks of encrypted layers and
+   journals; a root that stays fresh; leases and generations at a key service
+   of three replicas; seal keys under dual control; and a guest rebuilt for
+   them whose cold boot and idle memory come down to the hardware's floors.
+   Measured against Firecracker's snapshots and diff snapshots, gVisor's
+   checkpoint and restore, and QEMU's live migration and COLO, with
+   confidential computing off, and the guest's cold boot against Firecracker's
+   and a Kata Containers TDX guest's.
+3. **Templates and forks**, measured against many Firecracker VMs loaded
+   from one snapshot.
+4. **The other doors**: the Firecracker-compatible adapter, measured against
+   Firecracker behind the same API, and sessions as pods on Kubernetes
+   (pod-as-CVM), measured against Kata Containers' confidential pods.
 5. **Inference, review and the browser**: a verified channel to inference;
    private review within a budget; the release log and its witnesses; then
    browser verification of the session, its inference identity and its
    review policy.
-6. **Measured against the baselines** in
-   [session-performance.md](session-performance.md), and optimized from the
-   results.
+6. **The whole platform at scale** against the baselines in
+   [session-performance.md](session-performance.md): bursts, density and the
+   work inside, and optimized from the results.

@@ -14,12 +14,12 @@ every call that changes what a TD is returns evidence that the caller checks.
 
 | Caller | Trusted for | Calls | Authenticates with |
 |---|---|---|---|
-| orchestrator: the platform's control plane | availability, never data | pools, `Claim`, `Bind` (relaying), `Hold`, `Release`, `Seal`, `Destroy`, the flows, `GetStats`, `Watch` | mutual TLS with a service identity; quotas per orchestrator |
+| orchestrator: the platform's control plane | availability, never data | pools, `Claim`, `Bind` (relaying), `Hold`, `Release`, `Commit`, `Seal`, `Destroy`, the flows, `GetStats`, `Watch` | mutual TLS with a service identity; quotas per orchestrator |
 | binder: holds or reaches the owner's authority | deciding what a TD becomes | `GetEvidence`; `Bind` directly, or `SignBind` when the daemon calls it during a flow | TLS to an endpoint registered per tenant; the daemon believes nothing it says, and the guest checks the bind's signature |
 | verifiers: SDKs, browsers, the key service, the binder | their own checks | `GetEvidence`, `Connect` | none for evidence, which is public; `Connect` carries the verifier's own channel |
 | senders and readers of envelopes | their own messages | `Deliver`, `Collect` | the orchestrator's identity or a per-session token; envelopes are sealed and signed inside |
 | the platform's review service | the signals its review policy allows | `Collect`, for review batches | the orchestrator's identity; batches are encrypted to its review key |
-| guest agent | everything inside its TD | none: it reaches the daemon only over channels it opens, and answers only the host requests the calls below need: fence, bind, evidence and seal | its instance key |
+| guest agent | everything inside its TD | none: it reaches the daemon only over channels it opens, and answers only the host requests the calls below need: fence, bind, evidence, commit and seal | its instance key |
 
 **Who holds the binder decides who can direct a TD.** If the platform runs
 the binder, the platform chooses what each TD becomes, and the evidence shows
@@ -55,7 +55,7 @@ guest's own API on its TLS port.
 | pool | the orchestrator | image, class, hosts, depth per host, age limit, bind grace | the daemon |
 | TD | the daemon | host, pool, the instance key's digest, state, the session it serves | its own evidence |
 | session | the orchestrator | tenant, binder, state, the live TD, envelope counters | the key service for its generation and lease; the daemon for where it runs |
-| seal | session and generation | the ciphertext disk image and its size | the key service, which alone holds its key and verity root and knows whether it is the latest |
+| seal | session and generation | its layers' ciphertext and sizes, by layer id | the key service, which alone holds the layers' keys and root hashes and knows whether it is the latest |
 | template | its own name | a seal made before any secret, and who may fork it | the key service's record of it |
 | binder | the tenant | the endpoint the daemon calls during flows | the authority it holds |
 | envelope | session and sequence number | sealed bytes, in or out | the guest, which reads only what it can open and authenticate |
@@ -71,12 +71,13 @@ guest's own API on its TLS port.
                       lease lost
 ```
 
-- **booting to ready.** The daemon launches the TD from the pool's bundle.
-  The guest checks its launch document, makes its instance key and opens an
-  attested session with the key service, which releases nothing until a bind
-  arrives. It is ready only once that session is open. Before then it refuses
-  a bind unread, as not ready, so a pool whose key service it cannot reach
-  offers no TD.
+- **booting to ready.** The daemon launches the TD from the pool's bundle. The
+  guest checks its launch document, makes its instance key and opens an
+  attested session with the key service, which checks the guest's quote, hands
+  it the vendor's documents it checked the quote against, for the guest to
+  staple to its evidence, and releases nothing until a bind arrives. It is
+  ready only once that session is open. Before then it refuses a bind unread,
+  as not ready, so a pool whose key service it cannot reach offers no TD.
 - **ready to claimed.** `Claim` fences the TD, so that no connection opened
   before the claim survives it, and reserves the TD for a session. A claim
   nobody binds before the bind grace runs out returns the TD to ready, since
@@ -88,7 +89,9 @@ guest's own API on its TLS port.
   then but its own requests and the bind of its claim, and refuses `Connect`
   to it.
 - **running and held.** `Hold` stops the TD's vCPUs, and `Release` starts
-  them again.
+  them again. A `Commit` records the session's files while it runs; in
+  continuous mode the guest commits its processes and files every epoch on
+  its own.
 - **sealing to ended.** The guest writes its seal, records it at the key
   service and ends.
 
@@ -126,6 +129,7 @@ service Sessions {
   rpc Collect(CollectRequest) returns (stream Envelope);
   rpc Hold(SessionRef) returns (Session);
   rpc Release(SessionRef) returns (Session);
+  rpc Commit(CommitRequest) returns (Operation);
   rpc Seal(SealRequest) returns (Operation);
   rpc Destroy(DestroyRequest) returns (Session);
   rpc GetEvidence(EvidenceRequest) returns (Evidence);
@@ -162,6 +166,7 @@ message BindRequest {
   bytes bind = 3;                      // c8s-bind/v1, canonical JSON
   bytes signature = 4;
   repeated DiskRef disks = 5;          // what the bind names, in its slots
+  repeated LayerPlacement layers = 6;  // where each layer sits in the in slot
 }
 message Bound {
   Evidence evidence = 1;               // includes the bind; fresh over its nonce
@@ -173,7 +178,7 @@ message Evidence {
   repeated string events = 4;          // the digests the guest extended, in order
   bytes bind = 5;                      // when bound
   bytes quote = 6;                     // only in Bound: the guest's evidence envelope (JSON), fresh over the bind's nonce
-  bytes collateral = 7;                // the vendor's documents, stapled
+  bytes collateral = 7;                // the vendor's documents, from the key service, stapled
   repeated bytes release_proofs = 8;   // the release log's proofs for the image, class and policies, stapled
   bytes bind_signature = 9;            // when bound; a verifier holds the bind to it
   string phase = 10;                   // as the guest reports it
@@ -182,16 +187,25 @@ message DiskRef {
   string slot = 1;                     // root, ro, in or out
   string source = 2;                   // the daemon's name for what goes there
 }
+message LayerPlacement {
+  string layer = 1;                    // the id the guest gave the layer or record
+  uint64 offset = 2;                   // bytes into the in slot
+  uint64 size = 3;
+}
 enum SealLevel {
   SEAL_LEVEL_UNSPECIFIED = 0;
   PROCESSES = 1;                       // the sandbox's processes and files
-  FILES = 2;                           // the workspace only
-  TEMPLATE = 3;                        // processes, before any secret entered
+  FILES = 2;                           // the sandbox's files, not its processes
+  TEMPLATE = 3;                        // a template, before any secret entered
 }
 message SealRequest {
   string request_id = 1;
   string session = 2;
   SealLevel level = 3;
+}
+message CommitRequest {
+  string request_id = 1;
+  string session = 2;
 }
 message StartRequest {
   string request_id = 1;
@@ -224,7 +238,7 @@ message SignBindRequest {
   string session = 1;
   string tenant = 2;
   Evidence evidence = 3;
-  string purpose = 4;                  // start, restore or fork
+  string purpose = 4;                  // start, restore, fork or template
   uint64 generation = 5;
   string template = 6;
 }
@@ -240,11 +254,12 @@ What each call does, and what a daemon that cheats could do with it:
 |---|---|---|---|---|
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
 | `Claim` | orchestrator | fences a ready TD and returns its evidence; waits up to `wait`, then says when the next will be ready | nothing until a bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
-| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, posts the bind to the guest, and returns the evidence the guest answers with, fresh over the bind's nonce | checks and takes the bind, measures it, opens only the disks it names, restores if it names a seal | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
+| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, and returns the evidence the guest answers with, fresh over the bind's nonce | checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service |
 | `Connect` | anyone, once the TD is bound | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored; refuses a TD that is not bound yet | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
-| `Seal` | orchestrator | makes room on the TD's `out` slot and asks the guest to seal | checkpoints onto the slot under a new key, records the generation at the key service, ends | it loses the seal, and the key service refuses any older one in its place |
+| `Commit` | orchestrator | makes room on the TD's `out` slot, stores the layer the guest writes there, then asks the guest to commit it | snapshots its files without stopping the sandbox, writes what changed since the last layer, records the generation at the key service, keeps its lease and runs on | it loses the layer, and the commit fails |
+| `Seal` | orchestrator | makes room on the TD's `out` slot, stores the layers the guest writes there, then asks the guest to commit them | drains its gateways, checkpoints the sandbox if the level keeps processes (in continuous mode, only its last epoch), and writes new layers, each under a new key; then records the generation at the key service and ends | it loses the seal before the commit, and the session runs on at its last generation; after the commit, the key service refuses any older seal in its place |
 | `Destroy` | orchestrator | ends the TD and deletes the session's ciphertext; returns a claimed TD that was never sent a bind to its pool, as a lapsed claim does | nothing: ending a TD needs no cooperation | the same as any host stopping a guest |
 | `GetEvidence` | anyone | returns what the guest serves, with no fresh quote | serves its certificate, documents, events, bind and phase; it quotes fresh only in a bind's answer or over `Connect` | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
 | `GetStats` | orchestrator | reports what a host sees | nothing | nothing new: the host saw it anyway |
@@ -262,8 +277,8 @@ learns whose it is only from its bind.
 |---|---|
 | `pool`, `class` | the pool, and the class whose shape the TD was launched with |
 | `image` | the measured image the pool boots |
-| `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared |
-| `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own clock |
+| `machine` | the RTMR[0] values the release log lists for the class, since RTMR[0] records the virtual hardware the host declared; a TD whose RTMR[0] is not among them ends, and a document that lists none is refused |
+| `ageLimitSeconds` | the pool's age limit: past it, a TD nobody has bound ends itself, by its own monotonic clock |
 | `prestage` | images, by digest, that the guest unpacks before any bind so that a start need not pull them; the same for every TD of the pool, so they hold nothing of a tenant |
 | `keyService` | the key service the pool's TDs open their sessions with: its address, its image's pins and its launch key |
 
@@ -282,24 +297,25 @@ in the release log with its reference values
 | `authority` | the public key that signs the bind, in PEM, so the measured digest fixes it and verifiers read the session's authority from the evidence |
 | `instanceKey` | the digest of the TD's instance key, so the bind fits this TD alone |
 | `session`, `tenant` | the session's name, scoped by the authority that signs it |
-| `purpose` | `start`, `restore` or `fork`; with `generation` or `template` where they apply |
+| `purpose` | `start`, `restore`, `fork` or `template`; with the `generation` a restore expects, or the `template` a fork comes from |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; and the wall when the TD is a tenant VM |
+| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (`credentials`); its egress allowlist; the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
 | `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
-| `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default |
+| `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default, which the guest judges by the key service's time, never by its own wall clock ([Lease timing](session-state.md#lease-timing)) |
 
 The guest measures the bind's digest (rule 2 in
 [sessions.md](sessions.md#rules)), so the policy a session runs under is part
 of its evidence, and the browser or SDK that verifies it can show the owner
 exactly who may drive the session, which images, egress and inference it may
-use, and which review policy, if any, may report on it.
+use, what it may keep once its TD ends, and which review policy, if any, may
+report on it.
 
-[Milestone 1](sessions.md#milestones) needs `start` binds only. The other
-purposes, and the `disks`, `review` and `ownerKey` fields, come with the
-milestones that use them; until then an agent refuses them as fields it does
-not know.
+[Milestone 1](sessions.md#milestones) needs `start` binds only, and milestone
+2 adds `restore`, the `seal` and `commit` policies and `ownerKey`. The other
+purposes, and the `disks` and `review` fields, come with the milestones that
+use them; until then an agent refuses them as fields it does not know.
 
 ## Flows
 
@@ -315,10 +331,10 @@ not know.
    the binder signs a bind naming the TD's instance key, the session, the
    disks (a fresh root, and the read-only images by root hash), the policy, a
    nonce and a `notAfter` a minute away.
-4. The daemon calls `Bind`. The guest takes the bind, measures it, makes its
-   root file system under a key it generates, and starts the sandbox. The
-   answer carries a fresh quote over the binder's nonce, with the bind in the
-   TD's measurements.
+4. The daemon calls `Bind`. The guest takes the bind, measures it, and starts
+   the sandbox on the root file system it made before any bind, under a key it
+   generated. The answer carries a fresh quote over the binder's nonce, with
+   the bind in the TD's measurements.
 
 A bind holds no secret, so a stale quote costs at most a wasted bind: keys
 and credentials reach a session only after the key service, or the owner's
@@ -329,35 +345,49 @@ binder's check.
 
 ### Hold and release
 
-1. `Hold` stops the TD's vCPUs through a monitor that only the host reaches.
-   The guest is told nothing.
-2. `Release` starts the vCPUs again. The guest's clock has moved on while it
-   was held, so its gateways find the lease stale and let no effect leave
-   until the agent has renewed it
+1. `Hold` stops the TD with QMP's `stop`, on a socket only its launcher holds,
+   which stops the vCPUs and QEMU's devices, vhost back ends included. The
+   guest is told nothing. A hold may first ask the guest to give back its free
+   memory ([Levers](session-performance.md#levers)), so that a held TD costs
+   about what its processes hold.
+2. `Release` resumes the TD with QMP's `cont`. The guest's clock has moved on
+   while it was held, so its gateways find the lease stale and let no effect
+   leave until the agent has renewed it at its grant number
    ([session-state.md](session-state.md#lease-timing)). If the key service
-   refuses, because another TD now holds the session, this TD ends with
-   "lease lost".
+   refuses, because another TD now holds the session, this TD ends with "lease
+   lost".
 
-Whether a TD comes back from a VMM stop and continue with its clock,
-devices and network intact is the first thing milestone 2 tests; QEMU's TDX
-code has no handling of its own for a stopped machine, so the generic stop
-applies (inferred).
+A TD has no paravirtual clock to tell it that it was stopped, so its kernel
+takes a hold for a stall. The session kernel builds no lockup detector, and
+its RCU stall warnings only warn, so a hold of any length panics nothing.
+QEMU's TDX code has no handler for a change of run state
+(`target/i386/kvm/tdx.c`), so a hold is QEMU's generic stop. Milestone 1's
+launcher runs QEMU with no monitor at all, so milestone 2 adds the QMP socket,
+and its first test is whether a TD comes back from a hold with its clock,
+devices and network intact, after a second, after a lease's length and after
+an hour.
 
 ### Seal, restore and fork
 
-`Seal` checkpoints the session inside the TD, `Restore` brings the latest
-seal back into a new TD, and `Fork` starts many sessions from one template.
-Each is a bind with a purpose, so a guest restores or forks only when the
-owner's authority says so. [session-state.md](session-state.md) specifies
-them, with the leases that keep one live copy.
+`Commit` records a session's files while it runs, and continuous mode
+commits its processes and files every epoch, holding each output until its
+epoch is committed. `Seal` checkpoints the session inside the TD and ends
+it, `Restore` brings the latest generation back into a new TD, and `Fork`
+starts many sessions from one template. A restore and a fork are each a bind
+with a purpose, so a guest restores or forks only when the owner's authority
+says so. [session-state.md](session-state.md) specifies them, with the
+layers and journals they write and the leases that keep one live copy.
 
 ### Moving sessions off a host
 
 A TD cannot migrate between hosts: TD migration is not in Linux or QEMU
 today. A session moves the only way a TD can: `Seal` on the old host and
-`Restore` on another, with its processes, and with outside connections
-reopened by the guest's gateways. Draining a host, for a TCB recovery or an
-upgrade, seals every live session and restores each elsewhere.
+`Restore` on another, with its processes. Connections that leave the sandbox
+close at the seal, and the session makes them again as it needs them.
+Draining a host, for a TCB recovery or an upgrade, seals every live session
+and restores each elsewhere. In continuous mode a seal writes only its last
+epoch and the restore runs before its layers are read in full, so a move
+stops a session for about an epoch and the start of a restore.
 
 ### Destroy
 
@@ -369,31 +399,34 @@ upgrade, seals every live session and restores each elsewhere.
 
 ## Errors, retries, versions and limits
 
-- **Errors** use gRPC's codes: `NOT_FOUND`; `ALREADY_EXISTS` for a new
-  request id that names an existing pool or session; `FAILED_PRECONDITION`
-  for a call in the wrong state, such as a bind on a TD claimed for another
-  session; `ABORTED` when the key service refuses a compare-and-swap;
-  `RESOURCE_EXHAUSTED` when no TD is ready within `wait` or a quota is
-  reached, with the expected wait in gRPC's `RetryInfo` (for an empty pool,
-  how long its last boot took). `UNAVAILABLE` means a lost host or an
-  unreachable key service, and is worth a retry. A guest's own refusal comes
-  back as a separate detail, so a caller can tell the guest's decision from a
-  daemon fault; a daemon could forge one, which only denies service.
+- **Errors** use gRPC's codes: `NOT_FOUND`; `ALREADY_EXISTS` for a new request
+  id that names an existing pool or session; `FAILED_PRECONDITION` for a call
+  in the wrong state, such as a bind on a TD claimed for another session or a
+  seal its bind does not allow; `ABORTED` when the key service refuses a
+  compare-and-swap; `RESOURCE_EXHAUSTED` when no TD is ready within `wait` or
+  a quota is reached, with the expected wait in gRPC's `RetryInfo` (for an
+  empty pool, how long its last boot took). `UNAVAILABLE` means a lost host or
+  an unreachable key service, and is worth a retry. A guest's own refusal
+  comes back as a separate detail, so a caller can tell the guest's decision
+  from a daemon fault; a daemon could forge one, which only denies service.
 - **Retries.** A request id is kept for 24 hours, and a repeat returns the
   stored answer, across a restart too: the daemon keeps the first answers of
   `Claim` and `Bind` in each TD's record on disk, and TDs outlive it, each
   under a launcher process of its own, so a new daemon takes them over.
-  `Seal` and the flows return an operation with a phase (claimed, bound,
-  restoring, done) that the caller polls or waits on. A flow can be cancelled
-  until its bind, and after that only by `Destroy`.
+  `Commit`, `Seal` and the flows return an operation with a phase that the
+  caller polls or waits on: draining, writing, storing, committing and done
+  for a seal or a commit; claimed, bound, restoring and done for a flow. A
+  flow can be cancelled until its bind, and after that only by `Destroy`.
 - **Versions.** The package is `c8s.session.v1alpha1`, and fields are only
   ever added. The bind keeps its own schema version, `c8s-bind/v1`.
 - **Limits**, per orchestrator: pools, live TDs, held TDs, seal bytes and
   queued envelope bytes per session, each refused past its limit with
   `RESOURCE_EXHAUSTED`.
 - **Events** from `Watch`: a TD ready, claimed, bound, held, released,
-  sealing or ended (with its reason); a session sealed (with its generation)
-  or restored; a pool's depth.
+  sealing or ended (with its reason); a session committed or sealed (with
+  its generation) or restored (with whether its processes came back); a
+  pool's depth. Continuous mode's epochs are counted in `GetStats`, not sent
+  as events.
 
 ## Other doors
 
@@ -410,10 +443,15 @@ written for Firecracker. No Firecracker code runs behind it.
 | `PUT /snapshot/create` | `Seal(PROCESSES)`, or `Seal(TEMPLATE)` |
 | `PUT /snapshot/load` | `Restore` for a sealed session, `Fork` for a template |
 | `/mmds` | kept, as untrusted input that never carries a secret |
-| `/balloon` and its hinting | the guest's own free page reporting ([session-performance.md](session-performance.md#levers)) |
+| `/balloon` and its hinting | the guest's own return of free memory, through a change to its kernel ([session-performance.md](session-performance.md#levers)) |
 | `/entropy` | accepted and not relied on: the TD seeds itself |
 | `/vsock` | bridged to the guest |
 | `/metrics` | `GetStats` |
+
+A Firecracker VM can resume after `PUT /snapshot/create`, but a seal ends
+its TD, since a process image whose TD ran on would be spent at once
+([session-state.md](session-state.md#commit)). So a resume after a snapshot
+is a `Restore`.
 
 The difference that matters is `/snapshot/load`. In Firecracker, every VM
 loaded from one snapshot starts with that snapshot's memory, and so with its
@@ -441,7 +479,7 @@ template sealed before any secret, and each fork makes its own keys.
 
 ## Open questions
 
-1. **A held TD.** Whether a TD survives a VMM stop and continue with its
+1. **A held TD.** Whether a TD survives QMP's `stop` and `cont` with its
    clock, devices and network intact, and how long a hold may last.
 2. **The binder's placement.** Which deployments run the binder in the
    owner's client, which in an attested service of the owner's, and what a

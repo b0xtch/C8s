@@ -2,7 +2,9 @@
 
 Status: design. Milestone 1 built a first, single replica with what a start
 needs: pooled TDs' sessions, acquiring a session at its bind, tenants'
-authorities on first use, and stored credentials. The rest is not built yet.
+authorities on first use, and stored credentials. Milestone 2 adds sessions'
+generations, layers, journals and leases to it, on three replicas on one
+host; the rest is not built yet.
 [session-state.md](session-state.md) says what sessions ask of the key
 service; this document is how it keeps its promises when the hosts it runs
 on are untrusted.
@@ -28,11 +30,11 @@ replicated records, a ledger that cannot go back, and recovery.
   evidence. And the policy: the reference values it accepts, TCB floors, the
   platforms it accepts, the operators who may change policy and the escrow
   holders.
-- **Keys are random and kept as records.** A seal's key is made in the guest
-  that seals, and the key service keeps it as given. Deriving every key from
-  one seed would leave a deleted session's keys derivable for as long as the
-  seed lives, and generations, leases and tombstones must survive a recovery
-  anyway, so the key service recovers records, not a seed.
+- **Keys are random and kept as records.** Each layer's key is made in the
+  guest that writes it, and the key service keeps it as given. Deriving every
+  key from one seed would leave a deleted session's keys derivable for as
+  long as the seed lives, and generations, leases and tombstones must survive
+  a recovery anyway, so the key service recovers records, not a seed.
 - **Only the replicas decide.** Records live in the replicas' memory,
   replicated by consensus. The platform may cache what placement needs, but a
   cache never decides, since a host that kept an old copy could replay it.
@@ -159,8 +161,8 @@ both.
 
 ## Release
 
-The key service releases a seal's key, a template's key or a stored
-credential only when all of these hold:
+The key service releases the keys of a seal's or a template's layers, or a
+stored credential, only when all of these hold:
 
 1. The TD's evidence verifies against an image and a class from the release
    log, with their proofs, and against accepted attributes, platform and TCB
@@ -180,7 +182,11 @@ credential only when all of these hold:
   service at boot, before it has a tenant. The key service verifies its
   evidence then and keeps the verdict by instance key in its replicated state,
   so acquiring a session at bind time costs one round trip and one quorum
-  write, and the key service needs no new quote.
+  write, and the key service needs no new quote. It answers with the vendor's
+  documents it checked the quote against, which it fetches once per platform
+  and judges by its own clock, and newer ones in a later answer when the
+  vendor publishes them. The TD staples them to its evidence, so no TD fetches
+  them itself and no boot waits on the vendor's service.
 - **Sealed to the instance key.** What is released is also encrypted with
   HPKE, under the hybrid KEM, to the encryption key that the TD's instance key
   signed, inside the attested channel. A log or a proxy that ever saw the
@@ -211,17 +217,17 @@ Who holds a session's seal keys is the owner's choice, made per tenant:
 
 | Mode | The key service holds | The owner holds | A seal opens when |
 |---|---|---|---|
-| platform-held | the seal's key, under escrow | nothing | the key service releases it |
-| dual control | a share of the seal's key | the other share, in its own key manager | both release their shares to the same attested TD |
-| owner-held | generations and leases only | the whole key | the owner's key manager releases it |
+| platform-held | each layer's and journal's key, under escrow | nothing | the key service releases them |
+| dual control | a share of each layer's and journal's key | the other share, in its own key manager | both release their shares to the same attested TD |
+| owner-held | generations and leases only | the whole of each key | the owner's key manager releases them |
 
-- **Two shares.** Under dual control the sealing guest makes two random
-  shares and derives the seal's key from both. One share goes to the key
-  service with the new generation; the other is wrapped to the owner's key
-  and kept beside the seal. A restoring TD asks for both. The key service and
-  the owner's key manager each check its evidence and its bind for themselves
-  and release their share encrypted to it, and neither share alone opens
-  anything.
+- **Two shares.** Under dual control the guest that writes a layer or starts
+  a journal makes two random shares and derives the key from both. One share
+  goes to the key service with the new generation; the other is wrapped to
+  the owner's key and stored with the ciphertext. A restoring TD asks for both.
+  The key service and the owner's key manager each check its evidence and its
+  bind for themselves and release their share encrypted to it, and neither
+  share alone opens anything.
 - **What each side keeps.** The key service still decides which generation is
   the latest and who holds the lease, so one live copy and freshness hold in
   every mode. The owner can stop every restore at once by withholding its
@@ -245,14 +251,37 @@ TSC's count since it arrived, can raise the floor, which never falls. The
 replica's time is the later of the floor and its wall clock, and it judges no
 dates until it has a floor. A host can then move a replica's time forward,
 which only makes it refuse, and never more than 90 s back. Guests take their
-time from their session with the key service.
+time from their session with the key service: its answers carry its time, to
+which a guest adds its own monotonic count since, with the round trip as the
+error.
+
+A guest checks the key service's evidence before it has that time, so that
+check uses floors in place of a clock. The guest's measured image carries the
+vendor's TCB evaluation data number current at its build, from the update
+channel the key service fetches, and the build's date. A launch document may
+raise either but never lower it, and both are measured, so a verifier sees the
+floors a guest used. The key service puts the vendor's documents for its own
+platform in its attested certificate, and the guest checks that they chain to
+the vendor's root, that the TCB information and the quoting enclave's identity
+carry at least the floor's number, and that no next-update date among them or
+the revocation lists falls before the floor's date. Not-before dates go
+unjudged, since only a clock could judge them. The key service's TCB status
+must then meet the class's policy, and the guest sends nothing until all of it
+passes. Once an answer carries the key service's time, the guest judges the
+same documents by it, and each lease renewal brings the key service's newest
+documents for its own platform beside the guest's. A key service whose
+documents lapse or fall below a floor loses the session: a pooled TD ends,
+since it holds nothing, and a bound one treats it as a lapsed lease.
 
 ## Scale
 
-Each grant, restore and seal is one quorum write; a renewal costs a share of a
-heartbeat round and no write. A record is a few hundred bytes, so ten million
-sessions fit in a few GiB per replica (inferred). One key service is one Raft
-group, and it splits by tenant into several when one group's write rate is not
+Each grant, commit, epoch and seal is one write to the log. Continuous mode
+makes a write per session per epoch, so the leader puts all the writes that
+reach it during a round into one log entry. A renewal costs a share of a
+heartbeat round and no write. A record holds at most a bounded stack's layer
+entries and a few journal keys, a few KiB, so ten million sessions fit in a
+few tens of GiB per replica (inferred). One key service is one Raft group,
+and it splits by tenant into several when one group's write rate is not
 enough.
 
 ## Prior art
@@ -268,10 +297,11 @@ enough.
 
 ## Build order
 
-1. One replica, with the release rule, records, generations and leases in
-   memory, for milestones 1 and 2 in [sessions.md](sessions.md#milestones).
-2. Three replicas on one host, and the TLA+ model of leases, generations and
-   leader changes.
+1. One replica, with the release rule and records in memory, for milestone
+   1 in [sessions.md](sessions.md#milestones).
+2. Three replicas on one host, with generations, leases and journals, and
+   the TLA+ model of leases, generations and leader changes, for milestone 2:
+   a seal is worth only as much as its generation's record.
 3. The ledger, witnesses, recovery and escrow.
 4. Replicas across hosts.
 
@@ -279,5 +309,6 @@ enough.
 
 1. **Witnesses**: who runs them, outside the operator's reach.
 2. **Escrow holders**: who they are, and how many it takes.
-3. **Renewal load**: how many live sessions one group carries before it
-   splits.
+3. **Renewal and epoch load**: how many live sessions one group carries
+   before it splits, with renewals in commit mode and a write each epoch in
+   continuous mode.
