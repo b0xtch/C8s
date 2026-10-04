@@ -190,6 +190,16 @@ test-e2e-components-ready:
 test-e2e-cw-workload:
 	./test/e2e/cw-workload.sh
 
+# Hardware test of confidential sessions on one host: a key service in a TD,
+# the session daemon, and sessions that are each a TD of their own, with the
+# refusals invalid evidence must get. Needs a TDX host with QEMU, a quoting
+# service and passwordless sudo; C8S_SESSION_IMAGE and C8S_KEY_SERVICE_IMAGE
+# from session-guest-image/build; and, for locked images, C8S_SANDBOX_STORE
+# from test/session/sandboximage. Not CI-wired: no lane runs its own TDs.
+.PHONY: test-session-hardware
+test-session-hardware:
+	./test/session/hardware.sh
+
 # --- Linting ---
 
 vet:

@@ -241,6 +241,29 @@ c8s session-daemon drain --config /etc/c8s/sessions/daemon.yaml   # daemon stopp
 `drain` ends every TD the state directory records, bound or not, and waits
 until their memory is the host's again.
 
+## Testing on hardware
+
+`test/session/hardware.sh` (`make test-session-hardware`) runs all of the
+above on one TDX host with real TDs: a key service, a daemon with one pool
+that pins it, an owner who stores a credential, and two sessions of two
+tenants. It checks that a session's command reads the stored credential and
+one that a key of its bind released, and then what must be refused:
+
+| Refused | By whom |
+|---|---|
+| evidence of another image, of a pool under another launch key, of a pool that pins another key service | the owner's client, before it signs a bind |
+| a key service that is not the one pinned | the owner's client, before it sends anything |
+| a bind for a tenant nobody registered, or under another authority; a credential nobody stored | the key service |
+| a sandbox image whose content was changed | the guest |
+| a stranger's key; one session's binding on another session's TD | the guest |
+| a bind to a guest of a pool the key service does not serve | the guest, which is never ready |
+| a destroy without an orchestrator's certificate | the daemon |
+
+With dev images it also probes, from inside a guest, every address of its
+host and of the other guests, and requires the host's filter to have counted
+the attempts as dropped. The script's header lists what it needs and what it
+changes on the host while it runs.
+
 ## What is missing
 
 - The other calls of the design: pools made and changed through the API,
