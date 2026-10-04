@@ -11,6 +11,7 @@ import (
 	"time"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
+	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
 const (
@@ -19,6 +20,9 @@ const (
 	parallelBoots = 2
 	// readyPoll is how often a booting guest is asked whether it serves.
 	readyPoll = 100 * time.Millisecond
+	// warmEvery is how often a ready guest is asked for what a claim relays.
+	// A guest closes a connection that was idle for a minute.
+	warmEvery = 20 * time.Second
 	// retention is how long the record of an ended TD is kept, to answer a
 	// repeat of the request that ended it.
 	retention = 10 * time.Minute
@@ -106,6 +110,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.wg.Go(func() { d.keep(ctx, pool) })
 	}
 	d.wg.Go(func() { d.sweep(ctx) })
+	d.wg.Go(func() { d.keepWarm(ctx) })
 	<-ctx.Done()
 	close(d.stop)
 	d.wg.Wait()
@@ -313,11 +318,15 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 	defer deadline.Stop()
 	tick := time.NewTicker(readyPoll)
 	defer tick.Stop()
+	var offered *session.StateResponse
+	var collateral []byte
 	for {
 		probe, cancel := context.WithTimeout(t.ctx, 5*time.Second)
-		ready := d.guests.ready(probe, t.rec.Address)
+		if offered = d.guests.ready(probe, t.rec.Address); offered != nil {
+			collateral = d.guests.collateral(probe, t.rec.Address)
+		}
 		cancel()
-		if ready {
+		if offered != nil {
 			break
 		}
 		select {
@@ -340,6 +349,7 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 		return
 	}
 	t.rec.State = StateReady
+	t.offered, t.collateral = offered, collateral
 	pool.failures, pool.bootTime = 0, d.now().Sub(started)
 	if err := d.save(t); err != nil {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
@@ -439,6 +449,50 @@ func (d *Daemon) release(t *td, destroyID string) {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
 	}
 	d.notify()
+}
+
+// keepWarm asks every ready guest for the vendor's documents it holds, a few
+// times a minute. That keeps what a claim relays current, and keeps the
+// daemon's connection to the guest from idling out, so that a claim finds it
+// open.
+func (d *Daemon) keepWarm(ctx context.Context) {
+	tick := time.NewTicker(warmEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		d.mu.Lock()
+		var ready []*td
+		for _, t := range d.tds {
+			if t.rec.State == StateReady && !t.busy {
+				ready = append(ready, t)
+			}
+		}
+		d.mu.Unlock()
+		for _, t := range ready {
+			probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+			offered := d.guests.ready(probe, t.rec.Address)
+			var collateral []byte
+			if offered != nil {
+				collateral = d.guests.collateral(probe, t.rec.Address)
+			}
+			cancel()
+			if offered == nil {
+				continue
+			}
+			d.mu.Lock()
+			if t.rec.State == StateReady {
+				t.offered = offered
+				if collateral != nil {
+					t.collateral = collateral
+				}
+			}
+			d.mu.Unlock()
+		}
+	}
 }
 
 // sweep forgets ended TDs once their records have been kept long enough.

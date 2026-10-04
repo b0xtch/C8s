@@ -1,6 +1,7 @@
 package sessiond_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ecdsa"
@@ -9,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -508,6 +510,68 @@ func TestClaimFencesTheGuest(t *testing.T) {
 	_ = early.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := early.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("the connection opened before the claim outlived it: %v", err)
+	}
+}
+
+// The daemon holds one connection to each guest it keeps ready. A claim asks
+// the guest for its fence over it and relays what the guest said of itself
+// when it became ready, and the bind follows on the same connection: between
+// the daemon and the guest a session starts with no handshake.
+func TestSessionStartsOverTheKeptConnection(t *testing.T) {
+	h := newHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
+	o := newOwner(t)
+	s, err := h.begin(h.AsOrchestrator(), o, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	td := h.Runner.Last()
+	if got := td.Accepted(); got != 1 {
+		t.Fatalf("the guest accepted %d connections from boot to its bind's answer, want the daemon's one", got)
+	}
+	// What the claim relayed from before is what the guest holds: it verified
+	// as the pinned image, and the bind made for it was taken.
+	if s.ready == nil || len(s.ready.Launch) == 0 {
+		t.Fatalf("the claim relayed %+v", s.ready)
+	}
+	if _, err := h.drive(o, s).Exec(ctx(t), session.ExecRequest{Argv: []string{"true"}}); err != nil {
+		t.Fatalf("a command on the session: %v", err)
+	}
+}
+
+// A guest closes a connection that sat idle, and one that it was claimed
+// away from. The daemon's next request then goes over a new one, and a
+// session still starts.
+func TestKeptConnectionIsReplacedWhenItIsGone(t *testing.T) {
+	h := newHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
+	eventually(t, "the pool's TD boots", func() bool { return h.Runner.Booted() >= 1 })
+	td := h.Runner.Last()
+	eventually(t, "the daemon reaches its guest", func() bool { return td.Accepted() >= 1 })
+	// Somebody else claims the guest's attention: a fence from another
+	// connection closes the daemon's.
+	other, err := tls.Dial("tcp", td.Address(), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a probe: nothing about this peer is trusted
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	req, err := http.NewRequest(http.MethodPost, "https://guest"+session.PathFence, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := req.Write(other); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(other), req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("the other fence: %v, %v", resp, err)
+	}
+	resp.Body.Close()
+
+	o := newOwner(t)
+	if _, err := h.begin(h.AsOrchestrator(), o, "s1"); err != nil {
+		t.Fatalf("a session after the kept connection was closed: %v", err)
+	}
+	if got := td.Accepted(); got < 3 {
+		t.Fatalf("the guest accepted %d connections: the daemon's first, the other's and a new one of the daemon's make 3", got)
 	}
 }
 

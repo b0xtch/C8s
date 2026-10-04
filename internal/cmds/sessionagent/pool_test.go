@@ -737,6 +737,42 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Whoever claims a guest may send its bind on the connection the claim came
+// on: the fence ends every other connection and keeps that one, as the first
+// of those it lets a bind in from. A host that holds one connection to each
+// of its ready guests then starts a session with no handshake.
+func TestBindFollowsTheFenceOnItsConnection(t *testing.T) {
+	p := newPool(t)
+	p.start(t)
+	ready, err := p.client(t, p.access).Ready(ctxT(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, otherReader := p.heldConn(t)
+	claimer, reader := p.heldConn(t)
+	if status := requestOn(t, claimer, reader, http.MethodPost, session.PathFence, nil); status != http.StatusOK {
+		t.Fatalf("fence on a held connection: %d", status)
+	}
+	if status := requestOn(t, other, otherReader, http.MethodGet, session.PathState, nil); status != 0 {
+		t.Fatalf("another connection from before the fence still answered %d", status)
+	}
+	// The fence's connection is still there, and the guest is still nobody's.
+	if status := requestOn(t, claimer, reader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
+		t.Fatalf("state on the fence's connection: %d", status)
+	}
+	bind := p.bindFor(t, ready, nil)
+	body, err := json.Marshal(session.BindRequest{Bind: bind.Raw, Signature: bind.Signature})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := requestOn(t, claimer, reader, http.MethodPost, session.PathBind, body); status != http.StatusOK {
+		t.Fatalf("a bind on the connection that raised the fence: %d", status)
+	}
+	if state := p.state(t); state.Phase != session.PhaseRunning {
+		t.Fatalf("after the bind the guest says %s", state.Phase)
+	}
+}
+
 // A second fence ends the connections that came after the first.
 func TestFenceCanBeRaisedAgain(t *testing.T) {
 	p := newPool(t)

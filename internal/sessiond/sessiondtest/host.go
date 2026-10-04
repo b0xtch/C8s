@@ -58,7 +58,10 @@ type TD struct {
 	stop   sync.Once
 }
 
-func (i *TD) Address() string         { return strings.TrimPrefix(i.guest.URL, "https://") }
+func (i *TD) Address() string { return strings.TrimPrefix(i.guest.URL, "https://") }
+
+// Accepted is how many connections the TD's guest has accepted.
+func (i *TD) Accepted() int           { return i.guest.Accepted() }
 func (i *TD) Handle() sessiond.Handle { return i.handle }
 func (i *TD) Done() <-chan struct{}   { return i.done }
 

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,8 @@ type Guest struct {
 	keyService *session.KeyService
 	// stop ends the guest.
 	stop func()
+	// accepted counts the connections the guest's agent accepted.
+	accepted *atomic.Int64
 }
 
 // Close ends the guest before its test does, as a host ends a guest: its
@@ -248,8 +251,9 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	if err != nil {
 		t.Fatal(err)
 	}
+	accepted := new(atomic.Int64)
 	srv := agent.Server()
-	go func() { _ = agent.Serve(srv, ln) }()
+	go func() { _ = agent.Serve(srv, countingListener{Listener: ln, accepted: accepted}) }()
 	go agent.OpenKeyService(ctx)
 	stop := sync.OnceFunc(func() {
 		_ = srv.Close()
@@ -258,9 +262,27 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	t.Cleanup(stop)
 	return &Guest{
 		URL: "https://" + ln.Addr().String(), ManifestPath: manifest, LaunchKeyPath: filepath.Join(keys, session.PubkeyFile),
-		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop,
+		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop, accepted: accepted,
 	}
 }
+
+// countingListener counts the connections a guest accepted.
+type countingListener struct {
+	net.Listener
+	accepted *atomic.Int64
+}
+
+func (l countingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return conn, err
+}
+
+// Accepted is how many connections the guest has accepted since it began to
+// serve: what a test of who connects to a guest, and how often, counts.
+func (p *Guest) Accepted() int { return int(p.accepted.Load()) }
 
 // simulated is the runner of a guest whose sandbox is the test's own.
 type simulated struct {

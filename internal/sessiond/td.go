@@ -105,6 +105,13 @@ type td struct {
 	// gone is set once the TD's process is no more: its slot and its share of
 	// the host's capacity are free.
 	gone bool
+	// offered is what the guest said of itself when it became ready, and
+	// collateral the vendor's documents as it last handed them over. A claim
+	// relays both as they are kept, and asks the guest for its fence alone:
+	// what a ready guest says of itself does not change before a bind.
+	// Neither outlives the daemon.
+	offered    *session.StateResponse
+	collateral []byte
 }
 
 // session is the session the TD serves or served, or "".

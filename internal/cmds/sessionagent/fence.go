@@ -14,11 +14,13 @@ import (
 // it for a session. See session.FenceResponse.
 //
 // Every connection belongs to the epoch it was accepted in. Raising the fence
-// starts a new epoch and closes the connections of the earlier ones. A bind
-// is let in only from a connection of the current epoch, before any of it is
-// read, and counts as in flight until the agent is done with it. The fence is
-// not raised over a bind in flight: the guest then holds something a caller
-// sent it, and is no longer as it was booted.
+// starts a new epoch and closes the connections of the earlier ones, all but
+// the one the fence was raised on, which becomes the new epoch's first:
+// whoever claims the guest may send its bind the same way. A bind is let in
+// only from a connection of the current epoch, before any of it is read, and
+// counts as in flight until the agent is done with it. The fence is not
+// raised over a bind in flight: the guest then holds something a caller sent
+// it, and is no longer as it was booted.
 type fence struct {
 	mu    sync.Mutex
 	epoch uint64
@@ -94,8 +96,9 @@ func (f *fence) leave() {
 }
 
 // raise starts a new epoch and closes every connection of an earlier one but
-// keep, the connection the request to raise it came on. It returns how many
-// it closed. With a bind in flight it does neither, and reports false.
+// keep, the connection the request to raise it came on, which it moves into
+// the new epoch. It returns how many it closed. With a bind in flight it does
+// neither, and reports false.
 func (f *fence) raise(keep *fencedConn) (closed int, ok bool) {
 	f.mu.Lock()
 	if f.binds > 0 {
@@ -109,6 +112,9 @@ func (f *fence) raise(keep *fencedConn) (closed int, ok bool) {
 			stale = append(stale, c)
 		}
 	}
+	if keep != nil {
+		keep.epoch = f.epoch
+	}
 	f.mu.Unlock()
 	// Outside the lock: Close takes it to forget the connection.
 	for _, c := range stale {
@@ -118,8 +124,8 @@ func (f *fence) raise(keep *fencedConn) (closed int, ok bool) {
 }
 
 // admits reports whether a bind may be taken from c. Before the fence was
-// ever raised, any connection will do, tracked or not. After, only one that
-// was accepted since.
+// ever raised, any connection will do, tracked or not. After, only the one it
+// was last raised on and those accepted since.
 func (f *fence) admits(c *fencedConn) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()

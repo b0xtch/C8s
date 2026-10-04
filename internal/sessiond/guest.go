@@ -23,17 +23,24 @@ const maxGuestAnswer = 4 << 20
 
 // guestClient is how the daemon talks to the agents of its TDs. It verifies
 // nothing: the daemon is outside the trust boundary, relays what a guest says
-// unread, and acts on none of it beyond bookkeeping. Every request travels on
-// a connection of its own, so a bind always arrives on one opened after the
-// fence that precedes it.
+// unread, and acts on none of it beyond bookkeeping.
+//
+// It keeps a connection to each guest between requests, so that a claim and
+// the bind after it cost no handshake: a guest takes a bind on the connection
+// its fence was raised on. A connection the guest closed since is replaced
+// by the next request, which every request here may be sent again for.
 type guestClient struct {
 	http *http.Client
 }
 
 func newGuestClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *guestClient {
 	return &guestClient{http: &http.Client{Transport: &http.Transport{
-		DialContext:       dial,
-		DisableKeepAlives: true,
+		DialContext: dial,
+		// One kept connection a guest: more are opened when requests to one
+		// guest overlap, and closed after.
+		MaxIdleConnsPerHost: 1,
+		MaxIdleConns:        0,
+		IdleConnTimeout:     0,
 		TLSClientConfig: &tls.Config{
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true, //nolint:gosec // an untrusted relay: callers verify the evidence it hands on
@@ -41,6 +48,10 @@ func newGuestClient(dial func(ctx context.Context, network, addr string) (net.Co
 		TLSHandshakeTimeout: 10 * time.Second,
 	}}}
 }
+
+// reconnect drops the kept connections, so that the next request to a guest
+// is answered under the certificate the guest serves now.
+func (g *guestClient) reconnect() { g.http.CloseIdleConnections() }
 
 // refusal is a guest's definite answer that is neither success nor "try
 // again".
@@ -66,6 +77,12 @@ func (g *guestClient) do(ctx context.Context, addr, method, path string, body []
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if method != http.MethodGet {
+		// A guest answers a fence or a bind sent twice as it answered the
+		// first. This has the transport send one again when the kept
+		// connection it chose turns out to be closed.
+		req.Header.Set("Idempotency-Key", "repeatable")
 	}
 	resp, err := g.http.Do(req)
 	if err != nil {
@@ -107,28 +124,33 @@ func (g *guestClient) state(ctx context.Context, addr string) (*session.StateRes
 	return &state, leaf, nil
 }
 
-// ready reports whether the guest serves and waits for a bind, with whatever
-// its launch document has it prepare done.
-func (g *guestClient) ready(ctx context.Context, addr string) bool {
+// ready returns what the guest says of itself once it serves and waits for a
+// bind, with whatever its launch document has it prepare done. Nil is a
+// guest that is not there yet.
+func (g *guestClient) ready(ctx context.Context, addr string) *session.StateResponse {
 	state, _, err := g.state(ctx, addr)
-	return err == nil && state.Phase == session.PhaseReady && state.Prepared
+	if err != nil || state.Phase != session.PhaseReady || !state.Prepared {
+		return nil
+	}
+	return state
 }
 
-// fence has a ready guest cut every connection it accepted so far. The answer
-// says whether the guest is still nobody's.
-func (g *guestClient) fence(ctx context.Context, addr string) error {
-	data, _, err := g.do(ctx, addr, http.MethodPost, session.PathFence, nil)
+// fence has a ready guest cut every other connection it accepted so far. The
+// answer says whether the guest is still nobody's, and leaf is the
+// certificate it came under.
+func (g *guestClient) fence(ctx context.Context, addr string) (leaf []byte, err error) {
+	data, leaf, err := g.do(ctx, addr, http.MethodPost, session.PathFence, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var answer session.FenceResponse
 	if err := json.Unmarshal(data, &answer); err != nil {
-		return fmt.Errorf("the guest's answer to the fence: %w", err)
+		return nil, fmt.Errorf("the guest's answer to the fence: %w", err)
 	}
 	if answer.Phase != session.PhaseReady {
-		return fmt.Errorf("the guest is %s, not ready: somebody bound it", answer.Phase)
+		return nil, fmt.Errorf("the guest is %s, not ready: somebody bound it", answer.Phase)
 	}
-	return nil
+	return leaf, nil
 }
 
 // collateral is the vendor's documents as the guest keeps them, or nil.

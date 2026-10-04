@@ -19,8 +19,8 @@ func AdmissionOf(a *Agent) []session.AdmissionStep {
 }
 
 // EndedConnContext is the context of a request on a connection the agent's
-// fence has ended but that is still open, as the connection a fence request
-// itself came on is until its answer is written.
+// fence has ended but that is still open: one whose request was on its way
+// when the fence closed it.
 func EndedConnContext(ctx context.Context, a *Agent) context.Context {
 	a.fence.mu.Lock()
 	defer a.fence.mu.Unlock()

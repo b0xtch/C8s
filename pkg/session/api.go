@@ -163,10 +163,11 @@ type AdmissionStep struct {
 // claims the guest for a session.
 //
 // A guest that is bound says so, and nothing changes. A guest still unbound
-// closes every connection it accepted before the request and takes no bind
-// from one, then answers ready. Whoever held a connection to the guest
+// closes every other connection it accepted before the request and takes no
+// bind from one, then answers ready. Whoever held a connection to the guest
 // before, and whatever they had sent on it, can bind it no more: a bind after
-// this answer arrived on a connection opened after it.
+// this answer arrived on the connection that carried this request, or on one
+// opened after it.
 //
 // An answer of ready also says the guest has read no bind. One that is
 // reading a bind when the request comes answers 409 instead and changes

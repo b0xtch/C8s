@@ -400,8 +400,8 @@ func (a *Agent) serveFence(w http.ResponseWriter, r *http.Request) {
 		if closed > 0 {
 			a.log.Info("fenced", "closed", closed)
 		}
-		// This connection belongs to the epoch that just ended.
-		w.Header().Set("Connection", "close")
+		// This connection stays: it is the first of the epoch the fence
+		// began, and the bind may follow on it.
 		a.say(w, http.StatusOK, disclosure.MessageFence, session.FenceResponse{Phase: phase, Closed: closed})
 	}
 }

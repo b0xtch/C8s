@@ -3,6 +3,7 @@ package sessiond
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"regexp"
@@ -24,6 +25,9 @@ const (
 	maxClaimWait = 2 * time.Minute
 	// fenceTimeout bounds the daemon's own requests to a guest it claims.
 	fenceTimeout = 10 * time.Second
+	// certMargin is how long a certificate relayed with a claim must still
+	// be valid for.
+	certMargin = 10 * time.Minute
 	// maxBindWait bounds one Bind: the guest admits its sandbox within it or
 	// the caller asks again.
 	maxBindWait = 5 * time.Minute
@@ -181,12 +185,28 @@ func exhausted(pool string, hint time.Duration) error {
 func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState) (*sessionv1alpha1.Claimed, error) {
 	ctx, cancel := context.WithTimeout(ctx, fenceTimeout)
 	defer cancel()
-	if err := d.guests.fence(ctx, t.rec.Address); err != nil {
-		return nil, err
-	}
-	evidence, err := d.guests.evidence(ctx, t.rec.Address)
+	leaf, err := d.guests.fence(ctx, t.rec.Address)
 	if err != nil {
 		return nil, err
+	}
+	d.mu.Lock()
+	offered, collateral := t.offered, t.collateral
+	d.mu.Unlock()
+	// The fence's answer says the guest is still nobody's, so what it said
+	// of itself when it became ready still holds. Its certificate is the one
+	// the kept connection was made under: one about to run out is fetched
+	// again, with everything else, over a new connection.
+	var evidence *sessionv1alpha1.Evidence
+	if offered != nil && lasts(leaf, d.now()) {
+		evidence = &sessionv1alpha1.Evidence{
+			Certificate: leaf, LaunchDocument: offered.Launch, LaunchSignature: []byte(offered.Signature),
+			Events: offered.Events, Phase: string(session.PhaseReady), Collateral: collateral,
+		}
+	} else {
+		d.guests.reconnect()
+		if evidence, err = d.guests.evidence(ctx, t.rec.Address); err != nil {
+			return nil, err
+		}
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -207,6 +227,13 @@ func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState) (*sessionv1a
 	d.armLapse(t)
 	d.log.Info("claimed a TD", "td", t.rec.ID, "pool", t.rec.Pool, "session", t.rec.Claim.Session)
 	return answer, nil
+}
+
+// lasts reports whether a guest's certificate is good for long enough that
+// a caller who is handed it now can still use it.
+func lasts(leaf []byte, now time.Time) bool {
+	cert, err := x509.ParseCertificate(leaf)
+	return err == nil && now.Add(certMargin).Before(cert.NotAfter)
 }
 
 // Bind hands a claimed TD its bind and returns the guest's evidence.
