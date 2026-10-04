@@ -58,6 +58,9 @@ type BundleOptions struct {
 	// Machines lists the RTMR[0] values the guest may hold, in any order: the
 	// machines its host may build it. Empty pins none.
 	Machines []string
+	// KeyService pins the key service the pool's TDs open their sessions
+	// with, or nil.
+	KeyService *KeyService
 }
 
 // NewBundle writes and signs a pool's launch document. Dir must not exist; a
@@ -115,6 +118,7 @@ func NewBundle(opts BundleOptions) (err error) {
 		Image:           image,
 		AgeLimitSeconds: int(opts.AgeLimit / time.Second),
 		Prestage:        opts.Prestage,
+		KeyService:      opts.KeyService,
 	}
 	if len(opts.Machines) > 0 {
 		doc.Machine = &Machine{RTMR0: slices.Sorted(slices.Values(opts.Machines))}

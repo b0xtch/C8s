@@ -63,7 +63,14 @@ const SandboxProxyPort = 3128
 type Credential struct {
 	Name     string `json:"name"`
 	MaxBytes int    `json:"maxBytes,omitempty"`
+	// Source is where the secret comes from. Empty, a key the bind grants
+	// hands it over. SourceKeyService, the guest takes it from the bind's key
+	// service when it is bound, and no key may hand it over.
+	Source string `json:"source,omitempty"`
 }
+
+// ValidCredentialName reports whether name can name a credential.
+func ValidCredentialName(name string) bool { return credentialRE.MatchString(name) }
 
 // Limit is the effective size cap for this credential.
 func (c Credential) Limit() int {
@@ -146,11 +153,20 @@ func validateAccess(field string, access Access, credentials []Credential) error
 	if len(credentials) > maxCredentials {
 		return fmt.Errorf("at most %d credentials may be declared", maxCredentials)
 	}
-	if len(credentials) > 0 && len(access.Credentials) == 0 {
+	handed := 0
+	for _, c := range credentials {
+		if c.Source == "" {
+			handed++
+		}
+	}
+	if handed > 0 && len(access.Credentials) == 0 {
 		return fmt.Errorf("credentials are declared but %saccess.credentials names no key that could release them", field)
 	}
 	seen := make(map[string]bool, len(credentials))
 	for _, c := range credentials {
+		if c.Source != "" && c.Source != SourceKeyService {
+			return fmt.Errorf("credential %q source must be empty or %s", c.Name, SourceKeyService)
+		}
 		if !credentialRE.MatchString(c.Name) {
 			return fmt.Errorf("credential name %q must match %s", c.Name, credentialRE)
 		}

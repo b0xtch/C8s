@@ -71,6 +71,9 @@ type Bind struct {
 	// clock starts from a host-supplied value, so this binds an honest host only.
 	NotAfter string     `json:"notAfter"`
 	Policy   BindPolicy `json:"policy"`
+	// KeyService, when set, pins the key service the session trusts: the one
+	// the guest takes the policy's stored credentials from.
+	KeyService *KeyService `json:"keyService,omitempty"`
 }
 
 // BindPolicy is what the owner decides about its TD, one area to a member.
@@ -186,7 +189,20 @@ func (b *Bind) Validate() error {
 	if err := validateForward("policy.", b.Policy.Forward, b.Policy.Sandbox, b.Policy.Access.Forward); err != nil {
 		return err
 	}
-	return validateAccess("policy.", b.Policy.Access, b.Policy.Credentials)
+	if err := validateAccess("policy.", b.Policy.Access, b.Policy.Credentials); err != nil {
+		return err
+	}
+	if b.KeyService != nil {
+		if err := b.KeyService.validate(); err != nil {
+			return fmt.Errorf("keyService: %w", err)
+		}
+	}
+	for _, c := range b.Policy.Credentials {
+		if c.Source == SourceKeyService && b.KeyService == nil {
+			return fmt.Errorf("credential %q comes from a key service and the bind names none", c.Name)
+		}
+	}
+	return nil
 }
 
 // Expiry is NotAfter as a time. Validate has established that it parses.
@@ -283,6 +299,8 @@ type BindOptions struct {
 	// from now.
 	NotAfter time.Time
 	Policy   BindPolicy
+	// KeyService is the key service the session trusts, or nil.
+	KeyService *KeyService
 }
 
 // NewBind renders and signs a bind.
@@ -322,6 +340,7 @@ func NewBind(opts BindOptions) (*SignedBind, error) {
 		Nonce:         hex.EncodeToString(nonce),
 		NotAfter:      notAfter.UTC().Format(bindTimeLayout),
 		Policy:        opts.Policy,
+		KeyService:    opts.KeyService,
 	}
 	if err := doc.Validate(); err != nil {
 		return nil, err

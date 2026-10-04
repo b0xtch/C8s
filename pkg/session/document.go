@@ -72,6 +72,10 @@ type Document struct {
 	// Machine, when set, lists the virtual machines this guest may be. Unset,
 	// its host may build it any. See Machine.
 	Machine *Machine `yaml:"machine,omitempty" json:"machine,omitempty"`
+	// KeyService, when set, pins the key service the pool's TDs open their
+	// sessions with. A TD of a pool that names none takes no credential from
+	// a key service.
+	KeyService *KeyService `yaml:"keyService,omitempty" json:"keyService,omitempty"`
 }
 
 // Machine pins the virtual machine a host built around the guest. A TD's
@@ -149,42 +153,54 @@ var decimalRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 // Parse strictly validates launch.yaml bytes. It authenticates nothing: guests
 // use VerifySigned, verifiers check the signature against a pinned key.
 func Parse(data []byte) (*Document, error) {
-	if len(data) == 0 || len(data) > MaxDocumentSize {
-		return nil, fmt.Errorf("launch document must contain 1..%d bytes", MaxDocumentSize)
-	}
-	var tree yaml.Node
-	dec := yaml.NewDecoder(bytes.NewReader(data))
-	if err := dec.Decode(&tree); err != nil {
-		return nil, fmt.Errorf("parse launch YAML: %w", err)
-	}
-	var extra yaml.Node
-	if err := dec.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("launch document must contain exactly one YAML document")
-	}
-	if err := checkYAML(&tree, 0); err != nil {
-		return nil, err
-	}
-	dec = yaml.NewDecoder(bytes.NewReader(data))
-	dec.KnownFields(true)
 	var doc Document
-	if err := dec.Decode(&doc); err != nil {
-		return nil, fmt.Errorf("decode launch document: %w", err)
+	if err := ParseCanonicalYAML(data, &doc); err != nil {
+		return nil, err
 	}
 	if err := doc.Validate(); err != nil {
 		return nil, err
 	}
-	// One document, one spelling: the one this package writes. YAML has many
+	return &doc, nil
+}
+
+// ParseCanonicalYAML decodes one launch document into out, which is a pointer
+// to its type, under the rules every launch document is held to: one YAML
+// document of bounded size, with none of the features that let two readers
+// disagree, no field out does not know, and written exactly as this module
+// renders it. It validates no field.
+func ParseCanonicalYAML(data []byte, out any) error {
+	if len(data) == 0 || len(data) > MaxDocumentSize {
+		return fmt.Errorf("launch document must contain 1..%d bytes", MaxDocumentSize)
+	}
+	var tree yaml.Node
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&tree); err != nil {
+		return fmt.Errorf("parse launch YAML: %w", err)
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("launch document must contain exactly one YAML document")
+	}
+	if err := checkYAML(&tree, 0); err != nil {
+		return err
+	}
+	dec = yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(out); err != nil {
+		return fmt.Errorf("decode launch document: %w", err)
+	}
+	// One document, one spelling: the one this module writes. YAML has many
 	// for the same content (flow and block style, quoting, the old booleans),
 	// and a reader that is not this one may take some of them for another
 	// content. None survives a rendering, so a document must be its own.
-	canonical, err := yaml.Marshal(&doc)
+	canonical, err := yaml.Marshal(out)
 	if err != nil {
-		return nil, fmt.Errorf("render launch document: %w", err)
+		return fmt.Errorf("render launch document: %w", err)
 	}
 	if !bytes.Equal(canonical, data) {
-		return nil, errors.New("launch document is not in canonical form: the form 'c8s session launch-config new' writes it in")
+		return errors.New("launch document is not in canonical form: the form the c8s command that writes it gives it")
 	}
-	return &doc, nil
+	return nil
 }
 
 // checkYAML rejects the YAML features that let two readers disagree about one
@@ -259,6 +275,14 @@ func (d *Document) Validate() error {
 			return fmt.Errorf("prestage lists %s twice", digest)
 		}
 		seen[digest] = true
+	}
+	if d.KeyService != nil {
+		if err := d.KeyService.validate(); err != nil {
+			return fmt.Errorf("keyService: %w", err)
+		}
+		if d.KeyService.Image.Platform != d.Image.Platform {
+			return errors.New("keyService: its image is for another platform than the pool's")
+		}
 	}
 	return nil
 }

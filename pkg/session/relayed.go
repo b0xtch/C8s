@@ -69,6 +69,21 @@ func VerifyReady(ctx context.Context, policy Policy, engine Engine, r *Relayed, 
 	return verifyReady(withStapledRoot(WithCollateralSource(ctx, r.source)), policy, engine, leaf, state, now)
 }
 
+// VerifyReadyToRelease is VerifyReady for a verifier whose verdict lets a
+// secret go to the guest later, as a key service's does: the root CA CRL
+// under it is one the verifier fetched itself.
+func VerifyReadyToRelease(ctx context.Context, policy Policy, engine Engine, r *Relayed, now time.Time) (*ReadyTD, error) {
+	if err := policy.validate(); err != nil {
+		return nil, err
+	}
+	leaf, err := x509.ParseCertificate(r.Certificate)
+	if err != nil {
+		return nil, refuse("the relayed certificate does not parse: %v", err)
+	}
+	state := &StateResponse{Phase: r.Phase, Launch: r.Launch, Signature: r.Signature, Events: r.Events, Bind: r.Bind}
+	return verifyReady(WithCollateralSource(ctx, r.source), policy, engine, leaf, state, now)
+}
+
 // verifyReady judges a guest's state and serving certificate as those of a
 // guest nobody has bound.
 func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.Certificate, state *StateResponse, now time.Time) (*ReadyTD, error) {
