@@ -55,6 +55,16 @@ if [ "${C8S_DEV:-0}" = 1 ]; then
 fi
 : "${C8S_NAME:=$DEFAULT_NAME}"
 
+# The dev kernel is the locked kernel plus a console and debugfs. Both
+# fragments open with the same lines, so that what a dev image tests is the
+# kernel a locked image runs.
+common() { sed '/^# end of common$/q' "$1"; }
+if ! diff -q <(common "$PGI_DIR/kernel/session.config") <(common "$PGI_DIR/kernel/session-dev.config") > /dev/null \
+    || ! grep -q '^# end of common$' "$PGI_DIR/kernel/session.config"; then
+    echo "session-guest-image/build: kernel/session.config and kernel/session-dev.config differ before '# end of common'" >&2
+    exit 1
+fi
+
 # Kernel source patches, applied in name order. Each one changes the kernel,
 # and so the measurement, and is named by hash in the image's manifest.
 PATCHES=()

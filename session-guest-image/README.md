@@ -42,7 +42,7 @@ published file with a build.
 | `/etc/sysctl.d/50-c8s-session.conf` | verity root | No tunnel device in a new network namespace. The limit on user namespaces is the agent's to set: it makes the sandbox's and then has the kernel make no other |
 | `crun`, `nft`, `mke2fs` | distribution packages | crun runs the sandbox image a bind names, driven by the agent alone; nft loads the filter; mke2fs makes the state volume's file system, each boot |
 | `sandbox` user (2000:2000) and its home | `/etc/passwd` and `/home/sandbox`, written at build time | A session's commands run as this user in a dev image, when a bind names no sandbox image |
-| `kernel/session.config` | merged into the guest kernel | Adds vsock, which the agent uses to reach the host's quoting service and its key service, user namespaces for the sandbox's container, nftables for the filter, and transparent huge pages on request. Removes every console but the one that discards |
+| `kernel/session.config` | merged into the guest kernel | Adds vsock, which the agent uses to reach the host's quoting service, its key service and Intel's documents, user namespaces for the sandbox's container, nftables for the filter, and transparent huge pages on request. Removes every console but the one that discards, and every driver for a device a session guest is not given |
 
 The builder contributes the kernel, the layout of the dm-verity root and the
 distribution's packages. The initramfs is this repository's: `build` packs
