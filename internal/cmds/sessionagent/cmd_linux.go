@@ -117,6 +117,9 @@ func newRunCmd() *cobra.Command {
 			if image.Crun == "" && !cfg.Bare {
 				return errors.New("this guest can run a tenant's code nowhere: its image names no container runtime (--crun), and its agent is not a dev image's (--bare)")
 			}
+			if image.Crun != "" && image.SandboxInit == "" {
+				return errors.New("this guest's image names a container runtime (--crun) and not the program its containers start with (--sandbox-init)")
+			}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
 			var err error
 			// For the key service a launch document may pin. The guest has no
@@ -220,6 +223,7 @@ func newRunCmd() *cobra.Command {
 	f.StringVar(&schemas.Bind, "bind-schema", "", "the image's bind schema, on its measured root; the agent ends the guest if it is not the one the agent takes binds by")
 	f.BoolVar(&allowConsole, "allow-console", false, "serve in a guest whose kernel has a console its host can read: a dev image's mode. Without it the agent ends such a guest")
 	f.StringVar(&image.Crun, "crun", "", "crun binary; set by guest images that can run a sandbox image")
+	f.StringVar(&image.SandboxInit, "sandbox-init", "", "the program a sandbox's container runs until its session's bind names the sandbox's process (c8s-sandbox-init); set with --crun")
 	f.StringVar(&image.StateDir, "sandbox-state-dir", defaultStateDir, "directory on the encrypted scratch volume for the sandbox image")
 	f.StringVar(&image.RunDir, "sandbox-runtime-dir", defaultRuntimeDir, "RAM-backed directory for the container runtime's state")
 	f.Int64Var(&image.PidsLimit, "sandbox-pids-max", defaultPidsMax, "task limit of the sandbox and its commands together")

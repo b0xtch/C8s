@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,7 +41,9 @@ type staged struct {
 	registry *imagestoretest.Registry
 	image    map[string]ocispec.Descriptor
 	stateDir string
-	images   *sessionagent.ImageRunner
+	// cgroup is the agent's delegated cgroup: the container's is below it.
+	cgroup string
+	images *sessionagent.ImageRunner
 }
 
 type stagedOptions struct {
@@ -117,7 +120,7 @@ func newStaged(t *testing.T, o stagedOptions) *staged {
 			b.Prestage = append(b.Prestage, ref)
 		}
 	})
-	s.images, s.stateDir, _ = imageRunner(t, s.harness, crun, images)
+	s.images, s.stateDir, s.cgroup = imageRunner(t, s.harness, crun, images)
 	// What the registry was sent to build the store is not the guest's doing.
 	s.registry.Requests.Store(0)
 	s.start(t)
@@ -201,10 +204,15 @@ func TestGuestSaysWhenItsImagesAreUnpacked(t *testing.T) {
 			t.Fatal("the guest never said it was done with its images")
 		}
 	}
-	// Said, both trees are there: nothing is still under way.
+	// Said, both trees are there and nothing is still under way: the first
+	// image's under the container made for it, the other where it was
+	// unpacked.
 	trees, err := filepath.Glob(filepath.Join(s.stateDir, "prestaged", "*", "rootfs", "which"))
-	if err != nil || len(trees) != 2 {
-		t.Fatalf("the guest said it was done with %v on its disk, %v", trees, err)
+	if err != nil || len(trees) != 1 {
+		t.Fatalf("the guest said it was done with %v unpacked ahead, %v", trees, err)
+	}
+	if _, err := os.Stat(filepath.Join(s.stateDir, "rootfs", "which")); err != nil {
+		t.Fatalf("the guest said it was done, and the first image's container has no root: %v", err)
 	}
 }
 
@@ -234,6 +242,111 @@ func TestImageUnpackedAheadStartsAtTheBind(t *testing.T) {
 	s.gone(t)
 	if entries, _ := os.ReadDir(s.stateDir); len(entries) != 1 || entries[0].Name() != "rootfs" {
 		t.Errorf("the state directory holds %v", entries)
+	}
+}
+
+// first is the first process of the guest's container: its id on this
+// machine and what it runs.
+func (s *staged) first(t *testing.T) (pid int, command string) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(s.cgroup, "sandbox", "cgroup.procs"))
+	if err != nil {
+		t.Fatalf("the container's cgroup: %v", err)
+	}
+	// The kernel lists a cgroup's processes in the order they came.
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		t.Fatal("the container holds no process")
+	}
+	if pid, err = strconv.Atoi(fields[0]); err != nil {
+		t.Fatal(err)
+	}
+	line, err := os.ReadFile(filepath.Join("/proc", fields[0], "cmdline"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pid, strings.TrimSpace(strings.ReplaceAll(string(line), "\x00", " "))
+}
+
+// The container of the first image a pool lists is made before any bind,
+// with the sandbox's init as its process. A bind that names that image has a
+// process to start and nothing else: the init becomes the image's command in
+// place, or the command the bind gives, in the bind's environment, and what
+// it becomes inherits nothing of the init's.
+func TestContainerMadeAheadBecomesTheSandbox(t *testing.T) {
+	for name, tc := range map[string]struct {
+		change func(*session.Sandbox)
+		want   string
+	}{
+		"the image's own command": {func(*session.Sandbox) {}, "/bin/sleep 100000"},
+		"a command of the bind's": {func(w *session.Sandbox) {
+			w.Command, w.Args, w.Env = []string{"sleep"}, []string{"4242"}, map[string]string{"GREETING": "hello"}
+		}, "sleep 4242"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newStaged(t, stagedOptions{stored: []string{"a", "b"}, prestage: []string{"a", "b"}})
+			s.settled(t)
+			made, waiting := s.first(t)
+			if !strings.HasPrefix(waiting, "/proc/self/fd/") {
+				t.Fatalf("before any bind the container's first process runs %q, want the sandbox's init", waiting)
+			}
+			client := s.client(t, s.access)
+			ready, err := client.Ready(ctxT(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sandbox := &session.Sandbox{Image: elsewhere(s.image["a"].Digest)}
+			tc.change(sandbox)
+			bind := s.bindFor(t, ready, func(o *session.BindOptions) { o.Policy.Sandbox = sandbox })
+			resp, err := client.Bind(ctxT(t), bind)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+			if steps := stepNames(resp.Admission); steps != "prestaged,measure,start" {
+				t.Errorf("admission steps: %s", steps)
+			}
+			if pid, command := s.first(t); pid != made || command != tc.want {
+				t.Fatalf("after the bind the container's first process is %d running %q, want %d running %q", pid, command, made, tc.want)
+			}
+			tenant := s.boundClient(t, ready, bind)
+			if got := s.which(t, tenant); got != "a a" {
+				t.Errorf("the sandbox is image %q", got)
+			}
+			out, err := tenant.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `ls /proc/1/fd | tr '\n' ' '; tr '\0' '\n' < /proc/1/environ | grep -c GREETING`}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fields := strings.Fields(string(out.Stdout))
+			greeted := "0"
+			if sandbox.Env != nil {
+				greeted = "1"
+			}
+			if want := []string{"0", "1", "2", greeted}; !slices.Equal(fields, want) {
+				t.Errorf("the sandbox's process holds descriptors and a greeting %v, want %v", fields, want)
+			}
+			if n := s.registry.Requests.Load(); n != 0 {
+				t.Errorf("the registry was sent %d requests", n)
+			}
+		})
+	}
+}
+
+// A guest nobody binds ends with nothing of its container left: the init
+// that waited is gone, and so is the tree it was made over.
+func TestContainerMadeAheadEndsWithItsGuest(t *testing.T) {
+	s := newStaged(t, stagedOptions{stored: []string{"a"}, prestage: []string{"a"}})
+	s.settled(t)
+	if _, waiting := s.first(t); !strings.HasPrefix(waiting, "/proc/self/fd/") {
+		t.Fatalf("the container's first process runs %q", waiting)
+	}
+	if err := s.images.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(s.cgroup, "sandbox", "cgroup.procs")); err == nil && len(strings.Fields(string(data))) != 0 {
+		t.Fatalf("after the runner closed its container still holds %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(s.stateDir, "rootfs")); err == nil {
+		t.Error("the tree of a container nobody used is still there")
 	}
 }
 
@@ -331,22 +444,23 @@ func TestStoreThatWasChangedCostsTheBind(t *testing.T) {
 	}
 }
 
-// What is unpacked ahead stays until a bind: two images listed and held are
-// two trees, each under its digest.
+// What is unpacked ahead stays until a bind. The first image listed is the
+// root of the container made for it, whose init waits for a bind. Every
+// other is a tree under its digest.
 func TestImagesUnpackedAheadWaitForABind(t *testing.T) {
 	s := newStaged(t, stagedOptions{stored: []string{"a", "b"}, prestage: []string{"a", "b"}})
 	left := s.settled(t)
-	slices.Sort(left)
-	want := []string{s.image["a"].Digest.String(), s.image["b"].Digest.String()}
-	slices.Sort(want)
-	if !slices.Equal(left, want) {
-		t.Fatalf("unpacked ahead: %v, want %v", left, want)
+	if want := []string{s.image["b"].Digest.String()}; !slices.Equal(left, want) {
+		t.Fatalf("unpacked ahead and waiting as trees: %v, want %v", left, want)
 	}
-	for _, d := range want {
+	for _, d := range left {
 		dir := filepath.Join(s.stateDir, "prestaged", strings.TrimPrefix(d, "sha256:"))
 		if entries, _ := os.ReadDir(dir); len(entries) != 1 || entries[0].Name() != "rootfs" {
 			t.Errorf("%s holds %v, want the tree alone", dir, entries)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(s.stateDir, "rootfs", "which")); err != nil {
+		t.Fatalf("the first image's container has no root: %v", err)
 	}
 	if n := s.registry.Requests.Load(); n != 0 {
 		t.Errorf("the registry was sent %d requests", n)

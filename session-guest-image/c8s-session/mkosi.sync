@@ -22,6 +22,7 @@ ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
 case "$ROLE" in
     session)
         SERVICE=(/usr/local/bin/c8s-session-guest session-agent run "--platform=$PLATFORM" --crun=/usr/bin/crun
+            --sandbox-init=/usr/local/bin/c8s-sandbox-init
             --packet-filter=/etc/c8s-session/firewall.json
             --disclosure-schema=/etc/c8s-session/disclosure-schema.json
             --bind-schema=/etc/c8s-session/bind-schema.json)

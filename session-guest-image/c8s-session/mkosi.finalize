@@ -12,7 +12,7 @@ fi
 
 # The init runs these by path, and the agent runs crun. Without one of them
 # the guest would power off on every boot.
-for bin in usr/local/bin/c8s-session-guest usr/bin/crun usr/sbin/nft usr/sbin/mke2fs; do
+for bin in usr/local/bin/c8s-session-guest usr/local/bin/c8s-sandbox-init usr/bin/crun usr/sbin/nft usr/sbin/mke2fs; do
     if [ ! -x "$BUILDROOT/$bin" ]; then
         echo "c8s-session finalize: FATAL /$bin is not in the image" >&2
         exit 1

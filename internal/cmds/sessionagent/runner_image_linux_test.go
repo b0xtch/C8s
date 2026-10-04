@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -56,6 +57,37 @@ func containerFixtures(t *testing.T) (crun string, busybox []byte) {
 	}
 	return crun, busybox
 }
+
+// sandboxInit is the program a container starts with, built once for the
+// tests the way a guest image's build compiles it: static, since a
+// container's root holds no library of the guest's. C8S_TEST_SANDBOX_INIT
+// names one built already.
+var sandboxInit = sync.OnceValues(func() (string, error) {
+	if path := os.Getenv("C8S_TEST_SANDBOX_INIT"); path != "" {
+		return path, nil
+	}
+	root, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/confidential-dot-ai/c8s").Output()
+	if err != nil {
+		return "", fmt.Errorf("find the module: %w", err)
+	}
+	dir, err := os.MkdirTemp("", "c8s-sandbox-init-")
+	if err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "c8s-sandbox-init")
+	build := exec.Command("go", "build", "-o", path, "./cmd/c8s-sandbox-init")
+	build.Dir = strings.TrimSpace(string(root))
+	build.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := build.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build c8s-sandbox-init: %w\n%s", err, out)
+	}
+	// The container's user reaches it through a descriptor, and must be
+	// allowed to run it.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return "", err
+	}
+	return path, nil
+})
 
 // container is a harness whose agent runs a sandbox image under crun.
 type container struct {
@@ -139,9 +171,13 @@ func imageRunner(t *testing.T, h *harness, crun string, images *imagestore.Store
 	if err != nil {
 		t.Fatal(err)
 	}
+	init, err := sandboxInit()
+	if err != nil {
+		t.Skipf("needs the sandbox's init: %v", err)
+	}
 	runner, err = sessionagent.NewImageRunner(sessionagent.ImageRunnerConfig{
 		StateDir: stateDir, RunDir: t.TempDir(), CredentialDir: h.credDir, CgroupParent: cgroup,
-		PidsLimit: testPidsLimit, Crun: crun, PlainHTTP: func(string) bool { return true },
+		PidsLimit: testPidsLimit, Crun: crun, SandboxInit: init, PlainHTTP: func(string) bool { return true },
 		Pull:   imagestore.PullLimits{Layers: 4, BlobBytes: 64 << 20, TotalBytes: 128 << 20},
 		Unpack: imagestore.UnpackLimits{Entries: 1000, Bytes: 64 << 20},
 		Images: images,

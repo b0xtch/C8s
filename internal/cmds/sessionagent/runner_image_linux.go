@@ -3,6 +3,7 @@
 package sessionagent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
 
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sandboxinit"
 	"github.com/confidential-dot-ai/c8s/internal/fileutil"
 	"github.com/confidential-dot-ai/c8s/internal/imagestore"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -57,9 +59,14 @@ type ImageRunnerConfig struct {
 	// PidsLimit caps the tasks of the sandbox and its commands together.
 	PidsLimit int64
 	// Crun is the runtime binary.
-	Crun   string
-	Pull   imagestore.PullLimits
-	Unpack imagestore.UnpackLimits
+	Crun string
+	// SandboxInit is the program a container runs until its session's bind
+	// says what the sandbox's process is: internal/cmds/sandboxinit. The
+	// container is made around it ahead of the bind, and it then becomes
+	// that process.
+	SandboxInit string
+	Pull        imagestore.PullLimits
+	Unpack      imagestore.UnpackLimits
 	// Images is the host's image store, or nil. What it holds of an image is
 	// read from it, checked like a registry's answer, and the registry is
 	// asked for the rest.
@@ -81,6 +88,10 @@ type ImageRunner struct {
 	started  bool
 	exited   chan struct{}
 	exitErr  error
+	// made is the container made over the first image unpacked ahead, before
+	// any bind named an image. A Prepare takes it, for its sandbox or to end
+	// it.
+	made *madeSandbox
 	// net is the sandbox's namespaces and its proxy, made once, from when
 	// the runner is. A caller waits for them.
 	net func() (*sandboxNet, error)
@@ -107,6 +118,28 @@ type preparedSandbox struct {
 	rootfs  string
 	// egress is the document's allowlist, nil when it sets none.
 	egress *session.Egress
+	// made is the sandbox's container, whose init waits to become process.
+	made *madeSandbox
+}
+
+// madeSandbox is a container whose process is not the image's yet. Its
+// namespaces, mounts and limits are in place, and its first process is the
+// sandbox init, which waits for the agent to say what to become. Nothing of
+// the image has run.
+type madeSandbox struct {
+	// digest names the image whose tree is the container's root.
+	digest string
+	rootfs string
+	// control is the agent's end of the socket pair the init reads.
+	control *os.File
+	pidPath string
+	// cgroupsPath is the container's cgroup, as the kernel names it.
+	cgroupsPath string
+	logPath     string
+	// exited is closed when the container's runtime has ended, and exitErr
+	// then says how.
+	exited  chan struct{}
+	exitErr error
 }
 
 // NewImageRunner returns the runner of a guest image that carries crun.
@@ -114,8 +147,8 @@ func NewImageRunner(cfg ImageRunnerConfig, bare Runner) (*ImageRunner, error) {
 	if bare == nil {
 		return nil, errors.New("image runner needs a bare runner for guests without a sandbox")
 	}
-	if cfg.StateDir == "" || cfg.RunDir == "" || cfg.CredentialDir == "" || cfg.Crun == "" {
-		return nil, errors.New("image runner needs a state directory, a run directory, a credential directory and crun")
+	if cfg.StateDir == "" || cfg.RunDir == "" || cfg.CredentialDir == "" || cfg.Crun == "" || cfg.SandboxInit == "" {
+		return nil, errors.New("image runner needs a state directory, a run directory, a credential directory, crun and the sandbox's init")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -186,9 +219,15 @@ func (r *ImageRunner) Prestage(ctx context.Context, images []string) <-chan stru
 	r.mu.Unlock()
 	go func() {
 		defer close(done)
-		for _, entry := range order {
+		for i, entry := range order {
 			began := time.Now()
 			entry.err = r.unpackAhead(ctx, entry)
+			if entry.err == nil && i == 0 {
+				// The first image listed is the one a pool's sessions are
+				// expected to name: its container is made now, so that a
+				// bind which names it only has a process to start.
+				r.makeAhead(ctx, entry)
+			}
 			close(entry.done)
 			if entry.err != nil {
 				r.cfg.Logger.Warn("image not unpacked ahead", "image", entry.ref, "error", entry.err)
@@ -198,6 +237,47 @@ func (r *ImageRunner) Prestage(ctx context.Context, images []string) <-chan stru
 		}
 	}()
 	return done
+}
+
+// makeAhead makes the sandbox's container over an image unpacked ahead. A
+// failure leaves the image's tree where the unpack put it, for a Prepare to
+// take the usual way.
+func (r *ImageRunner) makeAhead(ctx context.Context, entry *prestagedImage) {
+	if ctx.Err() != nil {
+		return
+	}
+	began := time.Now()
+	digest, err := (&session.Sandbox{Image: entry.ref}).Digest()
+	if err != nil {
+		return
+	}
+	process, err := sandboxProcess(entry.config, &session.Sandbox{Image: entry.ref}, r.cfg.CredentialDir)
+	if err != nil {
+		// The image's own command does not run as it stands. A bind may
+		// still give it one.
+		r.cfg.Logger.Info("no container made ahead", "image", entry.ref, "reason", err)
+		return
+	}
+	rootfs := filepath.Join(r.cfg.StateDir, "rootfs")
+	if err := os.Rename(entry.rootfs, rootfs); err != nil {
+		r.cfg.Logger.Warn("no container made ahead", "image", entry.ref, "error", err)
+		return
+	}
+	made, err := r.mountAndMake(ctx, digest, rootfs, process)
+	if err != nil {
+		r.cfg.Logger.Warn("no container made ahead", "image", entry.ref, "error", err)
+		// Back where a Prepare looks for it.
+		if err := os.Rename(rootfs, entry.rootfs); err != nil {
+			entry.err = fmt.Errorf("the image's tree was lost to a container that could not be made: %w", err)
+		}
+		return
+	}
+	// The tree is the container's now: what held it is empty.
+	_ = os.Remove(filepath.Dir(entry.rootfs))
+	r.mu.Lock()
+	r.made = made
+	r.mu.Unlock()
+	r.cfg.Logger.Info("container made ahead", "image", entry.ref, "seconds", time.Since(began).Seconds())
 }
 
 // unpackAhead reads one image from the host's store and unpacks it beside
@@ -267,9 +347,12 @@ func (r *ImageRunner) takeAhead(ctx context.Context, w *session.Sandbox) *presta
 	return entry
 }
 
-// Prepare pulls the image, verifies it against the digest the launch document
-// pins, and unpacks it, or takes the tree that was unpacked ahead. Nothing of
-// the image runs.
+// Prepare readies the sandbox the bind names: its image in place, and its
+// container made, with the sandbox init as its process. A bind that names
+// the image whose container was made ahead finds all of that done. For any
+// other, the image is taken from what was unpacked ahead, or pulled and
+// verified against the digest the bind pins, and its container is made now.
+// Nothing of the image runs.
 func (r *ImageRunner) Prepare(ctx context.Context, w *session.Sandbox, egress *session.Egress) error {
 	if prepared, _ := r.sandbox(); prepared != nil {
 		return errors.New("a sandbox is already prepared")
@@ -281,38 +364,74 @@ func (r *ImageRunner) Prepare(ctx context.Context, w *session.Sandbox, egress *s
 	if err := r.stateDir(); err != nil {
 		return err
 	}
+	digest, err := w.Digest()
+	if err != nil {
+		return err
+	}
 	store, rootfs := filepath.Join(r.cfg.StateDir, "store"), filepath.Join(r.cfg.StateDir, "rootfs")
 	began := time.Now()
+	// Ends the unpacking ahead, and with it the making of a container: from
+	// here r.made does not change under this call.
+	ahead := r.takeAhead(ctx, w)
+	r.mu.Lock()
+	made := r.made
+	r.made = nil
+	r.mu.Unlock()
 	var process *specs.Process
-	var err error
-	if ahead := r.takeAhead(ctx, w); ahead != nil {
-		if process, err = sandboxProcess(ahead.config, w, r.cfg.CredentialDir); err == nil {
-			err = os.Rename(ahead.rootfs, rootfs)
-		}
+	switch {
+	case made != nil && made.digest == digest && ahead != nil:
+		process, err = sandboxProcess(ahead.config, w, r.cfg.CredentialDir)
 		recordStep(ctx, stepPrestaged, time.Since(began))
-	} else {
-		process, err = r.fetch(ctx, w, store, rootfs)
-		// The blobs are spent either way; the scratch volume keeps only a
-		// tree that is about to run.
-		began = time.Now()
-		if rmErr := os.RemoveAll(store); err == nil {
-			err = rmErr
+	default:
+		if made != nil {
+			// Made over another image than the bind names.
+			r.unmake(made)
+			made = nil
 		}
-		recordStep(ctx, stepClear, time.Since(began))
+		if ahead != nil {
+			if process, err = sandboxProcess(ahead.config, w, r.cfg.CredentialDir); err == nil {
+				err = os.Rename(ahead.rootfs, rootfs)
+			}
+			recordStep(ctx, stepPrestaged, time.Since(began))
+		} else {
+			process, err = r.fetch(ctx, w, store, rootfs)
+			// The blobs are spent either way; the scratch volume keeps only a
+			// tree that is about to run.
+			began = time.Now()
+			if rmErr := os.RemoveAll(store); err == nil {
+				err = rmErr
+			}
+			recordStep(ctx, stepClear, time.Since(began))
+		}
+		if err == nil {
+			if made, err = r.mountAndMake(ctx, digest, rootfs, process); err != nil {
+				err = fmt.Errorf("make the sandbox's container: %w", err)
+			}
+		}
+		if err != nil {
+			_ = os.RemoveAll(rootfs)
+		}
 	}
 	// What was unpacked ahead and is not this sandbox's is nobody's. It goes
 	// while the sandbox starts: no sandbox waits for it.
 	go func() { _ = os.RemoveAll(r.aheadDir()) }()
-	if err == nil {
-		err = mountRootfs(rootfs)
-	}
 	if err != nil {
-		_ = os.RemoveAll(rootfs)
+		if made != nil {
+			r.unmake(made)
+		}
 		return err
 	}
 	r.mu.Lock()
-	r.prepared = &preparedSandbox{process: process, rootfs: rootfs, egress: egress}
+	r.prepared = &preparedSandbox{process: process, rootfs: rootfs, egress: egress, made: made}
 	r.mu.Unlock()
+	// The sandbox's end is its container's from here.
+	go func() {
+		<-made.exited
+		r.mu.Lock()
+		r.exitErr = made.exitErr
+		r.mu.Unlock()
+		close(r.exited)
+	}()
 	return nil
 }
 
@@ -374,8 +493,152 @@ func (r *ImageRunner) crun(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// Start runs the container under a crun that stays in the foreground: the
-// agent is its parent, so the sandbox's end is the end of a child.
+// mountAndMake puts the tree at rootfs behind its mount and makes the
+// sandbox's container over it. On failure the tree is unmounted and stays.
+func (r *ImageRunner) mountAndMake(ctx context.Context, digest, rootfs string, image *specs.Process) (*madeSandbox, error) {
+	if err := mountRootfs(rootfs); err != nil {
+		return nil, err
+	}
+	made, err := r.makeSandbox(ctx, digest, rootfs, image)
+	if err != nil {
+		_ = unix.Unmount(rootfs, unix.MNT_DETACH)
+		return nil, err
+	}
+	return made, nil
+}
+
+// makeSandbox makes the sandbox's container under a crun that stays in the
+// foreground: the agent is its parent, so the sandbox's end is the end of a
+// child. The container's process is the sandbox init, run as the user and
+// under the limits of image's process, from a descriptor the runtime
+// preserves: the container holds no file of it. It returns once the init
+// runs, and waits there for Start.
+func (r *ImageRunner) makeSandbox(ctx context.Context, digest, rootfs string, image *specs.Process) (_ *madeSandbox, err error) {
+	cgroupsPath, ok := strings.CutPrefix(r.cgroupDir(), cgroupRoot)
+	if !ok || cgroupsPath == "" {
+		return nil, fmt.Errorf("delegated cgroup %s is not under %s", r.cfg.CgroupParent, cgroupRoot)
+	}
+	// Beside the credential directory, where the container's user can reach
+	// it: the run directory is the agent's alone.
+	mounts := sandboxMounts{CredentialDir: r.cfg.CredentialDir, ResolvConf: filepath.Join(filepath.Dir(r.cfg.CredentialDir), "sandbox-resolv.conf")}
+	if err := os.MkdirAll(r.cfg.CredentialDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := fileutil.WriteAtomic(mounts.ResolvConf, []byte(sandboxResolvConf), 0o644); err != nil {
+		return nil, err
+	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = sandboxID
+	}
+	if err := os.MkdirAll(r.cfg.RunDir, 0o700); err != nil {
+		return nil, err
+	}
+	sandboxNet, err := r.net()
+	if err != nil {
+		return nil, fmt.Errorf("the sandbox's namespaces: %w", err)
+	}
+	// The image's user, capabilities and limits, and nothing else of the
+	// image yet: its command, environment and directory come with Start.
+	init := *image
+	init.Args = []string{fmt.Sprintf("/proc/self/fd/%d", sandboxinit.ProgramFD)}
+	init.Env = []string{"PATH=" + defaultSandboxPath}
+	init.Cwd = "/"
+	spec := sandboxSpec(&init, rootfs, hostname, cgroupsPath, r.cfg.PidsLimit, mounts, sandboxNet.paths())
+	// containerd's default profile, for the capabilities the sandbox holds:
+	// what a container gets anywhere else. Capabilities and the user namespace
+	// already gate most of what it refuses; this narrows the kernel surface
+	// behind them, and crun applies it to every command too.
+	spec.Linux.Seccomp = seccomp.DefaultProfile(spec)
+	config, err := json.Marshal(spec)
+	if err != nil {
+		return nil, err
+	}
+	bundle := filepath.Join(r.cfg.RunDir, "bundle")
+	if err := os.MkdirAll(bundle, 0o700); err != nil {
+		return nil, err
+	}
+	if err := fileutil.WriteAtomic(filepath.Join(bundle, "config.json"), config, 0o600); err != nil {
+		return nil, err
+	}
+	// crun's own errors go to this file. The sandbox's output is tenant data
+	// and goes nowhere: the container's stdio is /dev/null.
+	made := &madeSandbox{
+		digest: digest, rootfs: rootfs, cgroupsPath: cgroupsPath, exited: make(chan struct{}),
+		logPath: filepath.Join(r.cfg.RunDir, "crun-run.log"), pidPath: filepath.Join(r.cfg.RunDir, "sandbox.pid"),
+	}
+	if err := os.Remove(made.pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	program, err := os.Open(r.cfg.SandboxInit)
+	if err != nil {
+		return nil, fmt.Errorf("the sandbox's init: %w", err)
+	}
+	defer program.Close()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("the sandbox init's control socket: %w", err)
+	}
+	made.control = os.NewFile(uintptr(pair[0]), "sandbox-init-control")
+	theirs := os.NewFile(uintptr(pair[1]), "sandbox-init")
+	defer theirs.Close()
+	// Not under ctx: the sandbox outlives the admission that made it.
+	cmd := r.crun(context.Background(), "--log", "file:"+made.logPath, "run", "--bundle", bundle, "--pid-file", made.pidPath,
+		"--preserve-fds", "2", sandboxID)
+	// Descriptors 3 and 4 of the runtime, and so of the container's process.
+	cmd.ExtraFiles = []*os.File{program, theirs}
+	if err := cmd.Start(); err != nil {
+		_ = made.control.Close()
+		return nil, fmt.Errorf("start crun: %w", err)
+	}
+	go func() {
+		err := cmd.Wait()
+		var status *exec.ExitError
+		if errors.As(err, &status) {
+			err = fmt.Errorf("sandbox exited with status %d", exitStatus(status.ProcessState))
+		}
+		made.exitErr = err
+		close(made.exited)
+	}()
+	if err := r.await(ctx, made, sandboxNet, true, nil); err != nil {
+		if reason := readTrimmed(made.logPath); reason != "" {
+			err = fmt.Errorf("%w: %s", err, reason)
+		}
+		r.endContainer(made)
+		return nil, err
+	}
+	return made, nil
+}
+
+// endContainer ends a made container and waits for its runtime to go. Its
+// init ends by itself when the agent's end of its socket closes, and the
+// cgroup's kill switch reaches whatever else is in it.
+func (r *ImageRunner) endContainer(made *madeSandbox) {
+	_ = made.control.Close()
+	if err := os.WriteFile(filepath.Join(r.cgroupDir(), "cgroup.kill"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+		r.cfg.Logger.Warn("end the sandbox's container", "error", err)
+	}
+	select {
+	case <-made.exited:
+	case <-time.After(stopTimeout):
+		r.cfg.Logger.Warn("the sandbox's container was still there after it was killed", "after", stopTimeout.String())
+	}
+	// What the runtime keeps of a container that ended under it.
+	_ = r.crun(context.Background(), "delete", "--force", sandboxID).Run()
+}
+
+// unmake ends a container that no sandbox will use, and removes the tree it
+// was made over.
+func (r *ImageRunner) unmake(made *madeSandbox) {
+	r.endContainer(made)
+	if err := unix.Unmount(made.rootfs, unix.MNT_DETACH); err != nil {
+		r.cfg.Logger.Warn("unmount the root filesystem of a container that was not used", "error", err)
+	}
+	_ = os.RemoveAll(made.rootfs)
+}
+
+// Start has the container's init become the sandbox's process: the image's
+// command, with the bind's overrides, in the container that was made for it.
 func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	w, started := r.sandbox()
 	switch {
@@ -386,106 +649,88 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	case credentialDir != r.cfg.CredentialDir:
 		return errors.New("the sandbox was prepared for another credential directory")
 	}
-	cgroupsPath, ok := strings.CutPrefix(r.cgroupDir(), cgroupRoot)
-	if !ok || cgroupsPath == "" {
-		return fmt.Errorf("delegated cgroup %s is not under %s", r.cfg.CgroupParent, cgroupRoot)
-	}
-	// Beside the credential directory, where the container's user can reach
-	// it: the run directory is the agent's alone.
-	mounts := sandboxMounts{CredentialDir: credentialDir, ResolvConf: filepath.Join(filepath.Dir(credentialDir), "sandbox-resolv.conf")}
-	if err := fileutil.WriteAtomic(mounts.ResolvConf, []byte(sandboxResolvConf), 0o644); err != nil {
-		return err
-	}
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = sandboxID
-	}
-	if err := os.MkdirAll(r.cfg.RunDir, 0o700); err != nil {
-		return err
-	}
 	sandboxNet, err := r.net()
 	if err != nil {
 		return fmt.Errorf("the sandbox's namespaces: %w", err)
 	}
-	spec := sandboxSpec(w.process, w.rootfs, hostname, cgroupsPath, r.cfg.PidsLimit, mounts, sandboxNet.paths())
-	// containerd's default profile, for the capabilities the sandbox holds:
-	// what a container gets anywhere else. Capabilities and the user namespace
-	// already gate most of what it refuses; this narrows the kernel surface
-	// behind them, and crun applies it to every command too.
-	spec.Linux.Seccomp = seccomp.DefaultProfile(spec)
-	config, err := json.Marshal(spec)
+	began := time.Now()
+	sandboxNet.serve(w.egress)
+	message, err := json.Marshal(sandboxinit.Process{Argv: w.process.Args, Env: w.process.Env, Cwd: w.process.Cwd})
 	if err != nil {
 		return err
 	}
-	bundle := filepath.Join(r.cfg.RunDir, "bundle")
-	if err := os.MkdirAll(bundle, 0o700); err != nil {
-		return err
+	control := w.made.control
+	if _, err := control.Write(message); err != nil {
+		return fmt.Errorf("tell the sandbox's init its process: %w", err)
 	}
-	if err := fileutil.WriteAtomic(filepath.Join(bundle, "config.json"), config, 0o600); err != nil {
-		return err
-	}
-	// crun's own errors go to this file. The sandbox's output is tenant data
-	// and goes nowhere: the container's stdio is /dev/null.
-	logPath := filepath.Join(r.cfg.RunDir, "crun-run.log")
-	pidPath := filepath.Join(r.cfg.RunDir, "sandbox.pid")
-	if err := os.Remove(pidPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	sandboxNet.serve(w.egress)
-	// Not under ctx: the sandbox outlives the admission that started it.
-	cmd := r.crun(context.Background(), "--log", "file:"+logPath, "run", "--bundle", bundle, "--pid-file", pidPath, sandboxID)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start crun: %w", err)
+	// The message ends where the agent stops writing.
+	if err := unix.Shutdown(int(control.Fd()), unix.SHUT_WR); err != nil {
+		return fmt.Errorf("tell the sandbox's init its process: %w", err)
 	}
 	r.mu.Lock()
 	r.started = true
 	r.mu.Unlock()
+	// The init answers only when it could not become the process.
+	refused := make(chan string, 1)
 	go func() {
-		err := cmd.Wait()
-		var status *exec.ExitError
-		if errors.As(err, &status) {
-			err = fmt.Errorf("sandbox exited with status %d", exitStatus(status.ProcessState))
-		}
-		r.mu.Lock()
-		r.exitErr = err
-		r.mu.Unlock()
-		close(r.exited)
+		line, _ := bufio.NewReader(control).ReadString('\n')
+		refused <- strings.TrimSpace(line)
 	}()
-	if err := r.awaitRunning(ctx, pidPath, cgroupsPath, sandboxNet); err != nil {
-		if reason := readTrimmed(logPath); reason != "" {
+	if err := r.await(ctx, w.made, sandboxNet, false, refused); err != nil {
+		if reason := readTrimmed(w.made.logPath); reason != "" {
 			err = fmt.Errorf("%w: %s", err, reason)
 		}
 		return err
 	}
-	r.cfg.Logger.Info("sandbox started")
+	r.cfg.Logger.Info("sandbox started", "took_us", time.Since(began).Microseconds())
 	return nil
 }
 
-// awaitRunning returns once the image's own program runs. The runtime writes
-// the container's first process to pidPath when the container is made, and
-// that process then becomes the image's command: until it has, its
-// executable is the runtime's. The process is taken for the container's only
-// if it is in the container's cgroup, whatever the file says, and it must run
-// in the namespaces the agent made for it.
-func (r *ImageRunner) awaitRunning(ctx context.Context, pidPath, cgroupsPath string, namespaces *sandboxNet) error {
+// await returns once the container's first process is the program that is
+// waited for: the sandbox init, when the container is made, and after Start
+// whatever the init became. The runtime writes the container's first process
+// to its pid file when the container is made, and until that process has
+// become the init its executable is the runtime's. The process is taken for
+// the container's only if it is in the container's cgroup, whatever the file
+// says, and it must run in the namespaces the agent made for it. refused,
+// when set, delivers what the init says if it could not become the process.
+func (r *ImageRunner) await(ctx context.Context, made *madeSandbox, namespaces *sandboxNet, init bool, refused <-chan string) error {
 	runtime, err := os.Stat(r.cfg.Crun)
+	if err != nil {
+		return err
+	}
+	program, err := os.Stat(r.cfg.SandboxInit)
 	if err != nil {
 		return err
 	}
 	deadline := time.Now().Add(startTimeout)
 	for {
 		select {
-		case <-r.exited:
-			return fmt.Errorf("the sandbox ended before it was running: %w", r.exitError())
+		case <-made.exited:
+			reason := made.exitErr
+			if reason == nil {
+				reason = errors.New("sandbox exited with status 0")
+			}
+			// The init says why before it goes.
+			if refused != nil {
+				select {
+				case said := <-refused:
+					if said != "" {
+						reason = fmt.Errorf("%w: %s", reason, said)
+					}
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
+			return fmt.Errorf("the sandbox ended before it was running: %w", reason)
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if pid, err := strconv.Atoi(readTrimmed(pidPath)); err == nil && pid > 1 {
+		if pid, err := strconv.Atoi(readTrimmed(made.pidPath)); err == nil && pid > 1 {
 			proc := filepath.Join("/proc", strconv.Itoa(pid))
 			// A file of the kernel's, a line long, which reports no size.
-			if cgroup, err := os.ReadFile(filepath.Join(proc, "cgroup")); err == nil && strings.TrimSpace(string(cgroup)) == "0::"+cgroupsPath {
-				if exe, err := os.Stat(filepath.Join(proc, "exe")); err == nil && !os.SameFile(exe, runtime) {
+			if cgroup, err := os.ReadFile(filepath.Join(proc, "cgroup")); err == nil && strings.TrimSpace(string(cgroup)) == "0::"+made.cgroupsPath {
+				if exe, err := os.Stat(filepath.Join(proc, "exe")); err == nil && !os.SameFile(exe, runtime) && os.SameFile(exe, program) == init {
 					return namespaces.holds(proc)
 				}
 			}
@@ -495,15 +740,6 @@ func (r *ImageRunner) awaitRunning(ctx context.Context, pidPath, cgroupsPath str
 		}
 		time.Sleep(awaitRunningEvery)
 	}
-}
-
-func (r *ImageRunner) exitError() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.exitErr == nil {
-		return errors.New("sandbox exited with status 0")
-	}
-	return r.exitErr
 }
 
 // Wait returns when the container's main process has ended. A guest waits
@@ -617,26 +853,31 @@ func (r *ImageRunner) Close() error {
 		stop()
 		<-done
 	}
-	w, started := r.sandbox()
+	w, _ := r.sandbox()
+	r.mu.Lock()
+	made := r.made
+	r.made = nil
+	r.mu.Unlock()
 	// The namespaces go last, and whether a sandbox came or not.
 	defer func() {
 		if sandboxNet, err := r.net(); err == nil {
 			_ = sandboxNet.Close()
 		}
 	}()
+	if made != nil {
+		// Made ahead, and no bind came for it.
+		r.unmake(made)
+	}
 	if w == nil {
 		return nil
 	}
-	if started {
-		// Reaches the container and every command in the cgroups below it.
-		if err := os.WriteFile(filepath.Join(r.cgroupDir(), "cgroup.kill"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		select {
-		case <-r.exited:
-		case <-time.After(stopTimeout):
-			return fmt.Errorf("the sandbox was still running %s after it was killed", stopTimeout)
-		}
+	// Reaches the container and every command in the cgroups below it,
+	// whether its process is the image's yet or still the init.
+	r.endContainer(w.made)
+	select {
+	case <-w.made.exited:
+	default:
+		return fmt.Errorf("the sandbox was still running %s after it was killed", stopTimeout)
 	}
 	if err := unix.Unmount(w.rootfs, unix.MNT_DETACH); err != nil {
 		return fmt.Errorf("unmount root filesystem: %w", err)

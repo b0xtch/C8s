@@ -4,6 +4,7 @@ package sessionagent_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sandboxinit"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 )
 
@@ -37,7 +39,7 @@ func fakeRuntime(mode string, args []string) int {
 	}
 	pid := os.Getpid()
 	switch mode {
-	case "outside", "elsewhere":
+	case "outside", "another":
 		// A process of this machine that is nothing of the container's.
 		other := exec.Command("sleep", "5")
 		if err := other.Start(); err != nil {
@@ -45,13 +47,25 @@ func fakeRuntime(mode string, args []string) int {
 		}
 		defer func() { _ = other.Process.Kill(); _ = other.Wait() }()
 		pid = other.Process.Pid
+	case "elsewhere":
+		// The sandbox's own init, from the descriptor a runtime is handed
+		// it on, with the control socket beside it: it waits there as it
+		// does in a container.
+		other := exec.Command(fmt.Sprintf("/proc/self/fd/%d", sandboxinit.ProgramFD))
+		other.ExtraFiles = []*os.File{os.NewFile(sandboxinit.ProgramFD, "program"), os.NewFile(sandboxinit.ControlFD, "control")}
+		if err := other.Start(); err != nil {
+			return 1
+		}
+		defer func() { _ = other.Process.Kill(); _ = other.Wait() }()
+		pid = other.Process.Pid
 	}
 	switch mode {
-	case "itself", "elsewhere":
+	case "itself", "another", "elsewhere":
 		// In the container's cgroup. "itself" is this process: what a
-		// runtime's first process is until it runs the image's program.
-		// "elsewhere" is another program there, started in the namespaces of
-		// this machine and in none of the sandbox's.
+		// runtime's first process is until it runs the sandbox's init.
+		// "another" is some other program there. "elsewhere" is the init
+		// itself, started in the namespaces of this machine and in none of
+		// the sandbox's.
 		var config struct {
 			Linux struct {
 				CgroupsPath string `json:"cgroupsPath"`
@@ -76,10 +90,10 @@ func fakeRuntime(mode string, args []string) int {
 	return 7
 }
 
-// A sandbox runs once the container's first process runs the image's own
-// program. The runtime says in a file which process that is, and the agent
-// believes it only of a process in the container's cgroup that is the
-// runtime no longer.
+// A container is made once its first process runs the sandbox's init. The
+// runtime says in a file which process that is, and the agent believes it
+// only of a process in the container's cgroup that runs the init, in the
+// namespaces the agent made for the sandbox.
 func TestSandboxRunsOnlyAsTheImagesOwnProgram(t *testing.T) {
 	containerFixtures(t)
 	self, err := os.Executable()
@@ -93,7 +107,8 @@ func TestSandboxRunsOnlyAsTheImagesOwnProgram(t *testing.T) {
 	}{
 		"outside":   {"a process outside the container's cgroup", notRunning},
 		"itself":    {"the runtime's own process, in the container's cgroup", notRunning},
-		"elsewhere": {"a program in the container's cgroup and outside the sandbox's namespaces", []string{"does not run in the user namespace made for it"}},
+		"another":   {"another program in the container's cgroup", notRunning},
+		"elsewhere": {"the init in the container's cgroup and outside the sandbox's namespaces", []string{"does not run in the user namespace made for it"}},
 	} {
 		t.Run(tc.what, func(t *testing.T) {
 			runtime := filepath.Join(t.TempDir(), fakeRuntimePrefix+mode)

@@ -36,6 +36,7 @@ published file with a build.
 |---|---|---|
 | `c8s-session-init` | the initramfs's `/init`, compiled from this checkout by `build` (`cmd/c8s-session-init`) | It is the guest's first and only init: it opens the verity root the command line names, makes the encrypted state volume, binds the launch key, and starts what `init.json` lists |
 | `c8s-session-guest` | `/usr/local/bin/c8s-session-guest`, compiled from this checkout by `build` (`cmd/c8s-session-guest`) | It is the agent: it verifies the launch document, takes the one bind, extends RTMR[3] and serves the attested API. It holds the agent, the key service and the schema command, and nothing else of c8s |
+| `c8s-sandbox-init` | `/usr/local/bin/c8s-sandbox-init`, compiled from this checkout by `build` (`cmd/c8s-sandbox-init`) | It is the first process of a sandbox's container until the session's bind names the sandbox's process, and then becomes that process. The agent makes the container around it before any bind, so a bind only has a process to start |
 | `/etc/c8s-session/init.json` | verity root, written by `mkosi.sync` | Everything that runs in the guest: two steps and one service, by path, with their arguments. The agent's flags are its configuration, so they are part of the image identity |
 | `/etc/c8s-session/firewall.nft` | verity root | The inbound filter: only the agent's port may be reached from outside the guest |
 | `/etc/c8s-session/disclosure-schema.json`, `bind-schema.json` | verity root, written by `build` | What the agent says in plaintext and what it takes in a bind. The agent checks both against its own definitions before it serves |
@@ -132,6 +133,7 @@ private to shared one page at a time during boot.
 | `C8S_MEMORY` | Default memory recorded in the manifest (default `1G`) |
 | `C8S_BINARY` | Stage this prebuilt linux/amd64 `c8s-session-guest` and skip the compile |
 | `C8S_INIT_BINARY` | Pack this prebuilt static linux/amd64 init and skip its compile |
+| `C8S_SANDBOX_INIT_BINARY` | Stage this prebuilt static linux/amd64 `c8s-sandbox-init` and skip its compile |
 | `CONFOS_DIR` | confos checkout to build with (default: a sibling of this repository) |
 | `C8S_TDX_FIRMWARE` | Boot this TDX firmware file. Unset, `firmware/build` builds it from source into `build/session-firmware/` |
 
