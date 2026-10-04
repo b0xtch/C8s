@@ -1,0 +1,122 @@
+syntax = "proto3";
+
+// The session API of the c8s daemon, as far as it is built. The design is
+// docs/session-api.md: a call it names that is missing here is not built yet.
+//
+// The daemon runs on the host, outside the trust boundary. Nothing in a
+// request or an answer is secret, and a caller acts on evidence it has
+// verified, never on the daemon's word.
+package c8s.session.v1alpha1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1";
+
+service Sessions {
+  // Claim reserves a ready TD of a pool for a session and fences it: no
+  // connection opened to the guest before the claim survives it.
+  rpc Claim(ClaimRequest) returns (Claimed);
+  // Bind hands a claimed TD its bind and returns the guest's evidence, fresh
+  // over the bind's own nonce.
+  rpc Bind(BindRequest) returns (Bound);
+  // Connect carries bytes to and from the TLS port of a bound TD, and
+  // terminates nothing: the caller's TLS session ends in the guest.
+  rpc Connect(stream Bytes) returns (stream Bytes);
+  // Destroy ends a session's TD. It needs nothing from the guest.
+  rpc Destroy(DestroyRequest) returns (Session);
+  // GetEvidence returns what a TD's guest serves to anyone: its certificate,
+  // its documents and its events.
+  rpc GetEvidence(EvidenceRequest) returns (Evidence);
+}
+
+message ClaimRequest {
+  // A repeat with the same id returns the first answer and changes nothing.
+  string request_id = 1;
+  string pool = 2;
+  // The session's name, an RFC 1123 label. One TD serves it at a time.
+  string session = 3;
+  // How long to wait for a ready TD when the pool has none.
+  google.protobuf.Duration wait = 4;
+  // Placement arrives with a second host.
+  reserved 5;
+}
+
+message Claimed {
+  string td = 1;
+  string host = 2;
+  Evidence evidence = 3;
+  // The claim lapses after this, and the TD returns to its pool.
+  google.protobuf.Timestamp bind_by = 4;
+}
+
+message BindRequest {
+  string request_id = 1;
+  string td = 2;
+  // c8s-bind/v1, canonical JSON, and its signature.
+  bytes bind = 3;
+  bytes signature = 4;
+  // Disks arrive with the disk slots.
+  reserved 5;
+}
+
+message Bound {
+  // The evidence now includes the bind.
+  Evidence evidence = 1;
+}
+
+// Evidence is what a guest says of itself, relayed unread. Each part is
+// checked by whoever acts on it.
+message Evidence {
+  // The guest's serving certificate, DER. Its evidence binds the instance key.
+  bytes certificate = 1;
+  bytes launch_document = 2;
+  bytes launch_signature = 3;
+  // The runtime register's event log, as the digests the guest extended.
+  repeated string events = 4;
+  // When bound.
+  bytes bind = 5;
+  // The platform's evidence for the nonce of the bind this answers, in the
+  // guest's own encoding. Only an answer to Bind carries it.
+  bytes quote = 6;
+  // The vendor's documents as the guest's host last handed them in.
+  bytes collateral = 7;
+  // Release proofs arrive with the release log.
+  reserved 8;
+  bytes bind_signature = 9;
+  // What the guest calls its state: ready, bound or running.
+  string phase = 10;
+}
+
+message Bytes {
+  // The caller's first frame names the TD and carries no data.
+  string td = 1;
+  // 0 is the guest's TLS port, and the only port there is so far.
+  uint32 port = 2;
+  bytes data = 3;
+}
+
+message DestroyRequest {
+  string request_id = 1;
+  string session = 2;
+}
+
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  // Claimed, with no bind taken yet.
+  SESSION_STATE_NEW = 1;
+  SESSION_STATE_LIVE = 2;
+  SESSION_STATE_DESTROYED = 3;
+}
+
+message Session {
+  string name = 1;
+  string pool = 2;
+  string td = 3;
+  string host = 4;
+  SessionState state = 5;
+}
+
+message EvidenceRequest {
+  string td = 1;
+}

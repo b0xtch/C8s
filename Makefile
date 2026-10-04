@@ -1,10 +1,12 @@
 .PHONY: build install build-c8s build-c8s-node build-get-cert build-ratls-mesh \
        build-nri-image-policy \
        test test-integration test-integration-cluster test-node-guest-image-role test-node-guest-image-gpu-label test-node-guest-image-gpu-cc test-node-guest-image-scratch test-node-guest-image-psa-ready test-node-guest-image-role-systemd test-node-guest-image-cloud-init test-e2e-cw-label-policy test-e2e-mesh-cw-enforcement test-e2e-allowlist-enforcement test-e2e-components-ready test-e2e-cw-workload mutation-check mutation-full vet fmt lint clean \
-       manifests generate check-crd-chart install-controller-gen require-controller-gen
+       manifests generate check-crd-chart install-controller-gen require-controller-gen \
+       proto check-proto
 
 CONTROLLER_GEN         ?= controller-gen
 CONTROLLER_GEN_VERSION ?= v0.20.1
+BUF_VERSION            ?= v1.73.0
 
 # CRD YAMLs land in the helm chart's crds/ folder — the install vector.
 CRD_OUT_DIR    ?= ./internal/helmchart/c8s/crds
@@ -224,6 +226,21 @@ check-crd-chart: require-controller-gen
 
 generate: require-controller-gen
 	$(CONTROLLER_GEN) object paths=./api/...
+
+# --- Session API generation ---
+
+# Regenerates the Go code of api/**/*.proto. buf.gen.yaml pins the plugins.
+proto:
+	GOWORK=off go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) generate
+
+check-proto:
+	@set -eu; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	GOWORK=off go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION) generate -o "$$tmp"; \
+	(cd "$$tmp/api" && find . -name '*.pb.go' | sort) | while read -r f; do \
+		diff -u "api/$$f" "$$tmp/api/$$f"; \
+	done
 
 # --- Cleanup ---
 
