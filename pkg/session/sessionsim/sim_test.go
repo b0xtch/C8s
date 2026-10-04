@@ -263,7 +263,7 @@ func TestPinnedPoolListsItsMachine(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 	}
-	plain := sessionsim.NewGuest(t, nil)
+	plain := sessionsim.NewUnpinnedGuest(t, nil)
 	for name, guest := range map[string]*sessionsim.Guest{"a pool that pins none": plain, "its twin": plain.Twin(t, nil)} {
 		if _, err := unbound(guest); err == nil || !strings.Contains(err.Error(), "pins no machine") {
 			t.Fatalf("%s: %v", name, err)

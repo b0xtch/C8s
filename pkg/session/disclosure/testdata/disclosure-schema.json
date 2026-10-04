@@ -224,6 +224,7 @@
             "bind_expired",
             "bind_no_sandbox",
             "bind_key_service",
+            "bind_no_machine",
             "bind_incomplete",
             "bind_failed",
             "no_collateral",

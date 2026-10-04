@@ -3,6 +3,7 @@ package sessionagent_test
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -77,7 +78,9 @@ func TestStageRefuses(t *testing.T) {
 		"host swaps in its own key and a document it signed": {func(t *testing.T, h *harness) {
 			// The initrd measured the pool's key. The host then replaces the
 			// staged pubkey and the launch files with a consistent set of its own.
-			other := newUnbound(t, func(o *session.BundleOptions) { o.ManifestPath = h.td.WriteManifest(t) })
+			other := newUnbound(t, func(o *session.BundleOptions) {
+				o.ManifestPath, o.Machines = h.td.WriteManifest(t), []string{hex.EncodeToString(h.td.RTMR[0][:])}
+			})
 			h.cfg.PubkeyPath, h.cfg.LaunchDir = other.cfg.PubkeyPath, other.cfg.LaunchDir
 		}, "not the one this guest was launched for"},
 		"pubkey file replaced": {func(t *testing.T, h *harness) {

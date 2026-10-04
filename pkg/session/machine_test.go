@@ -34,7 +34,7 @@ func TestLaunchDocumentMachines(t *testing.T) {
 		t.Fatal("the area does not allow exactly what it lists")
 	}
 	// A document that lists none allows any machine.
-	_, plain := newBundle(t, td, nil)
+	_, plain := newBundle(t, td, func(o *session.BundleOptions) { o.Machines = nil })
 	if plain.Document.Machine != nil || !plain.Document.Machine.Allows(raw(a)) {
 		t.Fatalf("a document with no list: %+v", plain.Document.Machine)
 	}
@@ -139,7 +139,7 @@ func TestVerifierHoldsAGuestToItsDocumentsMachines(t *testing.T) {
 // wants one pinned.
 func TestVerifierMayRequireAPinnedMachine(t *testing.T) {
 	td := sessiontest.NewTD()
-	_, bundle := newBundle(t, td, nil)
+	_, bundle := newBundle(t, td, func(o *session.BundleOptions) { o.Machines = nil })
 	g := bootGuest(t, td, bundle, newKey(t), nil, session.PhaseReady)
 	policy := policyFor(t, td, bundle)
 	policy.AllowReady = true

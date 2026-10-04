@@ -15,7 +15,7 @@ import (
 
 func TestBundleRoundTrip(t *testing.T) {
 	td := sessiontest.NewTD()
-	dir, bundle := newBundle(t, td, nil)
+	dir, bundle := newBundle(t, td, func(o *session.BundleOptions) { o.Machines = nil })
 	doc := bundle.Document
 	if doc.SchemaVersion != session.LaunchSchemaVersion || doc.Pool != "agents" || doc.Class != "s-4x16" ||
 		doc.Image.Platform != "tdx" || len(doc.Image.RTMRs) != 2 {

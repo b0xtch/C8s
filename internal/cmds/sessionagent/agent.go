@@ -155,7 +155,19 @@ type Agent struct {
 	// keyService is the guest's session with the key service its launch
 	// document pins, or nil.
 	keyService *keyService
+	// unpinned: a TD whose launch document lists no machine it may be. It
+	// serves what says which machine it is, and takes no bind: see Unpinned.
+	unpinned bool
 }
+
+// Unpinned reports whether this guest is a TD whose launch document lists no
+// machine (RTMR[0]) it may be. RTMR[0] holds what the host declared to the
+// firmware: the shape of the machine. A guest that took a bind under a
+// document that lists none would run a session on whatever machine its host
+// chose to build. It takes none. It still says what it is to anyone, so that
+// whoever writes the document can read the machine's value from its evidence
+// and list it.
+func (a *Agent) Unpinned() bool { return a.unpinned }
 
 // Stage authenticates this boot's launch document and measures it. Nothing the
 // host supplied is acted on before its signature verifies under the key the
@@ -207,6 +219,13 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 		attests:  make(chan struct{}, maxConcurrentAttests),
 		quotes:   newQuoteBudget(cfg.Now),
 		inflight: make(chan struct{}, maxInflightRequests),
+		// A TD has a register for what its host declared, and a document
+		// that lists no value for it leaves the host free to declare
+		// anything. Other TEEs measure the machine with the image.
+		unpinned: doc.Machine == nil && doc.Image.Platform == "tdx",
+	}
+	if a.unpinned {
+		cfg.Logger.Warn("the launch document lists no machine this guest may be: it takes no bind, and serves only what says which machine it is")
 	}
 	// The pubkey file is not itself measured, only its digest: confirm the
 	// staged key is the one the hardware binds before trusting anything it signed.
@@ -446,6 +465,7 @@ var (
 	errRetired      = errors.New("this guest takes no bind any more and is shutting down")
 	errFenced       = errors.New("this connection was opened before the guest was claimed, and the guest takes no bind from it")
 	errNotReady     = errors.New("this guest takes no bind yet: its key service has not judged it")
+	errNoMachine    = errors.New("this guest's launch document lists no machine it may be, so it takes no bind")
 	errBindInFlight = errors.New("this guest is reading a bind: it is not as it was booted")
 	errBindTooLate  = errors.New("this guest waited for a bind longer than its launch document allows")
 	errClockLeft    = errors.New("this guest's kernel left the " + ownClockSource + " clocksource, so it cannot tell how long it waited for a bind")
@@ -501,7 +521,12 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 		a.binding.Unlock()
 		return false, nil, errFenced
 	}
-	// The same for a bind that comes before the guest takes any.
+	// The same for a bind that comes before the guest takes any, and for
+	// one to a guest that takes none.
+	if current == nil && !retired && a.unpinned {
+		a.binding.Unlock()
+		return false, nil, errNoMachine
+	}
 	if current == nil && !retired && !a.takesBinds() {
 		a.binding.Unlock()
 		return false, nil, errNotReady
@@ -606,8 +631,9 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 // takesBinds reports whether the guest takes a bind yet. One whose launch
 // document pins a key service takes none until the key service has judged
 // it: the evidence the key service judges is of a guest that is nobody's.
+// One whose document lists no machine never takes one.
 func (a *Agent) takesBinds() bool {
-	return a.keyService == nil || a.keyService.isOpen()
+	return !a.unpinned && (a.keyService == nil || a.keyService.isOpen())
 }
 
 // preparedLocked reports whether the guest is done with what it does ahead

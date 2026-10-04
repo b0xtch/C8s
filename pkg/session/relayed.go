@@ -98,10 +98,16 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 	if state.Phase != PhaseReady || len(state.Bind) > 0 || !slices.Equal(state.Events, events) {
 		return nil, refuse("guest is bound already, or on its way to be (phase %s, events %v)", state.Phase, state.Events)
 	}
-	if err := verifyServingCert(ctx, policy, engine, leaf, now, doc, [][]string{events}); err != nil {
+	res, err := servingCertResult(ctx, policy, engine, leaf, now, doc, [][]string{events})
+	if err != nil {
 		return nil, err
 	}
-	return &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey}, nil
+	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey}
+	// Evidence of a TEE with no such register has no machine to report.
+	if machine, err := res.Claims.RTMR(0); err == nil {
+		ready.Machine = machine
+	}
+	return ready, nil
 }
 
 // VerifyBound judges a guest's relayed answer to a bind: evidence that must

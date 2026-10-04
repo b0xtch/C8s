@@ -162,7 +162,7 @@ func TestBindThenDrive(t *testing.T) {
 	if err := json.Unmarshal(stdout.Bytes(), &v); err != nil {
 		t.Fatal(err)
 	}
-	if !v.Verified || v.Tenant != "acme" || v.Session != "sbx-1" || len(v.Events) != 2 || v.BindDigest != res.BindDigest || v.Machine == "" || v.MachinePinned {
+	if !v.Verified || v.Tenant != "acme" || v.Session != "sbx-1" || len(v.Events) != 2 || v.BindDigest != res.BindDigest || v.Machine == "" || !v.MachinePinned {
 		t.Fatalf("verdict = %+v", v)
 	}
 	stdout.Reset()

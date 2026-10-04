@@ -1117,6 +1117,10 @@ type ReadyTD struct {
 	// InstanceKey is the key the connection terminated at: the one a bind for
 	// this guest must name.
 	InstanceKey crypto.PublicKey
+	// Machine is what the guest's evidence holds for the machine its host
+	// built it: RTMR[0] of a TD. Nil where the TEE has no such register. A
+	// launch document lists the values its guests may hold.
+	Machine []byte
 }
 
 // Ready fetches the guest's public state and proves, from the evidence in its

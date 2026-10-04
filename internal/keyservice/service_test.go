@@ -113,6 +113,8 @@ func newGuest(t *testing.T, pool *sessionsim.Pool, ks *keyservicetest.Sim) *gues
 	}
 	td.MRTD = identity.LaunchDigests()[0].Digest
 	td.RTMR[1], td.RTMR[2] = identity.RTMRs()[1], identity.RTMRs()[2]
+	// The machine the pool's launch document lists.
+	td.RTMR[0] = model.Machine()
 	read := func(path string) []byte {
 		data, err := os.ReadFile(path)
 		if err != nil {

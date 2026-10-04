@@ -59,6 +59,10 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 	// by the vendor's documents its host answers with, and has nothing to
 	// judge by until the first answer.
 	go func() {
+		// A guest that takes no bind has nothing to open a session for.
+		if agent.Unpinned() {
+			return
+		}
 		if cfg.CollateralDial != nil && cfg.Platform == "tdx" {
 			agent.AwaitCollateral(ctx, CollateralWait)
 		}

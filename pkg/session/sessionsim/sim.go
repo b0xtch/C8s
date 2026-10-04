@@ -108,6 +108,14 @@ func (e rootCRLEngine) Refetch(ctx context.Context) error { return e.refetch(ctx
 func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
+	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil)
+}
+
+// NewUnpinnedGuest is NewGuest in a pool whose launch document lists no
+// machine: a guest that says what it is and takes no bind.
+func NewUnpinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
+	t.Helper()
+	td := sessiontest.NewTD()
 	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil, nil)
 }
 
@@ -161,17 +169,19 @@ func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyServic
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, false, keyService, p.KeyServiceDial)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, true, keyService, p.KeyServiceDial)
 }
 
-// NewPinnedGuest is NewGuest in a pool whose launch document lists the
-// machine its guests run on, which a verifier that requires a pinned machine
-// accepts.
+// NewPinnedGuest is NewGuest: every pool's launch document lists the machine
+// its guests run on, since a guest of one that lists none takes no bind.
 func NewPinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
 	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil)
 }
+
+// Machine is what the guest's RTMR[0] holds: the machine its host built.
+func (p *Guest) Machine() [48]byte { return p.td.RTMR[0] }
 
 // Twin boots another guest of the same pool: the same image, launched under
 // the same launch key, with an instance key of its own. A verifier that pins

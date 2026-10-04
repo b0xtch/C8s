@@ -41,7 +41,11 @@ func keyPEM(t *testing.T, key *ecdsa.PrivateKey) string {
 func newBundle(t *testing.T, td *sessiontest.TD, mutate func(*session.BundleOptions)) (string, *session.Bundle) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "bundle")
-	opts := session.BundleOptions{Dir: dir, ManifestPath: td.WriteManifest(t), Pool: "agents", Class: "s-4x16"}
+	opts := session.BundleOptions{
+		Dir: dir, ManifestPath: td.WriteManifest(t), Pool: "agents", Class: "s-4x16",
+		// A guest whose document lists no machine takes no bind.
+		Machines: []string{machineOf(td)},
+	}
 	if mutate != nil {
 		mutate(&opts)
 	}

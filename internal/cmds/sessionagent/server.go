@@ -113,6 +113,14 @@ func (a *Agent) refuse(w http.ResponseWriter, status int, code disclosure.Code) 
 // agent has answered it.
 func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// A guest whose launch document lists no machine takes no bind at
+		// all, and sending it again changes nothing.
+		if a.unpinned {
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Cache-Control", "no-store")
+			a.refuse(w, http.StatusConflict, disclosure.BindNoMachine)
+			return
+		}
 		// A guest whose pool has a key service takes no bind until the key
 		// service has judged it. Refused on its headers, the bind was not
 		// read, and its sender may send it again.
@@ -261,6 +269,8 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		a.refuse(w, http.StatusGone, disclosure.Retired)
 	case errors.Is(err, errFenced):
 		a.refuse(w, http.StatusConflict, disclosure.Fenced)
+	case errors.Is(err, errNoMachine):
+		a.refuse(w, http.StatusConflict, disclosure.BindNoMachine)
 	case errors.Is(err, errNotReady):
 		w.Header().Set("Retry-After", "1")
 		a.refuse(w, http.StatusServiceUnavailable, disclosure.NotReady)

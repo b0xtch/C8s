@@ -124,10 +124,73 @@ func TestReadyCheckRefusesAMachineTheLaunchDocumentDoesNotList(t *testing.T) {
 		t.Fatalf("the unbound check of a guest on its listed machine: %v", err)
 	}
 	// And one whose document pins none is refused by that policy.
-	plain := newPool(t)
+	plain := newPoolWith(t, func(o *session.BundleOptions) { o.Machines = nil })
 	plain.policy.RequireMachine = true
 	plain.start(t)
 	if _, err := plain.client(t, plain.access).Ready(ctxT(t)); !errors.As(err, &verdict) || !strings.Contains(err.Error(), "pins no machine") {
 		t.Fatalf("the unbound check of a guest whose document pins no machine: %v", err)
+	}
+}
+
+// A TD whose launch document lists no machine may have been built any
+// machine by its host. It says what it is to anyone, so that whoever writes
+// the document can read the machine from its evidence and list it, and it
+// takes no bind: not a well-formed one, and not from the owner its pool
+// would serve. A host is never told it is ready.
+func TestGuestWhoseDocumentListsNoMachineTakesNoBind(t *testing.T) {
+	p := newPoolWith(t, func(o *session.BundleOptions) { o.Machines = nil })
+	p.start(t)
+	if !p.agent.Unpinned() {
+		t.Fatal("a TD whose document lists no machine is taken for a pinned one")
+	}
+	// What it is, it says: its state, and evidence a verifier accepts.
+	ready, err := p.client(t, p.access).Ready(ctxT(t))
+	if err != nil {
+		t.Fatalf("the unbound check: %v", err)
+	}
+	if ready.Document.Machine != nil || !bytes.Equal(ready.Machine, p.td.RTMR[0][:]) {
+		t.Fatalf("the check reports machine %x of a document that lists %+v", ready.Machine, ready.Document.Machine)
+	}
+	if state := p.state(t); state.Phase != session.PhaseReady || state.Prepared {
+		t.Fatalf("the guest says %+v: no host may offer it to a session", state)
+	}
+
+	bind := p.bindFor(t, ready, nil)
+	for name, post := range map[string]func() int{
+		"the owner's bind": func() int { return p.postBind(t, bind.Raw, bind.Signature) },
+		"something else":   func() int { return p.postBind(t, []byte("not json"), "AAAA") },
+	} {
+		if status := post(); status != http.StatusConflict {
+			t.Errorf("%s: HTTP %d, want 409", name, status)
+		}
+	}
+	// The same for a caller that hands the agent a bind directly.
+	if _, _, err := p.agent.Bind(ctxT(t), bind.Raw, bind.Signature); err == nil || !strings.Contains(err.Error(), "lists no machine") {
+		t.Fatalf("a bind handed to the agent: %v", err)
+	}
+	// It is as it was booted: nothing was measured, nothing ran, and it did
+	// not end over what it refused.
+	if state := p.state(t); state.Phase != session.PhaseReady || len(state.Bind) != 0 {
+		t.Fatalf("after the refusals the guest says %+v", state)
+	}
+	select {
+	case err := <-p.agent.Fatal():
+		t.Fatalf("the guest ended over a bind it refused: %v", err)
+	default:
+	}
+
+	// A guest whose document lists its machine is unchanged by any of this.
+	pinned := newPool(t)
+	pinned.start(t)
+	if pinned.agent.Unpinned() {
+		t.Fatal("a guest whose document lists its machine is taken for one that lists none")
+	}
+	ok, err := pinned.client(t, pinned.access).Ready(ctxT(t))
+	if err != nil || !bytes.Equal(ok.Machine, pinned.td.RTMR[0][:]) {
+		t.Fatalf("the unbound check of a pinned guest: %x, %v", ok.Machine, err)
+	}
+	good := pinned.bindFor(t, ok, nil)
+	if status := pinned.postBind(t, good.Raw, good.Signature); status != http.StatusOK {
+		t.Fatalf("a pinned guest's bind: HTTP %d", status)
 	}
 }

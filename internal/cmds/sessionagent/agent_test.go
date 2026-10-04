@@ -7,6 +7,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -87,7 +88,11 @@ func newUnbound(t *testing.T, mutate func(*session.BundleOptions)) *harness {
 	t.Helper()
 	td := sessiontest.NewTD()
 	dir := filepath.Join(t.TempDir(), "bundle")
-	opts := session.BundleOptions{Dir: dir, ManifestPath: td.WriteManifest(t), Pool: "agents", Class: "s-4x16"}
+	opts := session.BundleOptions{
+		Dir: dir, ManifestPath: td.WriteManifest(t), Pool: "agents", Class: "s-4x16",
+		// A guest whose document lists no machine takes no bind.
+		Machines: []string{hex.EncodeToString(td.RTMR[0][:])},
+	}
 	if mutate != nil {
 		mutate(&opts)
 	}
