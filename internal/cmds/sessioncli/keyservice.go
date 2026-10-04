@@ -2,6 +2,7 @@ package sessioncli
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,7 +35,7 @@ or an owner sends it nothing before its evidence has been held to a pin.
 See docs/session-key-service.md.`,
 	}
 	launch := &cobra.Command{Use: "launch-config", Short: "Create a key service's signed launch bundle"}
-	launch.AddCommand(newKeyServiceBundleCmd())
+	launch.AddCommand(newKeyServiceBundleCmd(), newKeyServiceMachineCmd())
 	tenant := &cobra.Command{Use: "tenant", Short: "Register a tenant with a key service"}
 	tenant.AddCommand(newTenantRegisterCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Store a tenant's credentials in a key service"}
@@ -68,6 +69,12 @@ image and the pools of session guests it serves, signed with a launch key.
 The key service measures the document at boot, so whoever verifies it knows
 which guests it releases to.
 
+The document lists the machines the key service may be (--machine), and a key
+service whose document lists none serves its state and nothing else. So a
+bundle is first written without --machine, one key service is launched from
+it in its class, 'launch-config machine' reads the value from its evidence,
+and the bundle is written again with it, under the same --key.
+
   <out>/launch.key              the launch private key (only when generated here)
   <out>/opkeydata/pubkey        attach these three as the guest's
   <out>/opkeydata/launch.yaml   opkeydata volume, as for a session guest
@@ -93,12 +100,82 @@ which guests it releases to.
 	f.StringVar(&opts.Dir, "out", "", "bundle directory to create (must not exist)")
 	f.StringVar(&opts.ManifestPath, "image-manifest", "", "manifest.json published with the key service's guest image")
 	f.StringVar(&opts.KeyPath, "key", "", "existing launch private key to sign with (default: generate <out>/launch.key)")
+	f.StringArrayVar(&opts.Machines, "machine", nil, "a machine the key service may be, as the value its RTMR[0] then holds (96 hex characters, as 'launch-config machine' prints it; repeatable). Without one the key service serves only what says which machine it is")
 	f.StringArrayVar(&pools, "pool", nil, "a pool the key service serves, as <manifest.json of its guest image>:<its launch public key PEM> (repeatable)")
 	acceptedTCBFlag(f, &acceptTCB, "the platform of a guest of these pools")
 	for _, name := range []string{"out", "image-manifest", "pool"} {
 		_ = cmd.MarkFlagRequired(name)
 	}
 	return cmd
+}
+
+func newKeyServiceMachineCmd() *cobra.Command {
+	var t trust
+	var bundle, url string
+	cmd := &cobra.Command{
+		Use:   "machine",
+		Short: "Print the machine a key service runs on, for its launch document to list",
+		Long: `Verify one key service and print what its RTMR[0] holds: the machine its
+host built it.
+
+The key service is held to its bundle in everything but its machine: its
+image, and the launch key that signed the document it measured. It is sent
+nothing but the request for that document. The value is what one host
+declared to the firmware for one shape of VM: compare it with a second host
+of the same build before it is published as a reference value.
+
+Exit codes: 0 printed, 1 usage error, 2 the key service is not the one the
+bundle describes, 3 it could not be reached or judged.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			os.Exit(runKeyServiceMachine(cmd.Context(), &t, bundle, url, cmd.OutOrStdout(), cmd.ErrOrStderr()))
+			return nil
+		},
+	}
+	f := cmd.Flags()
+	f.StringVar(&bundle, "bundle", "", "the key service's launch bundle directory")
+	f.StringVar(&url, "url", "", "where the key service is reached, as https://host:port")
+	t.collateralFlags(f)
+	f.DurationVar(&t.timeout, "timeout", 2*time.Minute, "overall deadline")
+	for _, name := range []string{"bundle", "url"} {
+		_ = cmd.MarkFlagRequired(name)
+	}
+	return cmd
+}
+
+// runKeyServiceMachine verifies the key service of a bundle in everything
+// but its machine, and prints the machine.
+func runKeyServiceMachine(ctx context.Context, t *trust, bundle, url string, stdout, stderr io.Writer) int {
+	pin, err := keyservice.Pin(bundle, url)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	}
+	pin.AcceptTCBStatus = t.acceptedTCB()
+	if err := pin.Validate(); err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	}
+	client, err := keyservice.NewClient(keyservice.Options{Pin: pin, Engine: t.engine()})
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	}
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	machine, err := client.Machine(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "NOT VERIFIED: %v\n", err)
+		return keyServiceExit(err)
+	}
+	if len(machine) == 0 {
+		fmt.Fprintln(stderr, "the key service's evidence holds no register for its machine: only a TD has one")
+		return ExitRefused
+	}
+	fmt.Fprintln(stdout, hex.EncodeToString(machine))
+	return ExitOK
 }
 
 func newKeyServicePinCmd() *cobra.Command {

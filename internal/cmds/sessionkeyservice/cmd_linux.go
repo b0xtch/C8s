@@ -25,6 +25,7 @@ import (
 const (
 	defaultPubkeyPath = "/etc/confai/operator-pubkey"
 	defaultLaunchDir  = "/run/c8s-session/launch"
+	pciDevicesPath    = "/sys/bus/pci/devices"
 	// The vendor's documents, kept between judgments. RAM-backed: nothing of
 	// a replica is read back from a disk.
 	defaultCollateralDir = "/run/c8s-key-service/collateral"
@@ -64,6 +65,12 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 					return err
 				}
 			}
+			// The load step checked the guest's devices before it read a
+			// file of the host's. A replica checks them again before it
+			// serves, as a session guest's agent does.
+			if err := (sessionagent.DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}).Check(); err != nil {
+				return err
+			}
 			tee, err := sessionagent.OpenTEE(platform)
 			if err != nil {
 				return err
@@ -71,12 +78,12 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
 			measured, err := sessionagent.MeasureDocument(ctx, tee, platform, pubkey, launchDir,
-				func(pub, launch []byte, signature string) (session.Image, error) {
+				func(pub, launch []byte, signature string) (session.Image, *session.Machine, error) {
 					doc, err := api.VerifySigned(pub, launch, signature)
 					if err != nil {
-						return session.Image{}, err
+						return session.Image{}, nil, err
 					}
-					return doc.Image, nil
+					return doc.Image, doc.Machine, nil
 				})
 			if err != nil {
 				return fmt.Errorf("stage launch document: %w", err)

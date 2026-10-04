@@ -3,12 +3,15 @@ package sessioncli
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/keyservice/keyservicetest"
 	"github.com/confidential-dot-ai/c8s/internal/sessiond"
@@ -265,5 +268,63 @@ func TestKeyServiceBundlePinAndPool(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, left)); !os.IsNotExist(err) {
 			t.Errorf("a refused command left %s behind", left)
 		}
+	}
+}
+
+// An operator reads a key service's machine from a replica booted under a
+// bundle that lists none, and writes the bundle again with it.
+func TestMachineOfAKeyService(t *testing.T) {
+	pool := sessionsim.NewPool(t)
+	ks := keyservicetest.NewWith(t, keyservicetest.Options{Unpinned: true}, pool)
+	flags := func() *trust { return &trust{timeout: 30 * time.Second, engineForTest: &counting{}} }
+	var stdout, stderr bytes.Buffer
+	if code := runKeyServiceMachine(context.Background(), flags(), ks.Bundle, ks.Pin.URL, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("key-service launch-config machine exit %d: %s", code, stderr.String())
+	}
+	machine := strings.TrimSpace(stdout.String())
+	if machine != hex.EncodeToString(ks.Machine[:]) {
+		t.Fatalf("printed %q, the replica's RTMR[0] is %x", machine, ks.Machine)
+	}
+	// The replica it was read from is sent nothing by an owner's tool.
+	owner := starting(t, sessiondtest.NewHostWithKeyService(t, 0, nil), "sbx-1")
+	tenant := &tenantFlags{pin: pinFile(t, ks.Pin), tenant: "acme", authorityKey: owner.authorityKey}
+	tenant.timeout, tenant.engineForTest = owner.timeout, owner.engineForTest
+	stderr.Reset()
+	if code := runTenantRegister(context.Background(), tenant, io.Discard, &stderr); code != ExitRefused || !strings.Contains(stderr.String(), "lists no machine") {
+		t.Fatalf("register at a key service whose document lists no machine: exit %d: %s", code, stderr.String())
+	}
+
+	// The value is what 'key-service launch-config new --machine' takes, and
+	// the document then lists it.
+	out := filepath.Join(t.TempDir(), "bundle")
+	cmd := newKeyServiceBundleCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--out", out, "--image-manifest", pool.ManifestPath, "--pool", pool.ManifestPath + ":" + pool.LaunchKeyPath, "--machine", machine})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("key-service launch-config new --machine: %v", err)
+	}
+	launch, err := os.ReadFile(filepath.Join(out, session.OpkeyDir, session.DocumentFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc, err := keyservice.Parse(launch); err != nil || doc.Machine == nil || len(doc.Machine.RTMR0) != 1 || doc.Machine.RTMR0[0] != machine {
+		t.Fatalf("the document lists %+v, %v", doc, err)
+	}
+
+	// A replica that lists its machine prints the same way. One that is not
+	// the bundle's is not read, and a bundle that is none is a usage error.
+	pinned := keyservicetest.New(t, pool)
+	stdout.Reset()
+	if code := runKeyServiceMachine(context.Background(), flags(), pinned.Bundle, pinned.Pin.URL, &stdout, &stderr); code != ExitOK ||
+		strings.TrimSpace(stdout.String()) != hex.EncodeToString(pinned.Machine[:]) {
+		t.Fatalf("the machine of a pinned replica: exit %d, printed %q", code, stdout.String())
+	}
+	stdout.Reset()
+	if code := runKeyServiceMachine(context.Background(), flags(), pinned.Bundle, ks.Pin.URL, &stdout, &stderr); code != ExitRefused || stdout.Len() != 0 {
+		t.Fatalf("a replica of another bundle: exit %d, printed %q", code, stdout.String())
+	}
+	if code := runKeyServiceMachine(context.Background(), flags(), filepath.Join(t.TempDir(), "absent"), ks.Pin.URL, &stdout, &stderr); code != ExitUsage {
+		t.Fatalf("a bundle that is no directory: exit %d", code)
 	}
 }

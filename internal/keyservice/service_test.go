@@ -1,6 +1,7 @@
 package keyservice_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
@@ -721,5 +723,88 @@ func TestClientRefusesAKeyServiceItDidNotPin(t *testing.T) {
 	})
 	if _, err := g.acquire(bind, "leaked"); status(err) != 404 {
 		t.Fatalf("the credential sent to a key service that was not pinned: %v", err)
+	}
+}
+
+// A key service's launch document lists the machines a replica may be. A
+// replica whose document lists none keeps nothing and releases nothing, and
+// nobody sends it anything. Only whoever reads its machine, to list it, takes
+// its evidence.
+func TestKeyServiceWithNoMachineListedServesOnlyItsState(t *testing.T) {
+	pool := sessionsim.NewPool(t)
+	ks := keyservicetest.NewWith(t, keyservicetest.Options{Unpinned: true}, pool)
+	if !ks.Service.Unpinned() {
+		t.Fatal("a replica whose document lists no machine is taken for a pinned one")
+	}
+	o := newOwner(t)
+	c := client(t, ks.Pin)
+	var refused *session.VerificationError
+	if err := c.RegisterAuthority(within(t), "acme", o.pub, o.signer); !errors.As(err, &refused) || !strings.Contains(err.Error(), "lists no machine") {
+		t.Fatalf("an owner's registration: %v", err)
+	}
+	g := newGuest(t, pool, ks)
+	if err := g.open(); !errors.As(err, &refused) || !strings.Contains(err.Error(), "lists no machine") {
+		t.Fatalf("a guest's open: %v", err)
+	}
+	// Its machine is read from its evidence, and reading it does not make
+	// the client take its word afterwards.
+	machine, err := c.Machine(within(t))
+	if err != nil || !bytes.Equal(machine, ks.Machine[:]) {
+		t.Fatalf("the machine read is %x, %v, and the replica's is %x", machine, err, ks.Machine)
+	}
+	if err := c.Verify(within(t)); !errors.As(err, &refused) {
+		t.Fatalf("after its machine was read, the replica verified: %v", err)
+	}
+
+	// A caller that skips the check gets nothing from the replica either.
+	handler := ks.Service.Handler()
+	for name, req := range map[string]*http.Request{
+		"a registration": httptest.NewRequest(http.MethodPut, api.AuthorityPath("acme"), strings.NewReader("{}")),
+		"a credential":   httptest.NewRequest(http.MethodPut, api.CredentialPath("acme", "token"), strings.NewReader("{}")),
+		"an open":        httptest.NewRequest(http.MethodPost, api.PathOpen, strings.NewReader("{}")),
+		"an acquire":     httptest.NewRequest(http.MethodPost, api.PathAcquire, strings.NewReader("{}")),
+	} {
+		answer := httptest.NewRecorder()
+		handler.ServeHTTP(answer, req)
+		if answer.Code != http.StatusConflict || !strings.Contains(answer.Body.String(), "lists no machine") {
+			t.Errorf("%s: HTTP %d %s", name, answer.Code, answer.Body.String())
+		}
+	}
+	answer := httptest.NewRecorder()
+	handler.ServeHTTP(answer, httptest.NewRequest(http.MethodGet, api.PathState, nil))
+	if answer.Code != http.StatusOK {
+		t.Fatalf("its state: HTTP %d", answer.Code)
+	}
+}
+
+// A replica on a machine its document does not list is one its host built
+// otherwise than the document's signer recorded. The real one ends before it
+// serves. Whoever reaches one that did not is told so by its evidence, and
+// sends it nothing.
+func TestClientHoldsAKeyServiceToItsDocumentsMachines(t *testing.T) {
+	pool := sessionsim.NewPool(t)
+	ks := keyservicetest.NewWith(t, keyservicetest.Options{Machines: []string{strings.Repeat("0", 96)}}, pool)
+	o := newOwner(t)
+	var refused *session.VerificationError
+	if err := client(t, ks.Pin).RegisterAuthority(within(t), "acme", o.pub, o.signer); !errors.As(err, &refused) || !strings.Contains(err.Error(), "is none of the 1 its launch document lists") {
+		t.Fatalf("an owner's registration: %v", err)
+	}
+	if err := newGuest(t, pool, ks).open(); !errors.As(err, &refused) || !strings.Contains(err.Error(), "is none of the 1 its launch document lists") {
+		t.Fatalf("a guest's open: %v", err)
+	}
+	// One on the machine its document lists is taken, and says the same
+	// value to whoever reads it.
+	good := keyservicetest.New(t, pool)
+	c := client(t, good.Pin)
+	if err := c.RegisterAuthority(within(t), "acme", o.pub, o.signer); err != nil {
+		t.Fatal(err)
+	}
+	if machine, err := c.Machine(within(t)); err != nil || !bytes.Equal(machine, good.Machine[:]) {
+		t.Fatalf("the machine read is %x, %v", machine, err)
+	}
+	// The read closed the connection it was made on, and the next call
+	// holds the replica to its list again.
+	if err := c.PutCredential(within(t), "acme", "token", []byte("value"), o.signer); err != nil {
+		t.Fatalf("a call after the machine was read: %v", err)
 	}
 }

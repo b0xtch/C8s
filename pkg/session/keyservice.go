@@ -184,19 +184,53 @@ func (p imagePins) Verify(r *teetypes.VerificationResult) error {
 
 // VerifyService proves, from the evidence in a serving certificate, that the
 // service holding the certificate's key runs the pinned image, was launched
-// for the pinned key, and has measured the launch document of this digest
-// and nothing after it. The caller has checked that the pinned key signed
-// that document.
+// for the pinned key, has measured the launch document of this digest and
+// nothing after it, and is one of the machines that document lists. The
+// caller has checked that the pinned key signed the document, and passes
+// the machines it lists.
 //
 // Like VerifyServingCert it is no freshness proof. The TLS handshake that
 // presented the certificate proves the key is live.
-func VerifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, now time.Time) error {
-	identity, err := pin.Image.Identity()
+func VerifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, machine *Machine, now time.Time) error {
+	rtmr0, err := ServiceMachine(ctx, pin, engine, leaf, document, now)
 	if err != nil {
 		return err
 	}
+	switch {
+	case !pin.Image.HasMachineRegister():
+		return nil
+	case machine == nil:
+		// Its host may have built it any machine: see Policy.AllowNoMachine.
+		return refuse("the key service's launch document lists no machine the key service may be")
+	case !machine.Allows(rtmr0):
+		return refuse("the key service's machine (RTMR[0] %x) is none of the %d its launch document lists", rtmr0, len(machine.RTMR0))
+	}
+	return nil
+}
+
+// ServiceMachine verifies a service as VerifyService does, except for its
+// machine, and returns what its RTMR[0] holds: nil on a TEE with no such
+// register. It is for whoever writes the service's launch document, to read
+// the value that document then lists. Nothing may be sent to a service on
+// this verdict.
+func ServiceMachine(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, now time.Time) ([]byte, error) {
+	identity, err := pin.Image.Identity()
+	if err != nil {
+		return nil, err
+	}
 	policy := Policy{Image: identity, LaunchKey: []byte(pin.LaunchKey), AcceptTCBStatus: pin.AcceptTCBStatus}
-	return verifyServingCert(ctx, policy, engine, leaf, now, nil, [][]string{{document}})
+	res, err := servingCertResult(ctx, policy, engine, leaf, now, nil, [][]string{{document}})
+	if err != nil {
+		return nil, err
+	}
+	if !pin.Image.HasMachineRegister() {
+		return nil, nil
+	}
+	rtmr0, err := res.Claims.RTMR(0)
+	if err != nil {
+		return nil, &VerificationError{Err: fmt.Errorf("the key service's evidence carries no RTMR[0]: %w", err)}
+	}
+	return rtmr0, nil
 }
 
 // AllowStapledRootCRL marks a verification that may rest on a root CA CRL

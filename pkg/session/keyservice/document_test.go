@@ -1,6 +1,7 @@
 package keyservice_test
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -112,6 +113,52 @@ func TestLaunchDocumentNamesAcceptedTCBStatuses(t *testing.T) {
 	_, _, plain, _ := bundle(t)
 	if strings.Contains(string(plain), "acceptTCBStatus") {
 		t.Fatalf("a document that accepts nothing more says so:\n%s", plain)
+	}
+}
+
+// A key service's document lists the machines a replica may be, as a pool's
+// does for its guests: sorted, each once, and for a TD only. One that lists
+// none says nothing of it.
+func TestLaunchDocumentListsItsMachines(t *testing.T) {
+	pool, service := sessionsim.NewPool(t), sessionsim.NewPool(t)
+	low, high := strings.Repeat("0", 96), strings.Repeat("a", 96)
+	opts := keyservice.BundleOptions{
+		Dir: filepath.Join(t.TempDir(), "key-service"), ManifestPath: service.ManifestPath, Machines: []string{high, low},
+		Pools: []keyservice.PoolOptions{{ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath}},
+	}
+	if err := keyservice.NewBundle(opts); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := os.ReadFile(filepath.Join(opts.Dir, session.OpkeyDir, session.DocumentFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := keyservice.Parse(launch)
+	if err != nil || doc.Machine == nil || !slices.Equal(doc.Machine.RTMR0, []string{low, high}) {
+		t.Fatalf("the document lists %+v, %v", doc.Machine, err)
+	}
+	_, _, plain, _ := bundle(t)
+	if strings.Contains(string(plain), "machine") {
+		t.Fatalf("a document that lists no machine says so:\n%s", plain)
+	}
+	var many []string
+	for i := range session.MaxMachines + 1 {
+		many = append(many, fmt.Sprintf("%096x", i))
+	}
+	for name, machines := range map[string][]string{
+		"a value that is no register's": {"abc"},
+		"one value twice":               {low, low},
+		"more than a document may list": many,
+	} {
+		opts.Dir, opts.Machines = filepath.Join(t.TempDir(), "refused"), machines
+		if err := keyservice.NewBundle(opts); err == nil {
+			t.Errorf("%s: a bundle was written", name)
+		}
+	}
+	// What is on file is held to the same rules as what the tool writes.
+	unsorted := strings.Replace(string(launch), low, strings.Repeat("f", 96), 1)
+	if _, err := keyservice.Parse([]byte(unsorted)); err == nil {
+		t.Error("a document whose machines are not in ascending order parsed")
 	}
 }
 

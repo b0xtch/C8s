@@ -106,14 +106,24 @@ func (c *Client) drop() {
 	}
 }
 
-// connect opens a connection and holds its far end to the pin. The caller
-// holds the lock.
+// connect opens a connection and holds its far end to the pin and to the
+// machines its launch document lists. The caller holds the lock.
 func (c *Client) connect(ctx context.Context) error {
+	_, err := c.reach(ctx, true)
+	return err
+}
+
+// reach opens a connection, asks its far end for the launch document it
+// measured, and judges the evidence in its certificate against the pin. With
+// held it also holds the far end to the machines that document lists, which
+// every caller that goes on to send something requires. Without, it returns
+// what the far end's RTMR[0] holds. The caller holds the lock.
+func (c *Client) reach(ctx context.Context, held bool) (machine []byte, err error) {
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
 	raw, err := c.opts.Dial(ctx, "tcp", c.addr)
 	if err != nil {
-		return fmt.Errorf("reach the key service: %w", err)
+		return nil, fmt.Errorf("reach the key service: %w", err)
 	}
 	config := &tls.Config{
 		MinVersion: tls.VersionTLS13,
@@ -131,12 +141,12 @@ func (c *Client) connect(ctx context.Context) error {
 	defer stop()
 	if err := conn.HandshakeContext(ctx); err != nil {
 		_ = raw.Close()
-		return fmt.Errorf("reach the key service: %w", err)
+		return nil, fmt.Errorf("reach the key service: %w", err)
 	}
 	c.conn, c.read = conn, bufio.NewReader(conn)
-	fail := func(err error) error {
+	fail := func(err error) ([]byte, error) {
 		c.drop()
-		return err
+		return nil, err
 	}
 	// What anyone may ask: the document the key service says it measured.
 	var state StateResponse
@@ -148,20 +158,27 @@ func (c *Client) connect(ctx context.Context) error {
 		return fail(&session.VerificationError{Err: errors.New("the key service presented no certificate")})
 	}
 	leaf := certs[0]
-	if _, err := VerifySigned([]byte(c.opts.Pin.LaunchKey), state.Launch, state.Signature); err != nil {
+	doc, err := VerifySigned([]byte(c.opts.Pin.LaunchKey), state.Launch, state.Signature)
+	if err != nil {
 		return fail(&session.VerificationError{Err: fmt.Errorf("the key service's launch document: %w", err)})
 	}
 	judging := ctx
 	if c.opts.Judging != nil {
 		judging = c.opts.Judging(ctx)
 	}
-	if err := session.VerifyService(judging, c.opts.Pin, c.opts.Engine, leaf, session.DocumentDigest(state.Launch), c.opts.Now()); err != nil {
+	digest := session.DocumentDigest(state.Launch)
+	if held {
+		err = session.VerifyService(judging, c.opts.Pin, c.opts.Engine, leaf, digest, doc.Machine, c.opts.Now())
+	} else {
+		machine, err = session.ServiceMachine(judging, c.opts.Pin, c.opts.Engine, leaf, digest, c.opts.Now())
+	}
+	if err != nil {
 		return fail(fmt.Errorf("the key service is not the one pinned: %w", err))
 	}
 	if c.key, err = session.InstanceKeyDigest(leaf.PublicKey); err != nil {
 		return fail(err)
 	}
-	return nil
+	return machine, nil
 }
 
 // exchange sends one request on the connection and reads its answer. The
@@ -267,6 +284,21 @@ func (c *Client) Verify(ctx context.Context) error {
 		return nil
 	}
 	return c.connect(ctx)
+}
+
+// Machine reaches the key service, judges it against the pin in everything
+// but its machine, and returns what its RTMR[0] holds: nil on a TEE with no
+// such register. It is for whoever writes the key service's launch document,
+// which then lists the value. Nothing else is sent to the far end, and the
+// connection is not kept: every other call holds the key service to its
+// list first.
+func (c *Client) Machine(ctx context.Context) ([]byte, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drop()
+	machine, err := c.reach(ctx, false)
+	c.drop()
+	return machine, err
 }
 
 // Open opens the calling guest's session with the key service: the guest's

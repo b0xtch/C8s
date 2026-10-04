@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"gopkg.in/yaml.v3"
 
@@ -44,6 +45,11 @@ type Document struct {
 	// Image is the key service's own image. A document signed for one build
 	// is not honoured by another.
 	Image session.Image `yaml:"image"`
+	// Machine lists the virtual machines a replica may be, under the rule of
+	// a pool's launch document: a replica on another machine ends before it
+	// serves, and one whose document lists none serves its state and
+	// releases nothing.
+	Machine *session.Machine `yaml:"machine,omitempty"`
 	// Pools are the session guests the key service serves. A guest of no
 	// listed pool is told nothing and given nothing.
 	Pools []Pool `yaml:"pools"`
@@ -79,6 +85,9 @@ func (d *Document) Validate() error {
 		return fmt.Errorf("schemaVersion must be %s", LaunchSchemaVersion)
 	}
 	if _, err := d.Image.Identity(); err != nil {
+		return err
+	}
+	if err := d.Machine.Validate(d.Image); err != nil {
 		return err
 	}
 	if len(d.Pools) == 0 || len(d.Pools) > MaxPools {
@@ -138,7 +147,11 @@ type BundleOptions struct {
 	ManifestPath string
 	// KeyPath is an existing launch private key. Empty generates one.
 	KeyPath string
-	Pools   []PoolOptions
+	// Machines lists the RTMR[0] values a replica may hold, in any order.
+	// Empty writes a document that lists none: a replica booted from it
+	// serves only what says which machine it is.
+	Machines []string
+	Pools    []PoolOptions
 }
 
 // NewBundle writes and signs a key service's launch document, in the layout
@@ -154,6 +167,9 @@ func NewBundle(opts BundleOptions) (err error) {
 	doc := Document{SchemaVersion: LaunchSchemaVersion}
 	if doc.Image, err = session.ImageFromManifest(opts.ManifestPath, 0); err != nil {
 		return err
+	}
+	if len(opts.Machines) > 0 {
+		doc.Machine = &session.Machine{RTMR0: slices.Sorted(slices.Values(opts.Machines))}
 	}
 	for _, pool := range opts.Pools {
 		image, err := session.ImageFromManifest(pool.ManifestPath, 0)

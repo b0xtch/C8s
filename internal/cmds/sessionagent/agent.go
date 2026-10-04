@@ -329,23 +329,27 @@ type MeasuredDocument struct {
 // MeasureDocument does for another measured service of a guest image what
 // Stage does for a session guest's agent: it authenticates this boot's launch
 // document under the key the hardware binds, holds it to this guest's own
-// image, and measures it before anything in it is acted on. verify checks
-// the document's signature and returns the image it was signed for.
+// image and to the machines it lists, and measures it before anything in it
+// is acted on. verify checks the document's signature and returns the image
+// it was signed for and the machines it lists.
 //
 // It needs a runtime register, so that the document is in the guest's
 // evidence: Intel TDX today.
 func MeasureDocument(ctx context.Context, tee TEE, platform, pubkeyPath, launchDir string,
-	verify func(pub, launch []byte, signature string) (session.Image, error),
+	verify func(pub, launch []byte, signature string) (session.Image, *session.Machine, error),
 ) (*MeasuredDocument, error) {
 	pub, launch, signature, self, err := launchFiles(ctx, tee, platform, pubkeyPath, launchDir)
 	if err != nil {
 		return nil, err
 	}
-	image, err := verify(pub, launch, string(signature))
+	image, machine, err := verify(pub, launch, string(signature))
 	if err != nil {
 		return nil, err
 	}
 	if err := checkOwnImage(self, image); err != nil {
+		return nil, err
+	}
+	if err := checkOwnMachine(self, machine); err != nil {
 		return nil, err
 	}
 	reg, err := tee.Register()

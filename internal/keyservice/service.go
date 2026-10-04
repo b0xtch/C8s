@@ -89,6 +89,9 @@ type Service struct {
 	// token must be for.
 	audience string
 	tls      *tls.Config
+	// unpinned: a TD whose launch document lists no machine it may be. It
+	// serves its state, which says which machine it is, and nothing else.
+	unpinned bool
 
 	mu      sync.Mutex
 	tenants map[string]*tenant
@@ -144,6 +147,9 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{cfg: cfg, log: cfg.Logger, doc: doc, tenants: map[string]*tenant{}, guests: map[string]*guest{}}
+	// A TD has a register for what its host declared, and a document that
+	// lists no value for it leaves the host free to declare anything.
+	s.unpinned = doc.Machine == nil && doc.Image.HasMachineRegister()
 	for _, p := range doc.Pools {
 		identity, err := p.Image.Identity()
 		if err != nil {
@@ -174,6 +180,9 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 	s.tls.ClientAuth = tls.RequestClientCert
 	if err := certs.WarmUp(ctx); err != nil {
 		return nil, fmt.Errorf("attest the instance key: %w", err)
+	}
+	if s.unpinned {
+		s.log.Warn("the launch document lists no machine this key service may be: it serves only what says which machine it is")
 	}
 	s.log.Info("key service ready", "pools", len(s.pins), "launch_digest", session.DocumentDigest(cfg.Launch), "instance_key", s.audience)
 	return s, nil
@@ -249,11 +258,29 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("GET "+api.PathState, func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, api.StateResponse{Launch: s.cfg.Launch, Signature: s.cfg.Signature})
 	})
-	mux.HandleFunc("POST "+api.PathOpen, s.guestRoute(s.open))
-	mux.HandleFunc("POST "+api.PathAcquire, s.guestRoute(s.acquire))
-	mux.HandleFunc("PUT "+api.PathTenants+"{tenant}/authority", s.registerAuthority)
-	mux.HandleFunc("PUT "+api.PathTenants+"{tenant}/credentials/{name}", s.putCredential)
+	mux.HandleFunc("POST "+api.PathOpen, s.pinned(s.guestRoute(s.open)))
+	mux.HandleFunc("POST "+api.PathAcquire, s.pinned(s.guestRoute(s.acquire)))
+	mux.HandleFunc("PUT "+api.PathTenants+"{tenant}/authority", s.pinned(s.registerAuthority))
+	mux.HandleFunc("PUT "+api.PathTenants+"{tenant}/credentials/{name}", s.pinned(s.putCredential))
 	return mux
+}
+
+// Unpinned reports whether this replica is a TD whose launch document lists
+// no machine it may be. Such a replica keeps nothing and releases nothing:
+// its host could have built it any machine. It still serves its state, so
+// that whoever writes the document can read the machine from the replica's
+// evidence and list it.
+func (s *Service) Unpinned() bool { return s.unpinned }
+
+// pinned admits a request only to a replica whose document lists its machine.
+func (s *Service) pinned(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.unpinned {
+			refuse(w, http.StatusConflict, "this key service's launch document lists no machine it may be: it serves its state and nothing else")
+			return
+		}
+		next(w, r)
+	}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

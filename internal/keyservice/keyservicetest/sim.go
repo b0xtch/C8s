@@ -6,6 +6,7 @@ package keyservicetest
 
 import (
 	"context"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"net"
@@ -29,6 +30,8 @@ type Sim struct {
 	Bundle string
 	// Service is the replica itself.
 	Service *keyservice.Service
+	// Machine is what the replica's RTMR[0] holds.
+	Machine [48]byte
 }
 
 // Options change the key service New boots.
@@ -38,6 +41,13 @@ type Options struct {
 	// AcceptTCBStatus is what its launch document accepts of its pools'
 	// guests besides UpToDate.
 	AcceptTCBStatus []string
+	// Unpinned boots it from a launch document that lists no machine: such
+	// a key service serves its state and nothing else.
+	Unpinned bool
+	// Machines, when set, is what its launch document lists in place of the
+	// machine it is: a replica a host built another machine than the
+	// document's signer recorded.
+	Machines []string
 }
 
 // New boots a key service whose launch document lists pools, and serves it
@@ -55,6 +65,13 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 	}
 	td := sessiontest.NewTD()
 	opts := api.BundleOptions{Dir: filepath.Join(t.TempDir(), "key-service"), ManifestPath: td.WriteManifest(t)}
+	switch {
+	case with.Unpinned:
+	case with.Machines != nil:
+		opts.Machines = with.Machines
+	default:
+		opts.Machines = []string{hex.EncodeToString(td.RTMR[0][:])}
+	}
 	for _, pool := range pools {
 		opts.Pools = append(opts.Pools, api.PoolOptions{
 			ManifestPath: pool.ManifestPath, LaunchKeyPath: pool.LaunchKeyPath, AcceptTCBStatus: with.AcceptTCBStatus,
@@ -105,5 +122,5 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Sim{Pin: pin, Bundle: opts.Dir, Service: service}
+	return &Sim{Pin: pin, Bundle: opts.Dir, Service: service, Machine: td.RTMR[0]}
 }

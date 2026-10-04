@@ -206,12 +206,25 @@ The pool's launch key comes first, because each document names the other
 side: the key service's lists the pool's public key, and the pool's pins the
 key service.
 
+The key service's launch document lists its machines under the pool's rule,
+so its bundle is written twice as well. A key service on a machine its
+document does not list ends before it serves. One whose document lists none
+serves its state and releases nothing, and its machine is read from its
+evidence. Guests and owners hold a key service to the list in the document
+it measured, so its pin stays the same when the list changes.
+
 ```sh
 # The operator: a key for the pool, the key service's bundle and pin, the pool's bundle.
 c8s session launch-config key --out pool.key
-c8s session key-service launch-config new --out ks \
+c8s session key-service launch-config new --out ks-probe \
     --image-manifest c8s-key-service/manifest.json \
     --pool c8s-session/manifest.json:pool.key.pub
+# ... launch one key service from ks-probe/opkeydata in its shape, then:
+ks_machine=$(c8s session key-service launch-config machine --bundle ks-probe \
+    --url https://192.0.2.7:8443)
+c8s session key-service launch-config new --out ks --key ks-probe/launch.key \
+    --image-manifest c8s-key-service/manifest.json \
+    --pool c8s-session/manifest.json:pool.key.pub --machine "$ks_machine"
 c8s session key-service pin --bundle ks --url https://192.0.2.7:8443 --out ks-pin.json
 c8s session launch-config new --out pool --key pool.key --key-service ks-pin.json \
     --image-manifest c8s-session/manifest.json --pool agents --class s-4x16 \
