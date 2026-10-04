@@ -30,6 +30,10 @@ const (
 	ErrorCodeSecretHolderQuota = "secret_holder_quota"
 	// ErrorCodeSecretStoreFull: the store is at --secrets-max-paths.
 	ErrorCodeSecretStoreFull = "secret_store_full"
+	// ErrorCodePortUnreachable: a session guest's agent was asked for a stream
+	// to a port of its sandbox and could not connect to it. Nothing listens
+	// there yet, or any more.
+	ErrorCodePortUnreachable = "port_unreachable"
 )
 
 // ErrorResponse is the body a c8s service returns with a non-2xx status: one

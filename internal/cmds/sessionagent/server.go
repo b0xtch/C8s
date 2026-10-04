@@ -1,0 +1,409 @@
+package sessionagent
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/confidential-dot-ai/c8s/internal/httputil"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
+	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/types"
+)
+
+const (
+	maxConcurrentAttests = 4
+	// maxInflightRequests covers eight commands, four attestations and room
+	// for credentials, at up to MaxRequestBytes of unauthenticated body each.
+	maxInflightRequests = 24
+	attestTimeout       = 30 * time.Second
+	// tokenClockSkew is wide because a guest's clock starts from a
+	// host-supplied value. Tokens travel only inside the attested channel and
+	// every mutating route is idempotent, so the wider window adds no replay.
+	tokenClockSkew = 5 * time.Minute
+)
+
+// Handler serves the agent API. Every route but the health probe, the state,
+// the bind, the fence and Intel's documents requires a token from a key the
+// guest's bind authorizes for that route, bound to this guest and to the
+// request's method, path and body.
+func (a *Agent) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET "+session.PathHealth, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	mux.HandleFunc("GET "+session.PathState, a.serveState)
+	mux.HandleFunc("POST "+session.PathBind, a.letIn(a.bounded(a.serveBind)))
+	mux.HandleFunc("POST "+session.PathFence, a.serveFence)
+	mux.HandleFunc("POST "+session.PathAttest, a.authorized(session.Access.AttestKeys, a.serveAttest))
+	mux.HandleFunc("POST "+session.PathExec, a.authorized(session.Access.ExecKeys, a.serveExec))
+	mux.HandleFunc("PUT "+session.PathCredentials+"{name}", a.authorized(session.Access.CredentialKeys, a.serveCredential))
+	mux.HandleFunc("POST "+session.PathForward, a.serveForward)
+	mux.HandleFunc("GET "+session.PathCollateral, a.serveCollateral)
+	return mux
+}
+
+// letIn admits a bind by the connection it came on, before any of its body is
+// read. One from a connection the fence ended is refused on its headers: the
+// guest has taken in nothing of the caller's and stays as it was booted. One
+// that is let in counts as in flight, which the fence respects, until the
+// agent has answered it.
+func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.fence.enter(connOf(r.Context())) {
+			// Closing keeps the server from reading the body to reuse the
+			// connection.
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Cache-Control", "no-store")
+			httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, errFenced.Error())
+			return
+		}
+		defer a.fence.leave()
+		next(w, r)
+	}
+}
+
+// hold takes one of the places the agent has for requests it is reading or
+// answering, or answers that there is none. The caller gives it back with
+// release, which may be called more than once.
+func (a *Agent) hold(w http.ResponseWriter) (release func(), ok bool) {
+	select {
+	case a.inflight <- struct{}{}:
+		return sync.OnceFunc(func() { <-a.inflight }), true
+	default:
+		w.Header().Set("Retry-After", "1")
+		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "too many requests in flight")
+		return nil, false
+	}
+}
+
+// bounded reads a request's body within the limits an unauthenticated peer
+// gets: a capped size, and a cap on how many are held at once.
+func (a *Agent) bounded(next func(http.ResponseWriter, *http.Request, []byte)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		release, ok := a.hold(w)
+		if !ok {
+			return
+		}
+		defer release()
+		body, ok := httputil.ReadCappedBody(w, r, session.MaxRequestBytes)
+		if !ok {
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r, body)
+	}
+}
+
+// authorized admits the request only under a valid token from one of the keys
+// the guest's bind grants this route. The token covers the body, so the
+// body is read first, within bounds.
+func (a *Agent) authorized(keys func(session.Access) []*ecdsa.PublicKey, next func(http.ResponseWriter, *http.Request, []byte)) http.HandlerFunc {
+	return a.bounded(func(w http.ResponseWriter, r *http.Request, body []byte) {
+		if _, ok := a.grantedKey(w, r, body, keys); ok {
+			next(w, r, body)
+		}
+	})
+}
+
+// grantedKey checks the request's token against the keys the guest's
+// documents grant a route, and answers the refusal itself. It returns which of
+// those keys signed, by its place among them. The keys are looked up per
+// request: a guest has none until it is bound. A refusal says nothing about
+// why: the reason goes to the log.
+func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, keys func(session.Access) []*ecdsa.PublicKey) (int, bool) {
+	access, _ := a.grants()
+	granted := keys(access)
+	// A guest grants no key, and then no token is even parsed:
+	// nothing of a caller's choosing is read before the guest is somebody's.
+	if len(granted) == 0 {
+		httputil.WriteError(w, http.StatusUnauthorized, types.ErrorCodeInvalidToken, "unauthorized")
+		return 0, false
+	}
+	key, err := a.verifier(granted).AuthorizedBy(r, body)
+	if err != nil {
+		a.log.Warn("request refused", "path", r.URL.Path, "error", err)
+		httputil.WriteError(w, http.StatusUnauthorized, types.ErrorCodeInvalidToken, "unauthorized")
+		return 0, false
+	}
+	return key, true
+}
+
+// serveState tells anyone how far along the guest is and what it measured:
+// see session.StateResponse. None of it costs a quote.
+func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
+	a.measured.RLock()
+	phase, events := a.stateLocked()
+	bind := a.bind
+	prestaged := phase == session.PhaseReady && a.prestagedLocked()
+	a.measured.RUnlock()
+
+	state := session.StateResponse{
+		Phase: phase, InstanceKey: a.keyDER, Prestaged: prestaged,
+		Launch: a.launch, Signature: a.signature, Events: events,
+	}
+	if bind != nil {
+		state.Bind, state.BindSignature = bind.Raw, bind.Signature
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, state)
+}
+
+// verifier checks a token against keys, for this guest alone. The same key
+// can be granted on many guests, and a token names the one it is for: what
+// one guest was sent is of no use at another.
+func (a *Agent) verifier(keys []*ecdsa.PublicKey) operatorauth.Verifier {
+	return operatorauth.Verifier{Keys: keys, ClockSkew: tokenClockSkew, Audience: a.audience}
+}
+
+// serveBind takes the guest's bind. No token guards it: the bind's own
+// signature and the guest it names are what admit it.
+func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req session.BindRequest
+	if !decodeStrict(body, &req) || len(req.Bind) == 0 {
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "malformed bind request")
+		return
+	}
+	replayed, evidence, err := a.Bind(r.Context(), req.Bind, req.Signature)
+	var refusal *bindRefusal
+	switch {
+	case errors.Is(err, errAlreadyBound):
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+	case errors.Is(err, errRetired):
+		httputil.WriteError(w, http.StatusGone, types.ErrorCodeInvalidRequest, err.Error())
+	case errors.Is(err, errFenced):
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+	case errors.As(err, &refusal):
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, err.Error())
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The caller gave up on a bind another request is still completing.
+		httputil.WriteError(w, http.StatusServiceUnavailable, types.ErrorCodeInternal, "the bind is not complete yet")
+	case err != nil:
+		a.log.Error("bind failed", "error", err)
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "the guest could not complete the bind and is shutting down")
+	default:
+		a.measured.RLock()
+		phase, _ := a.stateLocked()
+		admission := a.admission
+		a.measured.RUnlock()
+		writeJSON(w, http.StatusOK, session.BindResponse{Phase: phase, Replayed: replayed, Admission: admission, Attestation: evidence})
+	}
+}
+
+// bindEvidence is the evidence a bind's sender would ask for next, taken for
+// the nonce the bind carries: the answer then holds it, and the sender asks
+// for nothing. It comes out of the guest's ration like any other quote. With
+// none due, the answer goes without and the sender asks in its turn. Nobody
+// waits here.
+func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind) *session.AttestResponse {
+	if !a.quotes.take() {
+		return nil
+	}
+	resp, _, err := a.attestation(ctx, bind.Doc.EvidenceNonce())
+	if err != nil {
+		a.log.Warn("a bind is answered without evidence", "error", err)
+		return nil
+	}
+	return resp
+}
+
+// attestation takes a quote bound to nonce and to what the guest has measured,
+// and says what that is. unavailable tells a quoting service that failed from
+// a guest that could not ask it.
+func (a *Agent) attestation(ctx context.Context, nonce []byte) (_ *session.AttestResponse, unavailable bool, _ error) {
+	// The register cannot move while the quote is taken, so the events this
+	// response reports are the ones the quote's register holds.
+	a.measured.RLock()
+	phase, events := a.stateLocked()
+	bind := a.bind
+	reportData, err := session.ReportData(&a.key.PublicKey, nonce, events)
+	if err != nil {
+		a.measured.RUnlock()
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, attestTimeout)
+	defer cancel()
+	evidence, err := a.tee.Evidence(ctx, reportData)
+	a.measured.RUnlock()
+	if err != nil {
+		return nil, true, err
+	}
+	resp := &session.AttestResponse{Evidence: evidence, Launch: a.launch, Signature: a.signature, Events: events, Phase: phase}
+	if bind != nil {
+		resp.Bind, resp.BindSignature = bind.Raw, bind.Signature
+	}
+	return resp, false, nil
+}
+
+// serveFence is the host's claim of the guest, and what makes the answer
+// hold: see session.FenceResponse. It reads no body.
+func (a *Agent) serveFence(w http.ResponseWriter, r *http.Request) {
+	if connOf(r.Context()) == nil {
+		// Not served through Serve: there are no connections to close, and an
+		// answer of ready would promise what nothing enforces.
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "this agent does not track its connections")
+		return
+	}
+	phase, closed, ok, err := a.Fence(r.Context())
+	w.Header().Set("Cache-Control", "no-store")
+	switch {
+	case errors.Is(err, errBindInFlight):
+		// For the host this is a guest somebody may have bound: it holds a
+		// caller's bytes. Nothing was closed and the bind goes on.
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+	case err != nil:
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "the guest could not be fenced")
+	case !ok:
+		httputil.WriteError(w, http.StatusGone, types.ErrorCodeInvalidRequest, errRetired.Error())
+	default:
+		if closed > 0 {
+			a.log.Info("fenced", "closed", closed)
+		}
+		// This connection belongs to the epoch that just ended.
+		w.Header().Set("Connection", "close")
+		writeJSON(w, http.StatusOK, session.FenceResponse{Phase: phase, Closed: closed})
+	}
+}
+
+func (a *Agent) serveAttest(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req session.AttestRequest
+	if !decodeStrict(body, &req) || len(req.Nonce) != session.NonceSize {
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "attest needs one 32-byte nonce")
+		return
+	}
+	// Each quote costs a round trip to the host's quoting service.
+	select {
+	case a.attests <- struct{}{}:
+		defer func() { <-a.attests }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "too many attestations in flight")
+		return
+	}
+	// That service is every guest's. This one takes its share and no more: a
+	// quote that is nearly due is waited for here, and a caller further back
+	// is told when to return.
+	wait, booked := a.quotes.reserve()
+	if !booked {
+		w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(wait.Seconds()))))
+		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "this guest's fresh quotes are rationed")
+		return
+	}
+	if wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	resp, unavailable, err := a.attestation(r.Context(), req.Nonce)
+	switch {
+	case unavailable:
+		a.log.Warn("evidence generation failed", "error", err)
+		httputil.WriteError(w, http.StatusBadGateway, types.ErrorCodeAttestationUnavailable, "attestation unavailable")
+	case err != nil:
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "attestation unavailable")
+	default:
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+func (a *Agent) serveExec(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req session.ExecRequest
+	if !decodeStrict(body, &req) {
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "malformed exec request")
+		return
+	}
+	if err := req.Validate(); err != nil {
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, err.Error())
+		return
+	}
+	if !a.sandboxRunning() {
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, "the sandbox has not been admitted yet")
+		return
+	}
+	result, err := a.execs.run(r.Context(), &req)
+	switch {
+	case errors.Is(err, errExecBusy):
+		w.Header().Set("Retry-After", "1")
+		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, err.Error())
+	case errors.Is(err, errExecEvicted):
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+	case err != nil:
+		// The command line and its output are tenant data: neither is logged.
+		a.log.Warn("exec failed", "id", req.ID, "error", err)
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "command could not be run")
+	default:
+		writeJSON(w, http.StatusOK, result)
+	}
+}
+
+func (a *Agent) serveCredential(w http.ResponseWriter, r *http.Request, body []byte) {
+	name := r.PathValue("name")
+	_, declared := a.grants()
+	var decl session.Credential
+	ok := false
+	for _, c := range declared {
+		if c.Name == name {
+			decl, ok = c, true
+		}
+	}
+	if !ok {
+		httputil.WriteError(w, http.StatusNotFound, types.ErrorCodeInvalidRequest, "the guest's bind declares no such credential")
+		return
+	}
+	var req session.CredentialRequest
+	if !decodeStrict(body, &req) || len(req.Value) == 0 || len(req.Value) > decl.Limit() {
+		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "credential value is missing or exceeds its declared size")
+		return
+	}
+	// A credential is for the measured sandbox, never for a guest still
+	// waiting to admit one.
+	if !a.sandboxRunning() {
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, "the sandbox has not been admitted yet")
+		return
+	}
+	held, err := a.creds.put(name, req.Value)
+	switch {
+	case errors.Is(err, errCredentialHeld):
+		a.log.Warn("credential refused", "name", name, "error", err)
+		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+		return
+	case err != nil:
+		a.log.Warn("credential write failed", "name", name, "error", err)
+		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "credential could not be stored")
+		return
+	}
+	a.log.Info("credential released", "name", name, "bytes", len(req.Value), "held", held)
+	// A repeat of what the guest took is answered as held, and nothing is
+	// written again.
+	status := http.StatusCreated
+	if held {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]bool{"held": held})
+}
+
+// decodeStrict accepts exactly one JSON value with no unknown fields.
+func decodeStrict(body []byte, out any) bool {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return false
+	}
+	return dec.Decode(new(any)) == io.EOF
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
