@@ -18,6 +18,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 	"github.com/confidential-dot-ai/c8s/pkg/session/sessionsim"
 )
 
@@ -216,7 +217,8 @@ func TestPoolWithNoSandbox(t *testing.T) {
 func TestPoolWithASandboxTakesNoBindWithoutAnImage(t *testing.T) {
 	sandbox := &echo{}
 	err := bindWith(t, sessionsim.NewGuest(t, sandbox), nil)
-	if err == nil || !strings.Contains(err.Error(), "inside a sandbox image only") {
+	var refused *session.StatusError
+	if !errors.As(err, &refused) || refused.Code != string(disclosure.BindNoSandbox) {
 		t.Fatalf("a bind that names no image: %v", err)
 	}
 	if sandbox.image != nil {

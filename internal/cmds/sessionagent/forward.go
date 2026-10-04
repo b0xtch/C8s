@@ -83,7 +83,7 @@ func (a *Agent) serveForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer release()
-	body, ok := httputil.ReadCappedBody(w, r, session.MaxForwardRequestBytes)
+	body, ok := a.body(w, r, session.MaxForwardRequestBytes)
 	if !ok {
 		return
 	}

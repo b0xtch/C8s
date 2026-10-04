@@ -14,8 +14,6 @@ import (
 )
 
 const (
-	// stepCredentials: the stored credentials taken from the key service.
-	stepCredentials = "credentials"
 	// keyServiceRetry bounds the pause between attempts to open the guest's
 	// session with its key service.
 	keyServiceRetry = 30 * time.Second

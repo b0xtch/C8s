@@ -24,6 +24,7 @@ import (
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // Config is everything the agent is told. All of it is measured: the unit file
@@ -451,12 +452,17 @@ func (c Config) clockSource() string {
 	return c.ClockSource()
 }
 
-// bindRefusal is a bind the guest will not accept, with the reason.
-// The reason is the sender's to know: nothing in it is secret.
-type bindRefusal struct{ err error }
+// bindRefusal is a bind the guest will not accept. The code is what the
+// sender is told: one of a list, and nothing of the reason's own words.
+type bindRefusal struct {
+	code disclosure.Code
+	err  error
+}
 
 func (r *bindRefusal) Error() string { return r.err.Error() }
 func (r *bindRefusal) Unwrap() error { return r.err }
+
+func refused(code disclosure.Code, err error) *bindRefusal { return &bindRefusal{code: code, err: err} }
 
 // Bind makes the guest one session's. The bind is extended into the register
 // before anything in it takes effect, and the first one is the only one. Once
@@ -500,14 +506,14 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 			return true, nil, ctx.Err()
 		}
 	}
-	bind, events, err := a.acceptable(raw, signature)
-	if err != nil {
+	bind, events, refusal := a.acceptable(raw, signature)
+	if err := refusal; err != nil {
 		a.measured.Lock()
 		a.retired = true
 		a.measured.Unlock()
 		a.binding.Unlock()
 		_ = a.fail(fmt.Errorf("refused a bind while unbound: %w", err))
-		return false, nil, &bindRefusal{err}
+		return false, nil, err
 	}
 	a.measured.Lock()
 	// Launch document, then bind: two events.
@@ -541,38 +547,43 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 
 // acceptable checks a bind for this guest: well-formed, signed by the
 // authority it names, written for this instance key, and not past its time.
-func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, []string, error) {
+func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, []string, *bindRefusal) {
 	// Checked before the bind is parsed: a guest past its deadline reads
 	// nothing more that a stranger sends it.
 	if a.bindTooLate() {
-		return nil, nil, errBindTooLate
+		return nil, nil, refused(disclosure.BindTooLate, errBindTooLate)
 	}
 	// The deadline was counted on whatever clock the kernel used since the
 	// guest staged. If that is no longer its own, the count means nothing.
 	if a.doc.AgeLimitSeconds > 0 && a.cfg.clockSource() != ownClockSource {
-		return nil, nil, errClockLeft
+		return nil, nil, refused(disclosure.BindClock, errClockLeft)
+	}
+	// Parsed first, so that the two ways a bind fails to verify are told
+	// apart: it is no bind, or its signature is not its authority's.
+	if _, err := session.ParseBind(raw); err != nil {
+		return nil, nil, refused(disclosure.BindInvalid, err)
 	}
 	bind, err := session.VerifyBind(raw, signature)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, refused(disclosure.BindSignature, err)
 	}
 	if err := bind.Doc.Targets(&a.key.PublicKey); err != nil {
-		return nil, nil, err
+		return nil, nil, refused(disclosure.BindOtherGuest, err)
 	}
 	if !a.cfg.Bare && bind.Doc.Policy.Sandbox == nil {
-		return nil, nil, errNoSandbox
+		return nil, nil, refused(disclosure.BindNoSandbox, errNoSandbox)
 	}
 	// The guest holds one key service to a pin, its pool's, and opened its
 	// session with that one before it was anybody's.
 	if pin := bind.Doc.KeyService; pin != nil && !pin.Equal(a.doc.KeyService) {
-		return nil, nil, errors.New("the bind trusts a key service that this guest's launch document does not pin")
+		return nil, nil, refused(disclosure.BindKeyService, errors.New("the bind trusts a key service that this guest's launch document does not pin"))
 	}
 	if time.Now().After(bind.Doc.Expiry().Add(tokenClockSkew)) {
-		return nil, nil, fmt.Errorf("bind expired at %s", bind.Doc.NotAfter)
+		return nil, nil, refused(disclosure.BindExpired, fmt.Errorf("bind expired at %s", bind.Doc.NotAfter))
 	}
 	events, err := session.ExpectedEvents(a.launch, bind, session.PhaseRunning)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, refused(disclosure.BindInvalid, err)
 	}
 	return bind, events, nil
 }

@@ -6,34 +6,38 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // The steps of admitting a sandbox that a guest reports, in the order they
-// happen. A guest with no sandbox image reports none of the first six.
+// happen. A guest with no sandbox image reports none of the first eight. The
+// names are the disclosure schema's: a guest reports no step outside it.
 const (
 	// stepRegistryWait is what was lost before a registry answered: the
 	// attempts that reached none and the waits between them.
-	stepRegistryWait = "registry_wait"
+	stepRegistryWait = string(disclosure.StepRegistryWait)
 	// stepResolve: the registry was asked what it holds under the reference.
-	stepResolve = "resolve"
+	stepResolve = string(disclosure.StepResolve)
 	// stepFetch: manifest, config and layers, each checked against its digest.
-	stepFetch = "fetch"
+	stepFetch = string(disclosure.StepFetch)
 	// stepStore stands in for both when no registry was asked: every blob
 	// was read from the host's image store, and checked the same.
-	stepStore = "store"
+	stepStore = string(disclosure.StepStore)
 	// stepPrestaged stands in for every step before this one when the image
 	// was unpacked ahead of the bind: what it took to wait for an unpack
 	// still under way, and to take the tree.
-	stepPrestaged = "prestaged"
+	stepPrestaged = string(disclosure.StepPrestaged)
 	// stepUnpack: the layers decompressed and applied.
-	stepUnpack = "unpack"
+	stepUnpack = string(disclosure.StepUnpack)
 	// stepOwn: the tree handed to the sandbox's id range.
-	stepOwn = "own"
+	stepOwn = string(disclosure.StepOwn)
 	// stepClear: the fetched blobs removed.
-	stepClear = "clear"
+	stepClear = string(disclosure.StepClear)
 	// stepMeasure: the sandbox extended into the register.
-	stepMeasure = "measure"
-	stepStart   = "start"
+	stepMeasure = string(disclosure.StepMeasure)
+	// stepCredentials: the stored credentials taken from the key service.
+	stepCredentials = string(disclosure.StepCredentials)
+	stepStart       = string(disclosure.StepStart)
 )
 
 // admission collects how long each step of one admission took.

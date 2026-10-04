@@ -14,6 +14,7 @@ import (
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
@@ -89,7 +90,8 @@ func (g *guestClient) do(ctx context.Context, addr, method, path string, body []
 	}
 	var answer types.ErrorResponse
 	_ = json.Unmarshal(data, &answer)
-	return nil, nil, &refusal{status: resp.StatusCode, code: answer.Error, message: answer.Message}
+	// A guest refuses with a code. The words for it are this side's.
+	return nil, nil, &refusal{status: resp.StatusCode, code: answer.Error, message: disclosure.Describe(answer.Error)}
 }
 
 // state asks the guest what it says of itself, and under which certificate.

@@ -1,0 +1,254 @@
+{
+  "schemaVersion": "c8s-disclosure/v1",
+  "messages": [
+    {
+      "name": "state",
+      "says": "to anyone who asks what the guest is",
+      "fields": [
+        {
+          "name": "instance_key",
+          "kind": "public",
+          "max": 1024
+        },
+        {
+          "name": "prestaged",
+          "kind": "flag",
+          "optional": true
+        },
+        {
+          "name": "phase",
+          "kind": "code",
+          "codes": [
+            "ready",
+            "bound",
+            "running"
+          ]
+        },
+        {
+          "name": "launch",
+          "kind": "public",
+          "max": 65536
+        },
+        {
+          "name": "signature",
+          "kind": "public",
+          "max": 4096
+        },
+        {
+          "name": "events",
+          "kind": "list",
+          "max": 8,
+          "item": {
+            "name": "",
+            "kind": "digest"
+          }
+        },
+        {
+          "name": "bind",
+          "kind": "public",
+          "max": 262144,
+          "optional": true
+        },
+        {
+          "name": "bind_signature",
+          "kind": "public",
+          "max": 4096,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "fence",
+      "says": "to its host, which claims it for a session",
+      "fields": [
+        {
+          "name": "phase",
+          "kind": "code",
+          "codes": [
+            "ready",
+            "bound",
+            "running"
+          ]
+        },
+        {
+          "name": "closed",
+          "kind": "counter",
+          "max": 65536
+        }
+      ]
+    },
+    {
+      "name": "bound",
+      "says": "to whoever handed it its bind",
+      "fields": [
+        {
+          "name": "phase",
+          "kind": "code",
+          "codes": [
+            "ready",
+            "bound",
+            "running"
+          ]
+        },
+        {
+          "name": "replayed",
+          "kind": "flag",
+          "optional": true
+        },
+        {
+          "name": "admission",
+          "kind": "list",
+          "max": 16,
+          "item": {
+            "name": "",
+            "kind": "message",
+            "message": "step"
+          },
+          "optional": true
+        },
+        {
+          "name": "attestation",
+          "kind": "message",
+          "message": "attestation",
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "attestation",
+      "says": "with its answer to a bind: evidence over the bind's nonce",
+      "fields": [
+        {
+          "name": "evidence",
+          "kind": "evidence",
+          "codes": [
+            "tdx",
+            "snp"
+          ],
+          "max": 262144
+        },
+        {
+          "name": "phase",
+          "kind": "code",
+          "codes": [
+            "ready",
+            "bound",
+            "running"
+          ]
+        },
+        {
+          "name": "launch",
+          "kind": "public",
+          "max": 65536
+        },
+        {
+          "name": "signature",
+          "kind": "public",
+          "max": 4096
+        },
+        {
+          "name": "events",
+          "kind": "list",
+          "max": 8,
+          "item": {
+            "name": "",
+            "kind": "digest"
+          }
+        },
+        {
+          "name": "bind",
+          "kind": "public",
+          "max": 262144,
+          "optional": true
+        },
+        {
+          "name": "bind_signature",
+          "kind": "public",
+          "max": 4096,
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "step",
+      "says": "in its answer to a bind: one step of admitting the sandbox, and how long it took",
+      "fields": [
+        {
+          "name": "name",
+          "kind": "code",
+          "codes": [
+            "registry_wait",
+            "resolve",
+            "fetch",
+            "store",
+            "prestaged",
+            "unpack",
+            "own",
+            "clear",
+            "measure",
+            "credentials",
+            "start"
+          ]
+        },
+        {
+          "name": "us",
+          "kind": "counter",
+          "max": 3600000000
+        }
+      ]
+    },
+    {
+      "name": "refusal",
+      "says": "to a caller without a key whose request it will not serve",
+      "fields": [
+        {
+          "name": "error",
+          "kind": "code",
+          "codes": [
+            "busy",
+            "too_large",
+            "malformed",
+            "unauthorized",
+            "not_found",
+            "method_not_allowed",
+            "fenced",
+            "already_bound",
+            "retired",
+            "bind_in_flight",
+            "bind_too_late",
+            "bind_clock",
+            "bind_invalid",
+            "bind_signature",
+            "bind_other_guest",
+            "bind_expired",
+            "bind_no_sandbox",
+            "bind_key_service",
+            "bind_incomplete",
+            "bind_failed",
+            "no_collateral",
+            "internal"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "platform",
+      "says": "to its host, which fetches the vendor's documents for that platform",
+      "fields": [
+        {
+          "name": "fmspc",
+          "kind": "public",
+          "max": 12
+        },
+        {
+          "name": "ca",
+          "kind": "code",
+          "codes": [
+            "platform",
+            "processor"
+          ]
+        }
+      ]
+    }
+  ]
+}

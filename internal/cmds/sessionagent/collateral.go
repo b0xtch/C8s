@@ -1,15 +1,13 @@
 package sessionagent
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
-	"github.com/confidential-dot-ai/c8s/internal/httputil"
 	"github.com/confidential-dot-ai/c8s/internal/readutil"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
-	"github.com/confidential-dot-ai/c8s/pkg/types"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // hostListener accepts connections from the guest's host, and from nobody
@@ -54,11 +52,12 @@ func (a *Agent) takeHandIn(conn io.ReadWriteCloser) {
 	if platform == nil {
 		return
 	}
-	hello, err := json.Marshal(platform)
+	// The one thing the guest says on this channel: which platform it is.
+	hello, err := disclosure.Encode(disclosure.MessagePlatform, platform)
 	if err != nil {
 		return
 	}
-	if _, err := conn.Write(append(hello, '\n')); err != nil {
+	if _, err := conn.Write(hello); err != nil {
 		return
 	}
 	// Whoever only asks which platform this is sends nothing, and leaves
@@ -85,7 +84,7 @@ func (a *Agent) KeepCollateral(blob []byte) { a.collateral.Store(&blob) }
 func (a *Agent) serveCollateral(w http.ResponseWriter, _ *http.Request) {
 	blob := a.collateral.Load()
 	if blob == nil {
-		httputil.WriteError(w, http.StatusNotFound, types.ErrorCodeInvalidRequest, "this guest's host has handed it none of Intel's documents")
+		a.refuse(w, http.StatusNotFound, disclosure.NoCollateral)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

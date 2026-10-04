@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/httputil"
+	"github.com/confidential-dot-ai/c8s/internal/readutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
@@ -48,7 +50,59 @@ func (a *Agent) Handler() http.Handler {
 	mux.HandleFunc("PUT "+session.PathCredentials+"{name}", a.authorized(session.Access.CredentialKeys, a.serveCredential))
 	mux.HandleFunc("POST "+session.PathForward, a.serveForward)
 	mux.HandleFunc("GET "+session.PathCollateral, a.serveCollateral)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A request for what the guest does not serve gets a code like any
+		// other refusal, where the mux would answer in words of its own.
+		if _, pattern := mux.Handler(r); pattern == "" {
+			if servedByAnotherMethod(mux, r) {
+				a.refuse(w, http.StatusMethodNotAllowed, disclosure.MethodNotAllowed)
+				return
+			}
+			a.refuse(w, http.StatusNotFound, disclosure.NotFound)
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// routeMethods are the methods the agent's routes take.
+var routeMethods = []string{http.MethodGet, http.MethodPost, http.MethodPut}
+
+// servedByAnotherMethod reports whether the request's path is a route of the
+// mux under a method the request did not use.
+func servedByAnotherMethod(mux *http.ServeMux, r *http.Request) bool {
+	for _, method := range routeMethods {
+		if method == r.Method {
+			continue
+		}
+		probe := *r
+		probe.Method = method
+		if _, pattern := mux.Handler(&probe); pattern != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// say answers a caller the guest has not authenticated with one message of
+// its disclosure schema. A value the schema does not let that message carry
+// is not sent: the caller is told the guest could not answer.
+func (a *Agent) say(w http.ResponseWriter, status int, message string, v any) {
+	body, err := disclosure.Encode(message, v)
+	if err != nil {
+		a.log.Error("an answer was held back: it is beyond the disclosure schema", "error", err)
+		status = http.StatusInternalServerError
+		body, _ = disclosure.Encode(disclosure.MessageRefusal, disclosure.Refusal{Error: disclosure.Internal})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// refuse answers a caller the guest has not authenticated with a code and
+// nothing else.
+func (a *Agent) refuse(w http.ResponseWriter, status int, code disclosure.Code) {
+	a.say(w, status, disclosure.MessageRefusal, disclosure.Refusal{Error: code})
 }
 
 // letIn admits a bind by the connection it came on, before any of its body is
@@ -63,7 +117,7 @@ func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 			// connection.
 			w.Header().Set("Connection", "close")
 			w.Header().Set("Cache-Control", "no-store")
-			httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, errFenced.Error())
+			a.refuse(w, http.StatusConflict, disclosure.Fenced)
 			return
 		}
 		defer a.fence.leave()
@@ -80,7 +134,7 @@ func (a *Agent) hold(w http.ResponseWriter) (release func(), ok bool) {
 		return sync.OnceFunc(func() { <-a.inflight }), true
 	default:
 		w.Header().Set("Retry-After", "1")
-		httputil.WriteError(w, http.StatusTooManyRequests, types.ErrorCodeTooManyRequests, "too many requests in flight")
+		a.refuse(w, http.StatusTooManyRequests, disclosure.Busy)
 		return nil, false
 	}
 }
@@ -94,13 +148,28 @@ func (a *Agent) bounded(next func(http.ResponseWriter, *http.Request, []byte)) h
 			return
 		}
 		defer release()
-		body, ok := httputil.ReadCappedBody(w, r, session.MaxRequestBytes)
+		body, ok := a.body(w, r, session.MaxRequestBytes)
 		if !ok {
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		next(w, r, body)
 	}
+}
+
+// body reads a request's body within limit, and refuses the request if it
+// is larger or does not arrive.
+func (a *Agent) body(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, bool) {
+	body, err := readutil.ReadAll(r.Body, limit)
+	switch {
+	case errors.Is(err, readutil.ErrTooLarge):
+		a.refuse(w, http.StatusRequestEntityTooLarge, disclosure.TooLarge)
+		return nil, false
+	case err != nil:
+		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
+		return nil, false
+	}
+	return body, true
 }
 
 // authorized admits the request only under a valid token from one of the keys
@@ -125,13 +194,13 @@ func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, 
 	// A guest grants no key, and then no token is even parsed:
 	// nothing of a caller's choosing is read before the guest is somebody's.
 	if len(granted) == 0 {
-		httputil.WriteError(w, http.StatusUnauthorized, types.ErrorCodeInvalidToken, "unauthorized")
+		a.refuse(w, http.StatusUnauthorized, disclosure.Unauthorized)
 		return 0, false
 	}
 	key, err := a.verifier(granted).AuthorizedBy(r, body)
 	if err != nil {
 		a.log.Warn("request refused", "path", r.URL.Path, "error", err)
-		httputil.WriteError(w, http.StatusUnauthorized, types.ErrorCodeInvalidToken, "unauthorized")
+		a.refuse(w, http.StatusUnauthorized, disclosure.Unauthorized)
 		return 0, false
 	}
 	return key, true
@@ -154,7 +223,7 @@ func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 		state.Bind, state.BindSignature = bind.Raw, bind.Signature
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, state)
+	a.say(w, http.StatusOK, disclosure.MessageState, state)
 }
 
 // verifier checks a token against keys, for this guest alone. The same key
@@ -169,32 +238,34 @@ func (a *Agent) verifier(keys []*ecdsa.PublicKey) operatorauth.Verifier {
 func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 	var req session.BindRequest
 	if !decodeStrict(body, &req) || len(req.Bind) == 0 {
-		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, "malformed bind request")
+		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
 		return
 	}
 	replayed, evidence, err := a.Bind(r.Context(), req.Bind, req.Signature)
 	var refusal *bindRefusal
 	switch {
 	case errors.Is(err, errAlreadyBound):
-		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+		a.refuse(w, http.StatusConflict, disclosure.AlreadyBound)
 	case errors.Is(err, errRetired):
-		httputil.WriteError(w, http.StatusGone, types.ErrorCodeInvalidRequest, err.Error())
+		a.refuse(w, http.StatusGone, disclosure.Retired)
 	case errors.Is(err, errFenced):
-		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+		a.refuse(w, http.StatusConflict, disclosure.Fenced)
 	case errors.As(err, &refusal):
-		httputil.WriteError(w, http.StatusBadRequest, types.ErrorCodeInvalidRequest, err.Error())
+		// Why, in the guest's own words, stays in the guest's log.
+		a.log.Warn("a bind was refused", "code", refusal.code, "error", refusal.err)
+		a.refuse(w, http.StatusBadRequest, refusal.code)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		// The caller gave up on a bind another request is still completing.
-		httputil.WriteError(w, http.StatusServiceUnavailable, types.ErrorCodeInternal, "the bind is not complete yet")
+		a.refuse(w, http.StatusServiceUnavailable, disclosure.BindIncomplete)
 	case err != nil:
 		a.log.Error("bind failed", "error", err)
-		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "the guest could not complete the bind and is shutting down")
+		a.refuse(w, http.StatusInternalServerError, disclosure.BindFailed)
 	default:
 		a.measured.RLock()
 		phase, _ := a.stateLocked()
 		admission := a.admission
 		a.measured.RUnlock()
-		writeJSON(w, http.StatusOK, session.BindResponse{Phase: phase, Replayed: replayed, Admission: admission, Attestation: evidence})
+		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{Phase: phase, Replayed: replayed, Admission: admission, Attestation: evidence})
 	}
 }
 
@@ -249,7 +320,7 @@ func (a *Agent) serveFence(w http.ResponseWriter, r *http.Request) {
 	if connOf(r.Context()) == nil {
 		// Not served through Serve: there are no connections to close, and an
 		// answer of ready would promise what nothing enforces.
-		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "this agent does not track its connections")
+		a.refuse(w, http.StatusInternalServerError, disclosure.Internal)
 		return
 	}
 	phase, closed, ok, err := a.Fence(r.Context())
@@ -258,18 +329,18 @@ func (a *Agent) serveFence(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, errBindInFlight):
 		// For the host this is a guest somebody may have bound: it holds a
 		// caller's bytes. Nothing was closed and the bind goes on.
-		httputil.WriteError(w, http.StatusConflict, types.ErrorCodeInvalidRequest, err.Error())
+		a.refuse(w, http.StatusConflict, disclosure.BindInFlight)
 	case err != nil:
-		httputil.WriteError(w, http.StatusInternalServerError, types.ErrorCodeInternal, "the guest could not be fenced")
+		a.refuse(w, http.StatusInternalServerError, disclosure.Internal)
 	case !ok:
-		httputil.WriteError(w, http.StatusGone, types.ErrorCodeInvalidRequest, errRetired.Error())
+		a.refuse(w, http.StatusGone, disclosure.Retired)
 	default:
 		if closed > 0 {
 			a.log.Info("fenced", "closed", closed)
 		}
 		// This connection belongs to the epoch that just ended.
 		w.Header().Set("Connection", "close")
-		writeJSON(w, http.StatusOK, session.FenceResponse{Phase: phase, Closed: closed})
+		a.say(w, http.StatusOK, disclosure.MessageFence, session.FenceResponse{Phase: phase, Closed: closed})
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // pool is a harness whose guest nobody has bound yet, with the owner who will
@@ -620,6 +621,18 @@ func TestFenceIsNotRaisedOverABindInFlight(t *testing.T) {
 	}
 }
 
+// refusalCode is the code of a refusal the guest sent a caller it has not
+// authenticated, which carries nothing else.
+func refusalCode(body []byte) disclosure.Code {
+	var refusal map[string]json.RawMessage
+	if json.Unmarshal(body, &refusal) != nil || len(refusal) != 1 {
+		return ""
+	}
+	var code disclosure.Code
+	_ = json.Unmarshal(refusal["error"], &code)
+	return code
+}
+
 // A bind on a connection the fence ended is refused on its headers. The guest
 // reads none of it, stays unbound and does not end over it.
 func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
@@ -643,8 +656,8 @@ func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
 	rec := httptest.NewRecorder()
 	p.agent.Handler().ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "claimed") {
-		t.Fatalf("a bind on an ended connection: %d %s, want 409 naming the claim", rec.Code, rec.Body)
+	if rec.Code != http.StatusConflict || refusalCode(rec.Body.Bytes()) != disclosure.Fenced {
+		t.Fatalf("a bind on an ended connection: %d %s, want 409 and the fence's code", rec.Code, rec.Body)
 	}
 	if unread.n != 0 {
 		t.Fatalf("the agent read %d bytes of a bind it refused", unread.n)

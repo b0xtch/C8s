@@ -28,6 +28,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/readutil"
 	"github.com/confidential-dot-ai/c8s/internal/streamend"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
@@ -1351,6 +1352,11 @@ func decodeAnswer(status int, header http.Header, data []byte, out any) error {
 	if status < 200 || status > 299 {
 		var env types.ErrorResponse
 		_ = json.Unmarshal(data, &env)
+		// To a caller it has not authenticated a guest gives a code and no
+		// words. The words for it are this side's.
+		if env.Message == "" && env.Error != "" {
+			env.Message = disclosure.Describe(env.Error)
+		}
 		return &StatusError{Status: status, Code: env.Error, Message: env.Message, RetryAfter: retryAfter(header)}
 	}
 	if out != nil {
