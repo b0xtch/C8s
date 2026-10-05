@@ -132,3 +132,44 @@ func TestLockedKernelHasNoConsole(t *testing.T) {
 		t.Error("the dev kernel has no console: the two snapshots are no longer told apart")
 	}
 }
+
+// The guest's packet filter is its nftables ruleset and nothing beside it:
+// no iptables table of the old kind, and no xtables match inside nftables.
+// The agent lists the ruleset once and from then on asks the kernel for its
+// generation, which moves with every change to an nftables ruleset, so the
+// check covers the filter only while nothing else filters. Both fragments
+// say so, and this holds the two kernels' resolved configurations to it.
+func TestGuestKernelFiltersWithNftablesAlone(t *testing.T) {
+	const kernels = "../../../session-guest-image/kernel/"
+	for _, name := range []string{"config-x86_64-session.snapshot", "config-x86_64-session-dev.snapshot"} {
+		config := kernelConfig(t, kernels+name)
+		if config["NF_TABLES"] != "y" {
+			t.Errorf("%s: the kernel has no nftables", name)
+		}
+		for _, symbol := range []string{
+			"NETFILTER_XTABLES_LEGACY", "NFT_COMPAT",
+			"IP_NF_IPTABLES_LEGACY", "IP6_NF_IPTABLES_LEGACY", "IP_NF_ARPTABLES", "BRIDGE_NF_EBTABLES", "BRIDGE_NF_EBTABLES_LEGACY",
+			"IP_NF_FILTER", "IP_NF_MANGLE", "IP_NF_RAW", "IP_NF_NAT", "IP_NF_SECURITY", "IP_NF_ARPFILTER",
+			"IP6_NF_FILTER", "IP6_NF_MANGLE", "IP6_NF_RAW", "IP6_NF_NAT", "IP6_NF_SECURITY",
+		} {
+			if value, set := config[symbol]; set {
+				t.Errorf("%s: the kernel has CONFIG_%s=%s: a packet filter beside nftables, which the ruleset's generation says nothing of", name, symbol, value)
+			}
+		}
+	}
+	for _, name := range []string{"session.config", "session-dev.config"} {
+		fragment, err := os.ReadFile(kernels + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, _, marked := strings.Cut(string(fragment), "# end of common\n")
+		if !marked {
+			t.Fatalf("%s has no end of its common block", name)
+		}
+		for _, line := range []string{"# CONFIG_NETFILTER_XTABLES_LEGACY is not set\n", "# CONFIG_NFT_COMPAT is not set\n"} {
+			if !strings.Contains(common, line) {
+				t.Errorf("%s does not say %q in the block both kernels share", name, strings.TrimSpace(line))
+			}
+		}
+	}
+}
