@@ -32,10 +32,11 @@ enforces its rules without reading a session.
    the release log ([Releases](sessions.md#releases)). The agent ends a guest
    whose copy differs from the schema compiled into it, and a guest that said
    more would be another image.
-4. **One encoder.** The agent writes every plaintext message through one
-   encoder, which checks it against the schema as it is written and holds
-   back whatever does not fit. The sandbox has no path to the host but the
-   gateways, so nothing in it can add to what the guest says.
+4. **One encoder.** The agent, and the init that starts it, write every
+   plaintext message through one encoder, which checks it against the schema
+   as it is written and holds back whatever does not fit. The sandbox has no
+   path to the host but the gateways, so nothing in it can add to what the
+   guest says.
 
 The schema does not cover answers on routes that need a key the bind grants,
 once the guest has accepted the key: they travel only inside the TLS channel
@@ -54,6 +55,7 @@ choosing where the host can read it.
 | the TD as a VM | that it runs, its class, its memory high-water mark, and when it ends | the hardware; this is metadata |
 | the network | sizes, times and endpoints of ciphertext, a message sealed into a bind and its sealed answer among them | metadata ([non-goals](session-threat-model.md#goals)) |
 | answers to the daemon | phases; a bind taken, or a refusal code; whether the bind's quote is taken, still being tried or given up; whether a message sealed with the bind was taken, and its answer, sealed; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
+| a guest's end | why it ended, as a code, with the phase it had reached; from a kernel that faulted, one fixed code | the schema; the image, for the kernel's code |
 | events and statistics | VM-level counters, sizes and times | the schema |
 | evidence | certificates, documents, events, receipts and quotes | public by design |
 | a console | nothing once the kernel runs; before that, what a release build of the firmware and the boot stub print, before any session exists | the image ([Logs](#logs-consoles-and-crashes)) |
@@ -72,10 +74,22 @@ choosing where the host can read it.
 - **Logs stay in the session.** The agent's, the sandbox's and the kernel's
   logs are written inside the TD, kept with the session's state and sealed
   with it, and read by the owner over the attested channel.
-- **A crash leaves a code.** A guest that fails ends with a reason from the
-  schema, such as lease lost, bind refused, out of memory or a kernel fault.
-  Nothing of its memory leaves: the host cannot read a TD's private memory,
-  and the guest writes no dump outside it.
+- **An end leaves a code.** A guest that ends itself first tells its
+  launcher why, in one message of the schema over vsock: the phase it had
+  reached and a code from a list. The init sends it, since it sees the agent
+  end however it ends, and then powers the guest off. When the agent ends the
+  guest for a reason of its own, such as its age limit, its lease lost, a
+  bind refused or a guard's refusal, each guard with a code of its own, it
+  exits with that reason's code for the init to send; when it ends
+  otherwise, the code says that it exited, with its status, or was killed,
+  with the signal and whether the kernel killed it for memory. A kernel that
+  faults reports one fixed code to the VMM instead, through the platform's
+  call for a fatal error, and never the text of its panic, which can hold
+  addresses and data. The launcher gives the code as the TD's reason for
+  ending, or says that none came. Codes are for operators, and nothing that
+  guards a session rests on them. Nothing of a guest's memory leaves: the
+  host cannot read a TD's private memory, and the guest writes no dump
+  outside it.
 - **Support goes through the owner.** An operator who needs to see inside a
   session asks its owner, whose client can open the session's logs and share
   what it chooses. No call or key lets the platform look in alone.
