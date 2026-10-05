@@ -79,8 +79,10 @@ guest's own API on its TLS port.
   attested session with the key service, which checks the guest's quote, hands
   it the vendor's documents it checked the quote against, for the guest to
   staple to its evidence, and releases nothing until a bind arrives. It is
-  ready only once that session is open. Before then it refuses a bind unread,
-  as not ready, so a pool whose key service it cannot reach offers no TD.
+  ready only once that session is open and the work of its boot is done,
+  with nothing left to write, so that a ready TD is quiet. Before then it
+  refuses a bind unread, as not ready, so a pool whose key service it cannot
+  reach offers no TD.
 - **ready to claimed.** `Claim` reserves the TD for a session in the daemon's
   own record and asks the guest nothing: it relays the evidence the guest gave
   when it became ready, with the vendor's documents it last handed over, since

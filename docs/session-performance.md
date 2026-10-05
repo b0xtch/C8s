@@ -105,7 +105,7 @@ Each lever must keep the rules in
 | continuous mode | QEMU's COLO on the same VM, for the delay it adds to output | the epoch each sandbox sustains, the wait it adds to an output, and the CPU and writes it costs, against the same session in commit mode |
 | moving a session between hosts | QEMU's live migration of the same VM, and Firecracker's snapshot create, copy and load | a seal in continuous mode on one host to the first effect on another, at 1, 4 and 16 GiB |
 | the root's file system | ext4 on the same dm-crypt | btrfs with SHA-256 checksums and with BLAKE2b, for the work inside |
-| ending a TD | ending a VM | the host's time to free the TD's memory, per GiB, and its key ID, and what that costs the guests beside it and those starting |
+| ending a TD | ending a VM | the host's time to free the TD's memory, per GiB, and its key ID, timed to its VMM's exit, and what that costs the guests beside it and those starting |
 | idle memory per session | host memory per idle VM | the same, private and shared apart, per idle TD and per tenant-VM session |
 | sessions per host | until the host refuses or slows | the same, and what bounds it first: memory, CPU or the hardware's key IDs |
 | work inside | CPU, memory bandwidth, network and storage throughput | the same |
@@ -153,7 +153,9 @@ memory-acceptance floor; work inside within the published floors.
   as with pools for a burst of 100, the sides take turns instead, each side's
   guests up only in its own turns, and a turn begins only once the host has
   taken apart the guests of the turn before, their memory freed and a TD's
-  key ID free again, which the record times.
+  key ID free again, which the record times. A guest counts as idle only once
+  its own counters show it, its CPU and exits down to an idle guest's rate,
+  and never because a fixed rest has passed.
 - **Like for like.** Both sides reach their first command the same way, and
   the command does the same work on each. A baseline driven over a serial
   console, with no platform channel, is a floor, and is labeled as one. Work
