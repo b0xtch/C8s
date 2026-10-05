@@ -307,7 +307,49 @@ passes. Once an answer carries the key service's time, the guest judges the
 same documents by it, and each lease renewal brings the key service's newest
 documents for its own platform beside the guest's. A key service whose
 documents lapse or fall below a floor loses the session: a pooled TD ends,
-since it holds nothing, and a bound one treats it as a lapsed lease.
+since it holds nothing, and a bound one treats it as a lapsed lease. Floors
+keep out documents older than the guest's build, not documents from before a
+later revocation, so a guest sends nothing secret on this check: from its bind
+on, it holds its key service to the replicas its binder judged ([Which
+replicas a guest trusts](#which-replicas-a-guest-trusts)).
+
+## Which replicas a guest trusts
+
+Before its bind, a guest judges its key service on documents its host carries,
+against floors from its build ([Its clock](#its-clock)). A host holding the
+keys of a platform the vendor has since revoked could pass that check with a
+key service of its own, quoting on that platform, and documents from before
+the revocation. So the guest sends its key service nothing secret before its
+bind, and from the bind on holds it to replicas its binder judged, which needs
+no road to the vendor:
+
+- **The bind names them.** The binder judges each replica's evidence as it
+  would for a release, on the vendor's documents as it fetched them itself
+  within the last hour, and the bind names their instance keys
+  (`keyService.members`, [The bind](session-api.md#the-bind)). It judges them
+  ahead, as it does a pool's ready TDs, so naming them costs a bind no time.
+  The authority's signature carries that verdict to the guest. A guest whose
+  session is with a replica outside them opens one with a replica among them
+  before it judges the bind's `notAfter`, by that replica's time.
+- **Memberships follow restarts.** A replica that restarts comes back with a
+  new instance key ([Replicas](#replicas)), and an upgrade replaces every
+  replica in turn, so a session can outlive every replica its bind names. Each
+  change of members is a statement of the new members' instance keys,
+  numbered, that each member of the one before signs once the change is
+  committed and it has judged each newcomer's evidence on documents it fetched
+  itself within the hour. A guest takes a membership only with the signatures
+  of a majority of one it already holds, and from then on trusts its members
+  and no others.
+- **Every answer names its membership.** A replica's answers carry the number
+  of the membership it serves under, so a guest learns of a change by its next
+  renewal and asks for the statements it lacks. The replicas judge each other
+  again as the vendor's documents change and remove a member whose platform
+  the newest of them refuse, and a guest stops trusting that member with the
+  membership that removes it.
+
+Milestone 1's key service is one replica, so its binds name one key;
+memberships come with the replicas in milestone 2, before any guest sends its
+key service a layer's key.
 
 ## Scale
 
@@ -335,9 +377,10 @@ enough.
 
 1. One replica, with the release rule and records in memory, for milestone
    1 in [sessions.md](sessions.md#milestones).
-2. Three replicas on one host, with generations, leases and journals, and
-   the TLA+ model of leases, generations and leader changes, for milestone 2:
-   a seal is worth only as much as its generation's record.
+2. Three replicas on one host, with generations, leases, journals and the
+   memberships guests follow, and the TLA+ model of leases, generations and
+   leader changes, for milestone 2: a seal is worth only as much as its
+   generation's record.
 3. The ledger, witnesses, recovery and escrow.
 4. Replicas across hosts.
 
@@ -348,3 +391,8 @@ enough.
 3. **Renewal and epoch load**: how many live sessions one group carries
    before it splits, with renewals in commit mode and a write each epoch in
    continuous mode.
+4. **Answers a guest can check itself**: a guest takes a replica's word for
+   the membership it serves under, so a replica that left the group, and whose
+   platform broke afterwards, could still answer a guest that its host steers
+   to it as if it were the group. Answers signed by the majority whose round
+   confirmed them would close that, for a signature per replica and round.

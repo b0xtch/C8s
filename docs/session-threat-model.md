@@ -47,7 +47,7 @@ Non-goals, stated so that nobody assumes otherwise:
 | guest kernel, initrd, command line, and the root file system with the agent | in RTMR[1], RTMR[2] and the dm-verity root | the image's published manifest |
 | the launch key, the bind and later runtime events | the RTMR[3] chain on TDX; HOST_DATA and report data on SEV-SNP | replayed by the verifier |
 | the agent and its gateways (egress, inference, the message box) | on the verity root | the same pins |
-| the key service | attested code in its own CVMs, a quorum of replicas | each replica verifies the others; binds pin it |
+| the key service | attested code in its own CVMs, a quorum of replicas | each replica verifies the others; binds pin its replicas |
 | verifier code and reference values | they make the decision | reproducible builds, each in the public release log; the browser bundle pinned by hash |
 | the release log's witnesses | together they keep the log from showing two histories | at least one runs outside the operator's reach, and two of three must cosign |
 | the owner's binder and authority key | the owner chose them | the owner's responsibility |
@@ -171,7 +171,10 @@ but not confidentiality.
   TCB evaluation data number, and stay valid to at least the date, that the
   guest's measured image carries from its build or a launch document raised.
   The guest judges them again by the key service's time once it has it ([Its
-  clock](session-key-service.md#its-clock)).
+  clock](session-key-service.md#its-clock)). Floors keep out documents older
+  than the guest's build but not ones from before a later revocation, so the
+  guest sends nothing secret on that check ([A stand-in for the key
+  service](#keys-and-the-key-service)).
 - **Stale evidence.** A bind's answer is a receipt the guest's one-time key
   signs over the binder's nonce, and the quote over the same nonce follows; a
   verifier can ask for a quote over its own nonce through `Connect`; and the
@@ -197,6 +200,16 @@ but not confidentiality.
 - **The key service's operator** can deny service. It cannot read keys, which
   exist unwrapped only inside attested replicas, and it cannot point a
   session at another key service, which the bind pins.
+- **A stand-in for the key service.** A guest has no road to the vendor, so
+  before its bind it judges its key service on documents its host carries, and
+  a host holding the keys of a platform the vendor has since revoked could
+  pass that check with a key service of its own and documents from before the
+  revocation. So the guest sends nothing secret on that check, and from its
+  bind on takes nothing from a replica, and sends it nothing, unless its
+  binder judged it on documents it fetched itself within the hour and the bind
+  names it, or a majority of the replicas the guest holds signed a membership
+  that adds it ([Which replicas a guest
+  trusts](session-key-service.md#which-replicas-a-guest-trusts)).
 - **Rolling back the key service.** Its replicas trust no disk, and witnesses
   outside the operator's reach cosign its ledger only forward, so neither a
   host nor the operator can bring back an older state
