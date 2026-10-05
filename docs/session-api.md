@@ -198,7 +198,7 @@ message BindRequest {
   bytes sealed = 7;                    // the first command and credentials the binder holds, sealed to the guest's one-time KEM key; with the bind or in the next message
 }
 message Bound {
-  Evidence evidence = 1;               // includes the bind
+  Evidence evidence = 1;               // includes the bind; in a later message, the quote over the bind's nonce once taken, or that the guest gave up on it
   bytes receipt = 2;                   // c8s-bind-receipt/v1, signed by the guest's one-time key over the bind's nonce
   bytes sealed_answer = 3;             // in a later message: what became of each part, and the command's output and status, sealed back to the binder
   string sealed_status = 4;            // taken, unopened or too_late: with the receipt for a message sent with the bind, or on its own
@@ -296,7 +296,7 @@ What each call does, and what a daemon that cheats could do with it:
 |---|---|---|---|---|
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
 | `Claim` | orchestrator | reserves a ready TD in its own record and returns the evidence the guest gave when it became ready; waits up to `wait`, then says when the next will be ready | nothing: it learns of the claim from the bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
-| `Bind` | orchestrator or binder | for a bind that names no TD, first claims the ready TD the bind names, if the caller may (ready to bound); places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, with a message sealed for it if one comes, and returns the guest's receipt, signed over the bind's nonce, with its evidence, then the guest's sealed answer to that message | raises its fence; checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation, and answers with a receipt while it takes the quote over the bind's nonce; puts in place the credentials sealed with the bind before the sandbox runs anything of the tenant, and runs the command sealed with it once the sandbox runs | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service; it holds a bind back, which the guest takes only until its `notAfter` |
+| `Bind` | orchestrator or binder | for a bind that names no TD, first claims the ready TD the bind names, if the caller may (ready to bound); places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, with a message sealed for it if one comes, and returns the guest's receipt, signed over the bind's nonce, with its evidence, then, as each comes, the guest's sealed answer to that message and its quote over the bind's nonce | raises its fence; checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation, and answers with a receipt while it takes the quote over the bind's nonce, which it sends after the receipt; puts in place the credentials sealed with the bind before the sandbox runs anything of the tenant, and runs the command sealed with it once the sandbox runs | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service; it holds a bind back, which the guest takes only until its `notAfter` |
 | `Connect` | anyone, once the TD is bound | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored; refuses a TD that is not bound yet | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
@@ -474,10 +474,13 @@ reach, no new HTTP method and no cloud metadata endpoint.
    binder's nonce. Before the sandbox runs anything of the tenant, it tries
    the message sealed to its one-time KEM key if one came by then, puts in
    place the credentials it carries, and erases that key. It answers with the
-   receipt. The quote follows in the evidence it serves, and the binder holds
-   it to the receipt. A guest whose admission fails after it extended RTMR[3]
-   ends, with its receipt unsent and no quote, and a bind sent again is
-   answered with the same receipt and quote.
+   receipt, and sends the quote after it on the same call as soon as it has
+   it, so that a start never waits on the evidence requests the daemon relays,
+   which every caller shares; from then on the quote is in the evidence it
+   serves too. The binder holds the quote to the receipt. A guest whose
+   admission fails after it extended RTMR[3] ends, with its receipt unsent and
+   no quote, and a bind sent again is answered with the same receipt and
+   quote.
 
 A receipt is fresh because the nonce is the binder's, and only the guest's
 agent, as it takes its one bind, can sign one: the binder checks the quote
@@ -496,10 +499,11 @@ a quote that passes it but cannot yet be judged for want of one leaves the
 session running, and its verdict is kept once the document comes.
 
 A quote that fails that check ends the session, and so does no quote at all. A
-guest whose quote fails tries again a few times, then says in its state that
-it has given up (`bind_quote`); a binder that has no quote by then, or within
-a few seconds, asks for one over its own nonce through `Connect`, and destroys
-the session if none comes, since a check that cannot be made counts as failed
+guest whose quote fails tries again a few times, then says on the bind's call
+and in its state that it has given up (`bind_quote`); a binder that has no
+quote by then, or within a few seconds, or whose call ended without one, asks
+for one over its own nonce through `Connect`, and destroys the session if none
+comes, since a check that cannot be made counts as failed
 ([Rules](sessions.md#rules)). The verdict that is kept rests on a quote alone,
 and a binder whose policy asks for the quote first waits for it before it
 sends anything.
