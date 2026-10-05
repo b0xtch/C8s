@@ -350,7 +350,7 @@ spends nothing, since its own outputs wait for its own commits.
 
 | Call | Made by | Does |
 |---|---|---|
-| acquire | a TD whose bind names the session | for `start`, creates the record at generation 0, with this TD's lease; for `restore`, grants the lease if it is free, or at once in continuous mode, releases the stack if the bind names the latest generation, and spends its process layer unless the TD runs in continuous mode; for `fork`, releases a template's stack and creates the new session's record at generation 0, with this TD's lease |
+| acquire | a TD whose bind names the session | for `start`, creates the record at generation 0, with this TD's lease, and is refused for a session that has one; for `restore`, grants the lease if it is free, or at once in continuous mode, releases the stack if the bind names the latest generation, and spends its process layer unless the TD runs in continuous mode; for `fork`, releases a template's stack and creates the new session's record at generation 0, with this TD's lease |
 | renew | the lease holder | extends the lease at the holder's grant number, even once it has lapsed if no grant has followed, answered inside the attested channel with the key service's time, so no answer can be replayed; it and `advance` are refused once the vendor's documents the key service holds refuse the holder's platform |
 | advance | the lease holder | moves the generation from g to g+1 by compare-and-swap, with the new layers or journal record; releases the lease for a seal and keeps it for a commit or an epoch |
 | release | the lease holder | frees the lease at a clean end without a seal |

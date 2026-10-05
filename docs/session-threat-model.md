@@ -161,6 +161,18 @@ but not confidentiality.
   and a bind that claims it from the orchestrator or from a binder its pool
   names, under an authority the pool names for that binder. It refuses
   `Connect` to an unbound TD, and TD names are random besides.
+- **A start the daemon calls not ready.** A daemon can deliver a bind and then
+  tell the binder that the TD was not ready, or withhold the guest's answer,
+  so a binder that signs for another TD may have started the session in two.
+  Nothing reaches a TD the binder did not judge, and the binder keeps the
+  session's name for its second bind, so the key service decides between the
+  two: it creates a session's record, and grants its lease, for one TD only,
+  and the other ends with nothing it did having left its gateways ([Lease
+  timing](session-state.md#lease-timing)). The first TD can take that bind
+  only before its `notAfter`, and only until its pool's age limit ends it
+  unbound. Milestone 1 has no leases, so there both may run and a command
+  sealed with a bind may run twice; a binder that must never have that sends
+  its command over `Connect`, to the TD whose receipt it holds.
 - **A host that sets the guest's clock.** A guest's wall clock is its host's,
   so no check rests on it: durations run on the TD's monotonic clock, which
   the host can stop but not slow, and dates such as a bind's `notAfter` are

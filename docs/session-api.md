@@ -100,9 +100,12 @@ guest's own API on its TLS port.
   binder it looks only in the pools that name it with the bind's authority.
   For a TD claimed, bound or gone by then, or not in those pools, it answers
   not ready, before anything reaches a guest, and the binder signs for another
-  it has judged. The daemon reports each such start to the orchestrator in
-  `Watch`, with the key of the binder that sent it, and a binder can neither
-  bind a claimed TD nor end a TD: both stay the orchestrator's.
+  it has judged, under the same session name, since a daemon could have
+  delivered the first bind all the same ([A start the daemon calls not
+  ready](session-threat-model.md#binding-and-identity)). The daemon reports
+  each such start to the orchestrator in `Watch`, with the key of the binder
+  that sent it, and a binder can neither bind a claimed TD nor end a TD: both
+  stay the orchestrator's.
 - **claimed to bound.** The guest raises its fence as the bind arrives,
   closing every connection made before it but the daemon's own, so nothing
   sent to the guest before its bind reaches the session. It takes one bind,
@@ -340,7 +343,7 @@ in the release log with its reference values
 | `purpose` | `start`, `restore`, `fork` or `template`; with the `generation` a restore expects, or the `template` a fork comes from |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
 | `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (the key service, or the binder, sealed with the bind or put over `Connect`), with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`, which every bind carries; `any` allows every public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
-| `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other. With it, `members`: the digests of the instance keys of its replicas, each of which the binder judged as for a release, on the vendor's documents as it fetched them itself within the last hour. From the bind on, the guest takes nothing from a replica, and sends it nothing, unless it is one of them or joined them by a membership that a majority of the replicas the guest holds signed ([Which replicas a guest trusts](session-key-service.md#which-replicas-a-guest-trusts)) |
+| `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other, and at a bind naming none closes its session with the key service and deals with no replica after it. With it, `members`: the digests of the instance keys of its replicas, each of which the binder judged as for a release, on the vendor's documents as it fetched them itself within the last hour. From the bind on, the guest takes nothing from a replica, and sends it nothing, unless it is one of them or joined them by a membership that a majority of the replicas the guest holds signed ([Which replicas a guest trusts](session-key-service.md#which-replicas-a-guest-trusts)) |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |
 | `nonce`, `notAfter` | the binder's nonce, over which the guest answers the bind with fresh evidence, and a short validity, a minute by default, which the guest judges by the key service's time, never by its own wall clock ([Lease timing](session-state.md#lease-timing)) |

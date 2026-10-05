@@ -330,7 +330,11 @@ no road to the vendor:
   ahead, as it does a pool's ready TDs, so naming them costs a bind no time.
   The authority's signature carries that verdict to the guest. A guest whose
   session is with a replica outside them opens one with a replica among them
-  before it judges the bind's `notAfter`, by that replica's time.
+  before the bind has any other effect, so that the time it judges the bind's
+  `notAfter` by is a member's, and refuses the bind if it reaches none
+  (`bind_no_member`). After that it drops a connection to any replica outside
+  them as soon as the handshake shows the replica's key, having sent it
+  nothing.
 - **Memberships follow restarts.** A replica that restarts comes back with a
   new instance key ([Replicas](#replicas)), and an upgrade replaces every
   replica in turn, so a session can outlive every replica its bind names. Each
@@ -339,7 +343,8 @@ no road to the vendor:
   committed and it has judged each newcomer's evidence on documents it fetched
   itself within the hour. A guest takes a membership only with the signatures
   of a majority of one it already holds, and from then on trusts its members
-  and no others.
+  and no others. A replica serves the current statement with each member's
+  evidence, which is how a binder finds the replicas it judges.
 - **Every answer names its membership.** A replica's answers carry the number
   of the membership it serves under, so a guest learns of a change by its next
   renewal and asks for the statements it lacks. The replicas judge each other
