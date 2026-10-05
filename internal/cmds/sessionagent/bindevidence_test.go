@@ -561,6 +561,85 @@ func TestClientGoesOnWithAReceiptAndKeepsNoVerdictOnIt(t *testing.T) {
 	}
 }
 
+// An owner has its guest's certificate before the bind is answered, from the
+// evidence it verified the unbound guest by. A client that judges that
+// certificate ahead, by what a connection after the pin is held to, opens its
+// first connection without judging anything. A certificate for another key
+// is not judged ahead, and neither is any for a client that pinned no key.
+func TestClientJudgesItsGuestsCertificateAhead(t *testing.T) {
+	p, tee, _ := quoted(t)
+	binder, _ := p.watched(t, p.policy)
+	ready, err := binder.Ready(ctxT(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	served, _ := p.heldConn(t)
+	leaf := served.ConnectionState().PeerCertificates[0]
+	bind := p.bindFor(t, ready, nil)
+	bound := p.boundPolicy(ready, bind)
+	// The quoting service is slow: the guest serves under the certificate
+	// from before its bind for the length of the test.
+	release := tee.hold()
+	defer release()
+	resp, err := binder.Bind(ctxT(t), bind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.VerifyBindReceipt(bound, ready.InstanceKey, bind, resp.Receipt); err != nil {
+		t.Fatal(err)
+	}
+	receipted := func() (*session.Client, *steps) {
+		taken := &steps{}
+		client, err := session.NewClient(p.url, bound, sessiontest.Engine{}, p.access, taken.option(), session.Receipted(ready.InstanceKey))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(client.Close)
+		return client, taken
+	}
+
+	// Without it, the first connection judges the certificate.
+	plain, taken := receipted()
+	if _, err := plain.Exec(ctxT(t), session.ExecRequest{Argv: []string{"true"}}); err != nil {
+		t.Fatal(err)
+	}
+	if taken.count(session.TimedServingVerdict) != 1 {
+		t.Fatalf("a client that judged nothing ahead: %s", taken.list())
+	}
+
+	client, taken := receipted()
+	stranger, _, _ := quoted(t)
+	theirs, _ := stranger.heldConn(t)
+	if err := client.Prejudge(ctxT(t), theirs.ConnectionState().PeerCertificates[0]); err == nil {
+		t.Fatal("another guest's certificate was judged ahead for this client")
+	}
+	if err := client.Prejudge(ctxT(t), nil); err == nil {
+		t.Fatal("no certificate was judged ahead")
+	}
+	if err := client.Prejudge(ctxT(t), leaf); err != nil {
+		t.Fatalf("Prejudge: %v", err)
+	}
+	if taken.count(session.TimedServingVerdict) != 1 {
+		t.Fatalf("the steps after judging ahead: %s", taken.list())
+	}
+	out, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"echo", "ahead"}})
+	if err != nil || string(out.Stdout) != "ahead\n" {
+		t.Fatalf("the first command: %+v, %v", out, err)
+	}
+	if taken.count(session.TimedServingVerdict) != 1 || taken.count(session.TimedHandshake) != 1 {
+		t.Fatalf("the first connection judged the certificate again: %s", taken.list())
+	}
+	// A certificate judged ahead is no quote: the client keeps no verdict.
+	if _, ok := client.Verdict(); ok {
+		t.Fatal("a client keeps a verdict on a certificate it judged ahead")
+	}
+
+	unpinned, _ := p.watched(t, bound)
+	if err := unpinned.Prejudge(ctxT(t), leaf); err == nil {
+		t.Fatal("a client that pinned no key judged a certificate ahead")
+	}
+}
+
 // The same bind sent again, by a client that lost the first answer, is
 // answered as the first time: as bound, and with the evidence the guest took
 // over the bind's nonce.

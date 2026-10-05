@@ -449,6 +449,45 @@ func (c *Client) verifyConnection(cs tls.ConnectionState) error {
 	return nil
 }
 
+// Prejudge judges a serving certificate ahead of the connection that will
+// present it, by what a connection after the pin is held to, and keeps the
+// verdict: the handshake that presents the certificate then judges nothing.
+// It is for an owner that has its guest's certificate already, from the
+// evidence its daemon relayed, and time to spare while the guest takes its
+// bind. The certificate must carry the key the client has pinned.
+func (c *Client) Prejudge(ctx context.Context, leaf *x509.Certificate) error {
+	if leaf == nil {
+		return errors.New("no certificate to judge ahead")
+	}
+	der, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil {
+		return refuse("the certificate carries no usable instance key: %v", err)
+	}
+	if pinned := c.pinned(); pinned == nil || !bytes.Equal(der, pinned) {
+		return refuse("a certificate is judged ahead only for the instance key its client has pinned")
+	}
+	now := c.now()
+	began := time.Now()
+	res, err := judgeServingCert(c.judging(ctx, true), c.required(), c.engine, leaf, now)
+	if err != nil {
+		return err
+	}
+	c.timed(TimedServingVerdict, began)
+	until := stands(now, leaf, res)
+	if err := standsNot(now, until, leaf, res); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.remember(sha256.Sum256(leaf.Raw), until, now)
+	// As after a handshake: the verdict on the pinned key covers every
+	// certificate that carries it.
+	if until.After(c.judgedUntil) {
+		c.judgedUntil = until
+	}
+	return nil
+}
+
 // remember keeps until when the certificate of fingerprint passes the
 // handshake gate without being judged again. The caller holds mu.
 func (c *Client) remember(fingerprint [sha256.Size]byte, until, now time.Time) {
