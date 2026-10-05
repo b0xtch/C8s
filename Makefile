@@ -200,6 +200,16 @@ test-e2e-cw-workload:
 test-session-hardware:
 	./test/session/hardware.sh
 
+# Timing of a session's warm start on the same host and setup
+# (docs/session-performance.md): one session a round, each step timed, and
+# stock Firecracker sampled between the rounds when C8S_FIRECRACKER names a
+# directory written by test/session/firecracker-setup.sh. Needs, besides what
+# the hardware test needs, C8S_WARMSTART from go build
+# ./test/session/warmstart. Not CI-wired.
+.PHONY: bench-session-warmstart
+bench-session-warmstart:
+	./test/session/timing.sh
+
 # --- Linting ---
 
 vet:
