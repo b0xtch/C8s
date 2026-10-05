@@ -231,13 +231,13 @@ func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, 
 func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 	a.measured.RLock()
 	phase, events := a.stateLocked()
-	bind, quote := a.bind, a.bindQuote
+	bind, quote, quoteState := a.bind, a.bindQuote, a.bindQuoteState
 	prepared := phase == session.PhaseReady && a.preparedLocked()
 	a.measured.RUnlock()
 
 	state := session.StateResponse{
 		Phase: phase, InstanceKey: a.keyDER, Prepared: prepared,
-		Launch: a.launch, Signature: a.signature, Events: events, Attestation: quote,
+		Launch: a.launch, Signature: a.signature, Events: events, BindQuote: quoteState, Attestation: quote,
 	}
 	if bind != nil {
 		state.Bind, state.BindSignature = bind.Raw, bind.Signature

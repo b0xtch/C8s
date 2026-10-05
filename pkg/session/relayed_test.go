@@ -2,15 +2,18 @@ package session_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
@@ -230,5 +233,107 @@ func TestRelayedEvidenceIsRefused(t *testing.T) {
 	var refused *session.VerificationError
 	if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer); errors.As(err, &refused) {
 		t.Fatalf("the guest's own answer was refused: %v", err)
+	}
+}
+
+// awayEngine is an engine with no road to the vendor's service and nothing
+// kept: it judges nothing, and holds what it is asked to hold.
+type awayEngine struct {
+	sessiontest.Engine
+	held atomic.Int32
+}
+
+func (e *awayEngine) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	if !session.Offline(ctx) {
+		return nil, errors.New("collateral unavailable: no route to the vendor's service")
+	}
+	e.held.Add(1)
+	return e.Engine.VerifyEvidence(ctx, env, reportData)
+}
+
+// A quote that cannot be judged for want of one of the vendor's documents is
+// still held to everything that needs none, and to its receipt: that decides
+// whether the session goes on. What is held is no judgment: no verdict is
+// kept on it and no client is confirmed by it. A hold refuses what a
+// judgment refuses.
+func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
+	s := serveReady(t, sessiontest.NewTD())
+	engine := sessiontest.Engine{}
+	ready, err := session.VerifyReady(within(t), s.policy, engine, relayedState(t, s), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind := bindFor(t, s, ready)
+	answer := relayedBind(t, s, bind)
+	bound := (&session.Binding{LaunchKey: s.bundle.LaunchKey, Launch: ready.Launch, Bind: bind}).Policy(s.policy.Image)
+	receipt, err := session.VerifyBoundReceipt(bound, ready, bind, answer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	away := &awayEngine{}
+	if _, err := session.VerifyBound(within(t), bound, away, ready.InstanceKey, bind, answer); err == nil || isVerdict(err) {
+		t.Fatalf("a quote judged with no document at hand: %v, want an outage and no verdict", err)
+	}
+	held, err := session.HoldBound(within(t), bound, away, ready.InstanceKey, bind, answer)
+	if err != nil {
+		t.Fatalf("HoldBound: %v", err)
+	}
+	if !held.Held || away.held.Load() != 1 || held.Phase != session.PhaseRunning || held.Tenant != "acme" {
+		t.Fatalf("the held attestation: %+v after %d offline checks", held, away.held.Load())
+	}
+	if err := receipt.Confirmed(held); err != nil {
+		t.Fatalf("the held quote does not confirm its receipt: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(answer.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict, err := session.VerdictOn(bound, engine, held, leaf, time.Now()); err == nil || verdict != nil {
+		t.Fatalf("a verdict was kept on a quote that was held and never judged: %+v", verdict)
+	}
+	client, err := session.NewClient("https://"+s.addr, bound, engine, s.signer, session.Receipted(ready.InstanceKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Confirmed(held, leaf); err == nil {
+		t.Fatal("a client was confirmed by a quote that was held and never judged")
+	}
+	if _, ok := client.Verdict(); ok {
+		t.Fatal("the client keeps a verdict")
+	}
+	// The same quote, judged once the document is there, is no longer held.
+	judged, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer)
+	if err != nil || judged.Held {
+		t.Fatalf("the quote judged with its documents: held %v, %v", judged != nil && judged.Held, err)
+	}
+	if err := client.Confirmed(judged, leaf); err != nil {
+		t.Fatalf("Confirmed with the judged quote: %v", err)
+	}
+
+	other := serveReady(t, sessiontest.NewTD())
+	for name, tc := range map[string]func(r *session.Relayed){
+		"no quote":                             func(r *session.Relayed) { r.Evidence = nil },
+		"a quote that does not parse":          func(r *session.Relayed) { r.Evidence = []byte("{") },
+		"events the quote does not cover":      func(r *session.Relayed) { r.Events = r.Events[:1] },
+		"a phase the guest did not report":     func(r *session.Relayed) { r.Phase = session.PhaseBound },
+		"another bind in the bind's place":     func(r *session.Relayed) { r.Bind = bindFor(t, s, ready).Raw },
+		"another launch document in its place": func(r *session.Relayed) { r.Launch, r.Signature = other.bundle.Launch, other.bundle.Signature },
+	} {
+		relayed := *answer
+		relayed.Events = append([]string(nil), answer.Events...)
+		tc(&relayed)
+		if _, err := session.HoldBound(within(t), bound, away, ready.InstanceKey, bind, &relayed); !isVerdict(err) {
+			t.Errorf("%s was held as the guest's answer to the bind: %v", name, err)
+		}
+	}
+	// Another guest's key: the quote binds the one the bind names.
+	otherReady, err := session.VerifyReady(within(t), other.policy, engine, relayedState(t, other), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.HoldBound(within(t), bound, away, otherReady.InstanceKey, bind, answer); !isVerdict(err) {
+		t.Errorf("a quote was held under another guest's instance key: %v", err)
 	}
 }

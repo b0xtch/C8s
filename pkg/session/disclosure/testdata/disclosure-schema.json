@@ -56,6 +56,16 @@
           "optional": true
         },
         {
+          "name": "bind_quote",
+          "kind": "code",
+          "codes": [
+            "trying",
+            "taken",
+            "given_up"
+          ],
+          "optional": true
+        },
+        {
           "name": "attestation",
           "kind": "message",
           "message": "attestation",

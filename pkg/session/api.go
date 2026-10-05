@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // The agent serves these over RA-TLS on AgentPort. PathAttest, PathExec,
@@ -125,12 +126,24 @@ type StateResponse struct {
 	// measured it.
 	Bind          []byte `json:"bind,omitempty"`
 	BindSignature string `json:"bind_signature,omitempty"`
+	// BindQuote says where the quote over the bind's nonce stands, once the
+	// guest runs its sandbox: BindQuoteTrying, BindQuoteTaken or
+	// BindQuoteGivenUp. A binder that reads the last asks the guest for an
+	// attestation itself.
+	BindQuote string `json:"bind_quote,omitempty"`
 	// Attestation is the evidence a bound guest took over its bind's nonce,
 	// once it has it: what its answer to the bind held, or what followed the
 	// receipt in that answer. It is served as it was taken, and asking for
 	// the state has no guest take a quote.
 	Attestation *AttestResponse `json:"attestation,omitempty"`
 }
+
+// Where the quote a bound guest takes over its bind's nonce stands.
+const (
+	BindQuoteTrying  = string(disclosure.QuoteTrying)
+	BindQuoteTaken   = string(disclosure.QuoteTaken)
+	BindQuoteGivenUp = string(disclosure.QuoteGivenUp)
+)
 
 // BindRequest hands a guest its one bind.
 type BindRequest struct {

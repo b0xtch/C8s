@@ -152,8 +152,9 @@ const (
 // BoundEvidence waits for the quote the TD's guest takes over its bind's
 // nonce, and returns the guest's evidence with it, relayed and unjudged. A
 // guest that takes none, because its ration of quotes had none to give or
-// its quoting service failed, is waited for until ctx ends: its binder then
-// asks it for an attestation itself.
+// its quoting service failed, tries again a few times and then says that it
+// gave up: that is session.ErrNoBindQuote. Until then it is waited for until
+// ctx ends. Either way its binder asks it for an attestation itself.
 func (c *Client) BoundEvidence(ctx context.Context, td string) (*session.Relayed, error) {
 	for pause := quotePause; ; pause = min(2*pause, quotePauseMost) {
 		evidence, err := c.Evidence(ctx, td)
@@ -162,6 +163,9 @@ func (c *Client) BoundEvidence(ctx context.Context, td string) (*session.Relayed
 		}
 		if len(evidence.Evidence) > 0 {
 			return evidence, nil
+		}
+		if evidence.BindQuote == session.BindQuoteGivenUp {
+			return nil, session.ErrNoBindQuote
 		}
 		select {
 		case <-ctx.Done():
@@ -181,6 +185,7 @@ func relayed(e *sessionv1alpha1.Evidence) *session.Relayed {
 		Bind:          e.GetBind(),
 		BindSignature: string(e.GetBindSignature()),
 		Evidence:      e.GetQuote(),
+		BindQuote:     e.GetBindQuote(),
 		Collateral:    e.GetCollateral(),
 	}
 }

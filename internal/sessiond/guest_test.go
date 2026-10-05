@@ -121,9 +121,19 @@ func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 	if len(evidence.GetQuote()) != 0 || evidence.GetPhase() != string(session.PhaseRunning) || len(evidence.GetEvents()) != 3 || !bytes.Equal(evidence.GetBind(), []byte("bind")) {
 		t.Fatalf("the evidence of a bound guest that has no quote yet: %+v", evidence)
 	}
-	guest.say(func(g *saidGuest) { g.state.Attestation = quote })
+	// Where the guest says its quote stands is relayed as the guest says it.
+	for _, said := range []string{session.BindQuoteTrying, session.BindQuoteGivenUp, ""} {
+		guest.say(func(g *saidGuest) { g.state.BindQuote = said })
+		if evidence, err = client.evidence(ctx, addr); err != nil || evidence.GetBindQuote() != said || len(evidence.GetQuote()) != 0 {
+			t.Fatalf("a guest that says its quote is %q was relayed as %q (%v)", said, evidence.GetBindQuote(), err)
+		}
+	}
+	guest.say(func(g *saidGuest) { g.state.Attestation, g.state.BindQuote = quote, session.BindQuoteTaken })
 	if evidence, err = client.evidence(ctx, addr); err != nil {
 		t.Fatal(err)
+	}
+	if evidence.GetBindQuote() != session.BindQuoteTaken {
+		t.Fatalf("a guest that has its quote was relayed as %q", evidence.GetBindQuote())
 	}
 	if !bytes.Equal(evidence.GetQuote(), wantQuote) || !bytes.Equal(evidence.GetCertificate(), leaf) ||
 		!bytes.Equal(evidence.GetLaunchDocument(), []byte("launch")) || string(evidence.GetLaunchSignature()) != "launch signature" ||

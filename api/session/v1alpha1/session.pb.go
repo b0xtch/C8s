@@ -369,7 +369,10 @@ type Evidence struct {
 	Collateral    []byte `protobuf:"bytes,7,opt,name=collateral,proto3" json:"collateral,omitempty"`
 	BindSignature []byte `protobuf:"bytes,9,opt,name=bind_signature,json=bindSignature,proto3" json:"bind_signature,omitempty"`
 	// What the guest calls its state: ready, bound or running.
-	Phase         string `protobuf:"bytes,10,opt,name=phase,proto3" json:"phase,omitempty"`
+	Phase string `protobuf:"bytes,10,opt,name=phase,proto3" json:"phase,omitempty"`
+	// Where the guest says the quote over its bind's nonce stands, once it
+	// runs its sandbox: trying, taken or given_up.
+	BindQuote     string `protobuf:"bytes,11,opt,name=bind_quote,json=bindQuote,proto3" json:"bind_quote,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -463,6 +466,13 @@ func (x *Evidence) GetBindSignature() []byte {
 func (x *Evidence) GetPhase() string {
 	if x != nil {
 		return x.Phase
+	}
+	return ""
+}
+
+func (x *Evidence) GetBindQuote() string {
+	if x != nil {
+		return x.BindQuote
 	}
 	return ""
 }
@@ -725,7 +735,7 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\tsignature\x18\x04 \x01(\fR\tsignatureJ\x04\b\x05\x10\x06\"]\n" +
 	"\x05Bound\x12:\n" +
 	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
-	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xa5\x02\n" +
+	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xc4\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +
@@ -738,7 +748,9 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"collateral\x12%\n" +
 	"\x0ebind_signature\x18\t \x01(\fR\rbindSignature\x12\x14\n" +
 	"\x05phase\x18\n" +
-	" \x01(\tR\x05phaseJ\x04\b\b\x10\t\"?\n" +
+	" \x01(\tR\x05phase\x12\x1d\n" +
+	"\n" +
+	"bind_quote\x18\v \x01(\tR\tbindQuoteJ\x04\b\b\x10\t\"?\n" +
 	"\x05Bytes\x12\x0e\n" +
 	"\x02td\x18\x01 \x01(\tR\x02td\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +

@@ -219,8 +219,17 @@ var Steps = []Code{
 	StepChecks, StepMeasure, StepCredentials, StepStart,
 }
 
+// Where the quote a bound guest takes over its bind's nonce stands: still
+// being tried, taken, or given up after the guest's last attempt at it.
+const (
+	QuoteTrying  Code = "trying"
+	QuoteTaken   Code = "taken"
+	QuoteGivenUp Code = "given_up"
+)
+
 var (
-	phases = []Code{"ready", "bound", "running"}
+	bindQuotes = []Code{QuoteTrying, QuoteTaken, QuoteGivenUp}
+	phases     = []Code{"ready", "bound", "running"}
 	// platforms are the tags a guest's evidence comes under.
 	platforms = []Code{"tdx", "snp"}
 )
@@ -260,7 +269,9 @@ var Schema = []Message{
 	{Name: MessageState, Says: "to anyone who asks what the guest is", Fields: append(append([]Field{
 		{Name: "instance_key", Kind: KindPublic, Max: maxKey},
 		{Name: "prepared", Kind: KindFlag, Optional: true},
-	}, measured()...), Field{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true})},
+	}, measured()...),
+		Field{Name: "bind_quote", Kind: KindCode, Codes: bindQuotes, Optional: true},
+		Field{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true})},
 	{Name: MessageFence, Says: "to its host, which claims it for a session", Fields: []Field{
 		{Name: "phase", Kind: KindCode, Codes: phases},
 		{Name: "closed", Kind: KindCounter, Max: 1 << 16},

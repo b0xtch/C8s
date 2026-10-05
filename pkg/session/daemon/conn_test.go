@@ -45,6 +45,13 @@ func (c *carrier) Connect(stream sessionv1alpha1.Sessions_ConnectServer) error {
 // serve runs a daemon whose Connect is connect, and returns a client of it.
 func serve(t *testing.T, connect func(td string, stream sessionv1alpha1.Sessions_ConnectServer) error) *daemon.Client {
 	t.Helper()
+	return serveAPI(t, &carrier{connect: connect})
+}
+
+// serveAPI runs a daemon that answers as api does, and returns a client of
+// it.
+func serveAPI(t *testing.T, api sessionv1alpha1.SessionsServer) *daemon.Client {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -72,7 +79,7 @@ func serve(t *testing.T, connect func(td string, stream sessionv1alpha1.Sessions
 	srv := grpc.NewServer(grpc.Creds(credentials.NewTLS(&tls.Config{
 		MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
 	})))
-	sessionv1alpha1.RegisterSessionsServer(srv, &carrier{connect: connect})
+	sessionv1alpha1.RegisterSessionsServer(srv, api)
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(srv.Stop)
 	client, err := daemon.Dial(daemon.Options{Address: ln.Addr().String(), RootCAs: roots})

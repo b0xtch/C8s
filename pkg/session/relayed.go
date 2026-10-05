@@ -30,6 +30,9 @@ type Relayed struct {
 	// Evidence is the platform's evidence over the bind's nonce in the
 	// guest's encoding, once a bound guest has taken it.
 	Evidence []byte
+	// BindQuote is where the guest says the quote over its bind's nonce
+	// stands: BindQuoteTrying, BindQuoteTaken or BindQuoteGivenUp.
+	BindQuote string
 	// Receipt is the guest's receipt for its bind, in an answer to a bind:
 	// see VerifyBoundReceipt.
 	Receipt *SignedReceipt
@@ -135,6 +138,32 @@ func VerifyBound(ctx context.Context, policy Policy, engine Engine, instanceKey 
 	return VerifyAttestation(WithCollateralSource(ctx, r.source), policy, engine, instanceKey, bind.Doc.EvidenceNonce(), resp)
 }
 
+// ErrNoBindQuote is a guest that says it gave up on the quote over its
+// bind's nonce. Its binder asks it for an attestation itself, and ends the
+// session if none comes.
+var ErrNoBindQuote = errors.New("the guest gave up on the quote over its bind's nonce")
+
+// HoldBound holds the quote a guest took over its bind's nonce to everything
+// that needs none of the vendor's documents: its signature chains to the
+// vendor's root, its report data binds the bind's nonce and instanceKey, and
+// its register replays from the events it carries, under the pinned image
+// and bind. It is for a binder whose engine could not judge the quote for
+// want of a document: VerifyBound failed, and with no refusal. A quote that
+// passes leaves the session running until the document comes, held to its
+// receipt with BindReceipt.Confirmed. One that fails ends the session.
+//
+// The attestation is held and stays unjudged: it says nothing of where the
+// platform's TCB stands, no verdict is kept on it, and nothing is released
+// on it.
+func HoldBound(ctx context.Context, policy Policy, engine Engine, instanceKey crypto.PublicKey, bind *SignedBind, r *Relayed) (*Attestation, error) {
+	att, err := VerifyBound(offline(ctx), policy, engine, instanceKey, bind, r)
+	if err != nil {
+		return nil, err
+	}
+	att.Held = true
+	return att, nil
+}
+
 // VerifyBoundReceipt judges a guest's relayed answer to a bind by its
 // receipt: the word of the instance key that VerifyReady found, fresh for the
 // bind's nonce, that the guest took this bind, extended what the bind's
@@ -165,6 +194,9 @@ func VerifyBoundReceipt(policy Policy, ready *ReadyTD, bind *SignedBind, r *Rela
 // is an engine that does not say what it requires. An error is a judgment
 // that does not stand even now.
 func VerdictOn(policy Policy, engine Engine, att *Attestation, leaf *x509.Certificate, now time.Time) (*Verdict, error) {
+	if att.Held {
+		return nil, errors.New("no verdict is kept on evidence that was held and never judged")
+	}
 	until := stands(now, leaf, att.Result)
 	if err := standsNot(now, until, leaf, att.Result); err != nil {
 		return nil, err

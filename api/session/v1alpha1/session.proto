@@ -92,6 +92,9 @@ message Evidence {
   bytes bind_signature = 9;
   // What the guest calls its state: ready, bound or running.
   string phase = 10;
+  // Where the guest says the quote over its bind's nonce stands, once it
+  // runs its sandbox: trying, taken or given_up.
+  string bind_quote = 11;
 }
 
 message Bytes {

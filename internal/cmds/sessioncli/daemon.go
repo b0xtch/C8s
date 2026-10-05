@@ -376,16 +376,14 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	bound := binding.Policy(identity)
 	bound.AcceptTCBStatus = s.acceptedTCB()
-	att, verdict, quote, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
+	judged, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
 	if err != nil {
-		// A guest that took the bind and is refused is of no use to anyone.
-		// One that could not be judged, for want of a document, may be yet.
-		if exitCode(err) == ExitRefused {
-			release()
-			return finish(ExitRefused, fmt.Errorf("the bind was sent, but the guest does not verify as bound by it, and its session was ended: %w", err))
-		}
-		return finish(exitCode(err), fmt.Errorf("the bind was sent, but the guest does not verify as bound by it: %w", err))
+		// The guest took the bind and cannot be held to it: it is of no use
+		// to anyone, and a check that could not be made counts as failed.
+		release()
+		return finish(exitCode(err), fmt.Errorf("the bind was sent, but the guest does not verify as bound by it, and its session was ended: %w", err))
 	}
+	att, verdict, quote := judged.att, judged.verdict, judged.quote
 	result.AttestMillis = time.Since(began).Milliseconds()
 	// For the owner's next command, which then asks the guest for no quote.
 	if verdict != nil {
@@ -401,6 +399,13 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 		if err := session.WriteReceipt(s.out, answer.Receipt); err != nil {
 			fmt.Fprintf(stderr, "the guest's receipt for the bind was not kept: %v\n", err)
 		}
+	}
+	// The quote is the guest's, and agrees with its receipt, but where its
+	// platform stands could not be judged for want of one of Intel's
+	// documents. The session runs, and nothing was kept on it: the owner's
+	// next command judges the guest itself before it sends anything.
+	if judged.pending != nil {
+		return finish(exitCode(judged.pending), fmt.Errorf("the session runs and its guest's quote is held to the bind, but the quote could not be judged, so no verdict was kept: %w", judged.pending))
 	}
 	result.Started, result.Tenant, result.Session, result.Phase = true, att.Tenant, att.Session, string(att.Phase)
 	if !asJSON {
@@ -419,81 +424,127 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 // over the bind's nonce before it asks the guest for an attestation itself.
 const quoteWait = 5 * time.Second
 
+// judgedBind is what a start made of its guest's answer to the bind.
+type judgedBind struct {
+	att     *session.Attestation
+	verdict *session.Verdict
+	// quote says where the quote came from: see quoteWithAnswer.
+	quote string
+	// pending is set when the quote is the guest's and agrees with its
+	// receipt, and could not be judged for want of one of the vendor's
+	// documents: it is why. The session then runs with no verdict kept.
+	pending error
+}
+
 // judgeBound judges the guest's answer to the bind, and gives the verdict to
 // keep on it. This command keeps a verdict for the owner's next one, and a
 // verdict is made from a quote, so it waits for the quote before it says the
 // session started: the one over the bind's nonce, which comes with the answer
 // or with the guest's evidence a moment later. A receipt in the answer is
 // verified first, and the quote is held to it. A guest that gives no quote
-// for the bind's nonce, because its ration had none to give, is asked for an
-// attestation over a connection of its own.
+// for the bind's nonce, because its quoting service failed it, is asked for
+// an attestation over a connection of its own.
+//
+// An error is a guest that cannot be held to its bind, and its caller ends
+// the session: a receipt or a quote that is refused, a quote that disagrees
+// with its receipt, and no quote at all. A quote that passes everything that
+// needs none of the vendor's documents, and cannot be judged for want of
+// one, leaves the session running: that comes back as pending.
 func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td string, bound session.Policy, engine session.Engine,
 	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, accessPEM []byte, stderr io.Writer,
-) (_ *session.Attestation, _ *session.Verdict, quote string, _ error) {
+) (*judgedBind, error) {
 	var receipt *session.BindReceipt
-	quote = quoteWithAnswer
+	judged := &judgedBind{quote: quoteWithAnswer}
 	if answer.Receipt != nil {
 		var err error
 		if receipt, err = session.VerifyBoundReceipt(bound, ready, bind, answer); err != nil {
-			return nil, nil, "", err
+			return nil, err
 		}
 		if len(answer.Evidence) == 0 {
+			// Until the quote is there, the guest says it gave up on it, or
+			// a few seconds have passed.
 			waiting, cancel := context.WithTimeout(ctx, quoteWait)
 			quoted, err := host.BoundEvidence(waiting, td)
 			cancel()
 			if err == nil {
-				answer, quote = quoted, quoteWithEvidence
+				answer, judged.quote = quoted, quoteWithEvidence
 			}
 		}
 	}
-	if len(answer.Evidence) == 0 {
-		quote = quoteAskedFor
-	}
-	att, verdict, err := judgeQuote(ctx, s, host, td, bound, engine, ready, bind, answer, accessPEM, stderr)
-	if err != nil {
-		return nil, nil, "", err
-	}
-	if receipt != nil {
-		if err := receipt.Confirmed(att); err != nil {
-			return nil, nil, "", err
+	confirm := func(att *session.Attestation) error {
+		if receipt == nil {
+			return nil
 		}
+		return receipt.Confirmed(att)
 	}
-	return att, verdict, quote, nil
-}
-
-// judgeQuote judges the quote in the guest's evidence, or, with none there,
-// attests the guest over a connection of its own.
-func judgeQuote(ctx context.Context, s *startFlags, host *daemon.Client, td string, bound session.Policy, engine session.Engine,
-	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, accessPEM []byte, stderr io.Writer,
-) (*session.Attestation, *session.Verdict, error) {
 	if len(answer.Evidence) > 0 {
 		att, err := session.VerifyBound(ctx, bound, engine, ready.InstanceKey, bind, answer)
 		if err != nil {
-			return nil, nil, err
+			if exitCode(err) == ExitRefused {
+				return nil, err
+			}
+			// No verdict for want of a document. What needs none still
+			// decides whether the session goes on.
+			held, holdErr := session.HoldBound(ctx, bound, engine, ready.InstanceKey, bind, answer)
+			if holdErr != nil {
+				return nil, fmt.Errorf("the quote could not be judged (%w), and does not hold without the vendor's documents: %w", err, holdErr)
+			}
+			if err := confirm(held); err != nil {
+				return nil, err
+			}
+			judged.att, judged.pending = held, err
+			return judged, nil
+		}
+		if err := confirm(att); err != nil {
+			return nil, err
 		}
 		leaf, err := x509.ParseCertificate(answer.Certificate)
 		if err != nil {
 			leaf = nil
 		}
-		verdict, err := session.VerdictOn(bound, engine, att, leaf, time.Now())
-		return att, verdict, err
+		judged.att = att
+		judged.verdict, err = session.VerdictOn(bound, engine, att, leaf, time.Now())
+		return judged, err
 	}
+
+	// No quote over the bind's nonce: this command asks for one over a nonce
+	// of its own, on a connection that ends in the guest.
+	judged.quote = quoteAskedFor
 	signer, err := operatorauth.NewSignerFromKeyPEM(accessPEM)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	options := append(s.road(stderr), session.Through(host.Dialer(td)))
 	client, err := session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer, options...)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer client.Close()
-	att, err := client.Attest(ctx)
+	evidence, err := client.FetchEvidence(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("the guest gave no quote over its bind's nonce, and none when asked: %w", err)
 	}
-	verdict, _ := client.Verdict()
-	return att, verdict, nil
+	att, err := client.Judge(ctx, evidence)
+	if err != nil {
+		if exitCode(err) == ExitRefused {
+			return nil, err
+		}
+		held, holdErr := evidence.Hold(ctx, bound, engine)
+		if holdErr != nil {
+			return nil, fmt.Errorf("the quote could not be judged (%w), and does not hold without the vendor's documents: %w", err, holdErr)
+		}
+		if err := confirm(held); err != nil {
+			return nil, err
+		}
+		judged.att, judged.pending = held, err
+		return judged, nil
+	}
+	if err := confirm(att); err != nil {
+		return nil, err
+	}
+	judged.att = att
+	judged.verdict, _ = client.Verdict()
+	return judged, nil
 }
 
 func newDestroyCmd() *cobra.Command {

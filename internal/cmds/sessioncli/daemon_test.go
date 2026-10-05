@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -223,58 +224,109 @@ func TestVerifyHoldsTheKeptReceiptToItsGuest(t *testing.T) {
 }
 
 // failingLater is an engine that judges its first evidence, the unbound
-// guest's, and fails every one after it with err.
+// guest's, and fails every one after it with err. With holds it still holds
+// evidence to what needs none of the vendor's documents, as an engine does
+// that only lacks a document.
 type failingLater struct {
 	counting
-	err error
+	err   error
+	holds bool
+	held  atomic.Int32
 }
 
 func (e *failingLater) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
-	if e.calls.Add(1) > 1 {
-		return nil, e.err
+	if e.calls.Add(1) == 1 {
+		return e.Engine.VerifyEvidence(ctx, env, reportData)
 	}
-	return e.Engine.VerifyEvidence(ctx, env, reportData)
+	if e.holds && session.Offline(ctx) {
+		e.held.Add(1)
+		return e.Engine.VerifyEvidence(ctx, env, reportData)
+	}
+	return nil, e.err
 }
 
-// A guest that took the bind and whose quote is then refused is of no use to
-// anyone: the start ends its session, and the host has its place again. A
-// quote that could not be judged leaves the session, which may verify yet.
-func TestStartEndsAGuestWhoseQuoteIsRefused(t *testing.T) {
+// A guest that took the bind and cannot be held to it is of no use to
+// anyone: the start ends its session, and the host has its place again. That
+// is a guest whose quote is refused, and one whose quote can neither be
+// judged nor held. A quote that cannot be judged for want of a document, and
+// passes everything that needs none, leaves the session running with no
+// verdict kept.
+func TestStartEndsAGuestItCannotHoldToItsBind(t *testing.T) {
 	host := sessiondtest.NewHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
-	s := starting(t, host, "sbx-1")
-	s.engineForTest = &failingLater{err: &session.VerificationError{Err: errors.New("the quote is not the pinned guest's")}}
-	var stdout, stderr bytes.Buffer
-	if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitRefused {
-		t.Fatalf("a start whose guest's quote is refused: exit %d: %s%s", code, stdout.String(), stderr.String())
-	}
-	if !strings.Contains(stdout.String(), "its session was ended") {
-		t.Fatalf("the refused start said %s", stdout.String())
-	}
-	// The host has room for one TD, and the name is taken while a session
-	// of it lives: the next start succeeds only if the refused one is gone.
-	next := starting(t, host, "sbx-1")
-	if res := start(t, next); !res.Started {
-		t.Fatalf("start after the refused guest = %+v", res)
-	}
 	orchestrator := &daemonFlags{cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
-	stdout.Reset()
-	if code := runDestroy(context.Background(), orchestrator, next.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK {
-		t.Fatalf("destroy exit %d: %s", code, stderr.String())
+	for name, tc := range map[string]struct {
+		engine *failingLater
+		code   int
+	}{
+		"a quote that is refused": {
+			&failingLater{err: &session.VerificationError{Err: errors.New("the quote is not the pinned guest's")}}, ExitRefused,
+		},
+		"a quote that is refused, by an engine that would hold it": {
+			&failingLater{err: &session.VerificationError{Err: errors.New("the quote is not the pinned guest's")}, holds: true}, ExitRefused,
+		},
+		"a quote that can be neither judged nor held": {
+			&failingLater{err: errors.New("collateral unavailable")}, ExitUnavailable,
+		},
+	} {
+		s := starting(t, host, "sbx-1")
+		s.engineForTest = tc.engine
+		var stdout, stderr bytes.Buffer
+		if code := runStart(context.Background(), s, true, &stdout, &stderr); code != tc.code {
+			t.Fatalf("%s: exit %d, want %d: %s%s", name, code, tc.code, stdout.String(), stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "its session was ended") {
+			t.Fatalf("%s: the start said %s", name, stdout.String())
+		}
+		if tc.engine.held.Load() != 0 {
+			t.Fatalf("%s: a refused quote was held %d times", name, tc.engine.held.Load())
+		}
+		if _, err := os.Stat(filepath.Join(s.out, session.VerdictFile)); err == nil {
+			t.Fatalf("%s: a verdict was kept", name)
+		}
+		// The host has room for one TD, and the name is taken while a
+		// session of it lives: the next start succeeds only if this one's
+		// guest is gone.
+		next := starting(t, host, "sbx-1")
+		if res := start(t, next); !res.Started {
+			t.Fatalf("%s: the start after it = %+v", name, res)
+		}
+		stdout.Reset()
+		if code := runDestroy(context.Background(), orchestrator, next.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK {
+			t.Fatalf("destroy exit %d: %s", code, stderr.String())
+		}
 	}
 
-	// Intel's service being away says nothing about the guest.
+	// Intel's service being away says nothing about the guest. Its quote is
+	// the guest's own and agrees with its receipt: the session runs, and what
+	// could not be judged is not kept as judged.
 	away := starting(t, host, "sbx-2")
-	away.engineForTest = &failingLater{err: errors.New("collateral unavailable")}
-	stdout.Reset()
+	engine := &failingLater{err: errors.New("collateral unavailable"), holds: true}
+	away.engineForTest = engine
+	var stdout, stderr bytes.Buffer
 	if code := runStart(context.Background(), away, true, &stdout, &stderr); code != ExitUnavailable {
 		t.Fatalf("a start whose guest's quote could not be judged: exit %d: %s%s", code, stdout.String(), stderr.String())
 	}
-	if strings.Contains(stdout.String(), "its session was ended") {
-		t.Fatalf("the start ended a session it could not judge: %s", stdout.String())
+	var res startedSession
+	if err := json.Unmarshal(stdout.Bytes(), &res); err != nil {
+		t.Fatal(err)
 	}
+	if res.Started || !res.Receipt || !strings.Contains(res.Error, "no verdict was kept") || strings.Contains(res.Error, "its session was ended") {
+		t.Fatalf("the start said %+v", res)
+	}
+	if engine.held.Load() != 1 {
+		t.Fatalf("the quote was held %d times, want once", engine.held.Load())
+	}
+	if _, err := os.Stat(filepath.Join(away.out, session.VerdictFile)); err == nil {
+		t.Fatal("a verdict was kept on a quote that was held and never judged")
+	}
+	if _, err := os.Stat(filepath.Join(away.out, session.ReceiptFile)); err != nil {
+		t.Fatalf("the receipt the held quote confirmed was not kept: %v", err)
+	}
+	// The session is there: the owner's next command judges the guest
+	// itself, and here it is ended by its name.
 	stdout.Reset()
 	if code := runDestroy(context.Background(), orchestrator, away.out, "", 30*time.Second, &stdout, &stderr); code != ExitOK || !strings.Contains(stdout.String(), "DESTROYED session sbx-2") {
-		t.Fatalf("the session that could not be judged was not there to destroy: exit %d: %s%s", code, stdout.String(), stderr.String())
+		t.Fatalf("the session whose quote was held was not there to destroy: exit %d: %s%s", code, stdout.String(), stderr.String())
 	}
 }
 

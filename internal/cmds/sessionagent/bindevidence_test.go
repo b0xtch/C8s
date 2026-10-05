@@ -14,6 +14,7 @@ import (
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
@@ -382,8 +383,8 @@ func TestBindIsAnsweredWithAReceiptAndTheQuoteFollows(t *testing.T) {
 		!slices.Equal(receipt.Events, []string{session.DocumentDigest(bind.Raw), image}) {
 		t.Fatalf("the receipt says %+v", receipt)
 	}
-	if state := p.state(t); state.Phase != session.PhaseRunning || state.Attestation != nil {
-		t.Fatalf("the state before the quote is taken: phase %s, quote %v", state.Phase, state.Attestation != nil)
+	if state := p.state(t); state.Phase != session.PhaseRunning || state.Attestation != nil || state.BindQuote != session.BindQuoteTrying {
+		t.Fatalf("the state before the quote is taken: phase %s, quote %v, said to be %q", state.Phase, state.Attestation != nil, state.BindQuote)
 	}
 	// The same bind again is answered as the first time.
 	again, err := client.Bind(ctxT(t), bind)
@@ -399,6 +400,9 @@ func TestBindIsAnsweredWithAReceiptAndTheQuoteFollows(t *testing.T) {
 			t.Fatal("the guest's state never served the quote over the bind's nonce")
 		}
 		quote = p.state(t).Attestation
+	}
+	if said := p.state(t).BindQuote; said != session.BindQuoteTaken {
+		t.Fatalf("a guest that serves its bind's quote says the quote is %q", said)
 	}
 	att, err := session.VerifyAttestation(ctxT(t), bound, sessiontest.Engine{}, ready.InstanceKey, bind.Doc.EvidenceNonce(), quote)
 	if err != nil {
@@ -669,13 +673,16 @@ func TestReplayedBindIsAnsweredWithEvidenceToo(t *testing.T) {
 }
 
 // A guest that cannot take the quote over its bind's nonce answers with its
-// receipt alone and serves no quote. A sender that has waited for one asks
-// for an attestation on the connection it has, and that attestation confirms
-// the receipt like the bind's own quote would have.
+// receipt alone, tries a few more times, and then says in its state that it
+// gave up. A sender that waits for the quote stops waiting when it reads
+// that, long before its own patience ends, and asks for an attestation on
+// the connection it has. That attestation confirms the receipt like the
+// bind's own quote would have.
 func TestBindWithoutAQuoteIsAttestedOnTheSameConnection(t *testing.T) {
+	sessionagent.SetBindQuotePauses(t, 20*time.Millisecond, 20*time.Millisecond)
 	p, tee, log := quoted(t)
 	taken := &steps{}
-	client, err := session.NewClient(p.url, p.policy, sessiontest.Engine{}, p.access, taken.option(), session.QuoteWait(100*time.Millisecond))
+	client, err := session.NewClient(p.url, p.policy, sessiontest.Engine{}, p.access, taken.option(), session.QuoteWait(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,9 +701,13 @@ func TestBindWithoutAQuoteIsAttestedOnTheSameConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	tee.failFor(over)
+	began := time.Now()
 	resp, att, err := client.BindAttested(ctxT(t), bind, p.boundPolicy(ready, bind))
 	if err != nil {
 		t.Fatalf("BindAttested: %v", err)
+	}
+	if waited := time.Since(began); waited > 20*time.Second {
+		t.Fatalf("the sender waited %s for a quote its guest had given up on", waited)
 	}
 	if resp.Replayed || resp.Attestation != nil || resp.Receipt == nil {
 		t.Fatalf("a guest that could take no quote for its bind answered %+v", resp)
@@ -705,11 +716,21 @@ func TestBindWithoutAQuoteIsAttestedOnTheSameConnection(t *testing.T) {
 		taken.count(session.TimedRequest+" "+session.PathAttest) != 1 {
 		t.Fatalf("attestation %+v after the steps %s", att, taken.list())
 	}
-	if state := p.state(t); state.Attestation != nil {
-		t.Fatal("the guest serves a quote over the bind's nonce that it never took")
+	if state := p.state(t); state.Attestation != nil || state.BindQuote != session.BindQuoteGivenUp {
+		t.Fatalf("a guest that never took its bind's quote serves one (%v) or says the quote is %q", state.Attestation != nil, state.BindQuote)
 	}
 	if !log.has(withoutEvidence) {
 		t.Fatal("the agent did not say that an attempt gave no quote")
+	}
+	// The first attempt and two more, each for the bind's nonce.
+	tried := 0
+	for _, asked := range tee.quotes() {
+		if slices.Equal(asked, over) {
+			tried++
+		}
+	}
+	if tried != 3 {
+		t.Fatalf("the guest tried its bind's quote %d times, want 3", tried)
 	}
 }
 

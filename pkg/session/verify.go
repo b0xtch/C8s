@@ -162,6 +162,25 @@ type dcapEngine struct {
 	chains chainMemos
 }
 
+type offlineKey struct{}
+
+// offline asks an engine for the checks that need none of the vendor's
+// documents, and for no others.
+func offline(ctx context.Context) context.Context {
+	return context.WithValue(ctx, offlineKey{}, true)
+}
+
+// Offline reports whether ctx asks an engine to stop at what needs none of
+// the vendor's documents: the evidence's signature and its chain to the
+// vendor's root, the identity of what signed it, and its binding. An engine
+// that is asked so fetches nothing, and says nothing about where the
+// platform's TCB stands. Such a result holds a quote to its receipt while a
+// document cannot be had (HoldBound). No verdict is kept on it.
+func Offline(ctx context.Context) bool {
+	asked, _ := ctx.Value(offlineKey{}).(bool)
+	return asked
+}
+
 // NewEngine returns the in-process verifier, built on attestation-go and
 // go-tdx-guest like `c8s verify`. It judges TDX evidence against Intel's
 // collateral, always: the TCB info, the quoting enclave's identity and the
@@ -313,6 +332,10 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	if err := checkTDQuoteOrigin(quote); err != nil {
 		return nil, &VerificationError{Err: err}
 	}
+	// What needed none of Intel's documents is done: see Offline.
+	if Offline(ctx) {
+		return res, nil
+	}
 
 	// go-tdx-guest authenticates the collateral (Intel's signing chains, the
 	// validity windows, the CRLs) and checks the PCK chain against the CRLs.
@@ -433,6 +456,10 @@ type Attestation struct {
 	Result  *teetypes.VerificationResult
 	// InstanceKey is the PKIX DER of the guest-generated key the evidence binds.
 	InstanceKey []byte
+	// Held says the evidence was held to what needs none of the vendor's
+	// documents and was not judged: see HoldBound. No verdict is kept on such
+	// an attestation, and nothing is released on it.
+	Held bool
 }
 
 // Egress is where the guest's sandbox may connect. ok is false for a guest

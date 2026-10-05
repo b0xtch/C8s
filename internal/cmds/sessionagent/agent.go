@@ -118,9 +118,12 @@ type Agent struct {
 	admitted bool
 	// receipt is the guest's signed word on its bind, from when the bind's
 	// sandbox runs. bindQuote is the evidence it took over the bind's nonce,
-	// from when it has it: what its state then serves.
-	receipt   *session.SignedReceipt
-	bindQuote *session.AttestResponse
+	// from when it has it: what its state then serves. bindQuoteState says
+	// where that quote stands from when the sandbox runs: still being tried,
+	// taken, or given up after the last attempt.
+	receipt        *session.SignedReceipt
+	bindQuote      *session.AttestResponse
+	bindQuoteState string
 	// settling is set while a bind's sandbox is being admitted: the register
 	// already holds the sandbox's image, and the guest does not say so until
 	// the sandbox runs. It is closed when that is decided. A quote for anyone
@@ -496,6 +499,12 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		}
 		if quote == nil {
 			a.keepBindQuote(a.bindEvidenceAgain(ctx, bind, events))
+			// Whoever waits for the quote is told there is none to wait for.
+			a.measured.Lock()
+			if a.bindQuote == nil {
+				a.bindQuoteState = session.BindQuoteGivenUp
+			}
+			a.measured.Unlock()
 		}
 	}()
 	taken := steps.list()
@@ -539,7 +548,7 @@ func (a *Agent) keepBindQuote(resp *session.AttestResponse) {
 		return
 	}
 	a.measured.Lock()
-	a.bindQuote = resp
+	a.bindQuote, a.bindQuoteState = resp, session.BindQuoteTaken
 	a.measured.Unlock()
 }
 
@@ -568,6 +577,9 @@ func (a *Agent) settled(receipt *session.SignedReceipt) {
 	a.measured.Lock()
 	defer a.measured.Unlock()
 	a.staged, a.admitted, a.receipt = len(a.events), true, receipt
+	if a.bindQuote == nil {
+		a.bindQuoteState = session.BindQuoteTrying
+	}
 	close(a.settling)
 	a.settling = nil
 }

@@ -577,7 +577,7 @@ func (c *Client) Pinned() bool { return c.pinned() != nil }
 // key, so from here the client stands as one that attested its guest: it
 // keeps a verdict, and a credential may follow within the minute.
 func (c *Client) Confirmed(att *Attestation, leaf *x509.Certificate) error {
-	if att == nil || att.Result == nil {
+	if att == nil || att.Result == nil || att.Held {
 		return errors.New("a client is confirmed by a judged attestation")
 	}
 	now := c.now()
@@ -927,6 +927,29 @@ func (c *Client) Attest(ctx context.Context) (*Attestation, error) {
 		return nil, err
 	}
 	return c.judge(ctx, evidence)
+}
+
+// Judge runs the trust gate on evidence this client fetched (FetchEvidence),
+// and on success pins the guest's key: what Attest does with the evidence it
+// fetches. It is for a caller that keeps the evidence, to hold it by
+// Evidence.Hold if it cannot be judged for want of a document.
+func (c *Client) Judge(ctx context.Context, evidence *Evidence) (*Attestation, error) {
+	if evidence == nil {
+		return nil, errors.New("no evidence to judge")
+	}
+	return c.judge(ctx, evidence)
+}
+
+// Hold holds evidence to everything that needs none of the vendor's
+// documents, as HoldBound holds a relayed quote: for evidence that could not
+// be judged for want of one. The attestation is held and stays unjudged.
+func (e *Evidence) Hold(ctx context.Context, policy Policy, engine Engine) (*Attestation, error) {
+	att, err := e.Verify(offline(ctx), policy, engine)
+	if err != nil {
+		return nil, err
+	}
+	att.Held = true
+	return att, nil
 }
 
 // judge runs the trust gate on evidence and pins the guest's key.
@@ -1387,8 +1410,8 @@ const (
 )
 
 // bindQuote waits for the evidence the guest took over its bind's nonce and
-// serves with its state. Nil is a guest that gave none in time: its ration
-// of quotes had none, or its quoting service failed.
+// serves with its state. Nil is a guest that gave none in time, or says it
+// gave up: its ration of quotes had none, or its quoting service failed.
 func (c *Client) bindQuote(ctx context.Context) *AttestResponse {
 	ctx, cancel := context.WithTimeout(ctx, c.quoteWait)
 	defer cancel()
@@ -1399,6 +1422,10 @@ func (c *Client) bindQuote(ctx context.Context) *AttestResponse {
 		}
 		if state.Attestation != nil {
 			return state.Attestation
+		}
+		// The guest's last attempt failed: there is nothing to wait for.
+		if state.BindQuote == BindQuoteGivenUp {
+			return nil
 		}
 		select {
 		case <-ctx.Done():

@@ -11,6 +11,14 @@ import (
 // RecordStep is what a runner calls to report a step of an admission.
 var RecordStep = recordStep
 
+// SetBindQuotePauses has a guest that could not take its bind's quote wait
+// these long before each further attempt, until the test ends.
+func SetBindQuotePauses(t interface{ Cleanup(func()) }, pauses ...time.Duration) {
+	before := bindQuotePauses
+	bindQuotePauses = pauses
+	t.Cleanup(func() { bindQuotePauses = before })
+}
+
 // AdmissionOf is how long the agent's sandbox took to admit, step by step.
 func AdmissionOf(a *Agent) []session.AdmissionStep {
 	a.measured.RLock()
