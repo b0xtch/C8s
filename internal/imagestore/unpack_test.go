@@ -280,3 +280,43 @@ func TestAsRootFinishRefusesADeviceNode(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// An image is written out as it is unpacked, and whole when the unpacker
+// finishes: no more of it than flushEvery waits in memory for its disk, and
+// none is left for the kernel to write later. A tree that cannot be written
+// out at the end is not handed on.
+func TestUnpackWritesAnImageOutAsItGoesAndWholeAtItsEnd(t *testing.T) {
+	var synced []string
+	fail := error(nil)
+	was := syncTree
+	syncTree = func(root string) error {
+		synced = append(synced, root)
+		return fail
+	}
+	t.Cleanup(func() { syncTree = was })
+
+	big := strings.Repeat("x", flushEvery/2+1)
+	u := newUnpacker(t, UnpackLimits{Entries: 100, Bytes: 4 * flushEvery}, false)
+	if err := u.Apply(context.Background(), layer(file("a", big), file("b", big), file("c", big), file("d", big), file("e", "small"))); err != nil {
+		t.Fatal(err)
+	}
+	// Four files of half a measure and a little each: two full measures.
+	if len(synced) != 2 || synced[0] != u.root || synced[1] != u.root {
+		t.Fatalf("the tree was written out %d times while %d bytes were unpacked: %v", len(synced), 4*len(big), synced)
+	}
+	if _, err := u.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if len(synced) != 3 || synced[2] != u.root {
+		t.Fatalf("the tree was written out %d times by the unpacker's end, want once more", len(synced))
+	}
+
+	u = newUnpacker(t, roomy, false)
+	if err := u.Apply(context.Background(), layer(file("a", "small"))); err != nil {
+		t.Fatal(err)
+	}
+	fail = syscall.EIO
+	if _, err := u.Finish(); err == nil || !strings.Contains(err.Error(), "write the root filesystem out") {
+		t.Fatalf("Finish of a tree that could not be written out: %v", err)
+	}
+}

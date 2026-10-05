@@ -42,6 +42,16 @@ type UnpackStats struct {
 	SkippedDevices int
 }
 
+// flushEvery is how much of an image the unpacker lets wait in memory for
+// its disk. Written out all at once, later, by the kernel's own timer, an
+// image's pages take as much memory again to encrypt, in a guest whose host
+// backs every page it has ever used, and that at a time nobody chose.
+const flushEvery = 16 << 20
+
+// syncTree writes out what the file system of the tree at root holds in
+// memory, and waits for it. Tests replace it.
+var syncTree = syncFilesystem
+
 // Unpacker applies an image's layers, in order, onto one directory.
 type Unpacker struct {
 	root   string
@@ -49,6 +59,24 @@ type Unpacker struct {
 	stats  UnpackStats
 	// sameOwner is false only in tests, which cannot chown to the mapped range.
 	sameOwner bool
+}
+
+// flushing reads a layer and has the tree it is unpacked to written out
+// every flushEvery bytes, so that no more than that waits for the disk.
+type flushing struct {
+	r       io.Reader
+	root    string
+	pending int64
+}
+
+func (f *flushing) Read(p []byte) (int, error) {
+	n, err := f.r.Read(p)
+	if f.pending += int64(n); f.pending >= flushEvery {
+		f.pending = 0
+		// A tree that cannot be written out fails where it is next written.
+		_ = syncTree(f.root)
+	}
+	return n, err
 }
 
 // NewUnpacker prepares root, which must not exist, as an empty root filesystem.
@@ -68,7 +96,7 @@ func (u *Unpacker) Apply(ctx context.Context, layer io.Reader) error {
 	if !u.sameOwner {
 		opts = append(opts, archive.WithNoSameOwner())
 	}
-	if _, err := archive.Apply(ctx, u.root, layer, opts...); err != nil {
+	if _, err := archive.Apply(ctx, u.root, &flushing{r: layer, root: u.root}, opts...); err != nil {
 		return fmt.Errorf("unpack layer: %w", err)
 	}
 	return nil
@@ -116,7 +144,8 @@ func keepXattr(name string) bool {
 
 // Finish hands the tree to the sandbox's id range and confirms that nothing
 // in it is a device node. Directories the layers implied without listing were
-// created as this process, and are shifted here.
+// created as this process, and are shifted here. The tree is on its disk
+// when Finish returns: nothing of it is left for the kernel to write later.
 func (u *Unpacker) Finish() (UnpackStats, error) {
 	root, err := os.OpenRoot(u.root)
 	if err != nil {
@@ -160,6 +189,9 @@ func (u *Unpacker) Finish() (UnpackStats, error) {
 	})
 	if err != nil {
 		return UnpackStats{}, fmt.Errorf("finish root filesystem: %w", err)
+	}
+	if err := syncTree(u.root); err != nil {
+		return UnpackStats{}, fmt.Errorf("write the root filesystem out: %w", err)
 	}
 	return u.stats, nil
 }
