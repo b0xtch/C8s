@@ -42,10 +42,11 @@ const (
 	// answer their guests with, in the state directory: one set for every TD
 	// of the host.
 	collateralDir = "collateral"
-	// maxRelays bounds the evidence requests the daemon relays at once, and
-	// maxStreams the connections it carries, for every caller together.
-	maxRelays  = 64
-	maxStreams = 4096
+	// maxCallerRelays bounds the evidence requests one caller has in flight
+	// at once, and maxStreams the connections the daemon carries, for every
+	// caller together.
+	maxCallerRelays = 64
+	maxStreams      = 4096
 	// maxWatchers bounds the streams that watch pools' ready TDs, for every
 	// binder together.
 	maxWatchers = 64
@@ -70,8 +71,8 @@ type Daemon struct {
 	pools   map[string]*poolState
 	// streams counts the Connect streams in flight.
 	streams int
-	// relays bounds the evidence requests in flight.
-	relays chan struct{}
+	// relays bounds the evidence requests in flight, by caller.
+	relays relays
 	// watchers counts the WatchReady streams in flight, and eventWatchers
 	// the Watch streams.
 	watchers, eventWatchers int
@@ -103,8 +104,7 @@ func New(cfg *Config, runner Runner, log *slog.Logger) *Daemon {
 		cfg: cfg, log: log, runner: runner, dial: dialer.DialContext, now: time.Now,
 		bootTimeout: DefaultBootTimeout,
 		tds:         map[string]*td{}, changed: make(chan struct{}), pools: map[string]*poolState{},
-		stop:   make(chan struct{}),
-		relays: make(chan struct{}, maxRelays),
+		stop: make(chan struct{}),
 	}
 	for i := range cfg.Pools {
 		d.pools[cfg.Pools[i].name] = &poolState{cfg: &cfg.Pools[i]}

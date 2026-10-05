@@ -733,27 +733,32 @@ func (d *Daemon) GetEvidence(ctx context.Context, req *sessionv1alpha1.EvidenceR
 		d.mu.Unlock()
 		return nil, status.Error(codes.NotFound, "no such TD")
 	}
-	state, address := t.rec.State, t.rec.Address
-	d.mu.Unlock()
-	switch state {
+	switch t.rec.State {
 	case StateEnded:
+		d.mu.Unlock()
 		return nil, status.Error(codes.FailedPrecondition, "the TD ended")
 	case StateBooting:
+		d.mu.Unlock()
 		return nil, status.Error(codes.Unavailable, "the TD does not serve yet")
 	}
-	// Anyone may ask, so the daemon bounds how many it asks its guests for at
-	// once.
-	select {
-	case d.relays <- struct{}{}:
-		defer func() { <-d.relays }()
-	default:
-		return nil, status.Error(codes.ResourceExhausted, "too many evidence requests in flight")
+	// Anyone may ask. The daemon bounds how many requests of one caller it
+	// has in flight, and has a guest answer one at a time, for everyone who
+	// asked before it was sent.
+	leave := d.relays.enter(callerOf(ctx))
+	if leave == nil {
+		d.mu.Unlock()
+		return nil, status.Error(codes.ResourceExhausted, "too many evidence requests of this caller in flight: ask again")
 	}
-	ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
-	defer cancel()
-	evidence, err := t.guests.evidence(ctx, address)
-	if err != nil {
+	defer leave()
+	request := d.askLocked(t)
+	d.mu.Unlock()
+	select {
+	case <-request.done:
+	case <-ctx.Done():
+		return nil, status.FromContextError(ctx.Err()).Err()
+	}
+	if request.err != nil {
 		return nil, status.Error(codes.Unavailable, "the guest did not answer")
 	}
-	return evidence, nil
+	return request.evidence, nil
 }

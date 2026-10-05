@@ -127,6 +127,10 @@ type td struct {
 	// instanceKey is the digest of the key leaf carries: what a bind names
 	// its TD by.
 	instanceKey string
+	// asking is the request for the guest's evidence that is in flight, and
+	// asksNext the one that waits for it to end: see asked. Either is nil
+	// when there is none.
+	asking, asksNext *asked
 }
 
 // serves notes what a ready guest said of itself, and the certificate it

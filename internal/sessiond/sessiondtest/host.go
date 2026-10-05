@@ -145,8 +145,9 @@ func (r *Runner) Fail(err error) {
 type Host struct {
 	Config *sessiond.Config
 	Runner *Runner
-	// Addr is where the running daemon serves.
-	Addr string
+	// Daemon is the running daemon, and Addr where it serves.
+	Daemon *sessiond.Daemon
+	Addr   string
 	// Roots verify the daemon's certificate, and CAFile holds them as PEM.
 	Roots  *x509.CertPool
 	CAFile string
@@ -351,7 +352,7 @@ func (h *Host) StartDaemon() {
 			h.t.Errorf("serve: %v", err)
 		}
 	})
-	h.Addr = ln.Addr().String()
+	h.Daemon, h.Addr = d, ln.Addr().String()
 	h.stop = sync.OnceFunc(func() {
 		cancel()
 		wg.Wait()

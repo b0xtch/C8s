@@ -167,7 +167,7 @@ line.
 | `Claim`, `Bind` of a claimed TD, `Destroy`, `Watch` | an orchestrator | a client certificate that chains to the authority in `tls.clientCA` |
 | `Bind` that names no TD | an orchestrator, or a binder the pool names | as above, or a client certificate whose public key the pool's `binders` lists with the authority the bind is signed under |
 | `WatchReady` | a binder the pool names | a client certificate whose public key the pool's `binders` lists, whoever issued it: a stream shows how fast the pool refills, which is every tenant's starts together |
-| `GetEvidence` | anyone | nothing: what a guest serves to anyone is public |
+| `GetEvidence` | anyone | nothing: what a guest serves to anyone is public. The daemon has a guest answer one request at a time, and everyone who asks meanwhile shares the next, so an answer is of a request sent after its caller asked and no caller keeps another waiting. It has 64 requests of one caller in flight at once and tells that caller to ask again beyond them; a caller is the key of the certificate it presents, or without one its address |
 | `Connect` | anyone | nothing at the daemon: the guest authenticates every request under the keys its bind names |
 
 The handshake asks a caller for a certificate and proves that it holds the
@@ -629,7 +629,8 @@ given the development build and its images.
 - The JSON form of the API.
 - A second host, and with it placement.
 - Quotas per orchestrator. The bounds on open calls are fixed: 64 evidence
-  requests and 4096 connections in flight.
+  requests of one caller in flight, and 4096 connections for every caller
+  together.
 - A cgroup per TD, which statistics and memory limits need.
 - Disk slots. A TD has its image, its launch disk, a scratch disk and the
   image store.

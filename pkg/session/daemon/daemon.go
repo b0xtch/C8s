@@ -402,10 +402,10 @@ const (
 // gave up: that is session.ErrNoBindQuote. Until then it is waited for until
 // ctx ends. Either way its binder asks it for an attestation itself.
 //
-// A daemon relays so many evidence requests at once, for every caller
-// together. One it has no room for is asked again after the same pause, so
-// that a binder that started many sessions at once waits its turn for each
-// quote and loses none.
+// A daemon has so many evidence requests of one caller in flight at once.
+// One it has no room for is asked again after the same pause, so that a
+// binder that started many sessions at once waits its turn for each quote
+// and loses none.
 func (c *Client) BoundEvidence(ctx context.Context, td string) (*session.Relayed, error) {
 	for pause := quotePause; ; pause = min(2*pause, quotePauseMost) {
 		evidence, err := c.Evidence(ctx, td)
