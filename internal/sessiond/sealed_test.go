@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/confidential-dot-ai/c8s/internal/sessiond/sessiondtest"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -365,4 +368,52 @@ func TestBindCallEndsWithItsCaller(t *testing.T) {
 		t.Fatalf("the bind repeated after its caller left: %v", err)
 	}
 	h.Stop()
+}
+
+// A guest that took a sealed message owes its answer. A call whose guest is
+// cut off before the answer came ends as one to send again, and the same
+// request again brings the answer of the command that ran once.
+func TestBindCallWhoseSealedAnswerWasLostIsOneToSendAgain(t *testing.T) {
+	h := newHost(t, 1, nil)
+	c, o := h.AsOrchestrator(), newOwner(t)
+	s := h.seals(c, o, "s1", false)
+	// A command that ends when the test lets it.
+	gate := filepath.Join(t.TempDir(), "go")
+	message, err := session.SealWithBind(s.ready, s.bind, s.signer, session.SealedParts{Command: &session.ExecRequest{
+		Argv: []string{"/bin/sh", "-c", `echo ran >> "$MARKER"; until [ -e "$GATE" ]; do sleep 0.01; done; echo done`},
+		Env:  map[string]string{"MARKER": s.marker, "GATE": gate},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := requestID(t)
+	call, err := c.BindWith(ctx(t), id, s.td, s.bind, message.Sealed)
+	if err != nil {
+		t.Fatalf("the bind with its sealed message: %v", err)
+	}
+	defer call.Close()
+	if call.Answer.Receipt == nil || call.SealedStatus != session.SealedTaken {
+		t.Fatalf("the answer to the bind: receipt %v, sealed message %q", call.Answer.Receipt != nil, call.SealedStatus)
+	}
+	eventually(t, "the command runs", func() bool { return s.runs(t) == 1 })
+	s.guest.Cut()
+	if _, _, err := call.SealedAnswer(); status.Code(err) != codes.Unavailable || !strings.Contains(err.Error(), "send the same request again") {
+		t.Fatalf("a call whose guest was cut off before its sealed answer: %v", err)
+	}
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := c.BindWith(ctx(t), id, s.td, s.bind, message.Sealed)
+	if err != nil {
+		t.Fatalf("the same request again: %v", err)
+	}
+	defer again.Close()
+	sealed, taken, err := again.SealedAnswer()
+	if err != nil || taken != session.SealedTaken {
+		t.Fatalf("the sealed answer of the request sent again: %q, %v", taken, err)
+	}
+	opened, err := message.Open(sealed)
+	if err != nil || opened.Command == nil || string(opened.Command.Stdout) != "done\n" || s.runs(t) != 1 {
+		t.Fatalf("the command's answer: %+v, %v, after %d runs", opened, err, s.runs(t))
+	}
 }

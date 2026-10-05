@@ -368,12 +368,15 @@ func (x *BindRequest) GetSealed() []byte {
 
 type Bound struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The evidence now includes the bind.
+	// The evidence now includes the bind. In a later message than the
+	// receipt: the guest's evidence with the quote over the bind's nonce, once
+	// the guest has taken it, or with its word that it gave up on one
+	// (bind_quote).
 	Evidence *Evidence `protobuf:"bytes,1,opt,name=evidence,proto3" json:"evidence,omitempty"`
 	// The guest's receipt for the bind (c8s-bind-receipt/v1), as the guest
 	// sent it: signed by its one-time key over the bind's nonce. The quote
 	// over the same nonce is in the evidence if the guest had it by then, and
-	// in what GetEvidence returns once it has.
+	// follows in a later message of the call once it has.
 	Receipt []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
 	// In a later message than the receipt: what became of each part of the
 	// sealed message, with the command's output and status, sealed back to

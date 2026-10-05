@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
-	"sync"
 	"time"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
@@ -86,14 +85,18 @@ func (r *refusal) Error() string {
 // errBusy is a guest's "try again".
 var errBusy = errors.New("the guest is busy")
 
-// send sends one request and returns the guest's answer, unread.
-func (g *guestClient) send(ctx context.Context, addr, method, path string, body []byte) (*http.Response, error) {
+// send sends one request and returns the guest's answer, unread. header is
+// further header fields, each a name and its value.
+func (g *guestClient) send(ctx context.Context, addr, method, path string, body []byte, header ...string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "https://"+addr+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for i := 0; i+1 < len(header); i += 2 {
+		req.Header.Set(header[i], header[i+1])
 	}
 	if method != http.MethodGet {
 		// A guest answers a bind sent twice as it answered the first. This
@@ -185,6 +188,17 @@ func (g *guestClient) evidence(ctx context.Context, addr string) (*sessionv1alph
 	if err != nil {
 		return nil, err
 	}
+	evidence, err := stated(leaf, state)
+	if err != nil {
+		return nil, err
+	}
+	evidence.Collateral = g.collateral(ctx, addr)
+	return evidence, nil
+}
+
+// stated is the API's Evidence of what a guest says of itself, under the
+// certificate it said it under.
+func stated(leaf []byte, state *session.StateResponse) (*sessionv1alpha1.Evidence, error) {
 	evidence := &sessionv1alpha1.Evidence{
 		Certificate:     leaf,
 		LaunchDocument:  state.Launch,
@@ -195,12 +209,12 @@ func (g *guestClient) evidence(ctx context.Context, addr string) (*sessionv1alph
 		Phase:           string(state.Phase),
 	}
 	if att := state.Attestation; att != nil {
+		var err error
 		if evidence, err = attested(leaf, att); err != nil {
 			return nil, err
 		}
 	}
 	evidence.BindQuote, evidence.ReadyCertificate = state.BindQuote, state.ReadyCertificate
-	evidence.Collateral = g.collateral(ctx, addr)
 	return evidence, nil
 }
 
@@ -223,29 +237,38 @@ func attested(leaf []byte, att *session.AttestResponse) (*sessionv1alpha1.Eviden
 	}, nil
 }
 
-// sealedWait waits for the sealed answer of a sealed message a guest took
-// with its bind: the second document of the guest's answer.
-type sealedWait func() (*session.SealedReply, error)
+// followed is one thing a guest says after its first answer to a bind: the
+// sealed answer of a sealed message it took, or its evidence once the quote
+// over the bind's nonce is settled, taken or given up.
+type followed struct {
+	sealed   *session.SealedReply
+	evidence *sessionv1alpha1.Evidence
+}
+
+// following yields what follows a guest's first answer to a bind, in the
+// order the guest sends it, and io.EOF once the guest has said all it will.
+type following func() (*followed, error)
 
 // bound is a guest's answer to a bind, as the daemon relays it.
 type boundAnswer struct {
 	evidence *sessionv1alpha1.Evidence
 	receipt  []byte
 	// sealed is what the guest says became of a sealed message that came
-	// with the bind, and wait how its sealed answer is waited for, when it
-	// was taken.
+	// with the bind, and later what the guest says after this answer.
 	sealed string
-	wait   sealedWait
+	later  following
 }
 
 // bind hands the guest its bind, with a message sealed for it if one came,
 // and returns the guest's answer: its receipt for the bind, as it sent it,
 // and its evidence. The evidence holds the quote over the bind's nonce if the
 // guest had it by then. Otherwise it holds the certificate and the phase
-// alone: the receipt says the rest, and the quote comes with the guest's
-// evidence once the guest has it. A guest that took the sealed message sends
-// its sealed answer after that, once it has acted on it. wrote, if given, is
-// called once the bind has been written to the guest's connection.
+// alone: the receipt says the rest, and the guest sends its evidence with the
+// quote on the same answer once it has it, or its word that it gave up on
+// one. A guest that took the sealed message sends its sealed answer on that
+// answer too, once it has acted on it. The two come in the order the guest
+// has them. wrote, if given, is called once the bind has been written to the
+// guest's connection.
 func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, sealed []byte, wrote func()) (*boundAnswer, error) {
 	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature), Sealed: sealed})
 	if err != nil {
@@ -258,12 +281,13 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, se
 			}
 		}})
 	}
-	resp, err := g.send(ctx, addr, http.MethodPost, session.PathBind, body)
+	// This side reads the answer to its end.
+	resp, err := g.send(ctx, addr, http.MethodPost, session.PathBind, body, session.BindQuoteHeader, session.BindQuoteFollows)
 	if err != nil {
 		return nil, err
 	}
-	// The answer is one document, or two for a sealed message that was
-	// taken. The body stays open until the last is read.
+	// The answer is one document and whatever follows it. The body stays
+	// open until the last is read.
 	documents := json.NewDecoder(io.LimitReader(resp.Body, maxGuestAnswer))
 	if err := answered(resp); err != nil {
 		resp.Body.Close()
@@ -293,30 +317,58 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, se
 	} else {
 		out.evidence = &sessionv1alpha1.Evidence{Certificate: leaf, Phase: string(answer.Phase)}
 	}
-	if answer.Sealed != session.SealedTaken {
-		// Read to its end, so that the connection is kept for the next request.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		return out, nil
-	}
-	var once sync.Once
-	var result session.SealedReply
-	var failed error
-	out.wait = func() (*session.SealedReply, error) {
-		once.Do(func() {
-			defer resp.Body.Close()
-			if failed = documents.Decode(&result); failed != nil {
-				failed = fmt.Errorf("the guest's answer to the sealed message: %w", failed)
-				return
-			}
-			_, _ = io.Copy(io.Discard, resp.Body)
-		})
-		if failed != nil {
-			return nil, failed
+	// What follows is read by one caller, a document at a time, to the end
+	// of the answer, so that the connection is kept for the next request.
+	var ended error
+	out.later = func() (*followed, error) {
+		if ended != nil {
+			return nil, ended
 		}
-		return &result, nil
+		next, err := follows(documents, leaf)
+		if err != nil {
+			ended = err
+			resp.Body.Close()
+		}
+		return next, err
 	}
 	return out, nil
+}
+
+// follows reads the next document of a guest's answer to a bind after the
+// first: a sealed answer, which says what became of a sealed message, or the
+// guest's state. Anything else ends the reading.
+func follows(documents *json.Decoder, leaf []byte) (*followed, error) {
+	var raw json.RawMessage
+	if err := documents.Decode(&raw); err != nil {
+		// io.EOF is a guest that has said all it will.
+		return nil, err
+	}
+	var kind struct {
+		Sealed string        `json:"sealed"`
+		Phase  session.Phase `json:"phase"`
+	}
+	if err := json.Unmarshal(raw, &kind); err != nil {
+		return nil, fmt.Errorf("what followed the guest's answer to the bind: %w", err)
+	}
+	switch {
+	case kind.Sealed != "":
+		var reply session.SealedReply
+		if err := json.Unmarshal(raw, &reply); err != nil {
+			return nil, fmt.Errorf("the guest's answer to the sealed message: %w", err)
+		}
+		return &followed{sealed: &reply}, nil
+	case kind.Phase != "":
+		var state session.StateResponse
+		if err := json.Unmarshal(raw, &state); err != nil {
+			return nil, fmt.Errorf("the guest's state after its bind: %w", err)
+		}
+		evidence, err := stated(leaf, &state)
+		if err != nil {
+			return nil, err
+		}
+		return &followed{evidence: evidence}, nil
+	}
+	return nil, errors.New("the guest's answer to the bind was followed by a document that is neither a sealed answer nor its state")
 }
 
 // sealed hands a guest that is taking its bind a sealed message that

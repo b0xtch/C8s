@@ -72,6 +72,45 @@ type Guest struct {
 	// reached is what reached the guest's agent: the connections it
 	// accepted and the requests it was sent.
 	reached *reached
+	// tee is the guest's TEE, whose quotes a test can hold back.
+	tee *quoting
+}
+
+// quoting is a guest's simulated TEE, with a quoting service that a test can
+// have take its time.
+type quoting struct {
+	sessiontest.TEE
+	mu   sync.Mutex
+	held chan struct{}
+}
+
+func (q *quoting) Evidence(ctx context.Context, reportData []byte) (teetypes.AttestationEvidence, error) {
+	q.mu.Lock()
+	held := q.held
+	q.mu.Unlock()
+	if held != nil {
+		select {
+		case <-held:
+		case <-ctx.Done():
+			return teetypes.AttestationEvidence{}, ctx.Err()
+		}
+	}
+	return q.TEE.Evidence(ctx, reportData)
+}
+
+// HoldQuotes has every quote the guest asks for from now on wait until the
+// returned function is called, as a quoting service that is slow.
+func (p *Guest) HoldQuotes() (release func()) {
+	held := make(chan struct{})
+	p.tee.mu.Lock()
+	p.tee.held = held
+	p.tee.mu.Unlock()
+	return sync.OnceFunc(func() {
+		p.tee.mu.Lock()
+		p.tee.held = nil
+		p.tee.mu.Unlock()
+		close(held)
+	})
 }
 
 // Close ends the guest before its test does, as a host ends a guest: its
@@ -247,9 +286,10 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	}
 	keys := filepath.Join(bundle, session.OpkeyDir)
 	seen := &reached{asked: map[string]int{}, said: map[string]int{}}
+	tee := &quoting{TEE: sessiontest.TEE{TD: td}}
 	agent, err := sessionagent.Stage(ctx, sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(keys, session.PubkeyFile), LaunchDir: keys,
-		CredentialDir: credentials, TEE: sessiontest.TEE{TD: td}, Runner: runner, Bare: sandbox == nil,
+		CredentialDir: credentials, TEE: tee, Runner: runner, Bare: sandbox == nil,
 		Engine: sessiontest.Engine{}, KeyServiceDial: dial, CertTTL: certTTL,
 		Logger: slog.New(said{Handler: slog.Default().Handler(), reached: seen}),
 	})
@@ -283,7 +323,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	t.Cleanup(stop)
 	return &Guest{
 		URL: "https://" + ln.Addr().String(), ManifestPath: manifest, LaunchKeyPath: filepath.Join(keys, session.PubkeyFile),
-		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop, reached: seen,
+		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop, reached: seen, tee: tee,
 	}
 }
 

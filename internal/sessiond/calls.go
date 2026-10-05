@@ -369,10 +369,14 @@ func (d *Daemon) claimable(c *claimant, requestID string) (*td, error) {
 // with what the guest says became of a sealed message that came with the
 // bind. What became of one that came after it, and the sealed answer of one
 // the guest took, follow in a later message. The daemon reads none of
-// either.
+// either. The guest's evidence with the quote over the bind's nonce follows
+// in a later message too, as soon as the guest has it, or its word that it
+// gave up on one, unless the quote was in the first answer: a binder waits
+// for its quote on its own call, and asks the daemon for no evidence.
 //
-// A call whose bind came with no sealed message ends once its caller has
-// closed its side, having sent one or not.
+// A call whose bind came with no sealed message ends once its guest has
+// said all it will and its caller has closed its side, having sent a sealed
+// message or not.
 func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 	req, err := stream.Recv()
 	if err != nil {
@@ -398,7 +402,7 @@ func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 		late = make(chan error, 1)
 		go func() { late <- d.lateSealed(stream, relaying, receipted, send) }()
 	}
-	answer, wait, err := d.bind(ctx, req, relaying)
+	answer, later, err := d.bind(ctx, req, relaying)
 	if err != nil {
 		return err
 	}
@@ -406,13 +410,28 @@ func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 		return err
 	}
 	close(receipted)
-	if wait != nil {
-		result, err := wait()
+	// What the guest says after its receipt, as it says it: the sealed
+	// answer of a sealed message it took, and its evidence once the quote
+	// over the bind's nonce is settled.
+	owed := answer.GetSealedStatus() == session.SealedTaken
+	for later != nil {
+		next, err := later()
 		if err != nil {
-			d.log.Warn("the answer to a sealed message was lost", "td", req.GetTd(), "error", err)
-			return status.Error(codes.Unavailable, "the guest's answer to the sealed message was lost: send the same request again")
+			if owed {
+				d.log.Warn("the answer to a sealed message was lost", "td", req.GetTd(), "error", err)
+				return status.Error(codes.Unavailable, "the guest's answer to the sealed message was lost: send the same request again")
+			}
+			// A guest that sends no quote here serves it with its state.
+			break
 		}
-		return send(&sessionv1alpha1.Bound{SealedStatus: result.Sealed, SealedAnswer: result.Answer})
+		following := &sessionv1alpha1.Bound{Evidence: next.evidence}
+		if next.sealed != nil {
+			owed = false
+			following = &sessionv1alpha1.Bound{SealedStatus: next.sealed.Sealed, SealedAnswer: next.sealed.Answer}
+		}
+		if err := send(following); err != nil {
+			return err
+		}
 	}
 	// The caller may still send its sealed message, which the guest answers
 	// whenever it comes: by now, that it came too late, unless this call
@@ -466,13 +485,14 @@ func (d *Daemon) lateSealed(stream sessionv1alpha1.Sessions_BindServer, relaying
 }
 
 // bind is the bind itself: it records it, hands it to the guest and returns
-// the guest's first answer, with how to wait for the sealed answer of a
-// sealed message if the guest took one. relaying is told the TD once its
+// the guest's first answer, with what yields the rest of what the guest
+// says: the sealed answer of a sealed message it took, and its evidence once
+// the quote over the bind's nonce is settled. relaying is told the TD once its
 // guest has been sent the bind, now or by an earlier call, and nil if it
 // never was: a sealed message that follows the bind is sent to the guest
 // after the bind, on a connection opened after it, which is one the guest's
 // fence lets in.
-func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, sealedWait, error) {
+func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, following, error) {
 	began := time.Now()
 	var told sync.Once
 	tell := func(t *td) { told.Do(func() { relaying <- t }) }
@@ -618,8 +638,18 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		// Whoever sent the bind learns which TD it claimed.
 		answer.Td, answer.Host = t.rec.ID, d.cfg.Host
 	}
+	// What follows carries the same documents of the vendor's as the first
+	// answer does.
+	collateral := t.collateral
+	later := func() (*followed, error) {
+		next, err := relayed.later()
+		if err == nil && next.evidence != nil && len(next.evidence.GetCollateral()) == 0 {
+			next.evidence.Collateral = collateral
+		}
+		return next, err
+	}
 	if replay {
-		return answer, relayed.wait, nil
+		return answer, later, nil
 	}
 	if t.rec.Bind.Answer, err = proto.Marshal(answer); err != nil {
 		return nil, nil, status.Error(codes.Internal, "the answer could not be kept")
@@ -634,12 +664,12 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
 		"sealed", relayed.sealed, "claimed_by_bind", t.rec.Claim != nil && t.rec.Claim.ByBind)
 	d.notify()
-	return answer, relayed.wait, nil
+	return answer, later, nil
 }
 
-// relayBind posts the bind until the guest answers it for good. A guest that
-// took a sealed message with it answers that later, over the same request,
-// which lives until then.
+// relayBind posts the bind until the guest answers it for good. What the
+// guest says after its first answer comes over the same request, which lives
+// until the guest has said all of it or its reader gives up.
 func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest, wrote func()) (*boundAnswer, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxBindWait)
 	// The TD's end ends the wait.
@@ -650,11 +680,14 @@ func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sess
 	}
 	for {
 		answer, err := t.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetSealed(), wrote)
-		if err == nil && answer.wait != nil {
-			wait := answer.wait
-			answer.wait = func() (*session.SealedReply, error) {
-				defer done()
-				return wait()
+		if err == nil {
+			later := answer.later
+			answer.later = func() (*followed, error) {
+				next, err := later()
+				if err != nil {
+					done()
+				}
+				return next, err
 			}
 			return answer, nil
 		}

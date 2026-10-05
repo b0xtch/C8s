@@ -75,7 +75,7 @@ func TestStartThenDriveThroughADaemon(t *testing.T) {
 	}
 	// The guest answered the bind with its receipt, and the quote the start
 	// judged confirmed it.
-	if !res.Receipt || (res.Quote != quoteWithAnswer && res.Quote != quoteWithEvidence) {
+	if !res.Receipt || (res.Quote != quoteWithAnswer && res.Quote != quoteOnCall) {
 		t.Fatalf("start result = %+v", res)
 	}
 	// The start judged the bind's answer, and asked the guest for no quote of
@@ -533,6 +533,38 @@ func TestStartOwesWhatNoSealedAnswerSaysIsDone(t *testing.T) {
 		if strings.Join(held, ",") != tc.held || strings.Join(again, ",") != tc.again || resend != tc.resend {
 			t.Errorf("%s: held %v, owed %v, the command again %t", name, held, again, resend)
 		}
+	}
+}
+
+// A start waits for the quote over its bind's nonce on the bind's own call:
+// a guest whose quoting service is slow answers with its receipt, the quote
+// follows on that call, and the start says where it came from. It asks the
+// daemon for none of the guest's evidence, and the guest for no attestation.
+func TestStartTakesItsQuoteFromTheBindsOwnCall(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	for deadline := time.Now().Add(10 * time.Second); host.Runner.Booted() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the pool never launched its guest")
+		}
+	}
+	guest := host.Runner.All()[0]
+	s := starting(t, host, "sbx-1")
+	release := guest.HoldQuotes()
+	defer release()
+	go func() {
+		// Well after the guest has answered its bind.
+		for deadline := time.Now().Add(10 * time.Second); guest.Asked(session.PathBind) == 0 && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		release()
+	}()
+	res := start(t, s)
+	if !res.Started || !res.Receipt || res.Quote != quoteOnCall {
+		t.Fatalf("a start whose guest's quote came after its receipt: %+v", res)
+	}
+	if n := guest.Asked(session.PathAttest); n != 0 {
+		t.Fatalf("the guest was asked for %d attestations", n)
 	}
 }
 

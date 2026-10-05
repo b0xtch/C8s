@@ -30,6 +30,18 @@ const (
 	PathCollateral  = "/v1/collateral"
 )
 
+// BindQuoteHeader is a request header of PathBind, and BindQuoteFollows its
+// value. A caller that sends it reads the guest's answer to its end: after
+// the receipt the guest sends, as it has each, the sealed answer of a sealed
+// message it took and, once it has the quote over the bind's nonce or has
+// given up on one, its state, which says which (StateResponse.BindQuote).
+// Without the header the guest sends no state there, and its sender finds
+// the quote in the state the guest serves.
+const (
+	BindQuoteHeader  = "C8s-Bind-Quote"
+	BindQuoteFollows = "follows"
+)
+
 // MaxCollateralBytes bounds what a guest takes from its host as Intel's
 // documents, and so what it answers PathCollateral with: Intel's four
 // documents are a tenth of it.

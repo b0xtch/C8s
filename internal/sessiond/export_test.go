@@ -35,3 +35,11 @@ func (d *Daemon) HoldEvidenceRelays(key crypto.PublicKey) (release func()) {
 		}
 	}
 }
+
+// KeepCollateral has the daemon keep documents as the vendor's documents
+// that td's guest last handed over.
+func (d *Daemon) KeepCollateral(td string, documents []byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.tds[td].collateral = documents
+}

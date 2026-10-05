@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -126,7 +127,8 @@ func (c *Client) Claim(ctx context.Context, requestID, pool, name string, wait t
 // Bind hands the claimed TD its bind and returns the guest's answer, relayed
 // and unjudged: the guest's receipt for the bind, and its evidence, which
 // holds the quote over the bind's nonce if the guest had it by then.
-// Otherwise Evidence returns it once the guest has.
+// Otherwise the call that carried the bind brings it once the guest has
+// (BindWith, BindCall.Quote), which this call does not wait for.
 func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.SignedBind) (*session.Relayed, error) {
 	call, err := c.StartBind(ctx, requestID, td, bind, nil)
 	if err != nil {
@@ -164,6 +166,18 @@ type BindCall struct {
 	// carried says the call has carried its sealed message, and closed that
 	// its caller's side of it is closed.
 	carried, closed bool
+
+	// What the daemon sends after the answer is read by one reader, begun by
+	// whoever first waits for any of it. Each of sealed and quoted is closed
+	// when its part has come or the call has ended without it, and what the
+	// part was is read after that.
+	reading        sync.Once
+	sealed, quoted chan struct{}
+	sealedAnswer   []byte
+	sealedStatus   string
+	quote          *session.Relayed
+	// ended is how the call ended: io.EOF for one the daemon ended.
+	ended error
 }
 
 // BindWith hands the TD its bind, with a message sealed for the guest
@@ -215,7 +229,7 @@ func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *sess
 		cancel()
 		return nil, err
 	}
-	call := &BindCall{stream: stream, cancel: cancel, carried: len(sealed) > 0}
+	call := &BindCall{stream: stream, cancel: cancel, carried: len(sealed) > 0, sealed: make(chan struct{}), quoted: make(chan struct{})}
 	if err := stream.Send(&sessionv1alpha1.BindRequest{
 		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature), Sealed: sealed,
 	}); err != nil {
@@ -279,6 +293,42 @@ func (b *BindCall) SendSealed(sealed []byte) error {
 	return b.closeSend()
 }
 
+// read reads what the daemon sends after the answer, until the call ends:
+// what became of a sealed message, with the guest's sealed answer to one it
+// took, and the guest's evidence once the quote over the bind's nonce is
+// settled. They come in the order the guest has them, and each is told to
+// whoever waits for it as it comes.
+func (b *BindCall) read() {
+	b.reading.Do(func() {
+		go func() {
+			sealed, quoted := false, false
+			defer func() {
+				if !sealed {
+					close(b.sealed)
+				}
+				if !quoted {
+					close(b.quoted)
+				}
+			}()
+			for {
+				next, err := b.stream.Recv()
+				if err != nil {
+					b.ended = err
+					return
+				}
+				if evidence := next.GetEvidence(); evidence != nil && !quoted {
+					b.quote, quoted = relayed(evidence), true
+					close(b.quoted)
+				}
+				if (next.GetSealedStatus() != "" || len(next.GetSealedAnswer()) > 0) && !sealed {
+					b.sealedAnswer, b.sealedStatus, sealed = next.GetSealedAnswer(), next.GetSealedStatus(), true
+					close(b.sealed)
+				}
+			}
+		}()
+	})
+}
+
 // SealedAnswer waits for the guest's sealed answer, which
 // session.SealedMessage.Open opens. With it comes the daemon's word on what
 // became of the message. An answer that is none is a message the guest did
@@ -291,16 +341,54 @@ func (b *BindCall) SealedAnswer() (answer []byte, status string, err error) {
 	if b.SealedStatus != "" && b.SealedStatus != session.SealedTaken {
 		return nil, b.SealedStatus, nil
 	}
-	next, err := b.stream.Recv()
-	if errors.Is(err, io.EOF) {
+	b.read()
+	<-b.sealed
+	switch {
+	case b.sealedStatus != "" || len(b.sealedAnswer) > 0:
+		return b.sealedAnswer, b.sealedStatus, nil
+	case errors.Is(b.ended, io.EOF):
 		// The call ended with no word on the message: it came too late to
 		// be carried.
 		return nil, session.SealedTooLate, nil
 	}
-	if err != nil {
-		return nil, "", err
+	return nil, "", b.ended
+}
+
+// ErrQuoteNotSent is a Bind call that ended with no word of the quote over
+// the bind's nonce: its daemon or its guest sends none on the call, or the
+// call broke. The binder asks the guest for an attestation itself.
+var ErrQuoteNotSent = errors.New("the bind's call ended without the quote over the bind's nonce")
+
+// Quote waits for the quote the guest takes over the bind's nonce, which
+// comes on the bind's own call as soon as the guest has it, and returns the
+// guest's evidence with it, relayed and unjudged. The answer's own evidence
+// is returned when the quote was in it. A guest that says it gave up on the
+// quote is session.ErrNoBindQuote, and a call that ended with no word of one
+// is ErrQuoteNotSent: either way the binder asks the guest for an
+// attestation over a nonce of its own, on a connection that ends in the
+// guest, and no start asks the daemon for evidence.
+func (b *BindCall) Quote(ctx context.Context) (*session.Relayed, error) {
+	if b.Answer != nil && len(b.Answer.Evidence) > 0 {
+		return b.Answer, nil
 	}
-	return next.GetSealedAnswer(), next.GetSealedStatus(), nil
+	b.read()
+	select {
+	case <-b.quoted:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	switch {
+	case b.quote == nil && b.ended != nil && !errors.Is(b.ended, io.EOF):
+		return nil, fmt.Errorf("%w: %w", ErrQuoteNotSent, b.ended)
+	case b.quote == nil:
+		return nil, ErrQuoteNotSent
+	case len(b.quote.Evidence) > 0:
+		return b.quote, nil
+	case b.quote.BindQuote == session.BindQuoteGivenUp:
+		return nil, session.ErrNoBindQuote
+	}
+	// Evidence that says neither is none to wait on.
+	return nil, ErrQuoteNotSent
 }
 
 // Close ends the call.

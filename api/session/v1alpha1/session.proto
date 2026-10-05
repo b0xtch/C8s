@@ -95,12 +95,15 @@ message BindRequest {
 }
 
 message Bound {
-  // The evidence now includes the bind.
+  // The evidence now includes the bind. In a later message than the
+  // receipt: the guest's evidence with the quote over the bind's nonce, once
+  // the guest has taken it, or with its word that it gave up on one
+  // (bind_quote).
   Evidence evidence = 1;
   // The guest's receipt for the bind (c8s-bind-receipt/v1), as the guest
   // sent it: signed by its one-time key over the bind's nonce. The quote
   // over the same nonce is in the evidence if the guest had it by then, and
-  // in what GetEvidence returns once it has.
+  // follows in a later message of the call once it has.
   bytes receipt = 2;
   // In a later message than the receipt: what became of each part of the
   // sealed message, with the command's output and status, sealed back to

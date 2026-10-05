@@ -254,6 +254,12 @@ func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, 
 // serveState tells anyone how far along the guest is and what it measured:
 // see session.StateResponse. None of it costs a quote.
 func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	a.say(w, http.StatusOK, disclosure.MessageState, a.state())
+}
+
+// state is what the guest says of itself to anyone.
+func (a *Agent) state() session.StateResponse {
 	a.measured.RLock()
 	phase, events := a.stateLocked()
 	bind, quote, quoteState, readyCert := a.bind, a.bindQuote, a.bindQuoteState, a.readyCert
@@ -267,8 +273,7 @@ func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 	if bind != nil {
 		state.Bind, state.BindSignature, state.ReadyCertificate = bind.Raw, bind.Signature, readyCert
 	}
-	w.Header().Set("Cache-Control", "no-store")
-	a.say(w, http.StatusOK, disclosure.MessageState, state)
+	return state
 }
 
 // verifier checks a token against keys, for this guest alone. The same key
@@ -322,8 +327,11 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 			Phase: phase, Replayed: replayed, Sealed: answer.Sealed, Admission: admission,
 			Receipt: answer.Receipt, Attestation: answer.Attestation,
 		})
-		// The receipt goes out now. The sealed answer of a sealed message
-		// follows it as a second document, once the guest has acted on it.
+		// The receipt goes out now. What follows it comes as further
+		// documents, each when the guest has it: the sealed answer of a
+		// sealed message, once the guest has acted on it, and for a caller
+		// that reads on, the guest's state once the quote over the bind's
+		// nonce is settled.
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
@@ -331,21 +339,44 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		if !replayed {
 			trace.log(a.log)
 		}
-		if answer.Sealed != session.SealedTaken {
-			return
+		var sealed chan *session.SealedReply
+		if answer.Sealed == session.SealedTaken {
+			sealed = make(chan *session.SealedReply, 1)
+			go func() {
+				// A caller that went away gets none. The guest acts on the
+				// message all the same, and its answer is kept for the bind
+				// sent again.
+				defer close(sealed)
+				if result, err := a.sealedReply(r.Context()); err == nil {
+					sealed <- result
+				}
+			}()
 		}
-		result, err := a.sealedReply(r.Context())
-		if err != nil {
-			// The caller went away. The guest acts on the message all the
-			// same, and its answer is kept for the bind sent again.
-			return
+		var quoted <-chan struct{}
+		if answer.Attestation == nil && r.Header.Get(session.BindQuoteHeader) == session.BindQuoteFollows {
+			quoted = a.bindQuoteSettled()
 		}
-		body, err := disclosure.Encode(disclosure.MessageSealed, result)
-		if err != nil {
-			a.log.Error("an answer was held back: it is beyond the disclosure schema", "error", err)
-			return
+		for sealed != nil || quoted != nil {
+			message, document := "", any(nil)
+			select {
+			case result, ok := <-sealed:
+				if sealed = nil; !ok {
+					return
+				}
+				message, document = disclosure.MessageSealed, result
+			case <-quoted:
+				quoted = nil
+				message, document = disclosure.MessageState, a.state()
+			case <-r.Context().Done():
+				return
+			}
+			body, err := disclosure.Encode(message, document)
+			if err != nil {
+				a.log.Error("an answer was held back: it is beyond the disclosure schema", "error", err)
+				return
+			}
+			writeDocument(w, body)
 		}
-		writeDocument(w, body)
 	}
 }
 

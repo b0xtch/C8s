@@ -227,11 +227,13 @@ type startedSession struct {
 	Credentials  *sealedCredentialsResult `json:"credentials,omitempty"`
 }
 
-// Where the quote that a start judged came from.
+// Where the quote that a start judged came from: with the guest's answer to
+// the bind, after it on the bind's own call, or from an attestation this
+// command asked the guest for.
 const (
-	quoteWithAnswer   = "answer"
-	quoteWithEvidence = "evidence"
-	quoteAskedFor     = "attestation"
+	quoteWithAnswer = "answer"
+	quoteOnCall     = "call"
+	quoteAskedFor   = "attestation"
 )
 
 func newStartCmd() *cobra.Command {
@@ -519,7 +521,7 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	bound := binding.Policy(identity)
 	bound.AcceptTCBStatus = s.acceptedTCB()
-	judged, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, accessPEM, stderr)
+	judged, err := judgeBound(ctx, s, host, claimed.TD, bound, engine, ready, bind, answer, call.Quote, accessPEM, stderr)
 	if err != nil {
 		// The guest took the bind and cannot be held to it: it is of no use
 		// to anyone, and a check that could not be made counts as failed.
@@ -725,10 +727,11 @@ type judgedBind struct {
 // keep on it. This command keeps a verdict for the owner's next one, and a
 // verdict is made from a quote, so it waits for the quote before it says the
 // session started: the one over the bind's nonce, which comes with the answer
-// or with the guest's evidence a moment later. A receipt in the answer is
-// verified first, and the quote is held to it. A guest that gives no quote
-// for the bind's nonce, because its quoting service failed it, is asked for
-// an attestation over a connection of its own.
+// or after it on the bind's own call, as quote waits for it. A receipt in
+// the answer is verified first, and the quote is held to it. A guest that
+// gives no quote for the bind's nonce, because its quoting service failed it
+// or its call ended without one, is asked for an attestation over a
+// connection of its own. The daemon is asked for no evidence.
 //
 // An error is a guest that cannot be held to its bind, and its caller ends
 // the session: a receipt or a quote that is refused, a quote that disagrees
@@ -736,7 +739,8 @@ type judgedBind struct {
 // needs none of the vendor's documents, and cannot be judged for want of
 // one, leaves the session running: that comes back as pending.
 func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td string, bound session.Policy, engine session.Engine,
-	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, accessPEM []byte, stderr io.Writer,
+	ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed, quote func(context.Context) (*session.Relayed, error),
+	accessPEM []byte, stderr io.Writer,
 ) (*judgedBind, error) {
 	var receipt *session.BindReceipt
 	judged := &judgedBind{quote: quoteWithAnswer}
@@ -746,13 +750,13 @@ func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td stri
 			return nil, err
 		}
 		if len(answer.Evidence) == 0 {
-			// Until the quote is there, the guest says it gave up on it, or
-			// a few seconds have passed.
+			// Until the quote is there, the guest says it gave up on it, the
+			// call ends without it, or a few seconds have passed.
 			waiting, cancel := context.WithTimeout(ctx, quoteWait)
-			quoted, err := host.BoundEvidence(waiting, td)
+			quoted, err := quote(waiting)
 			cancel()
 			if err == nil {
-				answer, judged.quote = quoted, quoteWithEvidence
+				answer, judged.quote = quoted, quoteOnCall
 			}
 		}
 	}

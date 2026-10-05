@@ -68,6 +68,10 @@ func (i *TD) Address() string { return strings.TrimPrefix(i.guest.URL, "https://
 func (i *TD) Accepted() int         { return i.guest.Accepted() }
 func (i *TD) Asked(path string) int { return i.guest.Asked(path) }
 
+// HoldQuotes has the TD's guest wait for every quote it asks for from now
+// on, until the returned function is called.
+func (i *TD) HoldQuotes() (release func()) { return i.guest.HoldQuotes() }
+
 // Logged is how many times the TD's guest logged message.
 func (i *TD) Logged(message string) int { return i.guest.Logged(message) }
 

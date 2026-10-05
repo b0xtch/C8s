@@ -126,6 +126,10 @@ type Agent struct {
 	receipt        *session.SignedReceipt
 	bindQuote      *session.AttestResponse
 	bindQuoteState string
+	// quoteSettled is closed once the guest has that quote or has given up
+	// on one: what the bind's own call waits for after the receipt. Made by
+	// whoever first asks for it.
+	quoteSettled chan struct{}
 	// settling is set while a bind's sandbox is being admitted: the register
 	// already holds the sandbox's image, and the guest does not say so until
 	// the sandbox runs. It is closed when that is decided. A quote for anyone
@@ -558,6 +562,7 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 			a.measured.Lock()
 			if a.bindQuote == nil {
 				a.bindQuoteState = session.BindQuoteGivenUp
+				a.quoteSettledLocked()
 			}
 			a.measured.Unlock()
 		}
@@ -604,7 +609,36 @@ func (a *Agent) keepBindQuote(resp *session.AttestResponse) {
 	}
 	a.measured.Lock()
 	a.bindQuote, a.bindQuoteState = resp, session.BindQuoteTaken
+	a.quoteSettledLocked()
 	a.measured.Unlock()
+}
+
+// quoteSignalLocked is the signal that the quote over the bind's nonce is
+// settled, taken or given up. The caller holds measured for writing.
+func (a *Agent) quoteSignalLocked() chan struct{} {
+	if a.quoteSettled == nil {
+		a.quoteSettled = make(chan struct{})
+	}
+	return a.quoteSettled
+}
+
+// quoteSettledLocked gives that signal, once. The caller holds measured for
+// writing.
+func (a *Agent) quoteSettledLocked() {
+	signal := a.quoteSignalLocked()
+	select {
+	case <-signal:
+	default:
+		close(signal)
+	}
+}
+
+// bindQuoteSettled returns the signal that the quote over the bind's nonce
+// is settled.
+func (a *Agent) bindQuoteSettled() <-chan struct{} {
+	a.measured.Lock()
+	defer a.measured.Unlock()
+	return a.quoteSignalLocked()
 }
 
 // settle makes the register final for the bind: with a sandbox, it extends

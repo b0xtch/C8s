@@ -52,9 +52,9 @@ evidence it verified itself.
    |                           |                            | starts the sandbox
    | <-- receipt ------------- | <-- receipt -------------- |
    | <-- sealed answer ------- | <-- sealed answer -------- | ran the command
-   |                           |                            |
-   | GetEvidence(td) --------> | the quote over the bind's nonce, once taken
-   | hold the quote to the receipt                          |
+   | <-- evidence, quote ----- | <-- state, quote --------- | took the quote
+   | hold the quote to the receipt                          | over the bind's
+   |                           |                            | nonce
    |                           |                            |
    | Connect(td) ============= bytes =====================> | the TLS session
    |                           |                            | ends in the guest
@@ -78,6 +78,21 @@ became of the message: with no answer that opens, it releases the
 credentials over `Connect` and then sends the command again under the id it
 was sealed with, and the guest takes each credential once and runs the
 command once.
+
+The quote over the bind's nonce comes on the bind's own call. A guest
+answers with its receipt as soon as its sandbox runs and takes the quote
+beside it. Once it has the quote, or has given up on one, it sends its state
+on the same answer, the document it serves to anyone, and the daemon hands
+that on as the guest's evidence in a later message of the call. The sealed
+answer and the quote come in the order the guest has them. A binder waits for
+the quote there and asks the daemon for no evidence, so a start never waits
+on the evidence requests of others. One whose call ends without a quote, or
+whose guest says it gave up, asks the guest for an attestation through
+`Connect`. The daemon says in its request that it reads the answer to its end
+(`C8s-Bind-Quote: follows`), and a guest sends its state there only to a
+caller that does: the documents of an answer do not name their kind, and a
+caller that hands a guest its bind over a connection of its own reads the
+receipt and finds the quote in the state the guest serves.
 
 A binder that the pool names may watch it ([Who may call
 what](#who-may-call-what)): the daemon shows it each ready TD's evidence as

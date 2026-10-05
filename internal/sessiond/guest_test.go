@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -66,8 +68,9 @@ func (g *saidGuest) requests(path string) int {
 // A guest answers its bind with a receipt, and with the quote over the
 // bind's nonce only if it has it by then. The daemon relays both as they
 // are. With no quote in the answer it relays the certificate and the phase
-// and asks the guest nothing more: the quote comes with the guest's state
-// once it is taken, and whoever asks for the guest's evidence gets it then.
+// and asks the guest nothing more: the quote follows on the same answer from
+// a guest that sends it there, and comes with the guest's state either way,
+// so that whoever asks for the guest's evidence gets it then.
 func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 	guest := &saidGuest{}
 	server := httptest.NewTLSServer(guest)
@@ -101,8 +104,12 @@ func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 		t.Fatal(err)
 	}
 	evidence, relayed := answer.evidence, answer.receipt
-	if answer.sealed != "" || answer.wait != nil {
+	if answer.sealed != "" {
 		t.Fatalf("a bind that came with no sealed message was answered as one that did: %+v", answer)
+	}
+	// This guest says no more on its answer, and the daemon reads that.
+	if next, err := answer.later(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the answer of a guest that says no more: %+v, %v", next, err)
 	}
 	if !bytes.Equal(relayed, wantReceipt) {
 		t.Fatalf("the receipt was relayed as %s", relayed)
@@ -346,31 +353,199 @@ func TestBindAnswerComesBeforeItsSealedAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The guest has not answered the message, and the bind's answer is here.
-	if answer.sealed != session.SealedTaken || answer.wait == nil || answer.evidence.GetPhase() != string(session.PhaseRunning) {
+	if answer.sealed != session.SealedTaken || answer.evidence.GetPhase() != string(session.PhaseRunning) {
 		t.Fatalf("the bind's answer: %+v", answer)
 	}
 	if wrote.Load() != 1 {
 		t.Fatalf("the daemon was told %d times that the bind was written", wrote.Load())
 	}
 	guest.answer <- []byte("sealed answer")
-	result, err := answer.wait()
-	if err != nil || result.Sealed != session.SealedTaken || string(result.Answer) != "sealed answer" {
-		t.Fatalf("the sealed answer: %+v, %v", result, err)
+	next, err := answer.later()
+	if err != nil || next.sealed == nil || next.evidence != nil || next.sealed.Sealed != session.SealedTaken || string(next.sealed.Answer) != "sealed answer" {
+		t.Fatalf("the sealed answer: %+v, %v", next, err)
 	}
-	// Asked again, it is the same answer, and the guest is not.
-	if again, err := answer.wait(); err != nil || string(again.Answer) != "sealed answer" {
-		t.Fatalf("the sealed answer, asked for again: %+v, %v", again, err)
+	// That is all this guest says, however often it is asked.
+	for range 2 {
+		if next, err := answer.later(); !errors.Is(err, io.EOF) {
+			t.Fatalf("after the guest's last word: %+v, %v", next, err)
+		}
 	}
 
-	// A guest that ends before it answers the message: the wait says so.
+	// A guest that ends before it answers the message: what follows says so,
+	// and is no guest that said all it would.
 	answer, err = client.bind(ctx, addr, []byte("bind"), []byte("bind signature"), []byte("sealed message"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.CloseClientConnections()
-	if result, err := answer.wait(); err == nil {
-		t.Fatalf("a guest that went away answered its sealed message: %+v", result)
+	if next, err := answer.later(); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("a guest that went away answered its sealed message: %+v, %v", next, err)
 	}
+}
+
+// followingGuest answers a bind with a receipt and then with what a test
+// lines up, a document at a time, as a guest does that sends its sealed
+// answer and its state on the bind's own answer. It keeps what each bind's
+// request said of reading on.
+type followingGuest struct {
+	mu      sync.Mutex
+	first   session.BindResponse
+	follow  chan any
+	reading []string
+}
+
+func (g *followingGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != session.PathBind {
+		http.NotFound(w, r)
+		return
+	}
+	g.mu.Lock()
+	g.reading = append(g.reading, r.Header.Get(session.BindQuoteHeader))
+	first := g.first
+	g.mu.Unlock()
+	_ = json.NewEncoder(w).Encode(first)
+	w.(http.Flusher).Flush()
+	for {
+		select {
+		case document, more := <-g.follow:
+			if !more {
+				return
+			}
+			var out bytes.Buffer
+			if several, ok := document.(atOnce); ok {
+				for _, each := range several {
+					_ = json.NewEncoder(&out).Encode(each)
+				}
+			} else {
+				_ = json.NewEncoder(&out).Encode(document)
+			}
+			_, _ = w.Write(out.Bytes())
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// atOnce is documents a followingGuest writes in one piece, so that whoever
+// reads the first has the rest in hand.
+type atOnce []any
+
+// The daemon reads a guest's answer to a bind to its end, and says so in its
+// request. After the receipt the guest sends its sealed answer and, once the
+// quote over the bind's nonce is settled, its state: in the order it has
+// them. The daemon hands each on as what it is, the state as the guest's
+// evidence under the certificate that answer came under, and anything else
+// ends its reading.
+func TestWhatFollowsABindsReceiptIsRelayedAsItComes(t *testing.T) {
+	receipt := &session.SignedReceipt{Receipt: []byte(`{"schemaVersion":"c8s-bind-receipt/v1"}`), Signature: "c2lnbmF0dXJl"}
+	quote := &session.AttestResponse{
+		Evidence: teetypes.AttestationEvidence{Platform: "tdx", Evidence: json.RawMessage(`{"quote":"cXVvdGU="}`)},
+		Launch:   []byte("launch"), Signature: "launch signature", Events: []string{"sha256:1", "sha256:2", "sha256:3"},
+		Phase: session.PhaseRunning, Bind: []byte("bind"), BindSignature: "bind signature",
+	}
+	wantQuote, err := json.Marshal(quote.Evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taken := session.StateResponse{
+		Phase: session.PhaseRunning, Launch: []byte("launch"), Signature: "launch signature", Events: []string{"sha256:1", "sha256:2", "sha256:3"},
+		Bind: []byte("bind"), BindSignature: "bind signature", BindQuote: session.BindQuoteTaken, Attestation: quote,
+		ReadyCertificate: []byte("the certificate from before the bind"),
+	}
+	givenUp := taken
+	givenUp.BindQuote, givenUp.Attestation = session.BindQuoteGivenUp, nil
+	sealed := session.SealedReply{Sealed: session.SealedTaken, Answer: []byte("sealed answer")}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bound := func(t *testing.T, first session.BindResponse, follow ...any) (*boundAnswer, *followingGuest, []byte) {
+		t.Helper()
+		guest := &followingGuest{first: first, follow: make(chan any, len(follow))}
+		for _, document := range follow {
+			guest.follow <- document
+		}
+		close(guest.follow)
+		server := httptest.NewTLSServer(guest)
+		t.Cleanup(server.Close)
+		client := newGuestClient((&net.Dialer{}).DialContext)
+		t.Cleanup(client.reconnect)
+		answer, err := client.bind(ctx, strings.TrimPrefix(server.URL, "https://"), []byte("bind"), []byte("bind signature"), []byte("sealed message"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return answer, guest, server.Certificate().Raw
+	}
+	quoted := func(t *testing.T, next *followed, err error, leaf []byte) {
+		t.Helper()
+		if err != nil || next.sealed != nil || next.evidence == nil {
+			t.Fatalf("the guest's evidence with its quote: %+v, %v", next, err)
+		}
+		e := next.evidence
+		if !bytes.Equal(e.GetQuote(), wantQuote) || e.GetBindQuote() != session.BindQuoteTaken || !bytes.Equal(e.GetCertificate(), leaf) ||
+			len(e.GetEvents()) != 3 || !bytes.Equal(e.GetBind(), []byte("bind")) || string(e.GetReadyCertificate()) != "the certificate from before the bind" {
+			t.Fatalf("the evidence relayed with the quote: %+v", e)
+		}
+	}
+	answered := func(t *testing.T, next *followed, err error) {
+		t.Helper()
+		if err != nil || next.evidence != nil || next.sealed == nil || string(next.sealed.Answer) != "sealed answer" {
+			t.Fatalf("the sealed answer: %+v, %v", next, err)
+		}
+	}
+	ended := func(t *testing.T, answer *boundAnswer) {
+		t.Helper()
+		if next, err := answer.later(); !errors.Is(err, io.EOF) {
+			t.Fatalf("after the guest's last word: %+v, %v", next, err)
+		}
+	}
+	first := session.BindResponse{Phase: session.PhaseRunning, Receipt: receipt, Sealed: session.SealedTaken}
+
+	t.Run("the quote before the sealed answer", func(t *testing.T) {
+		answer, guest, leaf := bound(t, first, taken, sealed)
+		if len(guest.reading) != 1 || guest.reading[0] != session.BindQuoteFollows {
+			t.Fatalf("the daemon's request said %q of reading on", guest.reading)
+		}
+		next, err := answer.later()
+		quoted(t, next, err, leaf)
+		next, err = answer.later()
+		answered(t, next, err)
+		ended(t, answer)
+	})
+	t.Run("the sealed answer before the quote", func(t *testing.T) {
+		answer, _, leaf := bound(t, first, sealed, taken)
+		next, err := answer.later()
+		answered(t, next, err)
+		next, err = answer.later()
+		quoted(t, next, err, leaf)
+		ended(t, answer)
+	})
+	t.Run("a guest that gave up on its quote", func(t *testing.T) {
+		answer, _, _ := bound(t, first, sealed, givenUp)
+		next, err := answer.later()
+		answered(t, next, err)
+		if next, err = answer.later(); err != nil || next.evidence == nil || next.evidence.GetBindQuote() != session.BindQuoteGivenUp || len(next.evidence.GetQuote()) != 0 {
+			t.Fatalf("the word of a guest that gave up: %+v, %v", next, err)
+		}
+		ended(t, answer)
+	})
+	t.Run("a guest that sends no state there", func(t *testing.T) {
+		answer, _, _ := bound(t, first, sealed)
+		next, err := answer.later()
+		answered(t, next, err)
+		ended(t, answer)
+	})
+	t.Run("a document that is neither", func(t *testing.T) {
+		answer, _, _ := bound(t, first, atOnce{map[string]string{"something": "else"}, sealed})
+		_, refused := answer.later()
+		if refused == nil || errors.Is(refused, io.EOF) {
+			t.Fatalf("a document that is no sealed answer and no state was relayed: %v", refused)
+		}
+		// Nothing after it is relayed, though it came in the same piece.
+		if next, err := answer.later(); !errors.Is(err, refused) {
+			t.Fatalf("after a document the daemon could not read: %+v, %v", next, err)
+		}
+	})
 }
 
 // A sealed message that follows its bind goes on a connection of its own,
