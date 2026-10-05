@@ -207,6 +207,9 @@ type record struct {
 	// the guest takes for a fresh nonce, and this side's judgment of it.
 	Attest  int64 `json:"attest_us,omitempty"`
 	Destroy int64 `json:"destroy_us,omitempty"`
+	// Module is the measurement of the TDX module the guest ran under, as
+	// the quote of that attestation names it.
+	Module string `json:"tdx_module_mrseam,omitempty"`
 }
 
 func main() {
@@ -246,6 +249,7 @@ func main() {
 	flag.BoolVar(&o.loseFirst, "lose-first", false, "with --claim-with-bind, have a second bind for the TD each round signs for arrive first, to time what a collision of two binders costs; each round then takes two TDs")
 	flag.StringVar(&o.watchCert, "watch-cert", "", "a certificate to watch the pool under in place of --daemon-cert, PEM: a binder's own, which no authority need have signed")
 	flag.StringVar(&o.watchKey, "watch-key", "", "the private key of --watch-cert, PEM")
+	simulationFlags()
 	flag.Parse()
 	if err := run(&o); err != nil {
 		fmt.Fprintln(os.Stderr, "warmstart:", err)
@@ -359,7 +363,16 @@ func run(o *options) error {
 		defer printing.Unlock()
 		return out.Encode(v)
 	}
-	engine := session.NewEngine(session.EngineOptions{CollateralCacheDir: o.collateralCache})
+	engine, simulated, err := newEngine(session.EngineOptions{CollateralCacheDir: o.collateralCache})
+	if err != nil {
+		return err
+	}
+	// A run whose guests have no TEE says so before any of its numbers.
+	if simulated != nil {
+		if err := emit(simulated); err != nil {
+			return err
+		}
+	}
 	// What a verdict that lets a secret go takes from the vendor alone is
 	// fetched before a start needs it, as far as it can be named by now. It
 	// is work done before the measured path, so it is timed and recorded.
@@ -962,11 +975,16 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	}
 	if o.attest {
 		step = time.Now()
-		if _, err := client.Attest(ctx); err != nil {
+		if att, err := client.Attest(ctx); err != nil {
 			// A guest rations its quotes, and has just given one.
 			fmt.Fprintf(os.Stderr, "warmstart: round %d: no further attestation: %v\n", round, err)
 		} else {
 			rec.Attest = micros(step)
+			// What ran the guest, as its quote names it: a run's record of
+			// its versions takes the TDX module's measurement from here.
+			if att.Result != nil {
+				rec.Module, _ = att.Result.Claims.PlatformData["mr_seam"].(string)
+			}
 		}
 	}
 	return rec, nil

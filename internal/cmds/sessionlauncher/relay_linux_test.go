@@ -251,7 +251,7 @@ func TestVendorRelayCarriesItsGuestToTheVendor(t *testing.T) {
 	service, count := echoService(t)
 	run := func(cid uint32) uint32 {
 		t.Helper()
-		road, port, err := vendorRelay(service, cid, quiet)
+		road, port, err := vendorRelay("the vendor's", service, cid, quiet)
 		if err != nil {
 			t.Skipf("no vsock here: %v", err)
 		}

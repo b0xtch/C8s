@@ -102,6 +102,7 @@ misbehaves produces a guest that will not boot or will not verify.`,
 	f.BoolVar(&cfg.Console, "console", false, "attach a guest console to this process's output (dev images; a locked image prints nothing)")
 	f.StringVar(&cfg.ImageStore, "image-store", "", "a store of public images, written by 'c8s session image-store', that the guest takes sandbox images from before it asks a registry; read-only, and shared by every guest launched with it")
 	f.StringVar(&confine, "confine", "", "run QEMU as this numeric uid[:gid], with no capability and in process, IPC, host name and (except --network user) network namespaces of its own; needs CAP_SETUID, CAP_SETGID, CAP_SYS_ADMIN and CAP_KILL here")
+	cfg.sim.flags(f)
 	for _, name := range []string{"platform", "image-dir", "launch-dir", "work-dir"} {
 		_ = cmd.MarkFlagRequired(name)
 	}

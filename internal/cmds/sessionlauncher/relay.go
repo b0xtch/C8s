@@ -166,9 +166,10 @@ func fromGuest(cid uint32) func(net.Conn) bool {
 }
 
 // vendorRelay listens for this launcher's guest and carries what it takes to
-// one of the vendor's services, which is all it reaches: the guest names no
-// destination. The port it returns is what the guest dials for that service.
-func vendorRelay(service string, cid uint32, log *slog.Logger) (*relay, uint32, error) {
+// one of the vendor's services, at address, which is all it reaches: the
+// guest names no destination. The port it returns is what the guest dials
+// for that service.
+func vendorRelay(service, address string, cid uint32, log *slog.Logger) (*relay, uint32, error) {
 	ln, err := vsock.Listen(vsock.AnyPort, relayed)
 	if err != nil {
 		return nil, 0, err
@@ -179,11 +180,33 @@ func vendorRelay(service string, cid uint32, log *slog.Logger) (*relay, uint32, 
 		ln:   ln,
 		own:  fromGuest(cid),
 		dial: func(ctx context.Context) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp", service)
+			return dialer.DialContext(ctx, "tcp", address)
 		},
 		slots: relayed,
 		log:   log,
 	}, ln.Port(), nil
+}
+
+// vendorRoads makes a road for the guest with this context id to each of
+// the vendor's services for its platform, and returns the port the guest
+// dials for each. The roads it made are returned with an error too: their
+// listeners are the caller's to close.
+func vendorRoads(cfg *Config, cid uint32, log *slog.Logger) ([]*relay, map[string]uint32, error) {
+	services, err := session.VendorServices(cfg.Platform)
+	if err != nil {
+		return nil, nil, err
+	}
+	var roads []*relay
+	ports := map[string]uint32{}
+	for _, service := range services {
+		road, port, err := vendorRelay(service, cfg.sim.vendor(service), cid, log)
+		if err != nil {
+			return roads, nil, err
+		}
+		roads = append(roads, road)
+		ports[service] = port
+	}
+	return roads, ports, nil
 }
 
 // publishRelay listens on a TCP port of the host and carries what it takes

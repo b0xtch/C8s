@@ -77,6 +77,7 @@ See docs/sessions.md.`,
 	credential.AddCommand(newCredentialPutCmd())
 	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), newWatchCmd(), keyServiceCmd(), sessionschema.NewCmd())
 	cmd.AddCommand(imageStoreCmds()...)
+	cmd.AddCommand(simulationCmds()...)
 	return cmd
 }
 
@@ -513,6 +514,9 @@ type trust struct {
 	allowBound    bool
 	timeout       time.Duration
 	engineForTest session.Engine
+	// simulated judges under a simulated authority in place of the vendor:
+	// only a development build has an option that sets it.
+	simulated simulatedTrust
 	// daemon is how the guest's host is reached when the guest is, and td
 	// the guest's TD there. A binding that 'start' wrote names both.
 	daemon daemonFlags
@@ -539,6 +543,7 @@ func (t *trust) collateralFlags(f *pflag.FlagSet) {
 	f.BoolVar(&t.timing, "timing", false, "print how long each step took, a line each, to standard error")
 	f.StringSliceVar(&t.acceptTCB, "accept-tcb-status", nil,
 		"an Intel TCB status, besides UpToDate, that the guest's platform, its TDX module or its quoting enclave may have, such as OutOfDate or SWHardeningNeeded; repeat for more. Without it each of the three must be UpToDate. Revoked is never accepted")
+	t.simulated.flags(f)
 }
 
 // acceptedTCB is --accept-tcb-status as a policy carries it: sorted, each
@@ -693,9 +698,13 @@ func (t *trust) engine() session.Engine {
 	if t.engineForTest != nil {
 		return t.engineForTest
 	}
-	return session.NewEngine(session.EngineOptions{
+	opts := session.EngineOptions{
 		CollateralCacheDir: t.collateralCache, FreshCollateralOnly: t.freshCollateral, OwnCollateralOnly: t.ownCollateral,
-	})
+	}
+	if engine := t.simulated.engine(opts); engine != nil {
+		return engine
+	}
+	return session.NewEngine(opts)
 }
 
 // defaultCollateralCache is under the user's cache directory, or nowhere on a

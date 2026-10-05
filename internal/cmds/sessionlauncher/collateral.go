@@ -470,6 +470,6 @@ func collateralStock(cfg *Config, cid uint32, log *slog.Logger) (*stock, uint32,
 	return &stock{
 		ln:    ln,
 		own:   func(conn net.Conn) bool { peer, ok := conn.(*vsock.Conn); return ok && peer.Peer() == cid },
-		fetch: session.FetchCollateral, dir: cfg.CollateralCache, pace: collateralPace, log: log,
+		fetch: cfg.sim.fetcher(), dir: cfg.sim.stockDir(cfg.CollateralCache), pace: collateralPace, log: log,
 	}, ln.Port(), nil
 }

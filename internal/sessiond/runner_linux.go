@@ -115,6 +115,7 @@ func (r *QEMURunner) Start(_ context.Context, spec Spec) (Instance, error) {
 	if vmm.Console {
 		args = append(args, "--console")
 	}
+	args = append(args, vmm.launcherArgs()...)
 	var files []*os.File
 	defer func() {
 		for _, f := range files {

@@ -132,6 +132,9 @@ type Config struct {
 	// Confine holds the VMM as an unprivileged user in namespaces of its own.
 	// Nil runs it as the launcher, where the launcher is.
 	Confine *Confinement
+	// sim is a TEE simulated in software in place of the platform's: only a
+	// development build has one, and no option of any other build sets it.
+	sim simulation
 	// tap, vsock and disks are filled in by Run from the descriptors QEMU
 	// inherits.
 	tap   *tapDevice
@@ -386,10 +389,14 @@ const bareBoard = "sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off"
 // driver for and its agent takes for another device.
 const modernOnly = "disable-legacy=on"
 
+// guarded names the object that guards a guest's memory and state, to the
+// machine.
+const guarded = "confidential-guest-support=tee0,"
+
 // machine is the -machine value: the q35 chipset stripped to what a guest
 // uses, with what the platform adds, and the memory split if one is set.
 func (c *Config) machine(platform string) string {
-	machine := "q35,confidential-guest-support=tee0," + platform + "kernel-irqchip=split," + bareBoard
+	machine := "q35," + platform + "kernel-irqchip=split," + bareBoard
 	if c.LowMemoryMiB != 0 {
 		machine += fmt.Sprintf(",max-ram-below-4g=%dM", c.LowMemoryMiB)
 	}
@@ -418,8 +425,12 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 	if c.disks == nil {
 		return nil, errors.New("the guest's disks are not open")
 	}
-	switch c.Platform {
-	case "tdx":
+	switch {
+	case c.sim.on():
+		// The board, the CPU and the firmware of a TD of this class, and no
+		// object that guards the guest: its TEE is simulated inside it.
+		args = append(args, "-cpu", "host", "-machine", c.machine(""), "-bios", fdPath(c.disks.firmware))
+	case c.Platform == "tdx":
 		object := map[string]any{"qom-type": "tdx-guest", "id": "tee0"}
 		if c.QuoteSocket != "" {
 			address, err := quoteSocketAddress(c.QuoteSocket)
@@ -435,11 +446,11 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 		args = append(args,
 			// A named CPU model is refused for TDX; the TD sees what the module allows.
 			"-cpu", "host",
-			"-machine", c.machine(""),
+			"-machine", c.machine(guarded),
 			"-object", string(encoded),
 			"-bios", fdPath(c.disks.firmware),
 		)
-	case "snp":
+	case c.Platform == "snp":
 		if len(launchPubPEM) == 0 {
 			return nil, errors.New("SEV-SNP launch needs the launch public key to commit as HOST_DATA")
 		}
@@ -448,7 +459,7 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 		hostData := sha256.Sum256(launchPubPEM)
 		args = append(args,
 			"-cpu", "EPYC-Genoa",
-			"-machine", c.machine("igvm-cfg=igvm0,memory-backend=ram0,"),
+			"-machine", c.machine(guarded+"igvm-cfg=igvm0,memory-backend=ram0,"),
 			"-object", "igvm-cfg,id=igvm0,file="+fdPath(c.disks.firmware),
 			"-object", fmt.Sprintf("memory-backend-memfd,id=ram0,size=%dM,share=true", c.MemoryMiB),
 			"-object", "sev-snp-guest,id=tee0,cbitpos=51,reduced-phys-bits=1,host-data="+base64.StdEncoding.EncodeToString(hostData[:]),

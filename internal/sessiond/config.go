@@ -177,6 +177,9 @@ type VMM struct {
 	// Console attaches each guest's console to its launcher's log. A locked
 	// image prints nothing there.
 	Console bool `yaml:"console,omitempty"`
+	// Simulation is a TEE simulated in software in place of the host's: only
+	// a development build has an option for one, and no other build reads it.
+	Simulation `yaml:",inline"`
 }
 
 // Class is a launch shape: what a TD of the class is booted with. The shape
@@ -254,7 +257,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	base := filepath.Dir(path)
-	for _, p := range []*string{&cfg.StateDir, &cfg.TLS.Cert, &cfg.TLS.Key, &cfg.TLS.ClientCA} {
+	for _, p := range append(cfg.VMM.paths(), &cfg.StateDir, &cfg.TLS.Cert, &cfg.TLS.Key, &cfg.TLS.ClientCA) {
 		*p = resolve(base, *p)
 	}
 	for i := range cfg.Pools {

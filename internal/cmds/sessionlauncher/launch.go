@@ -55,6 +55,9 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if platform != cfg.Platform {
 		return fmt.Errorf("launch document is for %s, launcher was asked for %s", platform, cfg.Platform)
 	}
+	if err := cfg.sim.open(&cfg); err != nil {
+		return fmt.Errorf("simulated TEE: %w", err)
+	}
 	// Checked before any interface is touched.
 	for _, name := range []string{firmwareFile(&cfg), diskFile} {
 		if _, err := os.Stat(filepath.Join(cfg.ImageDir, name)); err != nil {
@@ -147,21 +150,16 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	// it takes from the vendor itself. One with a vsock device is carried
 	// there by its launcher, and needs no network device for it.
 	if cid := cfg.guestCID(); replica && cid != 0 {
-		services, err := session.VendorServices(cfg.Platform)
-		if err != nil {
-			return err
-		}
-		host.VendorPorts = map[string]uint32{}
-		for _, service := range services {
-			road, port, err := vendorRelay(service, cid, log)
-			if err != nil {
-				return fmt.Errorf("vendor relay: %w", err)
-			}
+		roads, ports, err := vendorRoads(&cfg, cid, log)
+		for _, road := range roads {
 			defer road.ln.Close()
-			carriers = append(carriers, road)
-			host.VendorPorts[service] = port
 		}
-		described = append(described, "vendor_services", len(services))
+		if err != nil {
+			return fmt.Errorf("vendor relay: %w", err)
+		}
+		carriers = append(carriers, roads...)
+		host.VendorPorts = ports
+		described = append(described, "vendor_services", len(ports))
 	}
 	// A TD with a vsock device asks its launcher for Intel's documents for
 	// its platform. The launcher looks for them now, ahead of the ask.
@@ -179,7 +177,8 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	// the image directory or the work directory and needs no right to enter
 	// either.
 	cfg.disks = &diskFiles{}
-	for _, file := range []struct {
+	var image [2]*os.File
+	for i, file := range []struct {
 		name string
 		fd   *int
 	}{{firmwareFile(&cfg), &cfg.disks.firmware}, {diskFile, &cfg.disks.root}} {
@@ -187,18 +186,25 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("guest image: %w", err)
 		}
-		*file.fd = inherit(f)
+		*file.fd, image[i] = inherit(f), f
 	}
 	hostJSON, err := json.Marshal(host)
 	if err != nil {
 		return err
 	}
-	iso, err := BuildISO(opkeyLabel, []ISOFile{
+	files := []ISOFile{
 		{Name: session.PubkeyFile, Data: pub},
 		{Name: session.DocumentFile, Data: launch},
 		{Name: session.SignatureFile, Data: signature},
 		{Name: session.HostConfigFile, Data: hostJSON},
-	})
+	}
+	// What stands for the guest's hardware where its TEE is simulated: the
+	// registers of the image these two open files are.
+	hardware, err := cfg.sim.declare(&cfg, image[0], image[1])
+	if err != nil {
+		return fmt.Errorf("simulated TEE: %w", err)
+	}
+	iso, err := BuildISO(opkeyLabel, append(files, hardware...))
 	if err != nil {
 		return err
 	}
@@ -241,6 +247,9 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = shutdownGrace
+	if cfg.sim.on() {
+		log.Warn("this guest runs in no TEE: its launcher declared its registers and handed it the key its quotes are certified under")
+	}
 	log.Info("starting guest", append([]any{"platform", cfg.Platform,
 		"launch_digest", session.DocumentDigest(launch), "vcpus", cfg.VCPUs, "memory_mib", cfg.MemoryMiB, "network", cfg.Network},
 		described...)...)
