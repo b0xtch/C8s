@@ -607,12 +607,21 @@ func TestBinderTakesTheGuestItWasShownFirst(t *testing.T) {
 		return judged
 	}
 
+	// standing is how many guests the binder can sign for at once.
+	standing := func(what string, want int) {
+		t.Helper()
+		if got := verdicts.Standing(); got != want {
+			t.Fatalf("%s: %d verdicts stand for a guest to take, want %d", what, got, want)
+		}
+	}
 	taken("a binder that was shown nothing", nil)
+	standing("a binder that was shown nothing", 0)
 	for i, r := range shown {
 		if err := verdicts.Judge(within(t), r); err != nil {
 			t.Fatalf("guest %d: %v", i, err)
 		}
 	}
+	standing("every guest shown and judged", len(shown))
 	// A guest shown again keeps its place.
 	if err := verdicts.Judge(within(t), shown[0]); err != nil {
 		t.Fatal(err)
@@ -621,6 +630,7 @@ func TestBinderTakesTheGuestItWasShownFirst(t *testing.T) {
 	// signed on, and none is dropped, since a refresh makes each anew.
 	engine.documents.Add(1)
 	taken("verdicts made under documents since replaced", nil)
+	standing("verdicts made under documents since replaced", 0)
 	if verdicts.Kept() != len(shown) {
 		t.Fatalf("%d verdicts are kept of %d that wait to be made anew", verdicts.Kept(), len(shown))
 	}
@@ -639,16 +649,20 @@ func TestBinderTakesTheGuestItWasShownFirst(t *testing.T) {
 	if verdicts.Kept() != len(shown)-1 {
 		t.Fatalf("%d verdicts are kept after one was taken", verdicts.Kept())
 	}
+	standing("one guest taken", len(shown)-1)
 	// The watch says the next guest left: the binder signs for the one after.
 	verdicts.Forget(sha256.Sum256(shown[1].Certificate))
+	standing("one guest taken and one that left", len(shown)-2)
 	taken("the guest shown after one that left", shown[2])
 	// A guest shown anew after it left comes after those that waited.
 	if err := verdicts.Judge(within(t), shown[1]); err != nil {
 		t.Fatal(err)
 	}
+	standing("two taken, and the one that left shown anew", len(shown)-2)
 	// Past its time no verdict stands.
 	clock = now.Add(session.ServingVerdictTTL)
 	taken("verdicts past their time", nil)
+	standing("verdicts past their time", 0)
 	clock = now
 	taken("the next that waited", shown[3])
 	taken("the last that waited", shown[4])

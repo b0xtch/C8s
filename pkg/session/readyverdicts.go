@@ -287,7 +287,7 @@ func (v *ReadyVerdicts) Take() (*JudgedReady, error) {
 	var first *readyVerdict
 	var at [sha256.Size]byte
 	for digest, kept := range v.judged {
-		if kept.made() && kept.left.IsZero() && v.usableLocked(kept) && (first == nil || kept.order < first.order) {
+		if v.waitsLocked(kept) && (first == nil || kept.order < first.order) {
 			first, at = kept, digest
 		}
 	}
@@ -296,6 +296,28 @@ func (v *ReadyVerdicts) Take() (*JudgedReady, error) {
 	}
 	delete(v.judged, at)
 	return &JudgedReady{ReadyTD: first.ready, Certificate: first.evidence.Certificate, Ahead: true, Took: first.took}, nil
+}
+
+// waitsLocked reports whether a verdict is one Take hands out: made, still
+// standing, and of a guest whose TD is still ready. The caller holds the
+// lock.
+func (v *ReadyVerdicts) waitsLocked(kept *readyVerdict) bool {
+	return kept.made() && kept.left.IsZero() && v.usableLocked(kept)
+}
+
+// Standing is how many guests Take would hand the binder now, one after
+// another. A binder asked for several sessions at once knows by it how many
+// it can sign for without waiting for a guest.
+func (v *ReadyVerdicts) Standing() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	n := 0
+	for _, kept := range v.judged {
+		if v.waitsLocked(kept) {
+			n++
+		}
+	}
+	return n
 }
 
 // Forget notes that the TD of the guest that served the certificate of this
