@@ -124,20 +124,28 @@ memory-acceptance floor; work inside within the published floors.
 - **A second baseline**: the same guest and VMM with TDX off, which separates
   the cost of confidentiality from the cost of the VMM. A session image stops
   without a TEE, so this baseline runs a development build of it whose TEE is
-  simulated in software: the same image but for that, with measurements of its
-  own and quotes in the vendor's format under a development root of the same
-  algorithms, so that every check costs what it costs on TDX and the
-  difference is what the hardware and the vendor's quoting add. No verifier or
-  key service but a development one accepts that root, and a session image
-  never falls back to the simulation.
+  simulated in software: the same image, firmware and kernel but for that,
+  with measurements of its own and quotes in the vendor's format under a
+  development root of the same algorithms, signed in the guest, so that every
+  check costs what it costs on TDX. The difference is then what the hardware
+  and the vendor's quoting add: memory acceptance, the TDX module's exits,
+  bounce buffers for device I/O and the quoting service. Only a development
+  build of a verifier or key service can accept that root, and then in place
+  of the vendor's, never beside it; a release build has no option that would,
+  and a session image never falls back to the simulation. Where the guest's
+  own work differs without a TEE, the record says so, as when a plain VM's
+  kernel zeroes all its memory at boot where a TD's accepts it as it goes.
 - **The same settings.** Power settings (governor, C-states, turbo) are pinned
-  and recorded, versions are named, and runs of the two sides interleave.
-  Nothing else runs on the host during a run: no other TD or VM.
+  and recorded, versions are named, and the sides interleave round by round
+  within one run. Nothing else runs on the host during a run: no TD or VM but
+  the sides' own, and a side that waits keeps its guests idle, with no boot in
+  flight, on cores apart from those of the side being measured, as the record
+  lists.
 - **Like for like.** Both sides reach their first command the same way. A
   baseline driven over a serial console, with no platform channel, is a floor,
   and is labeled as one. Work either side does before the measured path, such
-  as a snapshot made, or ready evidence judged, before the claim, is named and
-  timed beside the number.
+  as a snapshot made or ready evidence judged before the claim, or the
+  vendor's documents fetched, is named and timed beside the number.
 - **Published records.** Every number comes with its raw records, the commands
   that made them, the versions of the host kernel, VMM, firmware, TDX module
   and guest, and the host's store: its file system and how layers were placed.
