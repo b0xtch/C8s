@@ -165,13 +165,13 @@ Session TDs follow c8s's current launch-key and measurement contracts
   key and a hybrid KEM key, ML-KEM-768 with X25519, for its one bind. Every
   report it makes before that bind carries their digest in its report data,
   beside the instance key's, and its evidence keeps the last such quote. The
-  guest signs its answer to the bind with the first and erases it, then opens
-  with the second any message the binder sealed to it with the bind, carrying
-  the first command or the credentials the binder holds, and erases that key
-  too before anything of the tenant runs. The instance key must outlive the
-  bind, so code that broke out of the sandbox could read it; the one-time keys
-  are gone by then ([A session that reads its own
-  TD](session-threat-model.md#binding-and-identity)).
+  guest signs its answer to the bind with the first as soon as it has measured
+  the bind, and erases it; it opens with the second any message the binder
+  sealed to it with the bind, carrying the first command or the credentials
+  the binder holds, and erases that key too before anything of the tenant
+  runs. The instance key must outlive the bind, so code that broke out of the
+  sandbox could read it; the one-time keys are gone by then ([A session that
+  reads its own TD](session-threat-model.md#binding-and-identity)).
 - **Bind.** On TDX the guest extends RTMR[3] with the bind's digest, on top
   of the launch key's seed: the chain a node's per-workload measurement uses
   today. SEV-SNP has no runtime register, so there the guest puts the bind's
