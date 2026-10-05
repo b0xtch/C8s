@@ -84,19 +84,19 @@ Each `env.txt` says so in its first line.
 
 ## What to know when reading them
 
-- **The simulated side verifies more than the TD side in `-pb` and `-p`.** A
+- **Every simulated guest was a platform of its own to a verifier.** A
   verifier keeps, for each platform and for a minute, the outcome of the
   checks that depend only on the platform and the vendor's documents. Every
   TD of a host shares the attestation key of the host's quoting enclave, and
-  so is one platform to a verifier. In these runs each simulated guest made
-  an attestation key of its own at boot, and so was a platform of its own:
-  whoever judged its first quote ran those checks in full. That is the
-  binder's judgment of each ready guest, before the round, and the key
-  service's judgment of each session's guest, inside the bind. In `-pb` and
-  `-p` the simulated side's bind, start and first command therefore carry in
-  every round what the TD side's carry in one round of four, and the
-  difference of the medians there understates what the hardware adds. `-sb`
-  has no such step on its measured path.
+  so is one platform. In these runs each simulated guest made an attestation
+  key of its own at boot, so whoever judged its first quote ran those checks
+  in full: the binder when the guest became ready, and the key service when
+  the guest opened its session with it, at boot. Both are before the
+  measured path, where a bind finds the two verdicts standing. So the
+  simulated side's `ready TD judged ahead` is higher here than a platform
+  with one key gives, and its start is not: runs 3 and 4
+  ([2026-10-05-i27](../2026-10-05-i27/README.md)), where every simulated
+  guest shares one key, give the same start.
 - **The count of the host's other load is coarse.** It sums each process's
   share of one CPU over that process's whole life, so a process that started
   a moment before can count for a whole CPU. The second run took it before

@@ -1,0 +1,77 @@
+--- the TD side
+session claim                      n= 20  median       1.0  p90       1.1  min       1.0  max       1.3  ms
+session ready_check                n= 20  median       0.0  p90       0.0  min       0.0  max       0.3  ms
+session members                    n= 20  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session sign                       n= 20  median       0.3  p90       0.3  min       0.3  max       0.5  ms
+session seal                       n= 20  median       0.2  p90       0.3  min       0.2  max       0.3  ms
+session bind                       n= 20  median       7.3  p90       7.8  min       6.3  max       8.0  ms
+session judge                      n= 20  median       0.2  p90       0.3  min       0.1  max       0.4  ms
+session start                      n= 20  median       9.3  p90       9.8  min       8.0  max      10.1  ms
+session first_exec                 n= 20  median       0.9  p90       1.9  min       0.3  max       2.1  ms
+session first_cmd                  n= 20  median      10.1  p90      10.6  min       9.5  max      11.2  ms
+session quote                      n= 20  median       2.0  p90       6.3  min       1.5  max       6.7  ms
+session confirmed                  n= 20  median      11.2  p90      14.3  min      10.5  max      15.1  ms
+session attest                     n= 20  median       4.7  p90       6.3  min       3.5  max       6.3  ms
+session destroy                    n= 20  median       0.5  p90       0.7  min       0.4  max       0.7  ms
+of 20 rounds, the guest took the first command with its bind in 20, the command's answer was taken on the receipt in 20, and the connection for commands was made ahead in 20; the quote came with the bind's answer in 15
+of 20 rounds, the guest was judged before its claim in 20, and had a credential sealed with its bind in place in 0
+ready TD judged ahead              n= 20  median       1.5  p90       3.0  min       1.4  max       3.5  ms (before the round: no part of its times)
+vendor documents fetched           n=  1  median     545.9  p90     545.9  min     545.9  max     545.9  ms (before the rounds: no part of their times)
+key service replica judged         n=  1  median      81.0  p90      81.0  min      81.0  max      81.0  ms (before the rounds, and beside them when it failed: no part of their times)
+session later command              n= 60  median       2.0  p90       3.3  min       1.4  max       3.5  ms
+the first round, caches cold: start 10.1 ms, first command 10.7 ms
+session guest launch to ready      n= 23  median    2322.0  p90    2383.0  min    2281.0  max    4464.0  ms
+  before the VMM starts            n= 23  median      18.0  p90      20.0  min      16.0  max      23.0  ms
+  VMM start to documents asked     n= 23  median    2229.0  p90    2304.0  min    2192.0  max    3897.0  ms (the guest's first ask of its host)
+  documents asked to ready         n= 23  median      68.0  p90      74.0  min      54.0  max     551.0  ms
+--- the simulated TEE side
+session claim                      n= 20  median       1.0  p90       1.1  min       0.9  max       1.1  ms
+session ready_check                n= 20  median       0.0  p90       0.1  min       0.0  max       0.1  ms
+session members                    n= 20  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session sign                       n= 20  median       0.3  p90       0.3  min       0.3  max       0.7  ms
+session seal                       n= 20  median       0.3  p90       0.3  min       0.2  max       0.7  ms
+session bind                       n= 20  median       5.6  p90       6.4  min       5.3  max       7.4  ms
+session judge                      n= 20  median       0.1  p90       0.3  min       0.1  max       0.4  ms
+session start                      n= 20  median       7.6  p90       8.6  min       7.0  max       9.4  ms
+session first_exec                 n= 20  median       1.0  p90       1.7  min       0.0  max       1.8  ms
+session first_cmd                  n= 20  median       8.8  p90       9.3  min       7.9  max       9.4  ms
+session quote                      n= 20  median       1.9  p90       2.0  min       1.3  max       2.1  ms
+session confirmed                  n= 20  median       9.3  p90      10.4  min       8.4  max      10.9  ms
+session attest                     n= 20  median       2.1  p90       2.4  min       1.8  max       2.5  ms
+session destroy                    n= 20  median       0.6  p90       0.6  min       0.4  max       0.6  ms
+of 20 rounds, the guest took the first command with its bind in 20, the command's answer was taken on the receipt in 20, and the connection for commands was made ahead in 20; the quote came with the bind's answer in 20
+of 20 rounds, the guest was judged before its claim in 20, and had a credential sealed with its bind in place in 0
+ready TD judged ahead              n= 20  median       1.6  p90       2.3  min       1.3  max       2.7  ms (before the round: no part of its times)
+vendor documents fetched           n=  1  median       0.6  p90       0.6  min       0.6  max       0.6  ms (before the rounds: no part of their times)
+key service replica judged         n=  1  median       7.4  p90       7.4  min       7.4  max       7.4  ms (before the rounds, and beside them when it failed: no part of their times)
+session later command              n= 60  median       1.8  p90       2.5  min       1.2  max       2.8  ms
+the first round, caches cold: start 8.8 ms, first command 10.0 ms
+session guest launch to ready      n= 22  median    4121.0  p90    4161.0  min    4062.0  max    4242.0  ms (its kernel clears all of its memory first)
+  before the VMM starts            n= 22  median    1050.0  p90    1056.0  min    1047.0  max    1075.0  ms
+    its launcher's check           n= 22  median    1032.0  p90    1038.0  min    1030.0  max    1057.0  ms (it holds the firmware and the disk to the image's manifest: no launcher of a TD does)
+  VMM start to documents asked     n= 22  median    3003.0  p90    3054.0  min    2961.0  max    3120.0  ms (the guest's first ask of its host)
+  documents asked to ready         n= 22  median      56.0  p90      66.0  min      48.0  max      68.0  ms
+a plain guest's kernel clearing    n=  1  median    2353.0  p90    2353.0  min    2353.0  max    2353.0  ms for 16 GiB (one boot of the console image, alone, by its kernel's log: part of each launch above)
+this side's guests ran in no TEE: build tag c8s_simtee, authority /work/run/w23-m-p/sim/authority (root sha256 0cbf6bf2edbdf79aac67745d7734c3000a5137f74a5323f366e49842eeed47d3)
+--- what the hardware and the vendor's quoting add: the TD side's median less the simulated side's
+session claim                           -0.0 ms  (TD 1.0, simulated 1.0)
+session ready_check                     -0.0 ms  (TD 0.0, simulated 0.0)
+session members                         +0.0 ms  (TD 0.0, simulated 0.0)
+session sign                            +0.0 ms  (TD 0.3, simulated 0.3)
+session seal                            -0.0 ms  (TD 0.2, simulated 0.3)
+session bind                            +1.7 ms  (TD 7.3, simulated 5.6)
+session judge                           +0.0 ms  (TD 0.2, simulated 0.1)
+session start                           +1.7 ms  (TD 9.3, simulated 7.6)
+session first_exec                      -0.2 ms  (TD 0.9, simulated 1.0)
+session first_cmd                       +1.3 ms  (TD 10.1, simulated 8.8)
+session quote                           +0.1 ms  (TD 2.0, simulated 1.9)
+session confirmed                       +1.9 ms  (TD 11.2, simulated 9.3)
+session attest                          +2.6 ms  (TD 4.7, simulated 2.1)
+session destroy                         -0.0 ms  (TD 0.5, simulated 0.6)
+Firecracker snapshot made          n=  1  median   16065.0  p90   16065.0  min   16065.0  max   16065.0  ms (before the rounds, after a cold boot: no part of their times)
+Firecracker's first command over vsock: sh -c cat "$C8S_CREDENTIALS_DIR/api-token" (a file of 21 bytes on a read-only drive, unread before; its shell is busybox sha256 df12634c17fcdca839ae5dc47d7627b7558511f7645de7c99ccf097a0f28ed5b, read into the guest's memory before the snapshot)
+Firecracker cold to first command  n= 21  median    1097.6  p90    1125.8  min    1041.7  max    1166.7  ms (serial console: a floor)
+Firecracker snapshot load to first command n= 21  median       8.2  p90       8.7  min       6.8  max       8.9  ms (serial console: a floor)
+Firecracker snapshot load to first command n= 21  median      14.4  p90      15.1  min      12.9  max      15.4  ms (vsock to an agent in the guest)
+Firecracker later command          n= 21  median       1.4  p90       1.7  min       1.1  max       1.7  ms (vsock to an agent in the guest)
+method: power pinned (governor performance, idle states past C1E off, turbo on); 0 other VMs on the host, and its other programs at 132% of one CPU over the five seconds before the run (listed below); TDX on in the firmware, for every side; baseline Firecracker over vsock to an agent in its guest, its first command the sandbox image's shell reading a file of 21 bytes from a read-only drive as a session's is, and over its serial console (a floor), interleaved; second baseline: the same start in guests with no TEE and one simulated in software, taking turns with the TD side round by round in an order that alternates, each turn beginning with every pool full and idle; CPUs: TD guests 2,26,3,27,4,28,5,29,6,30,7,31, simulated guests 8,32,9,33,10,34,11,35,12,36,13,37, key services 14,38,15,39,16,40,17,41, Firecracker 18,42,19,43,20,44,21,45, daemons and drivers 22,46,23,47; before the measured path: the vendor's documents fetched by the binder (timed beside the rounds); each ready TD judged when it became ready (timed beside the rounds); the key service's replica judged by the binder, for its binds to name (timed beside the rounds)

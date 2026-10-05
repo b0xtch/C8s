@@ -1,0 +1,19 @@
+listen: 127.0.0.1:7453
+host: test-host
+stateDir: /work/run/w24-m-sb/sim/state
+capacity: 2
+tls: {cert: /work/run/w24-m-sb/pki/server.pem, key: /work/run/w24-m-sb/pki/server.key, clientCA: /work/run/w24-m-sb/pki/ca.pem}
+network: {mode: tap, guestCIDR: 10.214.0.0/24, tapPrefix: c8su}
+vmm:
+  simulatedTEE: /work/run/w24-m-sb/sim/authority
+  confine: "64055"
+classes:
+  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}
+pools:
+  - imageDir: /work/images-i27b/c8s-session-simtee
+    launchDir: /work/run/w24-m-sb/sim/bundle/opkeydata
+    depth: 2
+    imageStore: /work/store/images.store
+    binders:
+      - "sha256:0eb51327b253e1d4b8cf16a82bd6efdd0736d3fcbfeeabd442a8862c9f74e5b4"
+      - {key: "sha256:bd2f9046686cdb88c75ae822487e253edd78995ce5de491d02b3b021460266a4", authorities: ["sha256:4a1910f990075f802cea289c9a9544c673c590b328eb2734a25b0edbc9ffb1af"]}

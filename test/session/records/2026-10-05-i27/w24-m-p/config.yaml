@@ -1,0 +1,19 @@
+listen: 127.0.0.1:7443
+host: test-host
+stateDir: /work/run/w24-m-p/state
+capacity: 2
+tls: {cert: /work/run/w24-m-p/pki/server.pem, key: /work/run/w24-m-p/pki/server.key, clientCA: /work/run/w24-m-p/pki/ca.pem}
+network: {mode: tap, guestCIDR: 10.213.0.0/24}
+vmm:
+  quoteSocket: /var/run/tdx-qgs/qgs.socket
+  confine: "64055"
+classes:
+  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}
+pools:
+  - imageDir: /work/images-i26g/c8s-session
+    launchDir: /work/run/w24-m-p/bundle/opkeydata
+    depth: 2
+    imageStore: /work/store/images.store
+    binders:
+      - "sha256:de1e0c8b05bbfc975ae3ebe42b2c63cf3ed7c40cdba6a913ceade76ff2fb2af2"
+      - {key: "sha256:5a6f26a6c3af81b46915f556965aee2d889f952e3de4442cf6532a168e19410d", authorities: ["sha256:de858b5967633178f136f59c39057005623f9720a592bb90a996f08d523938d7"]}
