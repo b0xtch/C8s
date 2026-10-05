@@ -1,6 +1,7 @@
 package sessiond
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -44,6 +45,9 @@ const (
 	// maxStreams the connections it carries, for every caller together.
 	maxRelays  = 64
 	maxStreams = 4096
+	// maxWatchers bounds the streams that watch pools' ready TDs, for every
+	// binder together.
+	maxWatchers = 64
 )
 
 // Daemon keeps the pools of one host and serves the session API over them.
@@ -67,6 +71,8 @@ type Daemon struct {
 	streams int
 	// relays bounds the evidence requests in flight.
 	relays chan struct{}
+	// watchers counts the WatchReady streams in flight.
+	watchers int
 	// stop is closed when Run's context ends: the daemon's own work stops,
 	// and its TDs run on.
 	stop chan struct{}
@@ -497,9 +503,15 @@ func (d *Daemon) keepWarm(ctx context.Context) {
 			}
 			d.mu.Lock()
 			if t.rec.State == StateReady {
+				// Whoever watches the pool is shown a certificate the guest
+				// came to serve since: a claim is answered with it.
+				renewed := !bytes.Equal(t.leaf, leaf)
 				t.offered, t.leaf = offered, leaf
 				if collateral != nil {
 					t.collateral = collateral
+				}
+				if renewed {
+					d.notify()
 				}
 			}
 			d.mu.Unlock()

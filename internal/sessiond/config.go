@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -30,7 +31,13 @@ const (
 	DefaultBootTimeout = 5 * time.Minute
 	// maxConfigBytes bounds the daemon's configuration file.
 	maxConfigBytes = 1 << 20
+	// maxBinders bounds the callers a pool's configuration lets watch it.
+	maxBinders = 64
 )
+
+// binderRE is a binder as a pool's configuration names it: the digest of
+// the public key in its certificate.
+var binderRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // Networks a TD's guest can be given.
 const (
@@ -133,6 +140,12 @@ type Pool struct {
 	BindGrace Duration `yaml:"bindGrace,omitempty"`
 	// ImageStore is a store of public images handed to every guest.
 	ImageStore string `yaml:"imageStore,omitempty"`
+	// Binders are the callers that may watch the pool's ready TDs
+	// (WatchReady), each named by the SHA-256 of the public key in its
+	// certificate, as sha256:<64 hex>. A stream shows how fast the pool
+	// refills, which is every tenant's starts together, so it is open to
+	// nobody else: with none named, to nobody.
+	Binders []string `yaml:"binders,omitempty"`
 
 	// From the launch document.
 	name     string
@@ -340,6 +353,17 @@ func (p *Pool) load() error {
 	}
 	if grace := time.Duration(p.BindGrace); grace < time.Second || grace > 10*time.Minute {
 		return fmt.Errorf("bindGrace %s is outside one second to ten minutes", grace)
+	}
+	if len(p.Binders) > maxBinders {
+		return fmt.Errorf("binders: at most %d may watch a pool", maxBinders)
+	}
+	for i, binder := range p.Binders {
+		if !binderRE.MatchString(binder) {
+			return fmt.Errorf("binders: %q is not the digest of a certificate's public key, sha256:<64 lowercase hex>", binder)
+		}
+		if slices.Contains(p.Binders[:i], binder) {
+			return fmt.Errorf("binders: %s is named twice", binder)
+		}
 	}
 	pub, err := session.ReadBounded(filepath.Join(p.LaunchDir, session.PubkeyFile), 8192)
 	if err != nil {

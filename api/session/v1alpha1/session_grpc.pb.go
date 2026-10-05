@@ -31,6 +31,7 @@ const (
 	Sessions_Connect_FullMethodName     = "/c8s.session.v1alpha1.Sessions/Connect"
 	Sessions_Destroy_FullMethodName     = "/c8s.session.v1alpha1.Sessions/Destroy"
 	Sessions_GetEvidence_FullMethodName = "/c8s.session.v1alpha1.Sessions/GetEvidence"
+	Sessions_WatchReady_FullMethodName  = "/c8s.session.v1alpha1.Sessions/WatchReady"
 )
 
 // SessionsClient is the client API for Sessions service.
@@ -60,6 +61,12 @@ type SessionsClient interface {
 	// GetEvidence returns what a TD's guest serves to anyone: its certificate,
 	// its documents and its events.
 	GetEvidence(ctx context.Context, in *EvidenceRequest, opts ...grpc.CallOption) (*Evidence, error)
+	// WatchReady streams what each ready TD of a pool says of itself, as a
+	// claim of it would be answered: the TDs ready now, then each as it becomes
+	// ready or comes to serve another certificate. A binder judges them ahead
+	// of its claims. A stream shows how fast a pool refills, so it is open only
+	// to the binders the pool's configuration names.
+	WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Evidence], error)
 }
 
 type sessionsClient struct {
@@ -126,6 +133,25 @@ func (c *sessionsClient) GetEvidence(ctx context.Context, in *EvidenceRequest, o
 	return out, nil
 }
 
+func (c *sessionsClient) WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Evidence], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[2], Sessions_WatchReady_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchReadyRequest, Evidence]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_WatchReadyClient = grpc.ServerStreamingClient[Evidence]
+
 // SessionsServer is the server API for Sessions service.
 // All implementations must embed UnimplementedSessionsServer
 // for forward compatibility.
@@ -153,6 +179,12 @@ type SessionsServer interface {
 	// GetEvidence returns what a TD's guest serves to anyone: its certificate,
 	// its documents and its events.
 	GetEvidence(context.Context, *EvidenceRequest) (*Evidence, error)
+	// WatchReady streams what each ready TD of a pool says of itself, as a
+	// claim of it would be answered: the TDs ready now, then each as it becomes
+	// ready or comes to serve another certificate. A binder judges them ahead
+	// of its claims. A stream shows how fast a pool refills, so it is open only
+	// to the binders the pool's configuration names.
+	WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[Evidence]) error
 	mustEmbedUnimplementedSessionsServer()
 }
 
@@ -177,6 +209,9 @@ func (UnimplementedSessionsServer) Destroy(context.Context, *DestroyRequest) (*S
 }
 func (UnimplementedSessionsServer) GetEvidence(context.Context, *EvidenceRequest) (*Evidence, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetEvidence not implemented")
+}
+func (UnimplementedSessionsServer) WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[Evidence]) error {
+	return status.Error(codes.Unimplemented, "method WatchReady not implemented")
 }
 func (UnimplementedSessionsServer) mustEmbedUnimplementedSessionsServer() {}
 func (UnimplementedSessionsServer) testEmbeddedByValue()                  {}
@@ -267,6 +302,17 @@ func _Sessions_GetEvidence_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Sessions_WatchReady_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchReadyRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(SessionsServer).WatchReady(m, &grpc.GenericServerStream[WatchReadyRequest, Evidence]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_WatchReadyServer = grpc.ServerStreamingServer[Evidence]
+
 // Sessions_ServiceDesc is the grpc.ServiceDesc for Sessions service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -299,6 +345,11 @@ var Sessions_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _Sessions_Connect_Handler,
 			ServerStreams: true,
 			ClientStreams: true,
+		},
+		{
+			StreamName:    "WatchReady",
+			Handler:       _Sessions_WatchReady_Handler,
+			ServerStreams: true,
 		},
 	},
 	Metadata: "session/v1alpha1/session.proto",

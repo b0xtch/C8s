@@ -37,6 +37,12 @@ service Sessions {
   // GetEvidence returns what a TD's guest serves to anyone: its certificate,
   // its documents and its events.
   rpc GetEvidence(EvidenceRequest) returns (Evidence);
+  // WatchReady streams what each ready TD of a pool says of itself, as a
+  // claim of it would be answered: the TDs ready now, then each as it becomes
+  // ready or comes to serve another certificate. A binder judges them ahead
+  // of its claims. A stream shows how fast a pool refills, so it is open only
+  // to the binders the pool's configuration names.
+  rpc WatchReady(WatchReadyRequest) returns (stream Evidence);
 }
 
 message ClaimRequest {
@@ -154,4 +160,8 @@ message Session {
 
 message EvidenceRequest {
   string td = 1;
+}
+
+message WatchReadyRequest {
+  string pool = 1;
 }

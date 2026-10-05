@@ -151,10 +151,13 @@ type Host struct {
 	Roots  *x509.CertPool
 	CAFile string
 	// Orchestrator is a certificate the daemon takes claims under, with its
-	// files. Stranger is one of an authority the daemon does not know.
+	// files: the pool's configuration names it as a binder. Other is one of
+	// the same authority that no pool names. Stranger is one of an authority
+	// the daemon does not know.
 	Orchestrator         tls.Certificate
 	OrchestratorCertFile string
 	OrchestratorKeyFile  string
+	Other                tls.Certificate
 	Stranger             tls.Certificate
 
 	// What a binder pins: the image, with its manifest, and the pool's
@@ -216,6 +219,10 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 		t.Fatal(err)
 	}
 	dir := h.pki()
+	binder, err := daemon.BinderName(h.Orchestrator.Leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.Config = &sessiond.Config{
 		Listen: "127.0.0.1:0", Host: "host-a", StateDir: t.TempDir(), Capacity: 4,
 		TLS: sessiond.TLSConfig{
@@ -225,7 +232,7 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 		Classes: map[string]sessiond.Class{"sim": {VCPUs: 1, Memory: "1G"}},
 		Pools: []sessiond.Pool{{
 			ImageDir: t.TempDir(), LaunchDir: filepath.Dir(first.LaunchKeyPath), Depth: depth,
-			BindGrace: sessiond.Duration(time.Second),
+			BindGrace: sessiond.Duration(time.Second), Binders: []string{binder},
 		}},
 	}
 	if mutate != nil {
@@ -287,6 +294,7 @@ func (h *Host) pki() string {
 	server, _, serverKey := issue("daemon", ca, caKey)
 	var orchestratorKey *ecdsa.PrivateKey
 	h.Orchestrator, _, orchestratorKey = issue("orchestrator", ca, caKey)
+	h.Other, _, _ = issue("another orchestrator", ca, caKey)
 	_, other, otherKey := issue("another authority", nil, nil)
 	h.Stranger, _, _ = issue("stranger", other, otherKey)
 	h.Roots = x509.NewCertPool()

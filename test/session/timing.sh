@@ -40,6 +40,10 @@
 #   C8S_TIMING_SEALED=1      seal a credential with each bind, beside the
 #                            first command, where the default has the guest
 #                            take one from the key service
+#   C8S_TIMING_WATCH=0       judge each guest at its claim, where the default
+#                            watches the pool's ready TDs and judges each
+#                            before its claim: work a round does not time,
+#                            which the summary names and times beside it
 #   C8S_TIMING_WITH_BIND=0   send each first command over a connection once
 #                            the guest's receipt is checked, where the default
 #                            sends it with the bind
@@ -78,6 +82,7 @@ rounds=${C8S_TIMING_ROUNDS:-21}
 stored=${C8S_TIMING_STORED:-1}
 sealed=${C8S_TIMING_SEALED:-0}
 [ "$sealed" = 1 ] && stored=0
+watch=${C8S_TIMING_WATCH:-1}
 rest=${C8S_TIMING_REST:-3}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
@@ -223,6 +228,8 @@ tenant=(--key-service "$pin" --tenant acme --authority-key "$out/authority.key")
 quiet "$C8S" session key-service tenant register "${tenant[@]}" || die "the tenant's registration"
 quiet "$C8S" session key-service credential put api-token "${tenant[@]}" --from-file "$out/stored" || die "the stored credential"
 
+binder=sha256:$(openssl x509 -in "$pki/orchestrator.pem" -noout -pubkey 2>> "$out/setup.err" | openssl pkey -pubin -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)
+[ ${#binder} = 71 ] || die "the digest of the orchestrator's public key"
 {
     echo "listen: 127.0.0.1:$port"
     echo "host: test-host"
@@ -241,6 +248,8 @@ quiet "$C8S" session key-service credential put api-token "${tenant[@]}" --from-
     echo "    launchDir: $out/bundle/opkeydata"
     echo "    depth: 2"
     echo "    imageStore: $store"
+    # The orchestrator binds its sessions itself, and may watch the pool.
+    echo "    binders: [\"$binder\"]"
 } > "$out/config.yaml"
 sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -283,8 +292,9 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     baseline="not sampled"
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
     [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
-    printf 'baseline %s; no second baseline\n' "$baseline"
-    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
+    printf 'baseline %s; no second baseline; ' "$baseline"
+    printf 'before the measured path: %s\n' "$([ "$watch" = 1 ] && echo "each ready TD judged when it became ready (timed beside the rounds)" || echo "nothing: each TD judged at its claim")"
+    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, ready TDs watched $watch, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
@@ -315,6 +325,7 @@ args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/o
     --rounds "$rounds" --commands 3 --attest --before-round "$out/before-round")
 [ "$stored" = 1 ] && args+=(--key-service "$pin" --stored-credential api-token)
 [ "$sealed" = 1 ] && args+=(--sealed-credential api-token)
+[ "$watch" = 1 ] || args+=(--watch-ready=false)
 [ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
 [ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
 [ -n "${C8S_ACCEPT_TCB:-}" ] && args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
@@ -339,7 +350,8 @@ for key in ("claim_us", "ready_check_us", "sign_us", "seal_us", "bind_us", "judg
 if steady:
     count = lambda key: sum(1 for r in steady if r.get(key))
     print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
-    print(f"of {len(steady)} rounds, the guest had a credential sealed with its bind in place in {count('credential_with_bind')}")
+    print(f"of {len(steady)} rounds, the guest was judged before its claim in {count('ready_ahead')}, and had a credential sealed with its bind in place in {count('credential_with_bind')}")
+show("ready TD judged ahead", [r["ready_judged_us"] / 1000 for r in steady if r.get("ready_judged_us")], "ms (before the round: no part of its times)")
 show("session later command", [v / 1000 for r in steady for v in r.get("exec_us", [])], "ms")
 first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
 if first:

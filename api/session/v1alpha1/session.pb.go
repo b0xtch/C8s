@@ -756,6 +756,50 @@ func (x *EvidenceRequest) GetTd() string {
 	return ""
 }
 
+type WatchReadyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pool          string                 `protobuf:"bytes,1,opt,name=pool,proto3" json:"pool,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchReadyRequest) Reset() {
+	*x = WatchReadyRequest{}
+	mi := &file_session_v1alpha1_session_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchReadyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchReadyRequest) ProtoMessage() {}
+
+func (x *WatchReadyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_session_v1alpha1_session_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchReadyRequest.ProtoReflect.Descriptor instead.
+func (*WatchReadyRequest) Descriptor() ([]byte, []int) {
+	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *WatchReadyRequest) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
 var File_session_v1alpha1_session_proto protoreflect.FileDescriptor
 
 const file_session_v1alpha1_session_proto_rawDesc = "" +
@@ -815,18 +859,22 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x04host\x18\x04 \x01(\tR\x04host\x128\n" +
 	"\x05state\x18\x05 \x01(\x0e2\".c8s.session.v1alpha1.SessionStateR\x05state\"!\n" +
 	"\x0fEvidenceRequest\x12\x0e\n" +
-	"\x02td\x18\x01 \x01(\tR\x02td*y\n" +
+	"\x02td\x18\x01 \x01(\tR\x02td\"'\n" +
+	"\x11WatchReadyRequest\x12\x12\n" +
+	"\x04pool\x18\x01 \x01(\tR\x04pool*y\n" +
 	"\fSessionState\x12\x1d\n" +
 	"\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11SESSION_STATE_NEW\x10\x01\x12\x16\n" +
 	"\x12SESSION_STATE_LIVE\x10\x02\x12\x1b\n" +
-	"\x17SESSION_STATE_DESTROYED\x10\x032\x91\x03\n" +
+	"\x17SESSION_STATE_DESTROYED\x10\x032\xea\x03\n" +
 	"\bSessions\x12J\n" +
 	"\x05Claim\x12\".c8s.session.v1alpha1.ClaimRequest\x1a\x1d.c8s.session.v1alpha1.Claimed\x12J\n" +
 	"\x04Bind\x12!.c8s.session.v1alpha1.BindRequest\x1a\x1b.c8s.session.v1alpha1.Bound(\x010\x01\x12G\n" +
 	"\aConnect\x12\x1b.c8s.session.v1alpha1.Bytes\x1a\x1b.c8s.session.v1alpha1.Bytes(\x010\x01\x12N\n" +
 	"\aDestroy\x12$.c8s.session.v1alpha1.DestroyRequest\x1a\x1d.c8s.session.v1alpha1.Session\x12T\n" +
-	"\vGetEvidence\x12%.c8s.session.v1alpha1.EvidenceRequest\x1a\x1e.c8s.session.v1alpha1.EvidenceBIZGgithub.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1b\x06proto3"
+	"\vGetEvidence\x12%.c8s.session.v1alpha1.EvidenceRequest\x1a\x1e.c8s.session.v1alpha1.Evidence\x12W\n" +
+	"\n" +
+	"WatchReady\x12'.c8s.session.v1alpha1.WatchReadyRequest\x1a\x1e.c8s.session.v1alpha1.Evidence0\x01BIZGgithub.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1b\x06proto3"
 
 var (
 	file_session_v1alpha1_session_proto_rawDescOnce sync.Once
@@ -841,7 +889,7 @@ func file_session_v1alpha1_session_proto_rawDescGZIP() []byte {
 }
 
 var file_session_v1alpha1_session_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_session_v1alpha1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_session_v1alpha1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_session_v1alpha1_session_proto_goTypes = []any{
 	(SessionState)(0),             // 0: c8s.session.v1alpha1.SessionState
 	(*ClaimRequest)(nil),          // 1: c8s.session.v1alpha1.ClaimRequest
@@ -853,13 +901,14 @@ var file_session_v1alpha1_session_proto_goTypes = []any{
 	(*DestroyRequest)(nil),        // 7: c8s.session.v1alpha1.DestroyRequest
 	(*Session)(nil),               // 8: c8s.session.v1alpha1.Session
 	(*EvidenceRequest)(nil),       // 9: c8s.session.v1alpha1.EvidenceRequest
-	(*durationpb.Duration)(nil),   // 10: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil), // 11: google.protobuf.Timestamp
+	(*WatchReadyRequest)(nil),     // 10: c8s.session.v1alpha1.WatchReadyRequest
+	(*durationpb.Duration)(nil),   // 11: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
 }
 var file_session_v1alpha1_session_proto_depIdxs = []int32{
-	10, // 0: c8s.session.v1alpha1.ClaimRequest.wait:type_name -> google.protobuf.Duration
+	11, // 0: c8s.session.v1alpha1.ClaimRequest.wait:type_name -> google.protobuf.Duration
 	5,  // 1: c8s.session.v1alpha1.Claimed.evidence:type_name -> c8s.session.v1alpha1.Evidence
-	11, // 2: c8s.session.v1alpha1.Claimed.bind_by:type_name -> google.protobuf.Timestamp
+	12, // 2: c8s.session.v1alpha1.Claimed.bind_by:type_name -> google.protobuf.Timestamp
 	5,  // 3: c8s.session.v1alpha1.Bound.evidence:type_name -> c8s.session.v1alpha1.Evidence
 	0,  // 4: c8s.session.v1alpha1.Session.state:type_name -> c8s.session.v1alpha1.SessionState
 	1,  // 5: c8s.session.v1alpha1.Sessions.Claim:input_type -> c8s.session.v1alpha1.ClaimRequest
@@ -867,13 +916,15 @@ var file_session_v1alpha1_session_proto_depIdxs = []int32{
 	6,  // 7: c8s.session.v1alpha1.Sessions.Connect:input_type -> c8s.session.v1alpha1.Bytes
 	7,  // 8: c8s.session.v1alpha1.Sessions.Destroy:input_type -> c8s.session.v1alpha1.DestroyRequest
 	9,  // 9: c8s.session.v1alpha1.Sessions.GetEvidence:input_type -> c8s.session.v1alpha1.EvidenceRequest
-	2,  // 10: c8s.session.v1alpha1.Sessions.Claim:output_type -> c8s.session.v1alpha1.Claimed
-	4,  // 11: c8s.session.v1alpha1.Sessions.Bind:output_type -> c8s.session.v1alpha1.Bound
-	6,  // 12: c8s.session.v1alpha1.Sessions.Connect:output_type -> c8s.session.v1alpha1.Bytes
-	8,  // 13: c8s.session.v1alpha1.Sessions.Destroy:output_type -> c8s.session.v1alpha1.Session
-	5,  // 14: c8s.session.v1alpha1.Sessions.GetEvidence:output_type -> c8s.session.v1alpha1.Evidence
-	10, // [10:15] is the sub-list for method output_type
-	5,  // [5:10] is the sub-list for method input_type
+	10, // 10: c8s.session.v1alpha1.Sessions.WatchReady:input_type -> c8s.session.v1alpha1.WatchReadyRequest
+	2,  // 11: c8s.session.v1alpha1.Sessions.Claim:output_type -> c8s.session.v1alpha1.Claimed
+	4,  // 12: c8s.session.v1alpha1.Sessions.Bind:output_type -> c8s.session.v1alpha1.Bound
+	6,  // 13: c8s.session.v1alpha1.Sessions.Connect:output_type -> c8s.session.v1alpha1.Bytes
+	8,  // 14: c8s.session.v1alpha1.Sessions.Destroy:output_type -> c8s.session.v1alpha1.Session
+	5,  // 15: c8s.session.v1alpha1.Sessions.GetEvidence:output_type -> c8s.session.v1alpha1.Evidence
+	5,  // 16: c8s.session.v1alpha1.Sessions.WatchReady:output_type -> c8s.session.v1alpha1.Evidence
+	11, // [11:17] is the sub-list for method output_type
+	5,  // [5:11] is the sub-list for method input_type
 	5,  // [5:5] is the sub-list for extension type_name
 	5,  // [5:5] is the sub-list for extension extendee
 	0,  // [0:5] is the sub-list for field type_name
@@ -890,7 +941,7 @@ func file_session_v1alpha1_session_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_session_v1alpha1_session_proto_rawDesc), len(file_session_v1alpha1_session_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

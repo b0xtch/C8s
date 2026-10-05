@@ -1090,3 +1090,69 @@ func TestVerifierFetchesFromIntelAlone(t *testing.T) {
 		}
 	}
 }
+
+// An engine counts the vendor's documents it comes to hold, from the vendor
+// or from whoever handed one over, and counts a document it already holds no
+// second time. While the count stands, a verdict made earlier rests on the
+// newest documents the engine has: a binder keeps its verdicts on ready
+// guests by it.
+func TestEngineCountsTheDocumentsItComesToHold(t *testing.T) {
+	env, reportData := fixture(t)
+	k := keptCollateral(t)
+	at := k.newest.Add(10 * time.Minute)
+	service, asked := k.intel(false), 0
+	engine := k.cold(t, at, service)
+	var counter DocumentCounter = engine
+	if counter.Documents() != 0 {
+		t.Fatalf("an engine that holds nothing counts %d documents", counter.Documents())
+	}
+	// A first verdict takes the four in: three that were handed over, and
+	// the root CA CRL from Intel, since the verdict lets a secret go.
+	ctx := WithCollateralSource(lenient(), handing(&asked, k.documents()...))
+	if _, err := engine.VerifyEvidence(ctx, env, reportData); err != nil {
+		t.Fatal(err)
+	}
+	first := counter.Documents()
+	if first != uint64(len(k.files)) {
+		t.Fatalf("after its first verdict the engine counts %d documents, and it judged by %d", first, len(k.files))
+	}
+	// A second verdict on the same documents takes none in.
+	if _, err := engine.VerifyEvidence(ctx, env, reportData); err != nil {
+		t.Fatal(err)
+	}
+	if got := counter.Documents(); got != first {
+		t.Fatalf("a verdict on documents the engine held moved its count from %d to %d", first, got)
+	}
+	// The same document again, from Intel this time or handed over once
+	// more, is no new document for the URL it is kept under.
+	crl, ok := engine.cache.kept(fixtureRootCRLURL)
+	if !ok {
+		t.Fatal("the engine keeps no root CA CRL")
+	}
+	engine.cache.store(fixtureRootCRLURL, collateralEntry{header: crl.header, body: crl.body, fetched: at})
+	handed := k.document(t, fixtureTCBInfoURL)
+	engine.cache.storeStapled(fixtureTCBInfoURL, collateralEntry{header: handed.Header, body: handed.Body, fetched: at})
+	if got := counter.Documents(); got != first {
+		t.Fatalf("documents the engine already held moved its count from %d to %d", first, got)
+	}
+	// Another document under a URL is one: Intel's own answer for what was
+	// handed over before, and a newer body in place of an older.
+	engine.cache.store(fixtureTCBInfoURL, collateralEntry{header: handed.Header, body: handed.Body, fetched: at})
+	if got := counter.Documents(); got != first+1 {
+		t.Fatalf("Intel's own answer for a document that was handed over: the count went from %d to %d", first, got)
+	}
+	engine.cache.store(fixtureRootCRLURL, collateralEntry{header: crl.header, body: append([]byte("newer "), crl.body...), fetched: at})
+	if got := counter.Documents(); got != first+2 {
+		t.Fatalf("a newer root CA CRL: the count went from %d to %d", first+1, got)
+	}
+	// Another process over the same directory comes to hold what it reads
+	// there, and counts it.
+	second := k.engineAt(at.Add(time.Minute), k.intel(true), false)
+	second.cache.dir = engine.cache.dir
+	if second.Documents() != 0 {
+		t.Fatal("an engine counts documents it has not read")
+	}
+	if _, ok := second.cache.kept(fixtureRootCRLURL); !ok || second.Documents() != 1 {
+		t.Fatalf("an engine that read one kept document counts %d", second.Documents())
+	}
+}

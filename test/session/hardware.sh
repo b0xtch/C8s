@@ -54,6 +54,11 @@
 #                            and a guest of its key service. Unset, a host
 #                            that is behind fails the test at its first
 #                            verdict, which names the status.
+#   C8S_WARMSTART            the warmstart binary (go build
+#                            ./test/session/warmstart). With it the test also
+#                            has a binder watch the pool's ready TDs and find
+#                            a claimed guest judged, and a caller the pool
+#                            does not name shown nothing.
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -67,6 +72,7 @@ C8S=${C8S_BIN:-build/c8s}
 IMG=${C8S_SESSION_IMAGE:?set C8S_SESSION_IMAGE to a session image directory}
 KSIMG=${C8S_KEY_SERVICE_IMAGE:?set C8S_KEY_SERVICE_IMAGE to a key service image directory}
 dev=${C8S_SESSION_DEV:-0}
+warm=${C8S_WARMSTART:-}
 store_dir=${C8S_SANDBOX_STORE:-}
 quote_socket=${C8S_QUOTE_SOCKET:-/var/run/tdx-qgs/qgs.socket}
 confine=${C8S_SESSION_CONFINE:-}
@@ -141,12 +147,13 @@ finish() {
 # A guest's VMM, by the name its launcher gave it.
 guests() { pgrep -cf "[q]emu-system.*guest=$1"; }
 
-# The daemon's certificate and an orchestrator's, under one authority, and the
-# keys of two tenants and a stranger.
+# The daemon's certificate and two orchestrators', under one authority, and
+# the keys of two tenants and a stranger. The pool names the first
+# orchestrator as a binder, and the other not.
 pki=$out/pki
 openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key" 2>/dev/null
 openssl req -x509 -new -key "$pki/ca.key" -subj "/CN=session test authority" -days 2 -out "$pki/ca.pem" 2>/dev/null
-for who in server orchestrator; do
+for who in server orchestrator other; do
     openssl ecparam -name prime256v1 -genkey -noout -out "$pki/$who.key" 2>/dev/null
     openssl req -new -key "$pki/$who.key" -subj "/CN=$who" -out "$pki/$who.csr" 2>/dev/null
     printf 'subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth,clientAuth\n' > "$pki/$who.ext"
@@ -435,6 +442,7 @@ expect 3 "another key cannot store the tenant's credential" put-usurper \
     echo "    launchDir: $out/bundle/opkeydata"
     echo "    depth: 2"
     [ -n "$store" ] && echo "    imageStore: $store"
+    echo "    binders: [\"sha256:$(openssl x509 -in "$pki/orchestrator.pem" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64)\"]"
 } > "$out/config.yaml"
 start_daemon() {
     sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
@@ -559,6 +567,33 @@ s3=(--binding "$out/s3" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "a later command in s3" exec-s3 "$C8S" session exec "${s3[@]}" -- cat /tmp/first
 check "the first command ran once" [ "$(cat "$out/exec-s3.out")" = ran ]
 expect 0 "destroy s3" destroy-s3 "$C8S" session destroy --binding "$out/s3" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
+
+# A binder the pool names watches its ready TDs and judges each before its
+# claim: the second of two starts finds its guest judged, by its certificate
+# alone. A caller the pool does not name is shown nothing, and judges its
+# guest at the claim.
+if [ -n "$warm" ]; then
+    # Both of the pool's TDs are ready first, so that the stream shows the
+    # second start's guest before any claim can take it.
+    deadline=$(( $(date +%s) + 300 ))
+    until [ "$(sudo -n sh -c "grep -l '\"state\": *\"ready\"' '$out'/state/tds/*/td.json 2>/dev/null | wc -l")" -ge 2 ] || [ "$(date +%s)" -ge "$deadline" ]; do
+        sleep 0.2
+    done
+    watcher=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --pool agents --image-manifest "$manifest" --launch-key "$launch_key"
+        --authority-key "$out/authority.key" --tenant acme --sealed-credential bind-token --commands 1 --wait 120s
+        --collateral-cache "$out/cache-watch" "${sandbox[@]}" "${accept[@]}")
+    expect 0 "a binder the pool names watches its ready TDs" watch \
+        "$warm" "${watcher[@]}" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key" --session-prefix w --rounds 2
+    cat "$out/watch.out" >> "$out/records.jsonl"
+    check "the second start found its guest judged before its claim" \
+        sh -c "sed -n 2p '$out/watch.out' | grep -q '\"ready_ahead\":true'"
+    check "both starts sealed a credential with the bind, which the first command read back" \
+        [ "$(grep -c '"credential_with_bind":true' "$out/watch.out")" = 2 ]
+    expect 0 "a caller the pool does not name starts a session all the same" watch-other \
+        "$warm" "${watcher[@]}" --daemon-cert "$pki/other.pem" --daemon-key "$pki/other.key" --session-prefix x --rounds 1
+    check "it was shown none of the pool's ready TDs" grep -q "are not watched" "$out/watch-other.err"
+    check "it judged its guest at the claim" grep -q '"ready_ahead":false' "$out/watch-other.out"
+fi
 
 s1=(--binding "$out/s1" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "release a credential to s1" credential "$C8S" session credential put token "${s1[@]}" --from-file "$out/released"

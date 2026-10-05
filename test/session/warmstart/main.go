@@ -18,6 +18,13 @@
 // judged, as an owner does who sends nothing on a receipt. With
 // --sealed-credential the bind's sealed message also holds a credential this
 // side makes for the round, which the first command reads back.
+//
+// The process also watches the pool's ready TDs and judges each as it
+// becomes ready, as a binder does that keeps its check off the path of a
+// start: a round's claim then finds its guest judged. That work is done
+// before the round and is no part of its times, so a record says whether the
+// guest was judged ahead and how long that took. --watch-ready=false judges
+// every guest at its claim.
 // Each round prints one JSON record on standard output, with times in
 // microseconds on this process's monotonic clock. The first round finds the
 // engine's documents unread and its connections unmade: a reader who wants
@@ -47,6 +54,9 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
@@ -65,6 +75,7 @@ type options struct {
 	wait, timeout                      time.Duration
 	keep, attest, quoteFirst           bool
 	prejudge, preconnect, withBind     bool
+	watchReady                         bool
 }
 
 // record is one round. Every time is in microseconds.
@@ -83,10 +94,16 @@ type record struct {
 	// command: the receipt, or with --quote-first the quote.
 	Claim      int64 `json:"claim_us"`
 	ReadyCheck int64 `json:"ready_check_us"`
-	Sign       int64 `json:"sign_us"`
-	Seal       int64 `json:"seal_us,omitempty"`
-	Bind       int64 `json:"bind_us"`
-	Judge      int64 `json:"judge_us"`
+	// ReadyAhead says the check of the unbound guest was made before the
+	// claim, on what the daemon showed this side when the guest became
+	// ready. ReadyCheck is then the finding of that verdict alone, and
+	// ReadyJudged how long making it took, before this round began.
+	ReadyAhead  bool  `json:"ready_ahead"`
+	ReadyJudged int64 `json:"ready_judged_us,omitempty"`
+	Sign        int64 `json:"sign_us"`
+	Seal        int64 `json:"seal_us,omitempty"`
+	Bind        int64 `json:"bind_us"`
+	Judge       int64 `json:"judge_us"`
 	// Start is those together, as their caller waited for them.
 	Start int64 `json:"start_us"`
 	// FirstExec is what the session's first command took after the start:
@@ -148,6 +165,7 @@ func main() {
 	flag.BoolVar(&o.prejudge, "prejudge", true, "judge the guest's serving certificate while the guest takes its bind, so that the first command's connection does not wait for it")
 	flag.BoolVar(&o.preconnect, "preconnect", true, "with --prejudge, also make the connection the session's commands take ahead of the first that needs it")
 	flag.BoolVar(&o.withBind, "command-with-bind", true, "send the first command with the bind, sealed to the guest's one-time key (not with --quote-first)")
+	flag.BoolVar(&o.watchReady, "watch-ready", true, "watch the pool's ready TDs and judge each before its claim; the pool's configuration must name --daemon-cert as one of its binders")
 	flag.Parse()
 	if err := run(&o); err != nil {
 		fmt.Fprintln(os.Stderr, "warmstart:", err)
@@ -228,6 +246,16 @@ func run(o *options) error {
 	// The one document a verdict that lets a secret go takes from the vendor
 	// alone is fetched before a start needs it.
 	session.Prefetch(engine)
+	readyPolicy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, AcceptTCBStatus: accepted}
+	verdicts, err := session.NewReadyVerdicts(readyPolicy, engine)
+	if err != nil {
+		return err
+	}
+	if o.watchReady {
+		watching, stop := context.WithCancel(context.Background())
+		defer stop()
+		go watch(watching, host, o.pool, verdicts)
+	}
 	out := json.NewEncoder(os.Stdout)
 	for round := range o.rounds {
 		if o.before != "" {
@@ -238,7 +266,7 @@ func run(o *options) error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
-		rec, err := one(ctx, o, round, host, engine, identity, launchKey, authority, authorityPub, pin, accepted)
+		rec, err := one(ctx, o, round, host, engine, verdicts, identity, launchKey, authority, pin, accepted)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("round %d: %w", round, err)
@@ -252,9 +280,31 @@ func run(o *options) error {
 
 func micros(since time.Time) int64 { return time.Since(since).Microseconds() }
 
+// watch judges each ready TD of pool as the daemon shows it, until ctx ends.
+// A daemon that does not let this side watch leaves every guest to be judged
+// at its claim.
+func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *session.ReadyVerdicts) {
+	for ctx.Err() == nil {
+		err := host.WatchReady(ctx, pool, func(shown *session.Relayed) {
+			if err := verdicts.Judge(ctx, shown); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "warmstart: a ready TD the daemon showed was not judged ahead: %v\n", err)
+			}
+		})
+		switch status.Code(err) {
+		case codes.PermissionDenied, codes.Unimplemented, codes.NotFound, codes.Unauthenticated:
+			fmt.Fprintf(os.Stderr, "warmstart: the pool's ready TDs are not watched, and each is judged at its claim: %v\n", err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+		}
+	}
+}
+
 // one starts one session and runs its commands.
-func one(ctx context.Context, o *options, round int, host *daemon.Client, engine session.Engine, identity runtimemeasure.ImageIdentity,
-	launchKey []byte, authority *ecdsa.PrivateKey, authorityPub []byte, pin *session.KeyService, accepted []string,
+func one(ctx context.Context, o *options, round int, host *daemon.Client, engine session.Engine, verdicts *session.ReadyVerdicts,
+	identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey, pin *session.KeyService, accepted []string,
 ) (*record, error) {
 	rec := &record{Kind: "session", Round: round, Session: fmt.Sprintf("%s-%d", o.prefix, round)}
 
@@ -341,17 +391,21 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	}()
 
 	// The check of the unbound guest, as one that lets a secret go: what is
-	// sealed with the bind rests on it.
+	// sealed with the bind rests on it. A guest this side was shown when it
+	// became ready is found judged, by its certificate alone.
 	step = time.Now()
-	readyPolicy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, AcceptTCBStatus: accepted}
-	ready, err := session.VerifyReadyToRelease(ctx, readyPolicy, engine, claimed.Evidence, time.Now())
+	judged, err := verdicts.Claimed(ctx, claimed.Evidence)
 	if err != nil {
 		return nil, fmt.Errorf("the guest the daemon offers: %w", err)
 	}
+	ready := judged.ReadyTD
 	if pin != nil && !pin.Equal(ready.Document.KeyService) {
 		return nil, errors.New("the pool's guests open their sessions with another key service than --key-service pins")
 	}
-	rec.ReadyCheck = micros(step)
+	rec.ReadyCheck, rec.ReadyAhead = micros(step), judged.Ahead
+	if judged.Ahead {
+		rec.ReadyJudged = judged.Took.Microseconds()
+	}
 
 	step = time.Now()
 	bind, err := session.NewBind(session.BindOptions{

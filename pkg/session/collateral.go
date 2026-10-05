@@ -289,6 +289,10 @@ type collateralCache struct {
 	arrived map[string]collateralEntry
 	// flights are the fetches on their way, one for each URL.
 	flights map[string]*flight
+	// taken counts the documents this cache came to hold, from Intel or
+	// from whoever handed one over: one for each that is another document
+	// than the one it held for that URL before.
+	taken uint64
 }
 
 type collateralEntry struct {
@@ -341,7 +345,7 @@ func (c *collateralCache) kept(url string) (collateralEntry, bool) {
 	entry, ok := c.entries[url]
 	if !ok && c.dir != "" {
 		if entry, ok = c.read(c.path(url), url); ok {
-			c.entries[url] = entry
+			c.holdLocked(c.entries, url, entry)
 		}
 	}
 	// An entry from the future is a clock that moved, or a file that lies.
@@ -382,9 +386,25 @@ func (c *collateralCache) handed(url string) (collateralEntry, bool) {
 		return collateralEntry{}, false
 	}
 	c.mu.Lock()
-	c.stapled[url] = entry
+	c.holdLocked(c.stapled, url, entry)
 	c.mu.Unlock()
 	return entry, true
+}
+
+// holdLocked keeps entry for url in held, and counts it if it is another
+// document than the one held there. The caller holds the lock.
+func (c *collateralCache) holdLocked(held map[string]collateralEntry, url string, entry collateralEntry) {
+	if had, ok := held[url]; !ok || !bytes.Equal(had.body, entry.body) {
+		c.taken++
+	}
+	held[url] = entry
+}
+
+// count is how many documents the cache came to hold: see taken.
+func (c *collateralCache) count() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.taken
 }
 
 // acceptable holds a document somebody handed over to what it says of itself:
@@ -430,7 +450,7 @@ func (c *collateralCache) floor(url string) int {
 func (c *collateralCache) store(url string, entry collateralEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[url] = entry
+	c.holdLocked(c.entries, url, entry)
 	// What a fetch ahead of need brought is this one, or older.
 	delete(c.arrived, url)
 	if c.dir != "" {
@@ -443,7 +463,7 @@ func (c *collateralCache) store(url string, entry collateralEntry) {
 func (c *collateralCache) storeStapled(url string, entry collateralEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.stapled[url] = entry
+	c.holdLocked(c.stapled, url, entry)
 	if c.dir != "" {
 		c.write(c.stapledPath(url), url, entry)
 	}

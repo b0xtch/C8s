@@ -18,6 +18,9 @@ func bundle(t *testing.T) string {
 	return filepath.Dir(sessionsim.NewGuest(t, nil).LaunchKeyPath)
 }
 
+// binder is a binder as a pool's configuration names one.
+func binder(digit byte) string { return "sha256:" + strings.Repeat(string(digit), 64) }
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "daemon.yaml")
@@ -61,6 +64,16 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if cfg.Classes["sim"].VCPUs != 4 || cfg.VMM.Confine != "64055" {
 		t.Fatalf("the configuration: %+v", cfg)
+	}
+
+	// A pool watched by nobody names no binder. One that names some keeps
+	// them as they are written.
+	if len(pool.Binders) != 0 {
+		t.Fatalf("a pool that names no binder has %v", pool.Binders)
+	}
+	watched := strings.Replace(strings.ReplaceAll(validConfig, "LAUNCH", launch), "depth: 2", "depth: 2\n    binders: [\""+binder('a')+"\", \""+binder('b')+"\"]", 1)
+	if cfg, err = LoadConfig(writeConfig(t, watched)); err != nil || len(cfg.Pools[0].Binders) != 2 || cfg.Pools[0].Binders[1] != binder('b') {
+		t.Fatalf("a pool with two binders: %v, %v", cfg, err)
 	}
 
 	// A pool with no grace of its own gets the default.
@@ -110,6 +123,11 @@ func TestLoadConfigRefuses(t *testing.T) {
 		"a negative depth":                  {"depth: 2", "depth: -1"},
 		"no listen address":                 {"listen: 127.0.0.1:7443", "listen: \"\""},
 		"no state directory":                {"stateDir: state", "stateDir: \"\""},
+		"a binder by its name":              {"depth: 2", "depth: 2\n    binders: [orchestrator]"},
+		"a binder by a digest too short":    {"depth: 2", "depth: 2\n    binders: [\"sha256:" + strings.Repeat("a", 63) + "\"]"},
+		"a binder by a digest in capitals":  {"depth: 2", "depth: 2\n    binders: [\"sha256:" + strings.Repeat("A", 64) + "\"]"},
+		"one binder twice":                  {"depth: 2", "depth: 2\n    binders: [\"" + binder('a') + "\", \"" + binder('a') + "\"]"},
+		"more binders than a pool takes":    {"depth: 2", "depth: 2\n    binders: [" + strings.Repeat("\""+binder('a')+"\", ", maxBinders+1) + "]"},
 	} {
 		body := strings.Replace(validConfig, change[0], change[1], 1)
 		if body == validConfig {

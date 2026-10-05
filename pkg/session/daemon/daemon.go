@@ -302,6 +302,33 @@ func (c *Client) Evidence(ctx context.Context, td string) (*session.Relayed, err
 	return relayed(answer), nil
 }
 
+// WatchReady calls each with what each ready TD of pool says of itself, as a
+// claim of it would be answered: the TDs ready now, oldest first, then each
+// as it becomes ready or comes to serve another certificate. A binder judges
+// them ahead of its claims (session.ReadyVerdicts). It returns when ctx ends
+// or the stream breaks, with the reason: a caller that keeps watching calls
+// it again. The daemon answers it only for a caller the pool's configuration
+// names as a binder (BinderName).
+func (c *Client) WatchReady(ctx context.Context, pool string, each func(*session.Relayed)) error {
+	stream, err := c.api.WatchReady(ctx, &sessionv1alpha1.WatchReadyRequest{Pool: pool})
+	if err != nil {
+		return err
+	}
+	for {
+		evidence, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		each(relayed(evidence))
+	}
+}
+
+// BinderName is the name a pool's configuration lets a binder watch it by:
+// the digest of the public key in the certificate the binder presents.
+func BinderName(cert *x509.Certificate) (string, error) {
+	return session.InstanceKeyDigest(cert.PublicKey)
+}
+
 const (
 	// quotePause is how long BoundEvidence waits before it first looks
 	// again, and quotePauseMost the longest it waits between two looks. A

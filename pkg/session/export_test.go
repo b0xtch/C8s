@@ -3,6 +3,7 @@ package session
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"net"
 	"testing"
@@ -65,3 +66,35 @@ func Stapled(ctx context.Context) (docs []CollateralDocument, ok bool) {
 // MayStapleRoot reports whether a judgment's context lets its verdict rest
 // on a root CA CRL from the context's source.
 func MayStapleRoot(ctx context.Context) bool { return StapledRootCRLAllowed(ctx) }
+
+// SetClock has v read the time from now.
+func (v *ReadyVerdicts) SetClock(now func() time.Time) { v.now = now }
+
+// MaxReadyVerdicts is how many verdicts a binder keeps at most.
+const MaxReadyVerdicts = maxReadyVerdicts
+
+// FillReadyVerdicts puts n verdicts that stand into v, each made a second
+// after the one before, and returns the digest each is kept under.
+func FillReadyVerdicts(v *ReadyVerdicts, n int) [][sha256.Size]byte {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	done := make(chan struct{})
+	close(done)
+	now := v.now()
+	digests := make([][sha256.Size]byte, n)
+	for i := range n {
+		digests[i] = sha256.Sum256([]byte{byte(i), byte(i >> 8), byte(i >> 16)})
+		v.judged[digests[i]] = &readyVerdict{
+			done: done, ready: &ReadyTD{Until: now.Add(time.Hour)}, settled: true, epoch: v.epoch,
+			documents: v.documents(), began: now.Add(time.Duration(i) * time.Second),
+		}
+	}
+	return digests
+}
+
+// KeepsReadyVerdict reports whether v keeps a verdict under digest.
+func (v *ReadyVerdicts) KeepsReadyVerdict(digest [sha256.Size]byte) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.judged[digest] != nil
+}

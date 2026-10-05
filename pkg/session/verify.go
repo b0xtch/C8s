@@ -256,6 +256,17 @@ func (e *dcapEngine) Refetch(ctx context.Context) error {
 	return nil
 }
 
+// DocumentCounter is an engine that counts the vendor's documents it came to
+// hold, from the vendor or from whoever handed one over. While the count
+// stands, the documents a verdict was made under are the newest the engine
+// holds: see ReadyVerdicts.
+type DocumentCounter interface {
+	Documents() uint64
+}
+
+// Documents implements DocumentCounter.
+func (e *dcapEngine) Documents() uint64 { return e.cache.count() }
+
 // Requirements names what decides this engine's verdicts: whether it goes on
 // with collateral past its reuse period, and whether it takes Intel's
 // documents from Intel alone. Where the collateral is kept decides nothing.

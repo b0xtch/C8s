@@ -1,8 +1,9 @@
 # The session daemon
 
-Status: built for one host. It serves five calls of the
-[session API](session-api.md): `Claim`, `Bind`, `Connect`, `GetEvidence` and
-`Destroy`. [What is missing](#what-is-missing) lists the rest of the design.
+Status: built for one host. It serves six calls of the
+[session API](session-api.md): `Claim`, `Bind`, `Connect`, `GetEvidence`,
+`WatchReady` and `Destroy`. [What is missing](#what-is-missing) lists the rest
+of the design.
 
 `c8s session-daemon` keeps pools of ready TDs on a host and hands them to
 sessions. It runs on the host, outside the trust boundary
@@ -31,39 +32,73 @@ evidence it verified itself.
 ## A session's start
 
 ```text
- owner's client              daemon                      guest (TD)
+ binder                      daemon                      guest (TD)
    |                           |                            |
-   | Claim(pool, session) ---> | fence -------------------> | cuts every earlier
-   |                           |                            | connection
-   | <-- td, evidence, bind_by | <-- certificate, documents |
+   | WatchReady(pool) -------> |                            |
+   | <== each ready TD's evidence, as it becomes ready      |
+   | judge each: pinned image, pool's launch key, nobody's  |
    |                           |                            |
-   | verify: pinned image, pool's launch key, bound by nobody
-   | sign a bind for the TD's instance key
+   | Claim(pool, session) ---> | its own record             |
+   | <-- td, evidence, bind_by |                            |
    |                           |                            |
-   | Bind(td, bind) ---------> | bind --------------------> | checks, measures,
+   | find the verdict by the TD's certificate, or judge now |
+   | sign a bind for the TD's instance key                  |
+   | seal the first command and credentials to its one-time key
+   |                           |                            |
+   | Bind(td, bind, sealed) -> | bind, sealed ------------> | raises its fence,
+   |                           |                            | measures the bind,
+   |                           |                            | opens the message,
+   |                           |                            | signs its receipt,
    |                           |                            | starts the sandbox
-   | <-- evidence ------------ | <-- evidence, fresh over the bind's nonce
+   | <-- receipt ------------- | <-- receipt -------------- |
+   | <-- sealed answer ------- | <-- sealed answer -------- | ran the command
    |                           |                            |
-   | verify under the bind     |                            |
+   | GetEvidence(td) --------> | the quote over the bind's nonce, once taken
+   | hold the quote to the receipt                          |
    |                           |                            |
    | Connect(td) ============= bytes =====================> | the TLS session
    |                           |                            | ends in the guest
 ```
 
 No boot is on this path: a TD boots into its pool before any session asks
-for it. [session-performance.md](session-performance.md) is where measured
-times go.
+for it. A claim asks the guest nothing. The daemon answers it from its own
+record, with what the guest said of itself when it became ready, and the
+guest learns of its session from the bind, which is when it ends every
+connection made to it before. [session-performance.md](session-performance.md)
+is where measured times go.
 
-`c8s session start` is that client: it claims, verifies, signs with the
-owner's authority key, binds and verifies again, and writes a binding
-directory. `verify`, `credential put`, `exec` and `destroy` then take
-`--binding` and reach the guest through the daemon.
+A binder may send one sealed message with its bind: the session's first
+command, credentials it holds that the bind says come from its binder, or
+both. It is sealed to a key the guest made for its one bind and erases before
+anything of the session runs, so the daemon carries it unread. The guest has
+the credentials in place before its sandbox starts and runs the command as
+soon as the sandbox does. Its answer comes back under the same seal, after
+the receipt. A binder goes by that answer and never by what the daemon says
+became of the message: with no answer that opens, it releases the
+credentials over `Connect` and then sends the command again under the id it
+was sealed with, and the guest takes each credential once and runs the
+command once.
+
+A binder that the pool names may watch it ([Who may call
+what](#who-may-call-what)): the daemon shows it each ready TD's evidence as
+the TD becomes ready, and again when its guest comes to serve another
+certificate. The binder judges each then, and at a claim finds its guest by
+the certificate in the claim's answer, never by the TD's name. A TD it was
+not shown, or whose verdict no longer stands, it judges at the claim.
+
+`c8s session start` is the client for one session: it claims, judges, signs
+with the owner's authority key, binds and verifies again, and writes a
+binding directory. A command after `--` goes with the bind as the session's
+first, and `--sealed-credential NAME=FILE` seals a credential with it.
+`verify`, `credential put`, `exec` and `destroy` then take `--binding` and
+reach the guest through the daemon.
 
 ## Who may call what
 
 | Call | Caller | Needs |
 |---|---|---|
 | `Claim`, `Bind`, `Destroy` | an orchestrator | a client certificate of the authority in `tls.clientCA` |
+| `WatchReady` | a binder the pool names | such a certificate whose public key the pool's `binders` lists: a stream shows how fast the pool refills, which is every tenant's starts together |
 | `GetEvidence` | anyone | nothing: what a guest serves to anyone is public |
 | `Connect` | anyone | nothing at the daemon: the guest authenticates every request under the keys its bind names |
 
@@ -103,6 +138,7 @@ pools:
     depth: 4
     bindGrace: 30s
     imageStore: /var/lib/c8s/images/images.store
+    binders: ["sha256:9f2c..."] # optional: who may watch the pool's ready TDs
 ```
 
 | Key | Meaning |
@@ -113,6 +149,7 @@ pools:
 | `pools[].depth` | How many TDs the pool keeps ready. Two boot at a time. |
 | `pools[].bindGrace` | How long a claim waits for its bind. After it the TD returns to the pool: the daemon sent it nothing, so nothing of a tenant entered it. |
 | `pools[].imageStore` | A store of public images (`c8s session image-store write`) handed read-only to every guest, so that a bind which names one starts it without a pull. |
+| `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). With none, nobody watches the pool. |
 | `vmm.console` | Attach each guest's console to its launcher's log. For dev images only: a locked image prints nothing there. |
 
 Relative paths are taken from the configuration file's directory. An unknown
@@ -298,11 +335,14 @@ until their memory is the host's again.
 
 `test/session/hardware.sh` (`make test-session-hardware`) runs all of the
 above on one TDX host with real TDs: a key service, a daemon with one pool
-that pins it, an owner who stores a credential, and two sessions of two
+that pins it, an owner who stores a credential, and sessions of two
 tenants. It reads the key service's machine and the class's, each from the
 evidence of one guest, and lists them in the two launch documents. It checks
 that a session's command reads the stored credential and one that a key of
-its bind released, and then what must be refused:
+its bind released, that a first command and a credential sealed with a bind
+reach the guest with it, and, given the timing tool, that a binder the pool
+names finds a claimed guest judged ahead while a caller it does not name is
+shown nothing. Then what must be refused:
 
 | Refused | By whom |
 |---|---|
@@ -326,7 +366,8 @@ changes on the host while it runs.
 - The other calls of the design: pools made and changed through the API,
   `Hold`, `Release`, `Seal`, `Deliver`, `Collect`, `GetStats`, `Watch`, and
   the flows that call a registered binder (`Start`, `Restore`, `Fork`). Pools
-  come from the configuration file, and the binder is the caller's own.
+  come from the configuration file, with the binders that may watch them,
+  and the binder of a session is the caller's own.
 - The JSON form of the API.
 - A second host, and with it placement.
 - Quotas per orchestrator. The bounds on open calls are fixed: 64 evidence
