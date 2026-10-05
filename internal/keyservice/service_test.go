@@ -1446,8 +1446,12 @@ func TestWaitingGuestKeepsItsKeyServiceSessionOpen(t *testing.T) {
 			t.Fatal("the guest did not open its session again under its next certificate")
 		}
 	}
-	if g.Logged("opened the session with the key service again, under a new certificate") == 0 {
-		t.Fatal("the guest does not say it opened its session again")
+	// The guest says so once the key service has answered it, which is
+	// after the key service has its verdict.
+	for deadline := time.Now().Add(5 * time.Second); g.Logged("opened the session with the key service again, under a new certificate") == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the guest does not say it opened its session again")
+		}
 	}
 	// Bound now, it takes its stored credential on the verdict of the
 	// certificate it last opened with.
