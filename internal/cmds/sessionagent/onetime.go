@@ -33,8 +33,15 @@ type oneTime struct {
 	// kem is the seed of the hybrid KEM key, nil once erased.
 	kem []byte
 	// used says work on a key has left something on the heap since the last
-	// collection.
-	used bool
+	// collection began, and collecting counts the collections on their way.
+	// Nothing of the keys is left once neither holds.
+	used       bool
+	collecting int
+	// inflight is done when no collection is on its way.
+	inflight sync.WaitGroup
+	// hold, when set, is where a collection waits before it runs: a test's
+	// way to see what waits for one.
+	hold chan struct{}
 }
 
 // spentKey is an Ed25519 key that is no secret: the one of the all-zero
@@ -97,10 +104,39 @@ func (o *oneTime) collect() {
 	o.mu.Lock()
 	due := o.used
 	o.used = false
+	if due {
+		o.collecting++
+		o.inflight.Add(1)
+	}
+	hold := o.hold
 	o.mu.Unlock()
 	if due {
+		if hold != nil {
+			<-hold
+		}
 		runtime.GC()
+		o.mu.Lock()
+		o.collecting--
+		o.mu.Unlock()
+		o.inflight.Done()
 	}
+}
+
+// finish returns once nothing of the keys is left on the heap: it runs the
+// collection that is due, if one is, and waits for every other on its way,
+// whoever began it. Its caller has seen to it that no work on a key begins
+// any more.
+func (o *oneTime) finish() {
+	o.collect()
+	o.inflight.Wait()
+}
+
+// erased reports whether nothing of the keys is left: both are gone, and so
+// is what work on them left on the heap.
+func (o *oneTime) erased() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.signing == nil && o.kem == nil && !o.used && o.collecting == 0
 }
 
 // sign signs message with the one-time signing key and erases the key. It

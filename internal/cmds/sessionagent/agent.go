@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -430,20 +431,41 @@ func (a *Agent) Admit(ctx context.Context) error {
 	return nil
 }
 
-// admit prepares, measures and starts the sandbox, signs the receipt that
-// answers the bind, and takes the quote that follows it.
+// admit signs the receipt that answers the bind, prepares, measures and
+// starts the sandbox, and takes the quote that follows the receipt.
 //
-// The register is made final before the slow steps: the sandbox's image is
-// extended into it as soon as the image is in place. The quote over the
-// bind's nonce is then taken while the guest takes its credentials and starts
-// its sandbox. Once the sandbox runs the guest signs its receipt, and the
-// bind is answered with it: with the quote too if that is there by then, and
-// otherwise the quote is served with the guest's state when it arrives. A
-// guest whose admission fails after the extend ends, as it does on any other
-// failure here, and gives no quote on its way out.
+// The receipt is signed first, and the keys the guest made for its one bind
+// are gone from then on: see below. The register is made final before the
+// slow steps: the sandbox's image is extended into it as soon as the image is
+// in place. The quote over the bind's nonce is then taken while the guest
+// takes its credentials and starts its sandbox. Once the sandbox runs the
+// bind is answered with the receipt: with the quote too if that is there by
+// then, and otherwise the quote is served with the guest's state when it
+// arrives. A guest whose admission fails after the extend ends, as it does on
+// any other failure here, and gives no quote on its way out.
 func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.SignedReceipt, *session.AttestResponse, error) {
 	ctx, steps := withAdmission(ctx)
 	sandbox, egress := bind.Doc.Policy.Sandbox, bind.Doc.Policy.Egress
+	// The receipt is signed as soon as the bind is measured. What it names
+	// the bind has fixed: what the guest extends after its launch document,
+	// the sandbox's image included, which settle extends below. The key it
+	// is signed with was made for this one signature and is erased by it,
+	// before the guest takes anything for the tenant. The receipt leaves the
+	// guest only once the register holds what it says: to the key service
+	// once the image is measured, and in the answer once the sandbox runs. A
+	// guest whose admission fails ends, and its receipt with it.
+	a.measured.RLock()
+	named := append([]string(nil), a.events...)
+	a.measured.RUnlock()
+	receipt, err := session.NewBindReceipt(a.oneTime.sign, bind, named[1:], session.PhaseRunning)
+	if err != nil {
+		return nil, nil, err
+	}
+	traced(ctx, "signed")
+	// What signing left on the heap, and opening a sealed message before it,
+	// is erased by a collection. Begun this early, it runs beside every step
+	// that follows, and the sandbox's start waits for it below.
+	go a.oneTime.collect()
 	if sandbox != nil {
 		if err := a.cfg.Runner.Prepare(ctx, sandbox, egress); err != nil {
 			return nil, nil, fmt.Errorf("prepare sandbox: %w", err)
@@ -465,32 +487,16 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		}
 	}
 	traced(ctx, "checked")
+	// The register is made final for this bind: it holds what the receipt
+	// names, which a quote from before the bind does not.
 	events, err := a.settle(ctx, sandbox != nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	// The register is final for this bind, so the receipt can be signed:
-	// what the guest extended after its launch document, which a quote from
-	// before the bind does not hold. The key it is signed with was made for
-	// this one signature and is erased by it, before the guest takes
-	// anything for the tenant. The receipt leaves the guest only once the
-	// sandbox runs, in the answer, and to the key service before that.
-	receipt, err := session.NewBindReceipt(a.oneTime.sign, bind, events[1:], session.PhaseRunning)
-	if err != nil {
-		return nil, nil, err
+	if !slices.Equal(events, named) {
+		return nil, nil, errors.New("the register holds other events than the receipt for this bind names")
 	}
-	traced(ctx, "signed")
-	// What signing left on the heap, and opening a sealed message before it,
-	// is erased by a collection, which runs beside what follows and is done
-	// before the sandbox starts.
-	collected := make(chan struct{})
-	var collecting time.Duration
-	go func() {
-		defer close(collected)
-		began := time.Now()
-		a.oneTime.collect()
-		collecting = time.Since(began)
-	}()
+	traced(ctx, "measured")
 	evidence := make(chan *session.AttestResponse, 1)
 	go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
 	// What the bind has the key service hold for the session is in place
@@ -504,9 +510,12 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	traced(ctx, "acquired")
 	a.closeSealed()
 	a.putSealedCredentials()
-	<-collected
-	a.oneTime.collect()
-	tracedFor(ctx, "collection", collecting)
+	// No work on a one-time key begins any more. The sandbox starts once
+	// what all of it left is collected: the collection begun above, and one
+	// more for a sealed message that was opened after that began.
+	waited := time.Now()
+	a.oneTime.finish()
+	tracedFor(ctx, "collection", time.Since(waited))
 	traced(ctx, "collected")
 	if sandbox != nil {
 		began := time.Now()

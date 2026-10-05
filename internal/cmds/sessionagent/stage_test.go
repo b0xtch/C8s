@@ -163,6 +163,9 @@ type recordingRunner struct {
 	// starting, when set, is closed when Start is reached, and Start then
 	// waits until the test closes started.
 	starting, started chan struct{}
+	// onStart, when set, is called as Start is reached, before anything
+	// else happens there: what it reads is the agent as it starts a sandbox.
+	onStart func()
 }
 
 // preparedIn is how long the recording runner says its one step took.
@@ -218,6 +221,9 @@ func (r *recordingRunner) Prepare(ctx context.Context, w *session.Sandbox, egres
 
 func (r *recordingRunner) Start(context.Context, string) error {
 	r.mu.Lock()
+	if r.onStart != nil {
+		r.onStart()
+	}
 	r.steps = append(r.steps, "start")
 	r.atStart, _ = r.td.Extension()
 	starting, started := r.starting, r.started

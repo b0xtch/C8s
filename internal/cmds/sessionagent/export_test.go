@@ -58,6 +58,36 @@ func NewTestMemory(reserveMB int, rest bool, read func() ([]byte, error), accept
 // keys.
 func OneTimeKeysGone(a *Agent) bool { return a.oneTime.gone() }
 
+// OneTimeKeysErased reports whether the guest has erased both of its
+// one-time keys and collected what work on them left on its heap.
+func OneTimeKeysErased(a *Agent) bool { return a.oneTime.erased() }
+
+// HoldCollections has every collection of what the guest's one-time keys
+// left wait until the returned function is called.
+func HoldCollections(a *Agent) (release func()) {
+	hold := make(chan struct{})
+	a.oneTime.mu.Lock()
+	a.oneTime.hold = hold
+	a.oneTime.mu.Unlock()
+	return func() { close(hold) }
+}
+
+// OneTimeCollecting is how many collections of what the guest's one-time
+// keys left are on their way.
+func OneTimeCollecting(a *Agent) int {
+	a.oneTime.mu.Lock()
+	defer a.oneTime.mu.Unlock()
+	return a.oneTime.collecting
+}
+
+// OneTimeSigningGone reports whether the guest has erased its one-time
+// signing key.
+func OneTimeSigningGone(a *Agent) bool {
+	a.oneTime.mu.Lock()
+	defer a.oneTime.mu.Unlock()
+	return a.oneTime.signing == nil
+}
+
 // OneTimeKEMGone reports whether the guest has erased its one-time KEM key.
 func OneTimeKEMGone(a *Agent) bool {
 	a.oneTime.mu.Lock()

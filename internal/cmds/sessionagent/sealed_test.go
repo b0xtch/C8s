@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -257,6 +258,8 @@ func ran(t *testing.T, message *session.SealedMessage, answer bindAnswer) *sessi
 func TestSealedMessageComesWithTheBindAndIsActedOnOnce(t *testing.T) {
 	c := newSealing(t)
 	c.runner.starting, c.runner.started = make(chan struct{}), make(chan struct{})
+	var erased atomic.Bool
+	c.runner.onStart = func() { erased.Store(sessionagent.OneTimeKeysErased(c.agent)) }
 	message := c.seal(t, c.access, c.bind, true)
 
 	first := make(chan bindAnswer, 1)
@@ -271,6 +274,9 @@ func TestSealedMessageComesWithTheBindAndIsActedOnOnce(t *testing.T) {
 	// them, and nothing has run.
 	if !sessionagent.OneTimeKeysGone(c.agent) {
 		t.Fatal("the guest still holds a one-time key as its sandbox starts")
+	}
+	if !erased.Load() {
+		t.Fatal("what opening the message left on the heap is not collected as the sandbox starts")
 	}
 	for name, value := range held() {
 		if got := c.inPlace(t, name); !bytes.Equal(got, value) {
@@ -757,6 +763,8 @@ func TestSealedMessageSentAfterItsBindIsTakenWhileTheGuestTakesTheBind(t *testin
 	p := newPool(t)
 	p.runner.gate = make(chan struct{})
 	p.runner.starting, p.runner.started = make(chan struct{}), make(chan struct{})
+	var erased atomic.Bool
+	p.runner.onStart = func() { erased.Store(sessionagent.OneTimeKeysErased(p.agent)) }
 	p.start(t)
 	c := found(t, p)
 	message := c.seal(t, c.access, c.bind, true)
@@ -790,7 +798,12 @@ func TestSealedMessageSentAfterItsBindIsTakenWhileTheGuestTakesTheBind(t *testin
 	case <-time.After(10 * time.Second):
 		t.Fatal("the sandbox was never started")
 	}
-	// The sandbox is about to start, and finds the credentials in place.
+	// The sandbox is about to start: what opening the late message left is
+	// collected, by a collection of its own, and the credentials are in
+	// place.
+	if !erased.Load() {
+		t.Fatal("what opening a message sent after the bind left on the heap is not collected as the sandbox starts")
+	}
 	if got := c.inPlace(t, "api-token"); !bytes.Equal(got, held()["api-token"]) {
 		t.Fatalf("as the sandbox starts, the credential sent after the bind is %q", got)
 	}
