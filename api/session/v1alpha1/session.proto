@@ -64,7 +64,7 @@ message Bound {
   // The evidence now includes the bind.
   Evidence evidence = 1;
   // The guest's receipt for the bind (c8s-bind-receipt/v1), as the guest
-  // sent it: signed by its instance key over the bind's nonce. The quote
+  // sent it: signed by its one-time key over the bind's nonce. The quote
   // over the same nonce is in the evidence if the guest had it by then, and
   // in what GetEvidence returns once it has.
   bytes receipt = 2;
@@ -95,6 +95,10 @@ message Evidence {
   // Where the guest says the quote over its bind's nonce stands, once it
   // runs its sandbox: trying, taken or given_up.
   string bind_quote = 11;
+  // Once bound: the last certificate the guest issued before its bind. Its
+  // quote is of the guest while it was nobody's and binds the one-time key
+  // the guest's receipt for the bind is signed under.
+  bytes ready_certificate = 12;
 }
 
 message Bytes {

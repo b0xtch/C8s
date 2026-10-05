@@ -199,7 +199,7 @@ func (g *guestClient) evidence(ctx context.Context, addr string) (*sessionv1alph
 			return nil, err
 		}
 	}
-	evidence.BindQuote = state.BindQuote
+	evidence.BindQuote, evidence.ReadyCertificate = state.BindQuote, state.ReadyCertificate
 	evidence.Collateral = g.collateral(ctx, addr)
 	return evidence, nil
 }

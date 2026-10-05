@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -92,9 +94,14 @@ func status(err error) int {
 // evidence of it, and the pool's launch document. It is made by hand here so
 // that a test can ask the key service for what no agent would.
 type guest struct {
-	t         *testing.T
-	td        *sessiontest.TD
-	key       *ecdsa.PrivateKey
+	t   *testing.T
+	td  *sessiontest.TD
+	key *ecdsa.PrivateKey
+	// once is the one-time signing key, which a real guest erases as it
+	// signs its receipt, and oneTime the keys its certificate carries. A
+	// test clears oneTime for a guest that makes none.
+	once      ed25519.PrivateKey
+	oneTime   *session.OneTimeKeys
 	launch    []byte
 	signature string
 	client    *api.Client
@@ -140,6 +147,7 @@ func newGuest(t *testing.T, pool *sessionsim.Pool, ks *keyservicetest.Sim) *gues
 	if g.sealing, err = api.NewEncryptionKey(); err != nil {
 		t.Fatal(err)
 	}
+	g.once, g.oneTime = newOneTime(t)
 	g.client, err = api.NewClient(api.Options{
 		Pin: ks.Pin, Engine: sessiontest.Engine{},
 		Certificate: func() (*tls.Certificate, error) { return g.certificate(), nil },
@@ -151,19 +159,41 @@ func newGuest(t *testing.T, pool *sessionsim.Pool, ks *keyservicetest.Sim) *gues
 	return g
 }
 
+// newOneTime makes a guest's one-time keys.
+func newOneTime(t *testing.T) (ed25519.PrivateKey, *session.OneTimeKeys) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kem, err := hpke.MLKEM768X25519().GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return private, &session.OneTimeKeys{Signing: public, KEM: kem.PublicKey().Bytes()}
+}
+
 // certificate is the guest's attested certificate over its registers as
-// they are now.
+// they are now, with its one-time keys in it and bound by its quote.
 func (g *guest) certificate() *tls.Certificate {
 	g.t.Helper()
-	rd, err := ratls.ReportDataForKey(&g.key.PublicKey, nil)
+	rd, err := session.CertificateReportData(&g.key.PublicKey, g.oneTime)
 	if err != nil {
 		g.t.Fatal(err)
 	}
-	att, err := agratls.NewAttestation(g.td.Evidence(rd[:48]))
+	att, err := agratls.NewAttestation(g.td.Evidence(rd))
 	if err != nil {
 		g.t.Fatal(err)
 	}
-	der, err := ratls.CreateAttestedCert(g.key, att, &ratls.CertOptions{Subject: pkix.Name{CommonName: "c8s session"}, TTL: time.Hour})
+	opts := &ratls.CertOptions{Subject: pkix.Name{CommonName: "c8s session"}, TTL: time.Hour}
+	if g.oneTime != nil {
+		ext, err := g.oneTime.Extension()
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		opts.Extensions = []pkix.Extension{ext}
+	}
+	der, err := ratls.CreateAttestedCert(g.key, att, opts)
 	if err != nil {
 		g.t.Fatal(err)
 	}
@@ -201,14 +231,37 @@ func (g *guest) bind(o *owner, ks *keyservicetest.Sim, mutate func(*session.Bind
 	return bind
 }
 
+// receipt is the guest's receipt for bind, signed under key: its own
+// one-time key, or one a test hands it.
+func (g *guest) receipt(bind *session.SignedBind, key ed25519.PrivateKey) *session.SignedReceipt {
+	g.t.Helper()
+	events, err := session.ExpectedEvents(nil, bind, session.PhaseRunning)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	receipt, err := session.NewBindReceipt(func(message []byte) ([]byte, error) { return ed25519.Sign(key, message), nil },
+		bind, events[1:], session.PhaseRunning)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	return receipt
+}
+
+// acquire asks as the guest's agent does: with the bind, and its receipt for
+// it under its one-time key.
 func (g *guest) acquire(bind *session.SignedBind, names ...string) (*api.AcquireResponse, error) {
+	g.t.Helper()
+	return g.acquireWith(bind, g.receipt(bind, g.once), names...)
+}
+
+func (g *guest) acquireWith(bind *session.SignedBind, receipt *session.SignedReceipt, names ...string) (*api.AcquireResponse, error) {
 	g.t.Helper()
 	signature, err := api.SignEncryptionKey(g.key, g.sealing.Public())
 	if err != nil {
 		g.t.Fatal(err)
 	}
 	return g.client.Acquire(within(g.t), &api.AcquireRequest{
-		Bind: bind.Raw, BindSignature: bind.Signature,
+		Bind: bind.Raw, BindSignature: bind.Signature, Receipt: receipt,
 		EncryptionKey: g.sealing.Public(), EncryptionKeySignature: signature, Credentials: names,
 	})
 }
@@ -505,10 +558,32 @@ func TestReleaseRule(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = g.client.Acquire(within(t), &api.AcquireRequest{
-		Bind: bind.Raw, BindSignature: bind.Signature, EncryptionKey: forged.Public(), EncryptionKeySignature: signature, Credentials: []string{"token"},
+		Bind: bind.Raw, BindSignature: bind.Signature, Receipt: g.receipt(bind, g.once),
+		EncryptionKey: forged.Public(), EncryptionKeySignature: signature, Credentials: []string{"token"},
 	})
 	if status(err) != 400 {
 		t.Fatalf("an encryption key somebody else signed: %v", err)
+	}
+
+	// Rule 3's other half: the guest's receipt for the bind, under the
+	// one-time key its evidence bound. What a session could sign that read
+	// its guest's instance key, or that made a key of its own, is none.
+	strangers, _ := newOneTime(t)
+	elsewhere := g.bind(w.owner, w.ks, func(o *session.BindOptions) { o.Session = "s2" })
+	byInstance, err := operatorauth.SignDetached(g.key, append([]byte(session.BindReceiptSchema+" signature\x00"), g.receipt(bind, g.once).Receipt...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, receipt := range map[string]*session.SignedReceipt{
+		"no receipt":       nil,
+		"an empty receipt": {},
+		"a receipt under a key the guest did not bind": g.receipt(bind, strangers),
+		"a receipt the instance key signed":            {Receipt: g.receipt(bind, g.once).Receipt, Signature: byInstance},
+		"the guest's receipt for another bind":         g.receipt(elsewhere, g.once),
+	} {
+		if answer, err := g.acquireWith(bind, receipt, "token"); status(err) != 403 {
+			t.Errorf("%s released %+v: %v, want HTTP 403", name, answer, err)
+		}
 	}
 
 	// None of the refusals above counted as the guest's bind.
@@ -596,6 +671,62 @@ func TestOnlyServedPoolsOpenASession(t *testing.T) {
 	if err := debug.open(); status(err) != 403 {
 		t.Fatalf("a debug guest: %v", err)
 	}
+	// A guest whose evidence binds no one-time keys could show no receipt
+	// that only its agent signed.
+	keyless := newGuest(t, w.pool, w.ks)
+	keyless.oneTime = nil
+	if err := keyless.open(); status(err) != 403 {
+		t.Fatalf("a guest with no one-time keys: %v", err)
+	}
+	// One whose certificate carries keys its quote does not bind.
+	swapped := newGuest(t, w.pool, w.ks)
+	genuine := swapped.certificate()
+	_, swapped.oneTime = newOneTime(t)
+	forged := swapped.certificate()
+	// The quote of the first certificate, under the keys of the second.
+	if bytes.Equal(genuine.Certificate[0], forged.Certificate[0]) {
+		t.Fatal("the two certificates are one")
+	}
+	replay := replayQuote(t, swapped, genuine.Leaf)
+	swapped.client.Close()
+	swapped.client, err = api.NewClient(api.Options{
+		Pin: w.ks.Pin, Engine: sessiontest.Engine{},
+		Certificate: func() (*tls.Certificate, error) { return replay, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(swapped.client.Close)
+	if err := swapped.open(); status(err) != 403 {
+		t.Fatalf("a certificate with keys its quote does not bind: %v", err)
+	}
+}
+
+// replayQuote is a certificate g's instance key signs now, which carries g's
+// present one-time keys beside the quote of an earlier certificate: what a
+// session holds that read its guest's instance key and has its host's copy
+// of the guest's first evidence.
+func replayQuote(t *testing.T, g *guest, earlier *x509.Certificate) *tls.Certificate {
+	t.Helper()
+	att, err := ratls.ExtractAttestation(earlier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ext, err := g.oneTime.Extension()
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := ratls.CreateAttestedCert(g.key, att, &ratls.CertOptions{
+		Subject: pkix.Name{CommonName: "c8s session"}, TTL: time.Hour, Extensions: []pkix.Extension{ext},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: g.key, Leaf: leaf}
 }
 
 // accepting is the test engine that notes which TCB statuses each judgment

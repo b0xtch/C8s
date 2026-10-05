@@ -129,12 +129,19 @@ func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 			t.Fatalf("a guest that says its quote is %q was relayed as %q (%v)", said, evidence.GetBindQuote(), err)
 		}
 	}
-	guest.say(func(g *saidGuest) { g.state.Attestation, g.state.BindQuote = quote, session.BindQuoteTaken })
+	guest.say(func(g *saidGuest) {
+		g.state.Attestation, g.state.BindQuote, g.state.ReadyCertificate = quote, session.BindQuoteTaken, []byte("the certificate from before the bind")
+	})
 	if evidence, err = client.evidence(ctx, addr); err != nil {
 		t.Fatal(err)
 	}
 	if evidence.GetBindQuote() != session.BindQuoteTaken {
 		t.Fatalf("a guest that has its quote was relayed as %q", evidence.GetBindQuote())
+	}
+	// The certificate a bound guest keeps from before its bind, whose quote
+	// binds the key its receipt is signed under, is relayed with the rest.
+	if string(evidence.GetReadyCertificate()) != "the certificate from before the bind" {
+		t.Fatalf("the certificate from before the bind was relayed as %q", evidence.GetReadyCertificate())
 	}
 	if !bytes.Equal(evidence.GetQuote(), wantQuote) || !bytes.Equal(evidence.GetCertificate(), leaf) ||
 		!bytes.Equal(evidence.GetLaunchDocument(), []byte("launch")) || string(evidence.GetLaunchSignature()) != "launch signature" ||

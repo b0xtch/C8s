@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto"
-	"crypto/sha512"
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,7 +20,6 @@ import (
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
-	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/localverify"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -656,11 +654,13 @@ func servingCertResult(ctx context.Context, policy Policy, engine Engine, leaf *
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	rd, err := agratls.ReportDataForKey(leaf.PublicKey, nil)
+	// A certificate from before the guest's bind carries its one-time keys,
+	// and its quote binds them with the certificate's key.
+	rd, _, err := certificateReportData(leaf)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	res, err := engine.VerifyEvidence(policy.judging(ctx), env, rd[:sha512.Size384])
+	res, err := engine.VerifyEvidence(policy.judging(ctx), env, rd)
 	if err != nil {
 		return nil, err
 	}

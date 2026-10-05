@@ -6,8 +6,10 @@ import (
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
+	"crypto/hpke"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
@@ -46,14 +48,34 @@ func receiptBind(t *testing.T, instance crypto.PublicKey, sandbox bool) *SignedB
 	return bind
 }
 
-// signedReceipt signs whatever a guest might say in a receipt's place.
-func signedReceipt(t *testing.T, key *ecdsa.PrivateKey, domain string, raw []byte) *SignedReceipt {
+// oneTimeKey is a guest's one-time signing key and the keys its evidence
+// binds.
+type oneTimeKey struct {
+	private ed25519.PrivateKey
+	public  *OneTimeKeys
+}
+
+func newOneTimeKey(t *testing.T) *oneTimeKey {
 	t.Helper()
-	signature, err := operatorauth.SignDetached(key, append([]byte(domain), raw...))
+	public, private, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &SignedReceipt{Receipt: raw, Signature: signature}
+	kem, err := hpke.MLKEM768X25519().GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &oneTimeKey{private: private, public: &OneTimeKeys{Signing: public, KEM: kem.PublicKey().Bytes()}}
+}
+
+func (k *oneTimeKey) sign(message []byte) ([]byte, error) {
+	return ed25519.Sign(k.private, message), nil
+}
+
+// signedReceipt signs whatever a guest might say in a receipt's place.
+func signedReceipt(t *testing.T, key *oneTimeKey, domain string, raw []byte) *SignedReceipt {
+	t.Helper()
+	return &SignedReceipt{Receipt: raw, Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(key.private, append([]byte(domain), raw...)))}
 }
 
 func marshalReceipt(t *testing.T, receipt any) []byte {
@@ -70,10 +92,10 @@ func refusedByVerdict(err error) bool {
 	return errors.As(err, &refused)
 }
 
-// A receipt is the instance key's word on one bind: the bind's digest and
+// A receipt is the one-time key's word on one bind: the bind's digest and
 // nonce, what the guest extended after its launch document, and the phase.
 func TestBindReceiptSaysWhatTheGuestExtended(t *testing.T) {
-	key := receiptKey(t)
+	key, once := receiptKey(t), newOneTimeKey(t)
 	for name, tc := range map[string]struct {
 		sandbox bool
 		phase   Phase
@@ -89,11 +111,11 @@ func TestBindReceiptSaysWhatTheGuestExtended(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		signed, err := NewBindReceipt(key, bind, events[1:], tc.phase)
+		signed, err := NewBindReceipt(once.sign, bind, events[1:], tc.phase)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		receipt, err := VerifyBindReceipt(tc.policy, &key.PublicKey, bind, signed)
+		receipt, err := VerifyBindReceipt(tc.policy, &key.PublicKey, once.public, bind, signed)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -106,6 +128,7 @@ func TestBindReceiptSaysWhatTheGuestExtended(t *testing.T) {
 
 func TestBindReceiptIsRefused(t *testing.T) {
 	key, other := receiptKey(t), receiptKey(t)
+	once, otherOnce := newOneTimeKey(t), newOneTimeKey(t)
 	bind := receiptBind(t, &key.PublicKey, true)
 	events, err := ExpectedEvents(nil, bind, PhaseRunning)
 	if err != nil {
@@ -117,21 +140,27 @@ func TestBindReceiptIsRefused(t *testing.T) {
 		receipt := good
 		receipt.Events = slices.Clone(good.Events)
 		change(&receipt)
-		return signedReceipt(t, key, receiptDomain, marshalReceipt(t, receipt))
+		return signedReceipt(t, once, receiptDomain, marshalReceipt(t, receipt))
 	}
-	genuine, err := NewBindReceipt(key, bind, extended, PhaseRunning)
+	genuine, err := NewBindReceipt(once.sign, bind, extended, PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := VerifyBindReceipt(Policy{}, &key.PublicKey, bind, genuine); err != nil {
+	if _, err := VerifyBindReceipt(Policy{}, &key.PublicKey, once.public, bind, genuine); err != nil {
 		t.Fatalf("the genuine receipt: %v", err)
 	}
 	otherBind := receiptBind(t, &key.PublicKey, true)
-	forOther, err := NewBindReceipt(key, otherBind, extended, PhaseRunning)
+	forOther, err := NewBindReceipt(once.sign, otherBind, extended, PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// What the instance key would sign: the receipt of a session that read
+	// its own guest's key.
+	byInstance, err := operatorauth.SignDetached(key, append([]byte(receiptDomain), genuine.Receipt...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,24 +170,36 @@ func TestBindReceiptIsRefused(t *testing.T) {
 	for name, tc := range map[string]struct {
 		signed *SignedReceipt
 		key    crypto.PublicKey
+		once   *OneTimeKeys
 		policy Policy
 	}{
 		"no receipt":       {signed: nil},
 		"an empty receipt": {signed: &SignedReceipt{}},
-		"a receipt signed by another key": {
-			signed: signedReceipt(t, other, receiptDomain, genuine.Receipt),
+		"a receipt signed by another one-time key": {
+			signed: signedReceipt(t, otherOnce, receiptDomain, genuine.Receipt),
 		},
-		"a receipt held to a key the bind does not name": {
-			signed: signedReceipt(t, other, receiptDomain, genuine.Receipt), key: &other.PublicKey,
+		"a receipt signed by the guest's instance key": {
+			signed: &SignedReceipt{Receipt: genuine.Receipt, Signature: byInstance},
 		},
-		"a key that signs no receipt": {signed: genuine, key: edKey.Public()},
+		"a receipt held to an instance key the bind does not name": {signed: genuine, key: &other.PublicKey},
+		"an instance key no bind names":                            {signed: genuine, key: edKey.Public()},
+		"a guest whose evidence bound no one-time keys":            {signed: genuine, once: &OneTimeKeys{}},
+		"a guest whose evidence bound no signing key": {
+			signed: genuine, once: &OneTimeKeys{KEM: once.public.KEM},
+		},
+		"one-time keys with a KEM key that is none": {
+			signed: genuine, once: &OneTimeKeys{Signing: once.public.Signing, KEM: []byte("no key")},
+		},
 		"a receipt changed after it was signed": {
 			signed: &SignedReceipt{Receipt: marshalReceipt(t, BindReceipt{
 				SchemaVersion: BindReceiptSchema, Bind: good.Bind, Nonce: good.Nonce, Events: good.Events[:1], Phase: PhaseRunning,
 			}), Signature: genuine.Signature},
 		},
-		"a signature the key made over the receipt alone": {signed: signedReceipt(t, key, "", genuine.Receipt)},
-		"a signature the key made as something else":      {signed: signedReceipt(t, key, "c8s-bind/v1 signature\x00", genuine.Receipt)},
+		"a signature the key made over the receipt alone": {signed: signedReceipt(t, once, "", genuine.Receipt)},
+		"a signature the key made as something else":      {signed: signedReceipt(t, once, "c8s-bind/v1 signature\x00", genuine.Receipt)},
+		"a signature cut short": {
+			signed: &SignedReceipt{Receipt: genuine.Receipt, Signature: genuine.Signature[:len(genuine.Signature)-4]},
+		},
 		"no signature":                  {signed: &SignedReceipt{Receipt: genuine.Receipt}},
 		"a signature that is no base64": {signed: &SignedReceipt{Receipt: genuine.Receipt, Signature: "not a signature"}},
 		"a receipt for another bind":    {signed: forOther},
@@ -184,15 +225,15 @@ func TestBindReceiptIsRefused(t *testing.T) {
 		"a bound guest that says it extended its image": {
 			signed: said(func(r *BindReceipt) { r.Phase = PhaseBound }), policy: Policy{AllowBound: true},
 		},
-		"a receipt with a field no receipt has": {signed: signedReceipt(t, key, receiptDomain, withField)},
+		"a receipt with a field no receipt has": {signed: signedReceipt(t, once, receiptDomain, withField)},
 		"a receipt with something after it": {
-			signed: signedReceipt(t, key, receiptDomain, append(slices.Clone(genuine.Receipt), []byte(` {}`)...)),
+			signed: signedReceipt(t, once, receiptDomain, append(slices.Clone(genuine.Receipt), []byte(` {}`)...)),
 		},
-		"a receipt that is no document": {signed: signedReceipt(t, key, receiptDomain, []byte(`"running"`))},
+		"a receipt that is no document": {signed: signedReceipt(t, once, receiptDomain, []byte(`"running"`))},
 		// Both would pass but for their size: a decoder takes blanks after a
 		// document, and a signature is read with the blanks around it cut.
 		"a receipt larger than one is": {
-			signed: signedReceipt(t, key, receiptDomain, append(slices.Clone(genuine.Receipt), []byte(strings.Repeat(" ", MaxReceiptBytes))...)),
+			signed: signedReceipt(t, once, receiptDomain, append(slices.Clone(genuine.Receipt), []byte(strings.Repeat(" ", MaxReceiptBytes))...)),
 		},
 		"a signature larger than one is": {
 			signed: &SignedReceipt{Receipt: genuine.Receipt, Signature: genuine.Signature + strings.Repeat(" ", maxSignatureSize)},
@@ -205,9 +246,16 @@ func TestBindReceiptIsRefused(t *testing.T) {
 		if instance == nil {
 			instance = &key.PublicKey
 		}
-		if receipt, err := VerifyBindReceipt(tc.policy, instance, bind, tc.signed); !refusedByVerdict(err) {
+		keys := tc.once
+		if keys == nil {
+			keys = once.public
+		}
+		if receipt, err := VerifyBindReceipt(tc.policy, instance, keys, bind, tc.signed); !refusedByVerdict(err) {
 			t.Errorf("%s passed as the guest's receipt for the bind: %+v, %v", name, receipt, err)
 		}
+	}
+	if receipt, err := VerifyBindReceipt(Policy{}, &key.PublicKey, nil, bind, genuine); !refusedByVerdict(err) {
+		t.Errorf("a receipt passed with no one-time keys to hold it to: %+v, %v", receipt, err)
 	}
 }
 
@@ -215,18 +263,18 @@ func TestBindReceiptIsRefused(t *testing.T) {
 // guest: bound by the receipt's bind, in its phase, with a register that
 // holds the launch document and then exactly what the receipt lists.
 func TestQuoteConfirmsItsReceipt(t *testing.T) {
-	key := receiptKey(t)
+	key, once := receiptKey(t), newOneTimeKey(t)
 	bind := receiptBind(t, &key.PublicKey, true)
 	launch := []byte("launch document")
 	events, err := ExpectedEvents(launch, bind, PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := NewBindReceipt(key, bind, events[1:], PhaseRunning)
+	signed, err := NewBindReceipt(once.sign, bind, events[1:], PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := VerifyBindReceipt(Policy{}, &key.PublicKey, bind, signed)
+	receipt, err := VerifyBindReceipt(Policy{}, &key.PublicKey, once.public, bind, signed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,17 +309,19 @@ func TestQuoteConfirmsItsReceipt(t *testing.T) {
 }
 
 // A receipt kept with a bind is held to a later attestation of the guest:
-// the word of the key that attestation binds, for the bind the guest
-// measured, with a register that still begins with what the receipt lists.
+// the word of the one-time key that guest's evidence bound before its bind,
+// for the bind the guest measured, with a register that still begins with
+// what the receipt lists.
 func TestKeptReceiptIsHeldToALaterAttestation(t *testing.T) {
 	key, other := receiptKey(t), receiptKey(t)
+	once, otherOnce := newOneTimeKey(t), newOneTimeKey(t)
 	bind := receiptBind(t, &key.PublicKey, true)
 	launch := []byte("launch document")
 	events, err := ExpectedEvents(launch, bind, PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
-	signed, err := NewBindReceipt(key, bind, events[1:], PhaseRunning)
+	signed, err := NewBindReceipt(once.sign, bind, events[1:], PhaseRunning)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -297,12 +347,12 @@ func TestKeptReceiptIsHeldToALaterAttestation(t *testing.T) {
 	if err != nil || kept == nil || !bytes.Equal(kept.Receipt, signed.Receipt) || kept.Signature != signed.Signature {
 		t.Fatalf("the kept receipt: %+v, %v", kept, err)
 	}
-	if _, err := ConfirmReceipt(kept, attested(nil)); err != nil {
+	if _, err := confirmReceipt(kept, attested(nil), once.public); err != nil {
 		t.Fatalf("the guest the receipt is from: %v", err)
 	}
 	// A register only grows: what the guest extended since does not undo
 	// what it said then.
-	if _, err := ConfirmReceipt(kept, attested(func(a *Attestation) { a.Events = append(a.Events, a.Events[1]) })); err != nil {
+	if _, err := confirmReceipt(kept, attested(func(a *Attestation) { a.Events = append(a.Events, a.Events[1]) }), once.public); err != nil {
 		t.Fatalf("the same guest after it extended more: %v", err)
 	}
 	otherDER, err := x509.MarshalPKIXPublicKey(&other.PublicKey)
@@ -320,15 +370,27 @@ func TestKeptReceiptIsHeldToALaterAttestation(t *testing.T) {
 		"a register with something before these": func(a *Attestation) { a.Events = slices.Insert(a.Events, 1, a.Events[0]) },
 		"a register that holds nothing":          func(a *Attestation) { a.Events = nil },
 	} {
-		if receipt, err := ConfirmReceipt(kept, attested(change)); !refusedByVerdict(err) {
+		if receipt, err := confirmReceipt(kept, attested(change), once.public); !refusedByVerdict(err) {
 			t.Errorf("the kept receipt was held by %s: %+v, %v", name, receipt, err)
 		}
 	}
-	if _, err := ConfirmReceipt(kept, nil); !refusedByVerdict(err) {
+	if _, err := confirmReceipt(kept, nil, once.public); !refusedByVerdict(err) {
+		t.Errorf("the kept receipt was held by no attestation: %v", err)
+	}
+	// A guest whose evidence bound other keys never signed this receipt.
+	if _, err := confirmReceipt(kept, attested(nil), otherOnce.public); !refusedByVerdict(err) {
+		t.Errorf("the kept receipt was held by a guest with other one-time keys: %v", err)
+	}
+	// With no certificate from before the bind there are no keys to hold it
+	// to, whatever the attestation says.
+	if _, err := ConfirmReceipt(t.Context(), Policy{}, nil, kept, attested(nil), nil); !refusedByVerdict(err) {
+		t.Errorf("the kept receipt was held with no certificate from before the bind: %v", err)
+	}
+	if _, err := ConfirmReceipt(t.Context(), Policy{}, nil, kept, nil, []byte("a certificate")); !refusedByVerdict(err) {
 		t.Errorf("the kept receipt was held by no attestation: %v", err)
 	}
 	// The receipt's own word on which bind it is for, apart from the key.
-	receipt, err := ConfirmReceipt(kept, attested(nil))
+	receipt, err := confirmReceipt(kept, attested(nil), once.public)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +400,7 @@ func TestKeptReceiptIsHeldToALaterAttestation(t *testing.T) {
 	if err := receipt.HeldBy(nil); !refusedByVerdict(err) {
 		t.Errorf("a receipt was held by no attestation: %v", err)
 	}
-	if _, err := ConfirmReceipt(signedReceipt(t, other, receiptDomain, signed.Receipt), attested(nil)); !refusedByVerdict(err) {
+	if _, err := confirmReceipt(signedReceipt(t, otherOnce, receiptDomain, signed.Receipt), attested(nil), once.public); !refusedByVerdict(err) {
 		t.Errorf("a receipt another key signed was held by the guest: %v", err)
 	}
 

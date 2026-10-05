@@ -118,6 +118,9 @@ type Client struct {
 	receipted bool
 	// anotherKey says a guest presented another key than the pinned one.
 	anotherKey bool
+	// ready is the guest as this client last found it ready: the one-time
+	// keys its receipt for a bind is held to.
+	ready *ReadyTD
 	// last is the fresh attestation this client last ran, and lastAt when.
 	last   *Attestation
 	lastAt time.Time
@@ -599,6 +602,17 @@ func (c *Client) Confirmed(att *Attestation, leaf *x509.Certificate) error {
 		c.judgedUntil = until
 	}
 	return nil
+}
+
+// ConfirmReceipt holds a receipt that was kept with the guest's bind to att,
+// an attestation this client just ran, and to the certificate from before
+// the bind that the guest serves with its state: see ConfirmReceipt.
+func (c *Client) ConfirmReceipt(ctx context.Context, signed *SignedReceipt, att *Attestation) (*BindReceipt, error) {
+	var state StateResponse
+	if _, err := c.send(ctx, http.MethodGet, PathState, nil, &state, false); err != nil {
+		return nil, err
+	}
+	return ConfirmReceipt(c.judging(ctx, true), c.required(), c.engine, signed, att, state.ReadyCertificate)
 }
 
 // AnotherKey reports whether a guest presented another key than the one this
@@ -1261,6 +1275,10 @@ type ReadyTD struct {
 	// InstanceKey is the key the connection terminated at: the one a bind for
 	// this guest must name.
 	InstanceKey crypto.PublicKey
+	// OneTime are the keys the guest made for its one bind, as the quote in
+	// its certificate binds them: its receipt for the bind is signed under
+	// the first, and a command sent with the bind is sealed to the second.
+	OneTime *OneTimeKeys
 	// Machine is what the guest's evidence holds for the machine its host
 	// built it: RTMR[0] of a TD. Nil where the TEE has no such register. A
 	// launch document lists the values its guests may hold.
@@ -1288,6 +1306,9 @@ func (c *Client) Ready(ctx context.Context) (*ReadyTD, error) {
 		return nil, err
 	}
 	c.timed(TimedJudgment, began)
+	c.mu.Lock()
+	c.ready = ready
+	c.mu.Unlock()
 	return ready, nil
 }
 
@@ -1370,11 +1391,22 @@ func (c *Client) BindAttested(ctx context.Context, bind *SignedBind, bound Polic
 	if err != nil {
 		return resp, nil, fmt.Errorf("encode instance key: %w", err)
 	}
+	// A receipt is held to the one-time keys this client took from the
+	// guest's evidence when it found the guest ready. A client that did not
+	// find it ready itself has no such keys, and goes by the quote alone.
 	var receipt *BindReceipt
 	quote := resp.Attestation
+	c.mu.Lock()
+	ready := c.ready
+	c.mu.Unlock()
 	if resp.Receipt != nil {
-		if receipt, err = VerifyBindReceipt(bound, leaf.PublicKey, bind, resp.Receipt); err != nil {
-			return resp, nil, err
+		if ready != nil {
+			if !sameKey(ready.InstanceKey, leaf.PublicKey) {
+				return resp, nil, refuse("the bind's answer came from another guest than the one this client found ready")
+			}
+			if receipt, err = VerifyBindReceipt(bound, leaf.PublicKey, ready.OneTime, bind, resp.Receipt); err != nil {
+				return resp, nil, err
+			}
 		}
 		if quote == nil {
 			quote = c.bindQuote(ctx)

@@ -126,6 +126,12 @@ type StateResponse struct {
 	// measured it.
 	Bind          []byte `json:"bind,omitempty"`
 	BindSignature string `json:"bind_signature,omitempty"`
+	// ReadyCertificate is the last certificate a bound guest issued before
+	// its bind, DER. Its quote is of the guest while it was nobody's and
+	// binds the one-time key its receipt for the bind is signed under, so a
+	// receipt can be checked for as long as the guest lives: see
+	// ConfirmReceipt.
+	ReadyCertificate []byte `json:"ready_certificate,omitempty"`
 	// BindQuote says where the quote over the bind's nonce stands, once the
 	// guest runs its sandbox: BindQuoteTrying, BindQuoteTaken or
 	// BindQuoteGivenUp. A binder that reads the last asks the guest for an

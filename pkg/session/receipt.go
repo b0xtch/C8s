@@ -2,9 +2,12 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,15 +16,13 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-
-	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 )
 
 // BindReceiptSchema is the one version of a guest's receipt for its bind.
 const BindReceiptSchema = "c8s-bind-receipt/v1"
 
-// receiptDomain separates the instance key's signature over a receipt from
-// everything else that key signs.
+// receiptDomain starts what a guest's one-time key signs: a receipt, and
+// nothing else.
 const receiptDomain = BindReceiptSchema + " signature\x00"
 
 // MaxReceiptBytes bounds a receipt as it travels.
@@ -31,14 +32,16 @@ const MaxReceiptBytes = 8 << 10
 // bind, for which nonce, what the guest extended into its runtime register
 // since it was ready, and the phase it reached.
 //
-// The guest's instance key signs it, and the bind's nonce makes it fresh for
-// the binder that drew the nonce. It is worth what that key is worth: the
-// binder verified the quote that binds the key to the measured guest before
-// it signed the bind. What a receipt says of the register is the measured
-// agent's word until a quote over the same nonce says the same with the
-// hardware's: the guest takes that quote while it answers, and serves it once
-// it has it. A verdict that is kept is made from the quote, never from a
-// receipt.
+// The guest signs it with the one-time key it made for its one bind, and the
+// bind's nonce makes it fresh for the binder that drew the nonce. Only the
+// guest's agent, as it takes that bind, can sign one: the quote the binder
+// verified before it took the receipt binds the key to the measured guest,
+// and the guest erases the key before anything of the tenant runs. The
+// instance key would not do, since it lives as long as the session (see
+// OneTimeKeys). What a receipt says of the register is the measured agent's
+// word until a quote over the same nonce says the same with the hardware's:
+// the guest takes that quote while it answers, and serves it once it has it.
+// A verdict that is kept is made from the quote, never from a receipt.
 type BindReceipt struct {
 	SchemaVersion string `json:"schemaVersion"`
 	// Bind is the digest of the bind the guest took.
@@ -55,39 +58,44 @@ type BindReceipt struct {
 }
 
 // SignedReceipt is a receipt as it travels: the bytes the guest signed, and
-// its instance key's signature over them.
+// its one-time key's signature over them, in base64.
 type SignedReceipt struct {
 	Receipt   []byte `json:"receipt"`
 	Signature string `json:"signature"`
 }
 
-// NewBindReceipt renders and signs a guest's receipt for bind: events are
-// what the guest extended after its launch document, and phase what it
-// reached.
-func NewBindReceipt(instance *ecdsa.PrivateKey, bind *SignedBind, events []string, phase Phase) (*SignedReceipt, error) {
+// ReceiptSigner signs what it is handed with a guest's one-time signing key:
+// Ed25519. A guest's signer erases the key once it has signed.
+type ReceiptSigner func(message []byte) (signature []byte, err error)
+
+// NewBindReceipt renders a guest's receipt for bind and has sign sign it:
+// events are what the guest extended after its launch document, and phase
+// what it reached.
+func NewBindReceipt(sign ReceiptSigner, bind *SignedBind, events []string, phase Phase) (*SignedReceipt, error) {
 	raw, err := json.Marshal(BindReceipt{
 		SchemaVersion: BindReceiptSchema, Bind: DocumentDigest(bind.Raw), Nonce: bind.Doc.Nonce, Events: events, Phase: phase,
 	})
 	if err != nil {
 		return nil, err
 	}
-	signature, err := operatorauth.SignDetached(instance, append([]byte(receiptDomain), raw...))
+	signature, err := sign(append([]byte(receiptDomain), raw...))
 	if err != nil {
 		return nil, fmt.Errorf("sign the bind's receipt: %w", err)
 	}
-	return &SignedReceipt{Receipt: raw, Signature: signature}, nil
+	return &SignedReceipt{Receipt: raw, Signature: base64.StdEncoding.EncodeToString(signature)}, nil
 }
 
 // VerifyBindReceipt holds a guest's receipt to the bind it answers. The
-// receipt must be signed by instanceKey, which is the key the binder verified
-// and the bind names; it must be for this bind and its nonce; and it must say
-// the guest extended exactly what the bind implies for the phase it names,
-// which is the running phase unless policy allows a guest that is bound and
-// no more.
+// receipt must be signed under the signing key of oneTime, which are the keys
+// the caller took from a quote of the guest that holds instanceKey, from
+// before its bind (ReadyTD.OneTime); instanceKey is the key the bind names;
+// the receipt must be for this bind and its nonce; and it must say the guest
+// extended exactly what the bind implies for the phase it names, which is the
+// running phase unless policy allows a guest that is bound and no more.
 //
 // A receipt that passes lets its binder go on at once. The quote that follows
 // must agree with it: see BindReceipt.Confirmed.
-func VerifyBindReceipt(policy Policy, instanceKey crypto.PublicKey, bind *SignedBind, signed *SignedReceipt) (*BindReceipt, error) {
+func VerifyBindReceipt(policy Policy, instanceKey crypto.PublicKey, oneTime *OneTimeKeys, bind *SignedBind, signed *SignedReceipt) (*BindReceipt, error) {
 	if signed == nil || len(signed.Receipt) == 0 {
 		return nil, refuse("the answer to the bind carries no receipt")
 	}
@@ -96,13 +104,20 @@ func VerifyBindReceipt(policy Policy, instanceKey crypto.PublicKey, bind *Signed
 	}
 	key, ok := instanceKey.(*ecdsa.PublicKey)
 	if !ok {
-		return nil, refuse("the guest's instance key is a %T, which signs no receipt", instanceKey)
+		return nil, refuse("the guest's instance key is a %T, which no bind names", instanceKey)
 	}
 	if err := bind.Doc.Targets(key); err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	if err := operatorauth.VerifyDetached([]*ecdsa.PublicKey{key}, append([]byte(receiptDomain), signed.Receipt...), signed.Signature); err != nil {
-		return nil, refuse("the bind's receipt is not signed by the guest's instance key: %v", err)
+	if err := oneTime.Validate(); err != nil {
+		return nil, refuse("the guest's evidence binds no key its receipt could be signed under: %v", err)
+	}
+	signature, err := base64.StdEncoding.DecodeString(signed.Signature)
+	if err != nil || len(signature) != ed25519.SignatureSize {
+		return nil, refuse("the bind's receipt carries no signature of a one-time key")
+	}
+	if !ed25519.Verify(oneTime.Signing, append([]byte(receiptDomain), signed.Receipt...), signature) {
+		return nil, refuse("the bind's receipt is not signed by the guest's one-time key")
 	}
 	var receipt BindReceipt
 	dec := json.NewDecoder(bytes.NewReader(signed.Receipt))
@@ -212,10 +227,27 @@ func LoadReceipt(dir string) (*SignedReceipt, error) {
 }
 
 // ConfirmReceipt holds a receipt that was kept with a bind to an attestation
-// of the bound guest, judged just now: the receipt is the word of the
-// instance key the attestation binds, for the bind the guest measured, and
-// the guest's register still begins with what the receipt lists.
-func ConfirmReceipt(signed *SignedReceipt, att *Attestation) (*BindReceipt, error) {
+// of the bound guest, judged just now under policy with engine, and to
+// readyCertificate, the last certificate the guest issued before its bind,
+// which the guest keeps serving with its state. The certificate's quote must
+// be of the same guest, still nobody's, and binds the one-time key the
+// receipt is signed under; the receipt must be for the bind the guest
+// measured; and the guest's register must still begin with what the receipt
+// lists.
+func ConfirmReceipt(ctx context.Context, policy Policy, engine Engine, signed *SignedReceipt, att *Attestation, readyCertificate []byte) (*BindReceipt, error) {
+	if att == nil || att.Bind == nil {
+		return nil, refuse("a receipt is held to the attestation of a bound guest")
+	}
+	oneTime, err := readyOneTime(ctx, policy, engine, att, readyCertificate)
+	if err != nil {
+		return nil, err
+	}
+	return confirmReceipt(signed, att, oneTime)
+}
+
+// confirmReceipt holds a kept receipt to an attestation of the bound guest
+// and to the one-time keys a quote of that guest from before its bind binds.
+func confirmReceipt(signed *SignedReceipt, att *Attestation, oneTime *OneTimeKeys) (*BindReceipt, error) {
 	if att == nil || att.Bind == nil {
 		return nil, refuse("a receipt is held to the attestation of a bound guest")
 	}
@@ -224,7 +256,7 @@ func ConfirmReceipt(signed *SignedReceipt, att *Attestation) (*BindReceipt, erro
 		return nil, refuse("the attestation carries no usable instance key: %v", err)
 	}
 	// A receipt of a guest that was bound and no more is its word too.
-	receipt, err := VerifyBindReceipt(Policy{AllowBound: true}, key, att.Bind, signed)
+	receipt, err := VerifyBindReceipt(Policy{AllowBound: true}, key, oneTime, att.Bind, signed)
 	if err != nil {
 		return nil, err
 	}
@@ -232,4 +264,47 @@ func ConfirmReceipt(signed *SignedReceipt, att *Attestation) (*BindReceipt, erro
 		return nil, err
 	}
 	return receipt, nil
+}
+
+// readyOneTime takes the one-time keys of the guest att attests from the
+// certificate that guest issued before its bind. The certificate carries the
+// attested instance key, and its quote is of the pinned image under the
+// attested launch document with nothing measured after it, so it is a quote
+// that guest took while it was nobody's, and nothing a session in the guest
+// could have had it take since: every later quote shows the bind in the
+// register.
+//
+// The certificate is judged as of its issue. Its dates say when the guest
+// served under it, and a receipt is checked for as long as the session lives.
+func readyOneTime(ctx context.Context, policy Policy, engine Engine, att *Attestation, readyCertificate []byte) (*OneTimeKeys, error) {
+	if len(readyCertificate) == 0 {
+		return nil, refuse("the guest serves no certificate from before its bind: nothing binds the key its receipt is signed under")
+	}
+	leaf, err := x509.ParseCertificate(readyCertificate)
+	if err != nil {
+		return nil, refuse("the guest's certificate from before its bind does not parse: %v", err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	if err != nil || !bytes.Equal(der, att.InstanceKey) {
+		return nil, refuse("the certificate from before the bind carries another instance key than the guest's")
+	}
+	ready := Policy{
+		Image: policy.Image, LaunchKey: policy.LaunchKey, AllowReady: true,
+		AllowNoMachine: policy.AllowNoMachine, AcceptTCBStatus: policy.AcceptTCBStatus,
+	}
+	if err := ready.validate(); err != nil {
+		return nil, err
+	}
+	chain := [][]string{{DocumentDigest(att.Launch)}}
+	if _, err := servingCertResult(ctx, ready, engine, leaf, leaf.NotBefore, att.Document, chain); err != nil {
+		return nil, err
+	}
+	oneTime, err := oneTimeKeysOf(leaf)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if oneTime == nil {
+		return nil, refuse("the guest's certificate from before its bind binds no one-time keys")
+	}
+	return oneTime, nil
 }

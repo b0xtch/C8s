@@ -52,3 +52,7 @@ func NewTestMemory(reserveMB int, rest bool, read func() ([]byte, error), accept
 		idle:  func() error { return nil },
 	}
 }
+
+// OneTimeKeysGone reports whether the guest has erased both of its one-time
+// keys.
+func OneTimeKeysGone(a *Agent) bool { return a.oneTime.gone() }

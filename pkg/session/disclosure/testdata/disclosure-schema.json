@@ -56,6 +56,12 @@
           "optional": true
         },
         {
+          "name": "ready_certificate",
+          "kind": "public",
+          "max": 32768,
+          "optional": true
+        },
+        {
           "name": "bind_quote",
           "kind": "code",
           "codes": [
@@ -138,7 +144,7 @@
     },
     {
       "name": "receipt",
-      "says": "with its answer to a bind: its own word on the bind, signed by its instance key over the bind's nonce",
+      "says": "with its answer to a bind: its own word on the bind, signed by its one-time key over the bind's nonce",
       "fields": [
         {
           "name": "receipt",

@@ -242,7 +242,9 @@ const (
 	maxSignature = 4096
 	maxEvidence  = 256 << 10
 	maxReceipt   = 8 << 10
-	maxEvents    = 8
+	// A certificate with a quote and the guest's one-time keys in it.
+	maxCertificate = 32 << 10
+	maxEvents      = 8
 	// An admission step takes an hour at most, in microseconds.
 	maxMicros = 3600 * 1000 * 1000
 )
@@ -270,6 +272,7 @@ var Schema = []Message{
 		{Name: "instance_key", Kind: KindPublic, Max: maxKey},
 		{Name: "prepared", Kind: KindFlag, Optional: true},
 	}, measured()...),
+		Field{Name: "ready_certificate", Kind: KindPublic, Max: maxCertificate, Optional: true},
 		Field{Name: "bind_quote", Kind: KindCode, Codes: bindQuotes, Optional: true},
 		Field{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true})},
 	{Name: MessageFence, Says: "to its host, which claims it for a session", Fields: []Field{
@@ -283,7 +286,7 @@ var Schema = []Message{
 		{Name: "receipt", Kind: KindMessage, Message: MessageReceipt, Optional: true},
 		{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true},
 	}},
-	{Name: MessageReceipt, Says: "with its answer to a bind: its own word on the bind, signed by its instance key over the bind's nonce", Fields: []Field{
+	{Name: MessageReceipt, Says: "with its answer to a bind: its own word on the bind, signed by its one-time key over the bind's nonce", Fields: []Field{
 		{Name: "receipt", Kind: KindPublic, Max: maxReceipt},
 		{Name: "signature", Kind: KindPublic, Max: maxSignature},
 	}},

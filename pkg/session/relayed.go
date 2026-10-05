@@ -36,6 +36,9 @@ type Relayed struct {
 	// Receipt is the guest's receipt for its bind, in an answer to a bind:
 	// see VerifyBoundReceipt.
 	Receipt *SignedReceipt
+	// ReadyCertificate is the last certificate a bound guest issued before
+	// its bind, DER: its quote binds the key the receipt is signed under.
+	ReadyCertificate []byte
 	// Collateral is a CollateralResponse: the vendor's documents as the
 	// guest's host handed them in.
 	Collateral []byte
@@ -108,7 +111,16 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 	if err != nil {
 		return nil, err
 	}
-	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey}
+	// The quote just passed under report data made from these keys, so it
+	// binds them to the guest that holds the certificate's key.
+	oneTime, err := oneTimeKeysOf(leaf)
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	if oneTime == nil {
+		return nil, refuse("the guest's evidence binds no one-time keys: a receipt for its bind could not be told from one its session signed")
+	}
+	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey, OneTime: oneTime}
 	// Evidence of a TEE with no such register has no machine to report.
 	if machine, err := res.Claims.RTMR(0); err == nil {
 		ready.Machine = machine
@@ -165,10 +177,10 @@ func HoldBound(ctx context.Context, policy Policy, engine Engine, instanceKey cr
 }
 
 // VerifyBoundReceipt judges a guest's relayed answer to a bind by its
-// receipt: the word of the instance key that VerifyReady found, fresh for the
-// bind's nonce, that the guest took this bind, extended what the bind's
-// documents imply and reached its phase. policy is the policy for the bound
-// guest and pins the bind.
+// receipt: the word of the one-time key that VerifyReady found bound to the
+// guest, fresh for the bind's nonce, that the guest took this bind, extended
+// what the bind's documents imply and reached its phase. policy is the policy
+// for the bound guest and pins the bind.
 //
 // A binder may go on with a receipt at once. It still gets the quote over
 // the bind's nonce, from the same answer or from the guest's evidence a
@@ -185,7 +197,7 @@ func VerifyBoundReceipt(policy Policy, ready *ReadyTD, bind *SignedBind, r *Rela
 	if policy.Launch != nil && !bytes.Equal(policy.Launch, ready.Launch) {
 		return nil, refuse("the guest that was verified measured launch document %s, policy pins %s", DocumentDigest(ready.Launch), DocumentDigest(policy.Launch))
 	}
-	return VerifyBindReceipt(policy, ready.InstanceKey, bind, r.Receipt)
+	return VerifyBindReceipt(policy, ready.InstanceKey, ready.OneTime, bind, r.Receipt)
 }
 
 // VerdictOn is the verdict a verifier may keep on att, which it judged at now

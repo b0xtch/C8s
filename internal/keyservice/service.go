@@ -111,10 +111,12 @@ type tenant struct {
 	credentials map[string]bool
 }
 
-// guest is the verdict on a guest's evidence, by its instance key, and the
-// one bind the replica has accepted for it.
+// guest is the verdict on a guest's evidence, by its instance key, the
+// one-time keys that evidence bound, and the one bind the replica has
+// accepted for it.
 type guest struct {
 	verified time.Time
+	oneTime  *session.OneTimeKeys
 	bind     string
 }
 
@@ -344,11 +346,12 @@ func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certif
 		Certificate: leaf.Raw, Phase: session.PhaseReady, Launch: req.Launch, Signature: req.Signature,
 		Events: []string{session.DocumentDigest(req.Launch)},
 	}
+	var ready *session.ReadyTD
 	var last error
 	for _, p := range s.pins {
 		// The verdict will release a secret: the root CA CRL under it is one
 		// this replica fetched itself.
-		if _, last = session.VerifyReadyToRelease(ctx, p.policy, s.cfg.Engine, relayed, s.cfg.Now()); last == nil {
+		if ready, last = session.VerifyReadyToRelease(ctx, p.policy, s.cfg.Engine, relayed, s.cfg.Now()); last == nil {
 			break
 		}
 	}
@@ -359,7 +362,9 @@ func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certif
 	}
 	s.mu.Lock()
 	if _, known := s.guests[key]; !known {
-		s.guests[key] = &guest{verified: s.cfg.Now()}
+		// The one-time keys are the ones the quote just judged binds: a
+		// release is made only against a receipt signed under the first.
+		s.guests[key] = &guest{verified: s.cfg.Now(), oneTime: ready.OneTime}
 	}
 	s.mu.Unlock()
 	s.log.Info("opened a guest's session", "instance_key", key)
@@ -412,6 +417,17 @@ func (s *Service) acquire(w http.ResponseWriter, _ *http.Request, leaf *x509.Cer
 	if !registered || !bind.SignedBy([]byte(owner.authorityPEM)) {
 		// One answer for both, so that nobody learns which tenants exist.
 		refuse(w, http.StatusForbidden, "the bind is not signed by an authority this key service holds for its tenant")
+		return
+	}
+	// Rule 3, its other half: the guest's receipt for this bind, signed
+	// under the one-time key its evidence bound. The instance key and this
+	// channel outlive the bind, so a session that broke out of its sandbox
+	// holds both, and could present a bind another binder signed for this
+	// guest. It cannot sign the receipt: the guest erased that key before
+	// anything of the session ran.
+	if _, err := session.VerifyBindReceipt(session.Policy{AllowBound: true}, leaf.PublicKey, g.oneTime, bind, req.Receipt); err != nil {
+		s.log.Warn("a bind was presented without the guest's receipt for it", "instance_key", key, "error", err)
+		refuse(w, http.StatusForbidden, "the bind comes without the guest's receipt for it, signed by its one-time key")
 		return
 	}
 	// Rule 6: one bind to an instance key.

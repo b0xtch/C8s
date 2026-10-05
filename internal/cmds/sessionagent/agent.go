@@ -142,6 +142,15 @@ type Agent struct {
 	key *ecdsa.PrivateKey
 	// keyDER is the instance public key, PKIX.
 	keyDER []byte
+	// oneTime are the keys the guest makes for its one bind and erases
+	// before anything of the tenant runs.
+	oneTime *oneTime
+	// issued is the last certificate the guest issued under its one-time
+	// keys, DER, and readyCert the one it had when its bind came: what its
+	// state serves from then on, so that its receipt can be checked for as
+	// long as it lives. measured guards readyCert.
+	issued    atomic.Pointer[[]byte]
+	readyCert []byte
 	// audience is the name this guest takes tokens under: its instance key's
 	// digest. A token for another guest that grants the same key names another.
 	audience string
@@ -280,8 +289,14 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	if a.audience, err = session.InstanceKeyDigest(&a.key.PublicKey); err != nil {
 		return nil, err
 	}
+	if a.oneTime, err = newOneTime(); err != nil {
+		return nil, fmt.Errorf("generate one-time keys: %w", err)
+	}
+	serving := a.provider()
+	serving.seen = a.notePlatform
+	serving.issued = func(der []byte) { a.issued.Store(&der) }
 	a.tlsCfg, a.certs, err = ratls.NewServerTLSConfig(&ratls.ServerConfig{
-		CertProvider: &instanceProvider{key: a.key, tee: a.tee, ttl: cfg.CertTTL, seen: a.notePlatform},
+		CertProvider: serving,
 		CertTTL:      cfg.CertTTL,
 		Logger:       cfg.Logger,
 	})
@@ -450,25 +465,40 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	if err != nil {
 		return nil, nil, err
 	}
+	// The register is final for this bind, so the receipt can be signed:
+	// what the guest extended after its launch document, which a quote from
+	// before the bind does not hold. The key it is signed with was made for
+	// this one signature and is erased by it, before the guest takes
+	// anything for the tenant. The receipt leaves the guest only once the
+	// sandbox runs, in the answer, and to the key service before that.
+	receipt, err := session.NewBindReceipt(a.oneTime.sign, bind, events[1:], session.PhaseRunning)
+	if err != nil {
+		return nil, nil, err
+	}
+	// What signing left on the heap is erased by a collection, which runs
+	// beside what follows and is done before the sandbox starts.
+	collected := make(chan struct{})
+	go func() {
+		defer close(collected)
+		a.oneTime.collect()
+	}()
 	evidence := make(chan *session.AttestResponse, 1)
 	go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
 	// What the bind has the key service hold for the session is in place
 	// before the sandbox starts, so the sandbox finds it at its first read.
-	if err := a.acquire(ctx, bind); err != nil {
+	if err := a.acquire(ctx, bind, receipt); err != nil {
 		return nil, nil, err
 	}
+	// Nothing of the tenant has run yet, and the next step runs it.
+	a.oneTime.eraseKEM()
+	<-collected
+	a.oneTime.collect()
 	if sandbox != nil {
 		began := time.Now()
 		if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
 			return nil, nil, fmt.Errorf("start sandbox: %w", err)
 		}
 		recordStep(ctx, stepStart, time.Since(began))
-	}
-	// What the guest extended after its launch document, which a quote from
-	// before the bind does not hold.
-	receipt, err := session.NewBindReceipt(a.key, bind, events[1:], session.PhaseRunning)
-	if err != nil {
-		return nil, nil, err
 	}
 	a.settled(receipt)
 	// The quote goes with the answer only if it is there. Otherwise it is
@@ -493,7 +523,7 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		// this one, and it follows the bind's quote: the quoting service
 		// takes one request of a guest at a time.
 		if a.certs.CertReady() {
-			if err := a.certs.SwapProvider(ctx, &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}); err != nil {
+			if err := a.certs.SwapProvider(ctx, a.provider()); err != nil {
 				a.log.Warn("reissue serving certificate after sandbox admission", "error", err)
 			}
 		}
@@ -702,6 +732,11 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	}
 	a.events, a.staged, a.bind = events, 2, bind
 	a.admitted = bind.Doc.Policy.Sandbox == nil
+	// The last certificate from before the bind: its quote binds the key the
+	// receipt for this bind is signed under.
+	if der := a.issued.Load(); der != nil {
+		a.readyCert = *der
+	}
 	a.measured.Unlock()
 	a.binding.Unlock()
 	a.log.Info("bound", "bind_digest", session.DocumentDigest(raw), "sandbox", bind.Doc.Policy.Sandbox != nil)
@@ -963,16 +998,43 @@ type instanceProvider struct {
 	key *ecdsa.PrivateKey
 	tee TEE
 	ttl time.Duration
-	// seen, when set, is shown the evidence a certificate is issued over.
-	seen func(teetypes.AttestationEvidence)
+	// oneTime are the guest's one-time keys, for a certificate from before
+	// its bind: the certificate carries them, and its quote binds them
+	// beside the instance key. Nil from the bind on.
+	oneTime *session.OneTimeKeys
+	// seen, when set, is shown the evidence a certificate is issued over,
+	// and issued the certificate.
+	seen   func(teetypes.AttestationEvidence)
+	issued func(der []byte)
+}
+
+// provider issues the guest's certificates as its state has them: under its
+// one-time keys until its bind is measured, and under the instance key alone
+// from then on.
+func (a *Agent) provider() *instanceProvider {
+	p := &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}
+	a.measured.RLock()
+	defer a.measured.RUnlock()
+	if a.bind == nil {
+		p.oneTime = &a.oneTime.public
+	}
+	return p
 }
 
 func (p *instanceProvider) Provision(ctx context.Context) (*tls.Certificate, time.Duration, error) {
-	rd, err := ratls.ReportDataForKey(&p.key.PublicKey, nil)
+	rd, err := session.CertificateReportData(&p.key.PublicKey, p.oneTime)
 	if err != nil {
 		return nil, 0, err
 	}
-	env, err := p.tee.Evidence(ctx, rd[:48])
+	var carried []pkix.Extension
+	if p.oneTime != nil {
+		ext, err := p.oneTime.Extension()
+		if err != nil {
+			return nil, 0, err
+		}
+		carried = append(carried, ext)
+	}
+	env, err := p.tee.Evidence(ctx, rd)
 	if err != nil {
 		return nil, 0, fmt.Errorf("attest instance key: %w", err)
 	}
@@ -985,8 +1047,9 @@ func (p *instanceProvider) Provision(ctx context.Context) (*tls.Certificate, tim
 	}
 	der, err := ratls.CreateAttestedCert(p.key, att, &ratls.CertOptions{
 		// One name for every guest: whose it is, its evidence says.
-		Subject: pkix.Name{CommonName: "c8s session", Organization: []string{"Confidential"}},
-		TTL:     p.ttl,
+		Subject:    pkix.Name{CommonName: "c8s session", Organization: []string{"Confidential"}},
+		TTL:        p.ttl,
+		Extensions: carried,
 	})
 	if err != nil {
 		return nil, 0, err
@@ -994,6 +1057,9 @@ func (p *instanceProvider) Provision(ctx context.Context) (*tls.Certificate, tim
 	leaf, err := x509.ParseCertificate(der)
 	if err != nil {
 		return nil, 0, err
+	}
+	if p.issued != nil {
+		p.issued(der)
 	}
 	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: p.key, Leaf: leaf}, p.ttl, nil
 }

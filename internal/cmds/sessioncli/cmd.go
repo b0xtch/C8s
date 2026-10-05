@@ -855,7 +855,7 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 	if err == nil && t.binding != "" {
 		var kept *session.SignedReceipt
 		if kept, err = session.LoadReceipt(t.binding); err == nil && kept != nil {
-			if _, err = session.ConfirmReceipt(kept, att); err != nil {
+			if _, err = client.ConfirmReceipt(ctx, kept, att); err != nil {
 				err = &session.VerificationError{Err: fmt.Errorf("the receipt kept with the binding is not this guest's word on its bind: %w", err)}
 			}
 			receipted = err == nil

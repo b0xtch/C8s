@@ -201,5 +201,7 @@ func relayed(e *sessionv1alpha1.Evidence) *session.Relayed {
 		Evidence:      e.GetQuote(),
 		BindQuote:     e.GetBindQuote(),
 		Collateral:    e.GetCollateral(),
+
+		ReadyCertificate: e.GetReadyCertificate(),
 	}
 }

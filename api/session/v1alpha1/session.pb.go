@@ -297,7 +297,7 @@ type Bound struct {
 	// The evidence now includes the bind.
 	Evidence *Evidence `protobuf:"bytes,1,opt,name=evidence,proto3" json:"evidence,omitempty"`
 	// The guest's receipt for the bind (c8s-bind-receipt/v1), as the guest
-	// sent it: signed by its instance key over the bind's nonce. The quote
+	// sent it: signed by its one-time key over the bind's nonce. The quote
 	// over the same nonce is in the evidence if the guest had it by then, and
 	// in what GetEvidence returns once it has.
 	Receipt       []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
@@ -372,9 +372,13 @@ type Evidence struct {
 	Phase string `protobuf:"bytes,10,opt,name=phase,proto3" json:"phase,omitempty"`
 	// Where the guest says the quote over its bind's nonce stands, once it
 	// runs its sandbox: trying, taken or given_up.
-	BindQuote     string `protobuf:"bytes,11,opt,name=bind_quote,json=bindQuote,proto3" json:"bind_quote,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	BindQuote string `protobuf:"bytes,11,opt,name=bind_quote,json=bindQuote,proto3" json:"bind_quote,omitempty"`
+	// Once bound: the last certificate the guest issued before its bind. Its
+	// quote is of the guest while it was nobody's and binds the one-time key
+	// the guest's receipt for the bind is signed under.
+	ReadyCertificate []byte `protobuf:"bytes,12,opt,name=ready_certificate,json=readyCertificate,proto3" json:"ready_certificate,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *Evidence) Reset() {
@@ -475,6 +479,13 @@ func (x *Evidence) GetBindQuote() string {
 		return x.BindQuote
 	}
 	return ""
+}
+
+func (x *Evidence) GetReadyCertificate() []byte {
+	if x != nil {
+		return x.ReadyCertificate
+	}
+	return nil
 }
 
 type Bytes struct {
@@ -735,7 +746,7 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\tsignature\x18\x04 \x01(\fR\tsignatureJ\x04\b\x05\x10\x06\"]\n" +
 	"\x05Bound\x12:\n" +
 	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
-	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xc4\x02\n" +
+	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xf1\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +
@@ -750,7 +761,8 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x05phase\x18\n" +
 	" \x01(\tR\x05phase\x12\x1d\n" +
 	"\n" +
-	"bind_quote\x18\v \x01(\tR\tbindQuoteJ\x04\b\b\x10\t\"?\n" +
+	"bind_quote\x18\v \x01(\tR\tbindQuote\x12+\n" +
+	"\x11ready_certificate\x18\f \x01(\fR\x10readyCertificateJ\x04\b\b\x10\t\"?\n" +
 	"\x05Bytes\x12\x0e\n" +
 	"\x02td\x18\x01 \x01(\tR\x02td\x12\x12\n" +
 	"\x04port\x18\x02 \x01(\rR\x04port\x12\x12\n" +

@@ -127,6 +127,12 @@ func newRunCmd() *cobra.Command {
 			if image.Crun != "" && image.SandboxInit == "" {
 				return errors.New("this guest's image names a container runtime (--crun) and not the program its containers start with (--sandbox-init)")
 			}
+			// A guest makes keys for its one bind that must be gone before
+			// anything of a tenant runs: where they were kept, and whatever
+			// signing or decrypting with them left behind.
+			if !erasesTemporaries {
+				return errors.New("this guest's program was built without the runtime's secret mode (GOEXPERIMENT=runtimesecret): it cannot erase what its one-time keys leave in memory")
+			}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
 			var err error
 			// For the key service a launch document may pin. The guest has no

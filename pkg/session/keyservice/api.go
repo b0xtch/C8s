@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
+	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
 // A key service serves these over RA-TLS on Port. PathState answers anyone
@@ -62,6 +63,12 @@ type AcquireRequest struct {
 	// measured it.
 	Bind          []byte `json:"bind"`
 	BindSignature string `json:"bind_signature"`
+	// Receipt is the guest's receipt for that bind, signed under the one-time
+	// key its evidence bound when it opened its session. Only the guest's
+	// agent, as it took the bind, could sign it: the key is erased before
+	// anything of the tenant runs, while the instance key and this channel
+	// live on where a session that broke out of its sandbox could use them.
+	Receipt *session.SignedReceipt `json:"receipt"`
 	// EncryptionKey is the guest's HPKE public key, and EncryptionKeySignature
 	// its instance key's signature over it: see SignEncryptionKey. Every
 	// release is sealed to it.

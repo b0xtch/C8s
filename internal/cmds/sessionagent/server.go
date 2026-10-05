@@ -231,7 +231,7 @@ func (a *Agent) grantedKey(w http.ResponseWriter, r *http.Request, body []byte, 
 func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 	a.measured.RLock()
 	phase, events := a.stateLocked()
-	bind, quote, quoteState := a.bind, a.bindQuote, a.bindQuoteState
+	bind, quote, quoteState, readyCert := a.bind, a.bindQuote, a.bindQuoteState, a.readyCert
 	prepared := phase == session.PhaseReady && a.preparedLocked()
 	a.measured.RUnlock()
 
@@ -240,7 +240,7 @@ func (a *Agent) serveState(w http.ResponseWriter, _ *http.Request) {
 		Launch: a.launch, Signature: a.signature, Events: events, BindQuote: quoteState, Attestation: quote,
 	}
 	if bind != nil {
-		state.Bind, state.BindSignature = bind.Raw, bind.Signature
+		state.Bind, state.BindSignature, state.ReadyCertificate = bind.Raw, bind.Signature, readyCert
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	a.say(w, http.StatusOK, disclosure.MessageState, state)

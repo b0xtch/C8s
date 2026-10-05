@@ -371,7 +371,7 @@ func TestBindIsAnsweredWithAReceiptAndTheQuoteFollows(t *testing.T) {
 	if resp.Attestation != nil || resp.Receipt == nil || resp.Phase != session.PhaseRunning {
 		t.Fatalf("the bind's answer: %+v", resp)
 	}
-	receipt, err := session.VerifyBindReceipt(bound, ready.InstanceKey, bind, resp.Receipt)
+	receipt, err := session.VerifyBindReceipt(bound, ready.InstanceKey, ready.OneTime, bind, resp.Receipt)
 	if err != nil {
 		t.Fatalf("the receipt: %v", err)
 	}
@@ -491,7 +491,7 @@ func TestClientGoesOnWithAReceiptAndKeepsNoVerdictOnIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := session.VerifyBindReceipt(bound, ready.InstanceKey, bind, resp.Receipt)
+	receipt, err := session.VerifyBindReceipt(bound, ready.InstanceKey, ready.OneTime, bind, resp.Receipt)
 	if err != nil {
 		t.Fatalf("the receipt: %v", err)
 	}
@@ -589,7 +589,7 @@ func TestClientJudgesItsGuestsCertificateAhead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.VerifyBindReceipt(bound, ready.InstanceKey, bind, resp.Receipt); err != nil {
+	if _, err := session.VerifyBindReceipt(bound, ready.InstanceKey, ready.OneTime, bind, resp.Receipt); err != nil {
 		t.Fatal(err)
 	}
 	receipted := func() (*session.Client, *steps) {

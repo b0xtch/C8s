@@ -93,7 +93,7 @@ func (a *Agent) keyServiceCertificate(ks *keyService) (*tls.Certificate, error) 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), attestTimeout)
 	defer cancel()
-	cert, _, err := (&instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}).Provision(ctx)
+	cert, _, err := a.provider().Provision(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -167,9 +167,10 @@ func (a *Agent) OpenKeyService(ctx context.Context) {
 }
 
 // acquire takes the credentials the bind declares as its key service's and
-// puts them where the sandbox finds them. Each arrives sealed to this guest,
-// this bind and its own name.
-func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind) error {
+// puts them where the sandbox finds them, showing the key service the
+// guest's receipt for the bind. Each arrives sealed to this guest, this bind
+// and its own name.
+func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind, receipt *session.SignedReceipt) error {
 	var names []string
 	for _, c := range bind.Doc.Policy.Credentials {
 		if c.Source == session.SourceKeyService {
@@ -190,7 +191,7 @@ func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind) error {
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
 	defer cancel()
 	answer, err := ks.client.Acquire(ctx, &keyservice.AcquireRequest{
-		Bind: bind.Raw, BindSignature: bind.Signature,
+		Bind: bind.Raw, BindSignature: bind.Signature, Receipt: receipt,
 		EncryptionKey: ks.key.Public(), EncryptionKeySignature: ks.signature,
 		Credentials: names,
 	})
