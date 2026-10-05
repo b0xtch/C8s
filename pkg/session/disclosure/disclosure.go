@@ -44,7 +44,7 @@ const (
 	NotFound Code = "not_found"
 	// MethodNotAllowed: the guest serves the route by another method.
 	MethodNotAllowed Code = "method_not_allowed"
-	// Fenced: the connection was opened before the guest was claimed.
+	// Fenced: the connection was opened before the guest's bind arrived.
 	Fenced Code = "fenced"
 	// NotReady: the guest takes no bind yet. Its key service has not judged
 	// it. Try again.
@@ -53,8 +53,6 @@ const (
 	AlreadyBound Code = "already_bound"
 	// Retired: the guest takes no bind any more and is ending.
 	Retired Code = "retired"
-	// BindInFlight: the guest is reading a bind, and is not as it was booted.
-	BindInFlight Code = "bind_in_flight"
 	// BindTooLate: the guest waited longer for a bind than its launch
 	// document allows.
 	BindTooLate Code = "bind_too_late"
@@ -92,7 +90,7 @@ const (
 // Refusals lists every refusal code, in the order the schema prints them.
 var Refusals = []Code{
 	Busy, TooLarge, Malformed, Unauthorized, NotFound, MethodNotAllowed, Fenced, NotReady, AlreadyBound, Retired,
-	BindInFlight, BindTooLate, BindClock, BindInvalid, BindSignature, BindOtherGuest, BindExpired,
+	BindTooLate, BindClock, BindInvalid, BindSignature, BindOtherGuest, BindExpired,
 	BindNoSandbox, BindKeyService, BindNoMachine, BindIncomplete, BindFailed, NoCollateral, Internal,
 }
 
@@ -105,11 +103,10 @@ var describe = map[Code]string{
 	Unauthorized:     "the request carries no token of a key the guest's bind grants",
 	NotFound:         "the guest serves no such route",
 	MethodNotAllowed: "the guest serves that route by another method",
-	Fenced:           "the connection was opened before the guest was claimed, and the guest takes no bind from it",
+	Fenced:           "the connection was opened before the guest's bind arrived, and the guest takes no bind from it",
 	NotReady:         "the guest takes no bind yet: its key service has not judged it",
 	AlreadyBound:     "the guest is already bound by another bind",
 	Retired:          "the guest takes no bind any more and is shutting down",
-	BindInFlight:     "the guest is reading a bind: it is not as it was booted",
 	BindTooLate:      "the guest waited for a bind longer than its launch document allows",
 	BindClock:        "the guest's kernel left the clock its age limit is counted on",
 	BindInvalid:      "the bind is not a document this guest's bind schema takes",
@@ -152,6 +149,10 @@ const (
 	// KindEvidence is the platform's evidence under one of the field's
 	// platform tags, of up to Max bytes as rendered: public by design.
 	KindEvidence Kind = "evidence"
+	// KindSealed is up to Max bytes sealed to a key their reader holds and
+	// the guest's host does not: the host learns their size and when they
+	// came.
+	KindSealed Kind = "sealed"
 	// KindList is up to Max items, each as Item says.
 	KindList Kind = "list"
 	// KindMessage is another message of the schema, named by Message.
@@ -187,10 +188,10 @@ type Message struct {
 // Names of the messages.
 const (
 	MessageState       = "state"
-	MessageFence       = "fence"
 	MessageBound       = "bound"
 	MessageAttestation = "attestation"
 	MessageReceipt     = "receipt"
+	MessageCommand     = "command"
 	MessageStep        = "step"
 	MessageRefusal     = "refusal"
 	MessagePlatform    = "platform"
@@ -227,7 +228,15 @@ const (
 	QuoteGivenUp Code = "given_up"
 )
 
+// What became of a first command sent with a bind or after it.
+const (
+	CommandTaken    Code = "taken"
+	CommandUnopened Code = "unopened"
+	CommandTooLate  Code = "too_late"
+)
+
 var (
+	commands   = []Code{CommandTaken, CommandUnopened, CommandTooLate}
 	bindQuotes = []Code{QuoteTrying, QuoteTaken, QuoteGivenUp}
 	phases     = []Code{"ready", "bound", "running"}
 	// platforms are the tags a guest's evidence comes under.
@@ -242,6 +251,9 @@ const (
 	maxSignature = 4096
 	maxEvidence  = 256 << 10
 	maxReceipt   = 8 << 10
+	// The sealed answer to a first command: an exec result, and what sealing
+	// adds.
+	maxCommandAnswer = 4 << 20
 	// A certificate with a quote and the guest's one-time keys in it.
 	maxCertificate = 32 << 10
 	maxEvents      = 8
@@ -275,16 +287,17 @@ var Schema = []Message{
 		Field{Name: "ready_certificate", Kind: KindPublic, Max: maxCertificate, Optional: true},
 		Field{Name: "bind_quote", Kind: KindCode, Codes: bindQuotes, Optional: true},
 		Field{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true})},
-	{Name: MessageFence, Says: "to its host, which claims it for a session", Fields: []Field{
-		{Name: "phase", Kind: KindCode, Codes: phases},
-		{Name: "closed", Kind: KindCounter, Max: 1 << 16},
-	}},
 	{Name: MessageBound, Says: "to whoever handed it its bind", Fields: []Field{
 		{Name: "phase", Kind: KindCode, Codes: phases},
 		{Name: "replayed", Kind: KindFlag, Optional: true},
+		{Name: "command", Kind: KindCode, Codes: commands, Optional: true},
 		{Name: "admission", Kind: KindList, Max: 16, Optional: true, Item: &Field{Kind: KindMessage, Message: MessageStep}},
 		{Name: "receipt", Kind: KindMessage, Message: MessageReceipt, Optional: true},
 		{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true},
+	}},
+	{Name: MessageCommand, Says: "after its answer to a bind that came with a first command, and to one sent just after: what became of the command, and its answer sealed to its sender", Fields: []Field{
+		{Name: "command", Kind: KindCode, Codes: commands},
+		{Name: "answer", Kind: KindSealed, Max: maxCommandAnswer, Optional: true},
 	}},
 	{Name: MessageReceipt, Says: "with its answer to a bind: its own word on the bind, signed by its one-time key over the bind's nonce", Fields: []Field{
 		{Name: "receipt", Kind: KindPublic, Max: maxReceipt},
@@ -420,6 +433,16 @@ func checkField(field *Field, value any) error {
 		}
 		if size > field.Max {
 			return errors.New("a document beyond its bound")
+		}
+	case KindSealed:
+		// Ciphertext travels as base64 of its bytes, and is nothing else.
+		text, ok := value.(string)
+		if !ok {
+			return errors.New("not sealed bytes")
+		}
+		sealed, err := base64.StdEncoding.DecodeString(text)
+		if err != nil || int64(len(sealed)) > field.Max {
+			return errors.New("sealed bytes beyond their bound")
 		}
 	case KindEvidence:
 		// The envelope the verifiers take: a platform tag and that

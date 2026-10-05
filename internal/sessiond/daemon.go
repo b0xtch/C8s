@@ -324,10 +324,10 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 	tick := time.NewTicker(readyPoll)
 	defer tick.Stop()
 	var offered *session.StateResponse
-	var collateral []byte
+	var leaf, collateral []byte
 	for {
 		probe, cancel := context.WithTimeout(withDialLimit(t.ctx, readyDial), 5*time.Second)
-		if offered = d.guests.ready(probe, t.rec.Address); offered != nil {
+		if offered, leaf = d.guests.ready(probe, t.rec.Address); offered != nil {
 			collateral = d.guests.collateral(probe, t.rec.Address)
 		}
 		cancel()
@@ -354,7 +354,7 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 		return
 	}
 	t.rec.State = StateReady
-	t.offered, t.collateral = offered, collateral
+	t.offered, t.leaf, t.collateral = offered, leaf, collateral
 	pool.failures, pool.bootTime = 0, d.now().Sub(started)
 	if err := d.save(t); err != nil {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
@@ -456,10 +456,12 @@ func (d *Daemon) release(t *td, destroyID string) {
 	d.notify()
 }
 
-// keepWarm asks every ready guest for the vendor's documents it holds, a few
-// times a minute. That keeps what a claim relays current, and keeps the
-// daemon's connection to the guest from idling out, so that a claim finds it
-// open.
+// keepWarm asks every ready guest what it says of itself and for the
+// vendor's documents it holds, a few times a minute. That keeps what a claim
+// relays current, since a claim asks the guest nothing, and keeps the
+// daemon's connection to the guest from idling out, so that a bind finds it
+// open. A guest whose certificate is about to run out is asked over a new
+// connection, which it answers under the one it serves now.
 func (d *Daemon) keepWarm(ctx context.Context) {
 	tick := time.NewTicker(warmEvery)
 	defer tick.Stop()
@@ -479,7 +481,11 @@ func (d *Daemon) keepWarm(ctx context.Context) {
 		d.mu.Unlock()
 		for _, t := range ready {
 			probe, cancel := context.WithTimeout(ctx, 5*time.Second)
-			offered := d.guests.ready(probe, t.rec.Address)
+			offered, leaf := d.guests.ready(probe, t.rec.Address)
+			if offered != nil && !lasts(leaf, d.now()) {
+				d.guests.reconnect()
+				offered, leaf = d.guests.ready(probe, t.rec.Address)
+			}
 			var collateral []byte
 			if offered != nil {
 				collateral = d.guests.collateral(probe, t.rec.Address)
@@ -490,7 +496,7 @@ func (d *Daemon) keepWarm(ctx context.Context) {
 			}
 			d.mu.Lock()
 			if t.rec.State == StateReady {
-				t.offered = offered
+				t.offered, t.leaf = offered, leaf
 				if collateral != nil {
 					t.collateral = collateral
 				}

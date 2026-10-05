@@ -80,26 +80,6 @@
       ]
     },
     {
-      "name": "fence",
-      "says": "to its host, which claims it for a session",
-      "fields": [
-        {
-          "name": "phase",
-          "kind": "code",
-          "codes": [
-            "ready",
-            "bound",
-            "running"
-          ]
-        },
-        {
-          "name": "closed",
-          "kind": "counter",
-          "max": 65536
-        }
-      ]
-    },
-    {
       "name": "bound",
       "says": "to whoever handed it its bind",
       "fields": [
@@ -115,6 +95,16 @@
         {
           "name": "replayed",
           "kind": "flag",
+          "optional": true
+        },
+        {
+          "name": "command",
+          "kind": "code",
+          "codes": [
+            "taken",
+            "unopened",
+            "too_late"
+          ],
           "optional": true
         },
         {
@@ -138,6 +128,27 @@
           "name": "attestation",
           "kind": "message",
           "message": "attestation",
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "command",
+      "says": "after its answer to a bind that came with a first command, and to one sent just after: what became of the command, and its answer sealed to its sender",
+      "fields": [
+        {
+          "name": "command",
+          "kind": "code",
+          "codes": [
+            "taken",
+            "unopened",
+            "too_late"
+          ]
+        },
+        {
+          "name": "answer",
+          "kind": "sealed",
+          "max": 4194304,
           "optional": true
         }
       ]
@@ -260,7 +271,6 @@
             "not_ready",
             "already_bound",
             "retired",
-            "bind_in_flight",
             "bind_too_late",
             "bind_clock",
             "bind_invalid",

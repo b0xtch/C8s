@@ -5,16 +5,24 @@ package sessionagent
 import (
 	"bufio"
 	"bytes"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/hpke"
+	"crypto/rand"
 	"crypto/sha3"
 	"crypto/sha512"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/confidential-dot-ai/c8s/pkg/certutil"
+	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
+	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
 // mask hides a needle from the scan that looks for it: the test keeps what it
@@ -197,44 +205,17 @@ func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	if err != nil || !ed25519.Verify(keys.public.Signing, message, signature) {
 		t.Fatalf("the receipt's signature: %v", err)
 	}
-	enc, sender, err := hpke.NewSender(mustPublic(t, keys.public.KEM), hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("info"))
-	if err != nil {
-		t.Fatal(err)
+	bind, command := sealedCommand(t, &keys.public)
+	opened, err := keys.open(bind, command.Sealed)
+	if err != nil || len(opened.Exec) == 0 {
+		t.Fatalf("the command sealed to the KEM key: %v", err)
 	}
-	sealed, err := sender.Seal(nil, []byte("a command"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var opened []byte
-	inSecret(func() {
-		key, e := hpke.MLKEM768X25519().NewPrivateKey(keys.kem)
-		if e != nil {
-			err = e
-			return
-		}
-		recipient, e := hpke.NewRecipient(enc, key, hpke.HKDFSHA256(), hpke.AES256GCM(), []byte("info"))
-		if e != nil {
-			err = e
-			return
-		}
-		plain, e := recipient.Open(nil, sealed)
-		if e != nil {
-			err = e
-			return
-		}
-		opened = bytes.Clone(plain)
-	})
-	if err != nil || string(opened) != "a command" {
-		t.Fatalf("the command sealed to the KEM key opened to %q: %v", opened, err)
-	}
-	// The test opened the command where the guest will: it says so as the
-	// guest does.
-	keys.mu.Lock()
-	keys.used = true
-	keys.mu.Unlock()
-	keys.eraseKEM()
 	if !keys.gone() {
 		t.Fatal("the keys are not gone")
+	}
+	// A second command finds no key to open under.
+	if _, err := keys.open(bind, command.Sealed); !errors.Is(err, errKEMGone) {
+		t.Fatalf("a second command: %v, want the key gone", err)
 	}
 	// What the work allocated is erased when the collector finds it
 	// unreachable, and the guest's own collection is what makes it look.
@@ -245,13 +226,46 @@ func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	}
 }
 
-func mustPublic(t *testing.T, raw []byte) hpke.PublicKey {
+// sealedCommand is a first command its owner sealed to a guest's one-time
+// keys, and the bind it was sealed for.
+func sealedCommand(t *testing.T, oneTime *session.OneTimeKeys) (*session.SignedBind, *session.FirstCommand) {
 	t.Helper()
-	key, err := hpke.MLKEM768X25519().NewPublicKey(raw)
+	newKey := func() *ecdsa.PrivateKey {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return key
+	}
+	instance, access := newKey(), newKey()
+	accessPEM, err := certutil.MarshalECKeyPEM(access)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return key
+	signer, err := operatorauth.NewSignerFromKeyPEM(accessPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	granted, err := session.PublicKeyPEM(&access.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind, err := session.NewBind(session.BindOptions{
+		Authority: newKey(), InstanceKey: &instance.PublicKey, Tenant: "acme", Session: "sbx-1",
+		Policy: session.BindPolicy{
+			Sandbox: &session.Sandbox{Image: "ghcr.io/acme/agent@sha256:" + strings.Repeat("1", 64)},
+			Access:  session.Access{Exec: []string{string(granted)}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := &session.ReadyTD{InstanceKey: &instance.PublicKey, OneTime: oneTime}
+	command, err := session.SealFirstCommand(ready, bind, signer, session.ExecRequest{Argv: []string{"/bin/true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bind, command
 }
 
 func contains(names []string, want string) bool {

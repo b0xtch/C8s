@@ -228,8 +228,12 @@ type BindRequest struct {
 	RequestId string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	Td        string                 `protobuf:"bytes,2,opt,name=td,proto3" json:"td,omitempty"`
 	// c8s-bind/v1, canonical JSON, and its signature.
-	Bind          []byte `protobuf:"bytes,3,opt,name=bind,proto3" json:"bind,omitempty"`
-	Signature     []byte `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
+	Bind      []byte `protobuf:"bytes,3,opt,name=bind,proto3" json:"bind,omitempty"`
+	Signature []byte `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
+	// The session's first command, sealed to the guest's one-time KEM key
+	// under the bind: with the bind, or alone in the next message of the call.
+	// The daemon carries it unread.
+	Command       []byte `protobuf:"bytes,7,opt,name=command,proto3" json:"command,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -292,6 +296,13 @@ func (x *BindRequest) GetSignature() []byte {
 	return nil
 }
 
+func (x *BindRequest) GetCommand() []byte {
+	if x != nil {
+		return x.Command
+	}
+	return nil
+}
+
 type Bound struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The evidence now includes the bind.
@@ -300,7 +311,15 @@ type Bound struct {
 	// sent it: signed by its one-time key over the bind's nonce. The quote
 	// over the same nonce is in the evidence if the guest had it by then, and
 	// in what GetEvidence returns once it has.
-	Receipt       []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
+	Receipt []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
+	// In a later message than the receipt: the first command's output and
+	// status, sealed back to whoever sealed the command.
+	CommandResult []byte `protobuf:"bytes,3,opt,name=command_result,json=commandResult,proto3" json:"command_result,omitempty"`
+	// What became of a first command: taken, unopened or too_late, as the
+	// guest says. With the receipt for a command that came with the bind, and
+	// in a message of its own for one that came after. A result follows only
+	// what was taken.
+	Command       string `protobuf:"bytes,4,opt,name=command,proto3" json:"command,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -347,6 +366,20 @@ func (x *Bound) GetReceipt() []byte {
 		return x.Receipt
 	}
 	return nil
+}
+
+func (x *Bound) GetCommandResult() []byte {
+	if x != nil {
+		return x.CommandResult
+	}
+	return nil
+}
+
+func (x *Bound) GetCommand() string {
+	if x != nil {
+		return x.Command
+	}
+	return ""
 }
 
 // Evidence is what a guest says of itself, relayed unread. Each part is
@@ -737,16 +770,19 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x02td\x18\x01 \x01(\tR\x02td\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12:\n" +
 	"\bevidence\x18\x03 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x123\n" +
-	"\abind_by\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x06bindBy\"t\n" +
+	"\abind_by\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x06bindBy\"\x94\x01\n" +
 	"\vBindRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x0e\n" +
 	"\x02td\x18\x02 \x01(\tR\x02td\x12\x12\n" +
 	"\x04bind\x18\x03 \x01(\fR\x04bind\x12\x1c\n" +
-	"\tsignature\x18\x04 \x01(\fR\tsignatureJ\x04\b\x05\x10\x06\"]\n" +
+	"\tsignature\x18\x04 \x01(\fR\tsignature\x12\x18\n" +
+	"\acommand\x18\a \x01(\fR\acommandJ\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\x9e\x01\n" +
 	"\x05Bound\x12:\n" +
 	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
-	"\areceipt\x18\x02 \x01(\fR\areceipt\"\xf1\x02\n" +
+	"\areceipt\x18\x02 \x01(\fR\areceipt\x12%\n" +
+	"\x0ecommand_result\x18\x03 \x01(\fR\rcommandResult\x12\x18\n" +
+	"\acommand\x18\x04 \x01(\tR\acommand\"\xf1\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +
@@ -783,10 +819,10 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11SESSION_STATE_NEW\x10\x01\x12\x16\n" +
 	"\x12SESSION_STATE_LIVE\x10\x02\x12\x1b\n" +
-	"\x17SESSION_STATE_DESTROYED\x10\x032\x8d\x03\n" +
+	"\x17SESSION_STATE_DESTROYED\x10\x032\x91\x03\n" +
 	"\bSessions\x12J\n" +
-	"\x05Claim\x12\".c8s.session.v1alpha1.ClaimRequest\x1a\x1d.c8s.session.v1alpha1.Claimed\x12F\n" +
-	"\x04Bind\x12!.c8s.session.v1alpha1.BindRequest\x1a\x1b.c8s.session.v1alpha1.Bound\x12G\n" +
+	"\x05Claim\x12\".c8s.session.v1alpha1.ClaimRequest\x1a\x1d.c8s.session.v1alpha1.Claimed\x12J\n" +
+	"\x04Bind\x12!.c8s.session.v1alpha1.BindRequest\x1a\x1b.c8s.session.v1alpha1.Bound(\x010\x01\x12G\n" +
 	"\aConnect\x12\x1b.c8s.session.v1alpha1.Bytes\x1a\x1b.c8s.session.v1alpha1.Bytes(\x010\x01\x12N\n" +
 	"\aDestroy\x12$.c8s.session.v1alpha1.DestroyRequest\x1a\x1d.c8s.session.v1alpha1.Session\x12T\n" +
 	"\vGetEvidence\x12%.c8s.session.v1alpha1.EvidenceRequest\x1a\x1e.c8s.session.v1alpha1.EvidenceBIZGgithub.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1b\x06proto3"

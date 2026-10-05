@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"google.golang.org/grpc"
@@ -123,11 +124,111 @@ func (c *Client) Claim(ctx context.Context, requestID, pool, name string, wait t
 // holds the quote over the bind's nonce if the guest had it by then.
 // Otherwise Evidence returns it once the guest has.
 func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.SignedBind) (*session.Relayed, error) {
-	answer, err := c.api.Bind(ctx, &sessionv1alpha1.BindRequest{
-		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature),
-	})
+	call, err := c.StartBind(ctx, requestID, td, bind, nil)
 	if err != nil {
 		return nil, err
+	}
+	defer call.Close()
+	// The call carries no command.
+	if err := call.closeSend(); err != nil {
+		return nil, err
+	}
+	if err := call.Await(); err != nil {
+		return nil, err
+	}
+	return call.Answer, nil
+}
+
+// BindCall is a Bind call that may carry the session's first command: see
+// BindWith.
+type BindCall struct {
+	// Answer is the guest's answer to the bind, relayed and unjudged.
+	Answer *session.Relayed
+	// Command says what became of a first command that came with the bind:
+	// session.CommandTaken, CommandUnopened or CommandTooLate, as the guest
+	// says. Empty for a bind that came with none.
+	Command string
+
+	stream sessionv1alpha1.Sessions_BindClient
+	cancel context.CancelFunc
+	// carried says the call has carried its command, and closed that its
+	// caller's side of it is closed.
+	carried, closed bool
+}
+
+// BindWith hands the TD its bind, with the session's first command sealed
+// for the guest (session.SealFirstCommand) when command is not nil, and
+// returns once the guest has answered the bind. The daemon carries the
+// command and its answer unread.
+//
+// A command the guest took is answered by Result, once it has run. A binder
+// that had not sealed its command when it sent the bind, because its check of
+// the guest's evidence was still running, uses StartBind and sends it with
+// SendCommand meanwhile: the guest opens it if it is still taking the bind.
+//
+// A guest runs a command once, whatever carried it there: a caller that is
+// not told its command was taken sends session.FirstCommand.Request over a
+// connection of its own, and is answered with the first run's result if the
+// command did run. A call repeated because its answer was lost sends the
+// same command with the bind.
+//
+// The caller closes the call.
+func (c *Client) BindWith(ctx context.Context, requestID, td string, bind *session.SignedBind, command []byte) (*BindCall, error) {
+	call, err := c.StartBind(ctx, requestID, td, bind, command)
+	if err != nil {
+		return nil, err
+	}
+	if err := call.Await(); err != nil {
+		call.Close()
+		return nil, err
+	}
+	return call, nil
+}
+
+// StartBind sends the bind, with command if it is not nil, and returns
+// without waiting for the guest's answer: Await does that. In between, a
+// binder that now has its command sealed sends it with SendCommand.
+func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *session.SignedBind, command []byte) (*BindCall, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	stream, err := c.api.Bind(ctx)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	call := &BindCall{stream: stream, cancel: cancel, carried: len(command) > 0}
+	if err := stream.Send(&sessionv1alpha1.BindRequest{
+		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature), Command: command,
+	}); err != nil {
+		// The stream's own error says why.
+		_, err = stream.Recv()
+		cancel()
+		return nil, err
+	}
+	if call.carried {
+		// The command went with the bind: the call has no more to carry.
+		if err := call.closeSend(); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+	return call, nil
+}
+
+// closeSend closes the caller's side of the call: the daemon ends a call
+// whose bind came with no command once it has.
+func (b *BindCall) closeSend() error {
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	return b.stream.CloseSend()
+}
+
+// Await waits for the guest's answer to the bind.
+func (b *BindCall) Await() error {
+	answer, err := b.stream.Recv()
+	if err != nil {
+		return err
 	}
 	out := relayed(answer.GetEvidence())
 	if raw := answer.GetReceipt(); len(raw) > 0 && len(raw) <= 2*session.MaxReceiptBytes {
@@ -138,8 +239,49 @@ func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.S
 			out.Receipt = &receipt
 		}
 	}
-	return out, nil
+	b.Answer, b.Command = out, answer.GetCommand()
+	return nil
 }
+
+// SendCommand sends the session's first command in the call's next message,
+// for a binder that sent its bind without one. It is sent once, and before
+// the guest has answered the bind if the guest is to open it.
+func (b *BindCall) SendCommand(sealed []byte) error {
+	if b.carried || b.closed {
+		return errors.New("the call has carried its command, or its caller's side is closed")
+	}
+	b.carried = true
+	if err := b.stream.Send(&sessionv1alpha1.BindRequest{Command: sealed}); err != nil {
+		return err
+	}
+	return b.closeSend()
+}
+
+// Result waits for the sealed answer of the first command, which
+// session.FirstCommand.Open opens. For a command that came after the bind it
+// also says what became of it. An answer that is none is a command the guest
+// did not take: its sender sends it over a connection of its own.
+func (b *BindCall) Result() (sealed []byte, command string, err error) {
+	if !b.carried {
+		return nil, "", errors.New("the call carried no command")
+	}
+	if b.Command != "" && b.Command != session.CommandTaken {
+		return nil, b.Command, nil
+	}
+	answer, err := b.stream.Recv()
+	if errors.Is(err, io.EOF) {
+		// The call ended with no word on the command: it came too late to
+		// be carried.
+		return nil, session.CommandTooLate, nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return answer.GetCommandResult(), answer.GetCommand(), nil
+}
+
+// Close ends the call.
+func (b *BindCall) Close() { b.cancel() }
 
 // Destroy ends the session's TD.
 func (c *Client) Destroy(ctx context.Context, requestID, name string) (*sessionv1alpha1.Session, error) {

@@ -35,7 +35,7 @@ const (
 )
 
 // Handler serves the agent API. Every route but the health probe, the state,
-// the bind, the fence and Intel's documents requires a token from a key the
+// the bind and Intel's documents requires a token from a key the
 // guest's bind authorizes for that route, bound to this guest and to the
 // request's method, path and body.
 func (a *Agent) Handler() http.Handler {
@@ -44,8 +44,8 @@ func (a *Agent) Handler() http.Handler {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 	mux.HandleFunc("GET "+session.PathState, a.serveState)
-	mux.HandleFunc("POST "+session.PathBind, a.letIn(a.bounded(a.serveBind)))
-	mux.HandleFunc("POST "+session.PathFence, a.serveFence)
+	mux.HandleFunc("POST "+session.PathBind, a.letIn(a.boundedTo(session.MaxBindRequestBytes, a.serveBind)))
+	mux.HandleFunc("POST "+session.PathBindCommand, a.afterBind(a.boundedTo(session.MaxBindRequestBytes, a.serveBindCommand)))
 	mux.HandleFunc("POST "+session.PathAttest, a.authorized(session.Access.AttestKeys, a.serveAttest))
 	mux.HandleFunc("POST "+session.PathExec, a.authorized(session.Access.ExecKeys, a.serveExec))
 	mux.HandleFunc("PUT "+session.PathCredentials+"{name}", a.authorized(session.Access.CredentialKeys, a.serveCredential))
@@ -107,11 +107,12 @@ func (a *Agent) refuse(w http.ResponseWriter, status int, code disclosure.Code) 
 }
 
 // letIn admits a bind by the connection it came on, before any of its body is
-// read. One from a connection the fence ended, or to a guest that takes none
-// yet, is refused on its headers: the guest has taken in nothing of the
-// caller's and stays as it was booted. One
-// that is let in counts as in flight, which the fence respects, until the
-// agent has answered it.
+// read. One to a guest that takes none yet is refused on its headers: the
+// guest has taken in nothing of the caller's and stays as it was booted, with
+// every connection it had. The first that is let in raises the fence: every
+// other connection the guest accepted before it is closed, so nothing sent to
+// the guest before its bind reaches the session. A bind from a connection the
+// fence ended is refused on its headers too.
 func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// A guest whose launch document lists no machine takes no bind at
@@ -132,7 +133,8 @@ func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 			a.refuse(w, http.StatusServiceUnavailable, disclosure.NotReady)
 			return
 		}
-		if !a.fence.enter(connOf(r.Context())) {
+		admitted, closed := a.fence.arrive(connOf(r.Context()))
+		if !admitted {
 			// Closing keeps the server from reading the body to reuse the
 			// connection.
 			w.Header().Set("Connection", "close")
@@ -140,7 +142,25 @@ func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 			a.refuse(w, http.StatusConflict, disclosure.Fenced)
 			return
 		}
-		defer a.fence.leave()
+		if closed > 0 {
+			a.log.Info("a bind arrived, and the connections from before it are closed", "closed", closed)
+		}
+		next(w, r)
+	}
+}
+
+// afterBind admits what follows a bind by the connection it came on, before
+// any of its body is read: a first command sent after its bind. A guest no
+// bind has reached reads none, and neither does one from a connection the
+// fence ended.
+func (a *Agent) afterBind(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.fence.follows(connOf(r.Context())) {
+			w.Header().Set("Connection", "close")
+			w.Header().Set("Cache-Control", "no-store")
+			a.refuse(w, http.StatusConflict, disclosure.Fenced)
+			return
+		}
 		next(w, r)
 	}
 }
@@ -162,13 +182,18 @@ func (a *Agent) hold(w http.ResponseWriter) (release func(), ok bool) {
 // bounded reads a request's body within the limits an unauthenticated peer
 // gets: a capped size, and a cap on how many are held at once.
 func (a *Agent) bounded(next func(http.ResponseWriter, *http.Request, []byte)) http.HandlerFunc {
+	return a.boundedTo(session.MaxRequestBytes, next)
+}
+
+// boundedTo is bounded for a route whose requests may be up to limit bytes.
+func (a *Agent) boundedTo(limit int64, next func(http.ResponseWriter, *http.Request, []byte)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		release, ok := a.hold(w)
 		if !ok {
 			return
 		}
 		defer release()
-		body, ok := a.body(w, r, session.MaxRequestBytes)
+		body, ok := a.body(w, r, limit)
 		if !ok {
 			return
 		}
@@ -261,7 +286,7 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
 		return
 	}
-	replayed, answer, err := a.Bind(r.Context(), req.Bind, req.Signature)
+	replayed, answer, err := a.BindWith(r.Context(), req.Bind, req.Signature, req.Command)
 	var refusal *bindRefusal
 	switch {
 	case errors.Is(err, errAlreadyBound):
@@ -291,9 +316,48 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		admission := a.admission
 		a.measured.RUnlock()
 		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{
-			Phase: phase, Replayed: replayed, Admission: admission, Receipt: answer.Receipt, Attestation: answer.Attestation,
+			Phase: phase, Replayed: replayed, Command: answer.Command, Admission: admission,
+			Receipt: answer.Receipt, Attestation: answer.Attestation,
 		})
+		if answer.Command != session.CommandTaken {
+			return
+		}
+		// The receipt goes out now. The first command's sealed answer follows
+		// it as a second document, once the command has run.
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		result, err := a.commandAnswer(r.Context())
+		if err != nil {
+			// The caller went away. The command runs on, and its answer is
+			// kept for the bind sent again.
+			return
+		}
+		body, err := disclosure.Encode(disclosure.MessageCommand, result)
+		if err != nil {
+			a.log.Error("an answer was held back: it is beyond the disclosure schema", "error", err)
+			return
+		}
+		writeDocument(w, body)
 	}
+}
+
+// serveBindCommand takes a first command that follows its bind instead of
+// coming with it: see Agent.LateCommand. Like the bind it needs no token:
+// what admits it is that it opens under the guest's one-time key and that
+// bind, and that a key the bind grants signed what is inside.
+func (a *Agent) serveBindCommand(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req session.CommandRequest
+	if !decodeStrict(body, &req) || len(req.Command) == 0 {
+		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
+		return
+	}
+	result, err := a.LateCommand(r.Context(), req.Command)
+	if err != nil {
+		a.refuse(w, http.StatusServiceUnavailable, disclosure.BindIncomplete)
+		return
+	}
+	a.say(w, http.StatusOK, disclosure.MessageCommand, result)
 }
 
 // bindEvidence is the evidence a bind's sender would ask for next, taken for
@@ -367,36 +431,6 @@ func (a *Agent) attestation(ctx context.Context, nonce []byte) (_ *session.Attes
 		resp.Bind, resp.BindSignature = bind.Raw, bind.Signature
 	}
 	return resp, false, nil
-}
-
-// serveFence is the host's claim of the guest, and what makes the answer
-// hold: see session.FenceResponse. It reads no body.
-func (a *Agent) serveFence(w http.ResponseWriter, r *http.Request) {
-	if connOf(r.Context()) == nil {
-		// Not served through Serve: there are no connections to close, and an
-		// answer of ready would promise what nothing enforces.
-		a.refuse(w, http.StatusInternalServerError, disclosure.Internal)
-		return
-	}
-	phase, closed, ok, err := a.Fence(r.Context())
-	w.Header().Set("Cache-Control", "no-store")
-	switch {
-	case errors.Is(err, errBindInFlight):
-		// For the host this is a guest somebody may have bound: it holds a
-		// caller's bytes. Nothing was closed and the bind goes on.
-		a.refuse(w, http.StatusConflict, disclosure.BindInFlight)
-	case err != nil:
-		a.refuse(w, http.StatusInternalServerError, disclosure.Internal)
-	case !ok:
-		a.refuse(w, http.StatusGone, disclosure.Retired)
-	default:
-		if closed > 0 {
-			a.log.Info("fenced", "closed", closed)
-		}
-		// This connection stays: it is the first of the epoch the fence
-		// began, and the bind may follow on it.
-		a.say(w, http.StatusOK, disclosure.MessageFence, session.FenceResponse{Phase: phase, Closed: closed})
-	}
 }
 
 func (a *Agent) serveAttest(w http.ResponseWriter, r *http.Request, body []byte) {

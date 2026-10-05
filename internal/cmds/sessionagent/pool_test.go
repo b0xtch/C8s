@@ -345,8 +345,10 @@ func TestBoundGuestIgnoresOtherBinds(t *testing.T) {
 	}
 }
 
-// Two tenants race for one guest. Exactly one bind is measured and that
-// tenant's keys, and only they, drive the guest.
+// Tenants race for one guest, each on a connection it held before any bind
+// was sent. Exactly one bind is measured and that tenant's keys, and only
+// they, drive the guest. The others are refused, or find the connection they
+// held closed: the bind that arrived first ended it.
 func TestConcurrentBindsHaveOneWinner(t *testing.T) {
 	p := newPool(t)
 	p.start(t)
@@ -355,20 +357,36 @@ func TestConcurrentBindsHaveOneWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	const tenants = 8
-	binds := make([]*session.SignedBind, tenants)
-	for i := range binds {
-		binds[i] = p.bindFor(t, ready, func(o *session.BindOptions) { o.Session = "sbx-" + string(rune('a'+i)) })
+	type racer struct {
+		bind   *session.SignedBind
+		body   []byte
+		conn   *tls.Conn
+		reader *bufio.Reader
+	}
+	racers := make([]racer, tenants)
+	for i := range racers {
+		bind := p.bindFor(t, ready, func(o *session.BindOptions) { o.Session = "sbx-" + string(rune('a'+i)) })
+		body, err := json.Marshal(session.BindRequest{Bind: bind.Raw, Signature: bind.Signature})
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn, reader := p.heldConn(t)
+		racers[i] = racer{bind, body, conn, reader}
 	}
 	statuses := make([]int, tenants)
 	var wg sync.WaitGroup
-	for i := range binds {
+	for i := range racers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			statuses[i] = p.postBind(t, binds[i].Raw, binds[i].Signature)
+			statuses[i] = requestOn(t, racers[i].conn, racers[i].reader, http.MethodPost, session.PathBind, racers[i].body)
 		}()
 	}
 	wg.Wait()
+	binds := make([]*session.SignedBind, tenants)
+	for i := range racers {
+		binds[i] = racers[i].bind
+	}
 	winner := -1
 	for i, status := range statuses {
 		switch status {
@@ -377,7 +395,7 @@ func TestConcurrentBindsHaveOneWinner(t *testing.T) {
 				t.Fatalf("binds %d and %d were both accepted", winner, i)
 			}
 			winner = i
-		case http.StatusConflict:
+		case http.StatusConflict, 0:
 		default:
 			t.Fatalf("bind %d: HTTP %d", i, status)
 		}
@@ -450,29 +468,6 @@ func (c *testClock) advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// fence asks the guest what its host asks when it claims the guest.
-func (p *pool) fence(t *testing.T) (int, session.FenceResponse) {
-	t.Helper()
-	req, err := http.NewRequestWithContext(ctxT(t), http.MethodPost, p.url+session.PathFence, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := insecureClient()
-	defer client.CloseIdleConnections()
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var out session.FenceResponse
-	if resp.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return resp.StatusCode, out
-}
-
 // heldConn is a connection to the guest that someone opened and kept: one
 // request has been answered on it and it is idle.
 func (p *pool) heldConn(t *testing.T) (*tls.Conn, *bufio.Reader) {
@@ -510,116 +505,88 @@ func requestOn(t *testing.T, conn net.Conn, reader *bufio.Reader, method, path s
 	return resp.StatusCode
 }
 
-// A guest nobody bound goes to the next claim as it is. Whoever had it before
-// may still hold a connection to it, with a bind on the way. The fence ends
-// those connections and every bind sent on them, at one point in time, so the
-// guest cannot become the earlier tenant's after it was claimed.
-func TestFenceEndsWhatCameBeforeIt(t *testing.T) {
+// A guest nobody bound may have been reached by anybody, and whoever reached
+// it may still hold a connection to it. The bind that arrives ends those
+// connections at one point in time, before the guest reads any of it:
+// nothing sent to the guest before its bind reaches the session. The bind's
+// own connection goes on, and so does one opened since.
+func TestBindEndsWhatCameBeforeIt(t *testing.T) {
 	p := newPool(t)
 	p.start(t)
 	ready, err := p.client(t, p.access).Ready(ctxT(t))
 	if err != nil {
 		t.Fatalf("Unbound: %v", err)
 	}
-	earlier := p.bindFor(t, ready, func(o *session.BindOptions) { o.Tenant = "earlier" })
-	body, err := json.Marshal(session.BindRequest{Bind: earlier.Raw, Signature: earlier.Signature})
+	held, reader := p.heldConn(t)
+	other, otherReader := p.heldConn(t)
+	binder, binderReader := p.heldConn(t)
+	// Before any bind, one connection is as good as another.
+	if status := requestOn(t, held, reader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
+		t.Fatalf("an unbound guest answered a held connection with %d", status)
+	}
+	bind := p.bindFor(t, ready, nil)
+	body, err := json.Marshal(session.BindRequest{Bind: bind.Raw, Signature: bind.Signature})
 	if err != nil {
 		t.Fatal(err)
 	}
-	held, reader := p.heldConn(t)
-
-	status, fenced := p.fence(t)
-	if status != http.StatusOK || fenced.Phase != session.PhaseReady || fenced.Closed < 1 {
-		t.Fatalf("fence of an unbound guest: %d %+v, want unbound with the held connection closed", status, fenced)
+	if status := requestOn(t, binder, binderReader, http.MethodPost, session.PathBind, body); status != http.StatusOK {
+		t.Fatalf("the bind was answered %d", status)
 	}
-	// The earlier tenant's bind, on the connection it held: no answer.
-	if status := requestOn(t, held, reader, http.MethodPost, session.PathBind, body); status != 0 {
-		t.Fatalf("a bind on a connection from before the fence was answered %d", status)
+	for name, conn := range map[string]struct {
+		conn   *tls.Conn
+		reader *bufio.Reader
+	}{"one": {held, reader}, "another": {other, otherReader}} {
+		if status := requestOn(t, conn.conn, conn.reader, http.MethodGet, session.PathState, nil); status != 0 {
+			t.Errorf("%s connection from before the bind still answered %d", name, status)
+		}
 	}
-	// And one that was already past the connection when the fence came: the
-	// guest does not look at it, and does not end over it.
-	if _, _, err := p.agent.Bind(context.Background(), earlier.Raw, earlier.Signature); err == nil || !strings.Contains(err.Error(), "claimed") {
-		t.Fatalf("a bind from before the fence: %v, want it refused as fenced", err)
+	if status := requestOn(t, binder, binderReader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
+		t.Fatalf("the bind's own connection answered %d after it", status)
+	}
+	if state := p.state(t); state.Phase != session.PhaseRunning || !bytes.Equal(state.Bind, bind.Raw) {
+		t.Fatalf("state after the bind: %+v", state)
+	}
+	// A bound guest is somebody's: what reaches it now is its session's
+	// business, and nothing ends it. Not the bind sent again, and not
+	// another.
+	later, laterReader := p.heldConn(t)
+	if status := p.postBind(t, bind.Raw, bind.Signature); status != http.StatusOK {
+		t.Fatalf("the bind sent again on a new connection: %d", status)
+	}
+	another := p.bindFor(t, ready, func(o *session.BindOptions) { o.Tenant = "another" })
+	if status := p.postBind(t, another.Raw, another.Signature); status != http.StatusConflict {
+		t.Fatalf("another bind for a bound guest: %d", status)
+	}
+	if status := requestOn(t, later, laterReader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
+		t.Fatalf("a connection opened after the bind answered %d after two more binds", status)
 	}
 	select {
 	case err := <-p.agent.Fatal():
-		t.Fatalf("a fenced bind ended the guest: %v", err)
+		t.Fatalf("the guest ended: %v", err)
 	default:
-	}
-	if state := p.state(t); state.Phase != session.PhaseReady || len(state.Bind) != 0 {
-		t.Fatalf("state after the fence: %+v", state)
-	}
-	if steps := p.runner.recorded(); steps != "" {
-		t.Fatalf("a fenced guest drove its runner: %s", steps)
-	}
-
-	// The next tenant, on a connection opened after the fence, binds it.
-	next := p.bindFor(t, ready, nil)
-	if status := p.postBind(t, next.Raw, next.Signature); status != http.StatusOK {
-		t.Fatalf("a bind after the fence: %d", status)
-	}
-	if state := p.state(t); state.Phase != session.PhaseRunning || !bytes.Equal(state.Bind, next.Raw) {
-		t.Fatalf("state after the bind: %+v", state)
 	}
 }
 
-// A bind the guest has begun to read has put a caller's bytes inside it. The
-// fence then promises nothing: it answers 409, closes no connection, and the
-// bind goes on. The host takes that answer as a bound guest and destroys it.
-func TestFenceIsNotRaisedOverABindInFlight(t *testing.T) {
+// A bind handed to the agent with no connection raises the fence as one
+// that came over the server does.
+func TestBindHandedOverDirectlyEndsEveryConnection(t *testing.T) {
 	p := newPool(t)
 	p.start(t)
 	ready, err := p.client(t, p.access).Ready(ctxT(t))
 	if err != nil {
 		t.Fatalf("Unbound: %v", err)
 	}
-	earlier := p.bindFor(t, ready, func(o *session.BindOptions) { o.Tenant = "earlier" })
-	body, err := json.Marshal(session.BindRequest{Bind: earlier.Raw, Signature: earlier.Signature})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The bind's headers, and its body held back. The agent's 100 Continue
-	// says it has let the bind in and is waiting to read it.
 	held, reader := p.heldConn(t)
-	_ = held.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := fmt.Fprintf(held, "POST %s HTTP/1.1\r\nHost: guest\r\nContent-Type: application/json\r\nContent-Length: %d\r\nExpect: 100-continue\r\n\r\n",
-		session.PathBind, len(body)); err != nil {
-		t.Fatal(err)
+	bind := p.bindFor(t, ready, nil)
+	if _, _, err := p.agent.Bind(ctxT(t), bind.Raw, bind.Signature); err != nil {
+		t.Fatalf("Bind: %v", err)
 	}
-	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "HTTP/1.1 100 ") {
-		t.Fatalf("the agent answered a held-back bind with %q, %v, want 100 Continue", line, err)
+	if status := requestOn(t, held, reader, http.MethodGet, session.PathState, nil); status != 0 {
+		t.Fatalf("a connection from before the bind still answered %d", status)
 	}
-	if _, err := reader.ReadString('\n'); err != nil {
-		t.Fatal(err)
-	}
-
-	status, fenced := p.fence(t)
-	if status != http.StatusConflict || fenced.Closed != 0 {
-		t.Fatalf("fence with a bind in flight: %d %+v, want 409 and nothing closed", status, fenced)
-	}
-	if state := p.state(t); state.Phase != session.PhaseReady {
-		t.Fatalf("state with the bind held back: %+v", state)
-	}
-
-	// The connection is still the earlier tenant's, and its bind completes.
-	if _, err := held.Write(body); err != nil {
-		t.Fatalf("the connection of a bind in flight was closed: %v", err)
-	}
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		t.Fatalf("no answer to the bind: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("the bind in flight was answered %d", resp.StatusCode)
-	}
-	if state := p.state(t); state.Phase != session.PhaseRunning || !bytes.Equal(state.Bind, earlier.Raw) {
-		t.Fatalf("state after the bind: %+v", state)
-	}
-	// And the fence now says what the guest is.
-	if status, fenced := p.fence(t); status != http.StatusOK || fenced.Phase != session.PhaseRunning {
-		t.Fatalf("fence of the guest once bound: %d %+v", status, fenced)
+	// And the same again is the same bind, answered as the first.
+	if replayed, _, err := p.agent.Bind(ctxT(t), bind.Raw, bind.Signature); err != nil || !replayed {
+		t.Fatalf("the bind again: replayed %v, %v", replayed, err)
 	}
 }
 
@@ -635,8 +602,9 @@ func refusalCode(body []byte) disclosure.Code {
 	return code
 }
 
-// A bind on a connection the fence ended is refused on its headers. The guest
-// reads none of it, stays unbound and does not end over it.
+// A bind on a connection the fence ended, whose request was already on its
+// way when the guest's bind arrived, is refused on its headers. The guest
+// reads none of it, stays the session's it became and does not end over it.
 func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
 	p := newPool(t)
 	p.start(t)
@@ -644,8 +612,9 @@ func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unbound: %v", err)
 	}
-	if status, fenced := p.fence(t); status != http.StatusOK || fenced.Phase != session.PhaseReady {
-		t.Fatalf("fence: %d %+v", status, fenced)
+	bind := p.bindFor(t, ready, nil)
+	if status := p.postBind(t, bind.Raw, bind.Signature); status != http.StatusOK {
+		t.Fatalf("the bind: %d", status)
 	}
 	earlier := p.bindFor(t, ready, func(o *session.BindOptions) { o.Tenant = "earlier" })
 	body, err := json.Marshal(session.BindRequest{Bind: earlier.Raw, Signature: earlier.Signature})
@@ -667,22 +636,17 @@ func TestBindOnAnEndedConnectionIsRefusedUnread(t *testing.T) {
 	if got := rec.Header().Get("Connection"); got != "close" {
 		t.Errorf("Connection = %q, want close: a server that keeps the connection reads the body to reuse it", got)
 	}
+	// The same for one that was handed to the agent past the server.
+	if _, _, err := p.agent.Bind(sessionagent.EndedConnContext(context.Background(), p.agent), earlier.Raw, earlier.Signature); err == nil || !strings.Contains(err.Error(), "before the guest's bind arrived") {
+		t.Fatalf("a bind from before the fence: %v, want it refused as fenced", err)
+	}
 	select {
 	case err := <-p.agent.Fatal():
 		t.Fatalf("a refused bind ended the guest: %v", err)
 	default:
 	}
-	if state := p.state(t); state.Phase != session.PhaseReady || len(state.Bind) != 0 {
-		t.Fatalf("state after the refusal: %+v", state)
-	}
-	// The refusal left nothing in flight: the guest can be fenced again and
-	// bound on a new connection.
-	if status, fenced := p.fence(t); status != http.StatusOK || fenced.Phase != session.PhaseReady {
-		t.Fatalf("fence after the refusal: %d %+v", status, fenced)
-	}
-	next := p.bindFor(t, ready, nil)
-	if status := p.postBind(t, next.Raw, next.Signature); status != http.StatusOK {
-		t.Fatalf("a bind after the fence: %d", status)
+	if state := p.state(t); state.Phase != session.PhaseRunning || !bytes.Equal(state.Bind, bind.Raw) {
+		t.Fatalf("state after the refusals: %+v", state)
 	}
 }
 
@@ -700,6 +664,7 @@ func TestBindBeforeTheGuestTakesAnyIsRefusedUnread(t *testing.T) {
 	if state := p.state(t); state.Phase != session.PhaseReady || state.Prepared {
 		t.Fatalf("a guest its key service has not judged says %+v", state)
 	}
+	held, reader := p.heldConn(t)
 	const garbage = `{"bind":"e30=","signature":"c2ln"}`
 	unread := &countingReader{Reader: strings.NewReader(garbage)}
 	rec := httptest.NewRecorder()
@@ -724,6 +689,14 @@ func TestBindBeforeTheGuestTakesAnyIsRefusedUnread(t *testing.T) {
 	if state := p.state(t); state.Phase != session.PhaseReady {
 		t.Fatalf("the guest after the refusals: %+v", state)
 	}
+	// A bind the guest did not read raised no fence: over the server either,
+	// it cut nothing the guest had.
+	if status := p.postBind(t, []byte("{}"), "c2ln"); status != http.StatusServiceUnavailable {
+		t.Fatalf("a bind over the server before the guest takes any: %d", status)
+	}
+	if status := requestOn(t, held, reader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
+		t.Fatalf("a connection from before a bind the guest did not read answered %d", status)
+	}
 }
 
 type countingReader struct {
@@ -735,82 +708,6 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	n, err := r.Reader.Read(p)
 	r.n += n
 	return n, err
-}
-
-// Whoever claims a guest may send its bind on the connection the claim came
-// on: the fence ends every other connection and keeps that one, as the first
-// of those it lets a bind in from. A host that holds one connection to each
-// of its ready guests then starts a session with no handshake.
-func TestBindFollowsTheFenceOnItsConnection(t *testing.T) {
-	p := newPool(t)
-	p.start(t)
-	ready, err := p.client(t, p.access).Ready(ctxT(t))
-	if err != nil {
-		t.Fatal(err)
-	}
-	other, otherReader := p.heldConn(t)
-	claimer, reader := p.heldConn(t)
-	if status := requestOn(t, claimer, reader, http.MethodPost, session.PathFence, nil); status != http.StatusOK {
-		t.Fatalf("fence on a held connection: %d", status)
-	}
-	if status := requestOn(t, other, otherReader, http.MethodGet, session.PathState, nil); status != 0 {
-		t.Fatalf("another connection from before the fence still answered %d", status)
-	}
-	// The fence's connection is still there, and the guest is still nobody's.
-	if status := requestOn(t, claimer, reader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
-		t.Fatalf("state on the fence's connection: %d", status)
-	}
-	bind := p.bindFor(t, ready, nil)
-	body, err := json.Marshal(session.BindRequest{Bind: bind.Raw, Signature: bind.Signature})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status := requestOn(t, claimer, reader, http.MethodPost, session.PathBind, body); status != http.StatusOK {
-		t.Fatalf("a bind on the connection that raised the fence: %d", status)
-	}
-	if state := p.state(t); state.Phase != session.PhaseRunning {
-		t.Fatalf("after the bind the guest says %s", state.Phase)
-	}
-}
-
-// A second fence ends the connections that came after the first.
-func TestFenceCanBeRaisedAgain(t *testing.T) {
-	p := newPool(t)
-	p.start(t)
-	if status, fenced := p.fence(t); status != http.StatusOK || fenced.Phase != session.PhaseReady {
-		t.Fatalf("first fence: %d %+v", status, fenced)
-	}
-	held, reader := p.heldConn(t)
-	if status, fenced := p.fence(t); status != http.StatusOK || fenced.Closed < 1 {
-		t.Fatalf("second fence: %d %+v, want the connection opened since closed", status, fenced)
-	}
-	if status := requestOn(t, held, reader, http.MethodGet, session.PathState, nil); status != 0 {
-		t.Fatalf("a connection from before the second fence still answered %d", status)
-	}
-}
-
-// A bound guest is somebody's. The fence says so and touches nothing: the
-// host then destroys the guest, and until it does the tenant's connections
-// are the tenant's.
-func TestFenceLeavesABoundGuestAlone(t *testing.T) {
-	p := newPool(t)
-	p.start(t)
-	client := p.client(t, p.access)
-	ready, err := client.Ready(ctxT(t))
-	if err != nil {
-		t.Fatalf("Unbound: %v", err)
-	}
-	if _, err := client.Bind(ctxT(t), p.bindFor(t, ready, nil)); err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
-	held, reader := p.heldConn(t)
-	status, fenced := p.fence(t)
-	if status != http.StatusOK || fenced.Phase != session.PhaseRunning || fenced.Closed != 0 {
-		t.Fatalf("fence of a bound guest: %d %+v, want running and nothing closed", status, fenced)
-	}
-	if status := requestOn(t, held, reader, http.MethodGet, session.PathState, nil); status != http.StatusOK {
-		t.Fatalf("a bound guest's connection after a fence: %d", status)
-	}
 }
 
 // newTimedPool is a guest whose launch document gives it an hour to be

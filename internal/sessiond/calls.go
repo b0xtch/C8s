@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -23,8 +25,9 @@ import (
 const (
 	// maxClaimWait bounds how long one Claim waits for a ready TD.
 	maxClaimWait = 2 * time.Minute
-	// fenceTimeout bounds the daemon's own requests to a guest it claims.
-	fenceTimeout = 10 * time.Second
+	// evidenceTimeout bounds the daemon's own request to a guest for what it
+	// serves to anyone.
+	evidenceTimeout = 10 * time.Second
 	// certMargin is how long a certificate relayed with a claim must still
 	// be valid for.
 	certMargin = 10 * time.Minute
@@ -51,7 +54,9 @@ func checkRequestID(id string) error {
 	return nil
 }
 
-// Claim reserves a ready TD of a pool for a session and fences it.
+// Claim reserves a ready TD of a pool for a session, in the daemon's own
+// record. It asks the guest nothing: the guest learns of the claim from the
+// bind, and raises its fence then.
 func (d *Daemon) Claim(ctx context.Context, req *sessionv1alpha1.ClaimRequest) (*sessionv1alpha1.Claimed, error) {
 	if err := checkRequestID(req.GetRequestId()); err != nil {
 		return nil, err
@@ -100,16 +105,16 @@ func (d *Daemon) Claim(ctx context.Context, req *sessionv1alpha1.ClaimRequest) (
 			d.end(t, "its record could not be kept", "")
 			return nil, status.Error(codes.Internal, "the claim could not be recorded")
 		}
-		answer, err := d.fence(ctx, t, pool, picked)
+		answer, err := d.claimed(ctx, t, pool, picked)
 		if err == nil {
 			return answer, nil
 		}
-		// A TD that does not take its fence is not offered again, and the
-		// claim goes on to the next.
+		// A TD whose evidence the daemon neither kept nor could fetch is
+		// not offered again, and the claim goes on to the next.
 		d.log.Warn("a ready TD could not be claimed", "td", t.rec.ID, "error", err)
 		d.mu.Lock()
 		t.rec.Claim, t.busy = nil, false
-		d.endLocked(t, "could not be fenced", "")
+		d.endLocked(t, "gave no evidence for its claim", "")
 		d.mu.Unlock()
 		if ctx.Err() != nil {
 			return nil, status.FromContextError(ctx.Err()).Err()
@@ -181,36 +186,39 @@ func exhausted(pool string, hint time.Duration) error {
 	return st.Err()
 }
 
-// fence has the claimed guest cut the connections it has, collects what it
-// serves to anyone, and starts the claim's grace. picked is when the claim
-// took the TD.
-func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState, picked time.Time) (*sessionv1alpha1.Claimed, error) {
-	ctx, cancel := context.WithTimeout(ctx, fenceTimeout)
-	defer cancel()
-	asked := time.Now()
-	leaf, err := d.guests.fence(ctx, t.rec.Address)
-	if err != nil {
-		return nil, err
-	}
-	guest := time.Since(asked)
+// claimed answers a claim with what the claimed guest said of itself when it
+// was last asked, and starts the claim's grace. picked is when the claim took
+// the TD.
+func (d *Daemon) claimed(ctx context.Context, t *td, pool *poolState, picked time.Time) (*sessionv1alpha1.Claimed, error) {
 	d.mu.Lock()
-	offered, collateral := t.offered, t.collateral
+	offered, leaf, collateral := t.offered, t.leaf, t.collateral
 	d.mu.Unlock()
-	// The fence's answer says the guest is still nobody's, so what it said
-	// of itself when it became ready still holds. Its certificate is the one
-	// the kept connection was made under: one about to run out is fetched
-	// again, with everything else, over a new connection.
+	// A ready guest says the same of itself until it is bound, and a guest
+	// that somebody bound around the daemon refuses the bind this claim
+	// leads to. A daemon that took the TD over from an earlier one has kept
+	// nothing yet, and a certificate about to run out is of no use to a
+	// binder: the guest is asked then, over a new connection, which it
+	// answers under the certificate it serves now.
 	var evidence *sessionv1alpha1.Evidence
+	var guest time.Duration
 	if offered != nil && lasts(leaf, d.now()) {
 		evidence = &sessionv1alpha1.Evidence{
 			Certificate: leaf, LaunchDocument: offered.Launch, LaunchSignature: []byte(offered.Signature),
 			Events: offered.Events, Phase: string(session.PhaseReady), Collateral: collateral,
 		}
 	} else {
+		ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
+		defer cancel()
+		asked := time.Now()
 		d.guests.reconnect()
+		var err error
 		if evidence, err = d.guests.evidence(ctx, t.rec.Address); err != nil {
 			return nil, err
 		}
+		if session.Phase(evidence.GetPhase()) != session.PhaseReady {
+			return nil, fmt.Errorf("the guest is %s, not ready: somebody bound it", evidence.GetPhase())
+		}
+		guest = time.Since(asked)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -222,9 +230,11 @@ func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState, picked time.
 	answer := &sessionv1alpha1.Claimed{
 		Td: t.rec.ID, Host: d.cfg.Host, Evidence: evidence, BindBy: timestamppb.New(t.rec.Claim.BindBy),
 	}
-	if t.rec.Claim.Answer, err = proto.Marshal(answer); err != nil {
+	kept, err := proto.Marshal(answer)
+	if err != nil {
 		return nil, err
 	}
+	t.rec.Claim.Answer = kept
 	if err := d.save(t); err != nil {
 		return nil, err
 	}
@@ -241,17 +251,128 @@ func lasts(leaf []byte, now time.Time) bool {
 	return err == nil && now.Add(certMargin).Before(cert.NotAfter)
 }
 
-// Bind hands a claimed TD its bind and returns the guest's evidence.
-func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*sessionv1alpha1.Bound, error) {
+// Bind hands a claimed TD its bind and answers with the guest's receipt for
+// it. The call is a stream both ways. Its first message is the bind, with the
+// session's first command sealed for the guest if its sender had it by then;
+// a command may also come alone in the next message, and is carried to the
+// guest, which opens it while it still takes the bind. The first answer is
+// the receipt, with what became of a command that came with the bind. What
+// became of a command that came after it, and the sealed answer of one the
+// guest took, follow in a later message. The daemon reads none of either.
+//
+// A call whose bind came with no command ends once its caller has closed its
+// side, having sent a command or not.
+func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
+	req, err := stream.Recv()
+	if err != nil {
+		return status.Error(codes.InvalidArgument, "the call's first message is the bind")
+	}
+	if n := len(req.GetCommand()); n > session.MaxFirstCommandBytes {
+		return status.Errorf(codes.InvalidArgument, "command is at most %d bytes", session.MaxFirstCommandBytes)
+	}
+	ctx := stream.Context()
+	// One answer goes out at a time, and the receipt before any other.
+	var sending sync.Mutex
+	send := func(answer *sessionv1alpha1.Bound) error {
+		sending.Lock()
+		defer sending.Unlock()
+		return stream.Send(answer)
+	}
+	relaying := make(chan *td, 1)
+	receipted := make(chan struct{})
+	// late is what a command that comes in the call's next message comes
+	// to: nil when the bind brought its own.
+	var late chan error
+	if len(req.GetCommand()) == 0 {
+		late = make(chan error, 1)
+		go func() { late <- d.lateCommand(stream, relaying, receipted, send) }()
+	}
+	answer, wait, err := d.bind(ctx, req, relaying)
+	if err != nil {
+		return err
+	}
+	if err := send(answer); err != nil {
+		return err
+	}
+	close(receipted)
+	if wait != nil {
+		result, err := wait()
+		if err != nil {
+			d.log.Warn("the answer to a first command was lost", "td", req.GetTd(), "error", err)
+			return status.Error(codes.Unavailable, "the guest's answer to the first command was lost: send the same request again")
+		}
+		return send(&sessionv1alpha1.Bound{Command: result.Command, CommandResult: result.Answer})
+	}
+	// The caller may still send its command, which the guest answers
+	// whenever it comes: by now, that it came too late, unless this call
+	// repeats one whose command the guest took.
+	if late != nil {
+		return <-late
+	}
+	return nil
+}
+
+// lateCommand carries a first command that comes alone in the next message
+// of a Bind call to the guest, once the bind has been sent there, and sends
+// back what became of it after the receipt. It returns once the caller has
+// said all it will.
+func (d *Daemon) lateCommand(stream sessionv1alpha1.Sessions_BindServer, relaying <-chan *td, receipted <-chan struct{}, send func(*sessionv1alpha1.Bound) error) error {
+	next, err := stream.Recv()
+	if err != nil || len(next.GetCommand()) == 0 {
+		// The caller has no more to say, or the call is over.
+		return nil
+	}
+	if len(next.GetCommand()) > session.MaxFirstCommandBytes {
+		return status.Errorf(codes.InvalidArgument, "command is at most %d bytes", session.MaxFirstCommandBytes)
+	}
+	ctx := stream.Context()
+	var t *td
+	select {
+	case t = <-relaying:
+	case <-ctx.Done():
+		return nil
+	}
+	if t == nil {
+		// The bind was never sent to a guest.
+		return nil
+	}
+	d.mu.Lock()
+	address := t.rec.Address
+	d.mu.Unlock()
+	answer, err := d.guests.command(ctx, address, next.GetCommand())
+	if err != nil {
+		// The guest took it or did not: its sender sends the command over a
+		// connection of its own, which the guest answers either way.
+		d.log.Warn("a first command sent after its bind got no answer", "error", err)
+		answer = &session.CommandAnswer{Command: session.CommandTooLate}
+	}
+	select {
+	case <-receipted:
+	case <-ctx.Done():
+		return nil
+	}
+	return send(&sessionv1alpha1.Bound{Command: answer.Command, CommandResult: answer.Answer})
+}
+
+// bind is the bind itself: it records it, hands it to the guest and returns
+// the guest's first answer, with how to wait for a first command's sealed
+// answer if the guest took one. relaying is told the TD once its guest has
+// been sent the bind, now or by an earlier call, and nil if it never was: a
+// command that follows the bind is sent to the guest after the bind, on a
+// connection opened after it, which is one the guest's fence lets in.
+func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, commandWait, error) {
 	began := time.Now()
+	var told sync.Once
+	tell := func(t *td) { told.Do(func() { relaying <- t }) }
+	defer tell(nil)
 	if err := checkRequestID(req.GetRequestId()); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if n := len(req.GetBind()); n == 0 || n > session.MaxBindSize {
-		return nil, status.Errorf(codes.InvalidArgument, "bind must be 1 to %d bytes", session.MaxBindSize)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "bind must be 1 to %d bytes", session.MaxBindSize)
 	}
 	if n := len(req.GetSignature()); n == 0 || n > maxSignatureBytes {
-		return nil, status.Errorf(codes.InvalidArgument, "signature must be 1 to %d bytes", maxSignatureBytes)
+		return nil, nil, status.Errorf(codes.InvalidArgument, "signature must be 1 to %d bytes", maxSignatureBytes)
 	}
 	sum := sha256.New()
 	sum.Write(req.GetBind())
@@ -263,52 +384,68 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 	t, ok := d.tds[req.GetTd()]
 	if !ok {
 		d.mu.Unlock()
-		return nil, status.Error(codes.NotFound, "no such TD")
+		return nil, nil, status.Error(codes.NotFound, "no such TD")
 	}
+	replay := false
 	switch b := t.rec.Bind; {
 	case b != nil && b.RequestID != req.GetRequestId():
 		d.mu.Unlock()
-		return nil, status.Error(codes.FailedPrecondition, "the TD was sent a bind by another request")
+		return nil, nil, status.Error(codes.FailedPrecondition, "the TD was sent a bind by another request")
 	case b != nil && b.Digest != digest:
 		d.mu.Unlock()
-		return nil, status.Error(codes.InvalidArgument, "request_id was used for another bind")
-	case b != nil && b.Answer != nil:
+		return nil, nil, status.Error(codes.InvalidArgument, "request_id was used for another bind")
+	case b != nil && b.Answer != nil && len(req.GetCommand()) == 0:
 		defer d.mu.Unlock()
 		var answer sessionv1alpha1.Bound
 		if err := proto.Unmarshal(b.Answer, &answer); err != nil {
-			return nil, status.Error(codes.Internal, "the first answer could not be read back")
+			return nil, nil, status.Error(codes.Internal, "the first answer could not be read back")
 		}
-		return &answer, nil
+		// What became of a command is said to whoever sent one. The guest
+		// has the bind, and answers a command that followed it as it did the
+		// first time.
+		answer.Command = ""
+		tell(t)
+		return &answer, nil, nil
 	case t.busy:
 		d.mu.Unlock()
-		return nil, status.Error(codes.Aborted, "another request for this TD is still in progress")
+		return nil, nil, status.Error(codes.Aborted, "another request for this TD is still in progress")
 	case t.rec.State == StateEnded:
 		reason := t.rec.Ended.Reason
 		d.mu.Unlock()
-		return nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", reason)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", reason)
+	case b != nil && b.Answer != nil:
+		// The same bind again, with a command: the guest answers it as it
+		// answered the first, and says what became of this command. Only
+		// the guest keeps a command's sealed answer.
+		replay = true
 	case b == nil && t.rec.State != StateClaimed:
 		state := t.rec.State
 		d.mu.Unlock()
-		return nil, status.Errorf(codes.FailedPrecondition, "the TD is %s, not claimed: a claim lapses when its grace runs out", state)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD is %s, not claimed: a claim lapses when its grace runs out", state)
 	}
 	// A new bind, or the same one again after an answer that was lost: the
 	// guest answers a bind it has taken as it answered the first time.
 	if t.lapse != nil {
 		t.lapse.Stop()
 	}
-	t.rec.Bind = &bound{RequestID: req.GetRequestId(), Digest: digest}
-	t.rec.State = StateBound
+	if !replay {
+		t.rec.Bind = &bound{RequestID: req.GetRequestId(), Digest: digest}
+		t.rec.State = StateBound
+	}
 	t.busy = true
 	address := t.rec.Address
-	err := d.save(t)
+	var err error
+	if !replay {
+		err = d.save(t)
+	}
 	d.mu.Unlock()
 	if err != nil {
 		d.end(t, "its record could not be kept", "")
-		return nil, status.Error(codes.Internal, "the bind could not be recorded")
+		return nil, nil, status.Error(codes.Internal, "the bind could not be recorded")
 	}
 
 	asked := time.Now()
-	evidence, receipt, err := d.relayBind(ctx, t, address, req)
+	relayed, err := d.relayBind(ctx, t, address, req, func() { tell(t) })
 	guest := time.Since(asked)
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -318,27 +455,31 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 	case errors.As(err, &refused):
 		// Whatever the guest made of those bytes, it is not offered again.
 		d.endLocked(t, "the guest refused its bind", "")
-		return nil, status.Errorf(codes.FailedPrecondition, "the guest refused the bind and its TD is ended: %s", refused.message)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "the guest refused the bind and its TD is ended: %s", refused.message)
 	case err != nil:
 		if t.rec.State == StateEnded {
-			return nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
+			return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
 		}
 		// Whether the guest took the bind is not known: the same request
 		// again finds out.
 		d.log.Warn("a bind's answer was lost", "td", t.rec.ID, "error", err)
-		return nil, status.Error(codes.Unavailable, "the guest did not answer the bind: send the same request again")
+		return nil, nil, status.Error(codes.Unavailable, "the guest did not answer the bind: send the same request again")
 	}
 	if t.rec.State == StateEnded {
-		return nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
 	}
+	evidence := relayed.evidence
 	// The vendor's documents as the guest last handed them over: the binder's
 	// verifier may want them, and the guest is not asked again for them.
 	if len(evidence.GetCollateral()) == 0 {
 		evidence.Collateral = t.collateral
 	}
-	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: receipt}
+	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, Command: relayed.command}
+	if replay {
+		return answer, relayed.wait, nil
+	}
 	if t.rec.Bind.Answer, err = proto.Marshal(answer); err != nil {
-		return nil, status.Error(codes.Internal, "the answer could not be kept")
+		return nil, nil, status.Error(codes.Internal, "the answer could not be kept")
 	}
 	if session.Phase(evidence.GetPhase()) == session.PhaseRunning {
 		t.rec.State = StateRunning
@@ -347,26 +488,41 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
 	}
 	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
-		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer))
+		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
+		"command", relayed.command)
 	d.notify()
-	return answer, nil
+	return answer, relayed.wait, nil
 }
 
-// relayBind posts the bind until the guest answers it for good.
-func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest) (evidence *sessionv1alpha1.Evidence, receipt []byte, err error) {
+// relayBind posts the bind until the guest answers it for good. A guest that
+// took a first command with it answers that later, over the same request,
+// which lives until then.
+func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest, wrote func()) (*boundAnswer, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxBindWait)
-	defer cancel()
 	// The TD's end ends the wait.
 	stop := context.AfterFunc(t.ctx, cancel)
-	defer stop()
+	done := func() {
+		stop()
+		cancel()
+	}
 	for {
-		evidence, receipt, err = d.guests.bind(ctx, address, req.GetBind(), req.GetSignature())
+		answer, err := d.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetCommand(), wrote)
+		if err == nil && answer.wait != nil {
+			wait := answer.wait
+			answer.wait = func() (*session.CommandAnswer, error) {
+				defer done()
+				return wait()
+			}
+			return answer, nil
+		}
 		if !errors.Is(err, errBusy) {
-			return evidence, receipt, err
+			done()
+			return answer, err
 		}
 		select {
 		case <-ctx.Done():
-			return nil, nil, ctx.Err()
+			done()
+			return nil, ctx.Err()
 		case <-time.After(busyRetry):
 		}
 	}
@@ -450,7 +606,7 @@ func (d *Daemon) GetEvidence(ctx context.Context, req *sessionv1alpha1.EvidenceR
 	default:
 		return nil, status.Error(codes.ResourceExhausted, "too many evidence requests in flight")
 	}
-	ctx, cancel := context.WithTimeout(ctx, fenceTimeout)
+	ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
 	defer cancel()
 	evidence, err := d.guests.evidence(ctx, address)
 	if err != nil {

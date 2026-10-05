@@ -698,10 +698,13 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	r.mu.Lock()
 	r.started = true
 	r.mu.Unlock()
+	told := time.Since(began)
 	// The init says why when it could not become the process.
 	refused := make(chan string, 1)
+	answered := make(chan time.Duration, 1)
 	go func() {
 		_, reason := sandboxinit.ReadAnswer(control)
+		answered <- time.Since(began)
 		refused <- reason
 	}()
 	if err := r.await(ctx, w.made, sandboxNet, false, refused); err != nil {
@@ -710,7 +713,15 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 		}
 		return err
 	}
-	r.cfg.Logger.Info("sandbox started", "took_us", time.Since(began).Microseconds())
+	took := time.Since(began)
+	// When the init's end of the socket closed, if it has by now: at its
+	// exec, unless something else still holds that end.
+	var closed time.Duration
+	select {
+	case closed = <-answered:
+	default:
+	}
+	r.cfg.Logger.Info("sandbox started", "took_us", took.Microseconds(), "told_us", told.Microseconds(), "closed_us", closed.Microseconds())
 	return nil
 }
 

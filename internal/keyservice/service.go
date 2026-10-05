@@ -373,6 +373,7 @@ func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certif
 
 // acquire releases what a guest's bind allows, by the release rule.
 func (s *Service) acquire(w http.ResponseWriter, _ *http.Request, leaf *x509.Certificate, key string, body []byte) {
+	began := time.Now()
 	var req api.AcquireRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		refuse(w, http.StatusBadRequest, "malformed acquire request")
@@ -470,7 +471,7 @@ func (s *Service) acquire(w http.ResponseWriter, _ *http.Request, leaf *x509.Cer
 	}
 	g.bind = digest
 	s.log.Info("released to a bound guest", "instance_key", key, "tenant", bind.Doc.Tenant, "session", bind.Doc.Session,
-		"bind", digest, "credentials", len(out.Credentials))
+		"bind", digest, "credentials", len(out.Credentials), "took_us", time.Since(began).Microseconds())
 	writeJSON(w, out)
 }
 

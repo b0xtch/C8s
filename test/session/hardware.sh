@@ -321,6 +321,15 @@ if [ "$code" = 409 ] && grep -q bind_no_machine "$out/bind-raw.out"; then
 else
     record FAIL "the guest takes no bind, and says its document lists no machine" "HTTP $code: $(head -c 300 "$out/bind-raw.out" | tr '\n' ' ')"
 fi
+# Nor a command for a session: one follows a bind, and a guest that no bind
+# has reached reads none.
+code=$(curl -sk --max-time 10 -o "$out/command-raw.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"command":"AAAA"}' \
+    "https://127.0.0.1:$probe_port/v1/bind/command")
+if [ "$code" = 409 ] && grep -q fenced "$out/command-raw.out"; then
+    record PASS "a guest that no bind has reached reads no command"
+else
+    record FAIL "a guest that no bind has reached reads no command" "HTTP $code: $(head -c 300 "$out/command-raw.out" | tr '\n' ' ')"
+fi
 stop_pid "$probe_pid"; probe_pid=""
 
 expect 0 "the pool's launch bundle, which pins the key service and lists the machine" bundle "$C8S" session launch-config new --out "$out/bundle" \
@@ -467,6 +476,13 @@ guest_logged() {
 said() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$out/$1.out" "$2" 2>/dev/null
 }
+# first <log> <field>: a field of what a start says of its first command.
+# What the command wrote is printed as its bytes.
+first() {
+    python3 -c 'import base64,json,sys
+value = (json.load(open(sys.argv[1])).get("first_command") or {}).get(sys.argv[2], "")
+print(base64.b64decode(value).decode() if sys.argv[2] in ("stdout", "stderr") else value)' "$out/$1.out" "$2" 2>/dev/null
+}
 reason() { # reason <step> <start log> <pattern>
     [ "$dev" = 1 ] || return 0
     check "$1" guest_logged "$2" "$3"
@@ -515,6 +531,22 @@ expect 0 "start session s2, another tenant's" start-s2 start_session s2 "$out/s2
 cat "$out/start-s2.out" >> "$out/records.jsonl"
 expect 3 "a second start of a live session is refused" start-s1-again \
     start_session s1 "$out/s1-again" acme "$out/authority.key" "$manifest" "$launch_key" "${sandbox[@]}"
+
+# A session whose first command goes with its bind, sealed to the key its
+# guest made for its one bind: the daemon carries it unread, and the guest
+# runs it as soon as its sandbox does. The command reads what the key service
+# released at that bind, and leaves a line each time it runs.
+expect 0 "start session s3 with its first command in the bind" start-s3 start_session s3 "$out/s3" acme "$out/authority.key" "$manifest" "$launch_key" \
+    "${sandbox[@]}" "${stored[@]}" -- sh -c 'echo ran >> /tmp/first; cat "$C8S_CREDENTIALS_DIR/api-token"'
+cat "$out/start-s3.out" >> "$out/records.jsonl"
+check "its guest took the command with the bind" [ "$(first start-s3 with_bind)" = True ]
+check "the command read the credential released at that bind" [ "$(first start-s3 stdout)" = "stored-secret-$run" ]
+check "the daemon carried the command, and its guest took it" grep -q '"msg":"bound a TD".*"command":"taken"' "$out/daemon.log"
+reason "its guest opened the command while it took the bind" start-s3 'a first command came.*taken'
+s3=(--binding "$out/s3" --image-manifest "$manifest" "${accept[@]}")
+expect 0 "a later command in s3" exec-s3 "$C8S" session exec "${s3[@]}" -- cat /tmp/first
+check "the first command ran once" [ "$(cat "$out/exec-s3.out")" = ran ]
+expect 0 "destroy s3" destroy-s3 "$C8S" session destroy --binding "$out/s3" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
 
 s1=(--binding "$out/s1" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "release a credential to s1" credential "$C8S" session credential put token "${s1[@]}" --from-file "$out/released"

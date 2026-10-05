@@ -44,6 +44,9 @@ const Pool = "sim"
 type Runner struct {
 	t     testing.TB
 	first *sessionsim.Guest
+	// sandbox is what the TDs run from the image a bind names. Nil is a pool
+	// of bare guests, whose binds name none.
+	sandbox sessionsim.Sandbox
 
 	mu      sync.Mutex
 	started []*TD
@@ -60,8 +63,17 @@ type TD struct {
 
 func (i *TD) Address() string { return strings.TrimPrefix(i.guest.URL, "https://") }
 
-// Accepted is how many connections the TD's guest has accepted.
-func (i *TD) Accepted() int           { return i.guest.Accepted() }
+// Accepted is how many connections the TD's guest has accepted, and Asked
+// how many requests it was sent for a path, or for any when path is empty.
+func (i *TD) Accepted() int         { return i.guest.Accepted() }
+func (i *TD) Asked(path string) int { return i.guest.Asked(path) }
+
+// Logged is how many times the TD's guest logged message.
+func (i *TD) Logged(message string) int { return i.guest.Logged(message) }
+
+// Cut closes every connection the TD's guest has accepted so far.
+func (i *TD) Cut() { i.guest.Cut() }
+
 func (i *TD) Handle() sessiond.Handle { return i.handle }
 func (i *TD) Done() <-chan struct{}   { return i.done }
 
@@ -79,7 +91,7 @@ func (r *Runner) Start(context.Context, sessiond.Spec) (sessiond.Instance, error
 	if r.fail != nil {
 		return nil, r.fail
 	}
-	td := &TD{guest: r.first.Twin(r.t, nil), done: make(chan struct{})}
+	td := &TD{guest: r.first.Twin(r.t, r.sandbox), done: make(chan struct{})}
 	td.handle = sessiond.Handle{PID: 1000 + len(r.started), Start: 1}
 	r.started = append(r.started, td)
 	return td, nil
@@ -165,17 +177,24 @@ type Host struct {
 // running. mutate may change the daemon's configuration first.
 func NewHost(t testing.TB, depth int, mutate func(*sessiond.Config)) *Host {
 	t.Helper()
-	return newHost(t, depth, mutate, false)
+	return newHost(t, depth, mutate, false, nil)
+}
+
+// NewHostWithSandbox is NewHost for a pool whose guests run sandbox from the
+// image a bind names, and take no bind that names none.
+func NewHostWithSandbox(t testing.TB, depth int, sandbox sessionsim.Sandbox) *Host {
+	t.Helper()
+	return newHost(t, depth, nil, false, sandbox)
 }
 
 // NewHostWithKeyService is NewHost for a pool whose launch document pins a
 // key service, which runs beside the host.
 func NewHostWithKeyService(t testing.TB, depth int, mutate func(*sessiond.Config)) *Host {
 	t.Helper()
-	return newHost(t, depth, mutate, true)
+	return newHost(t, depth, mutate, true, nil)
 }
 
-func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService bool) *Host {
+func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService bool, sandbox sessionsim.Sandbox) *Host {
 	t.Helper()
 	pool := sessionsim.NewPool(t)
 	var service *keyservicetest.Sim
@@ -186,7 +205,7 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 	}
 	first := pool.Boot(t, nil, pin)
 	h := &Host{
-		t: t, Runner: &Runner{t: t, first: first}, Engine: sessionsim.Engine(), KeyService: service,
+		t: t, Runner: &Runner{t: t, first: first, sandbox: sandbox}, Engine: sessionsim.Engine(), KeyService: service,
 		ManifestPath: first.ManifestPath, LaunchKeyPath: first.LaunchKeyPath,
 	}
 	var err error

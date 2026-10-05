@@ -372,3 +372,47 @@ func TestReachUsageErrors(t *testing.T) {
 		}
 	}
 }
+
+// A start given a command sends it with the bind: the guest runs it as its
+// session's first, and the start prints what it wrote once the session has
+// verified. The guest is asked for no command over its own route, and the
+// command's status is reported without changing the start's.
+func TestStartCarriesTheSessionsFirstCommand(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	s := starting(t, host, "sbx-1")
+	marker := filepath.Join(t.TempDir(), "ran")
+	s.command = []string{"sh", "-c", `echo ran >> "$0"; echo out; echo err >&2; exit 7`, marker}
+	res := start(t, s)
+	if !res.Started || res.FirstCommand == nil {
+		t.Fatalf("start result = %+v", res)
+	}
+	first := res.FirstCommand
+	if !first.WithBind || first.ExitCode != 7 || string(first.Stdout) != "out\n" || string(first.Stderr) != "err\n" {
+		t.Fatalf("the first command: %+v", first)
+	}
+	guest := host.Runner.All()[0]
+	if n := guest.Asked(session.PathExec); n != 0 {
+		t.Fatalf("the guest was asked for %d commands over its own route", n)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "ran\n" {
+		t.Fatalf("the command ran %q times: %v", data, err)
+	}
+	// The session goes on under the binding the start wrote.
+	var stdout, stderr bytes.Buffer
+	flags := &trust{binding: s.out, manifest: s.manifest, timeout: s.timeout, engineForTest: s.engineForTest}
+	if code := runExec(context.Background(), flags, session.ExecRequest{Argv: []string{"cat", marker}}, &stdout, &stderr); code != 0 || stdout.String() != "ran\n" {
+		t.Fatalf("exec exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
+	}
+
+	// As text, the command's output follows the start's own.
+	text := starting(t, host, "sbx-2")
+	text.command = []string{"echo", "hello"}
+	stdout.Reset()
+	stderr.Reset()
+	if code := runStart(context.Background(), text, false, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("start exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	if out := stdout.String(); !strings.Contains(out, "first command exit 0, sent with the bind\nhello\n") || !strings.HasSuffix(out, "hello\n") {
+		t.Fatalf("start printed %q", out)
+	}
+}

@@ -14,12 +14,19 @@ import "google/protobuf/timestamp.proto";
 option go_package = "github.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1";
 
 service Sessions {
-  // Claim reserves a ready TD of a pool for a session and fences it: no
-  // connection opened to the guest before the claim survives it.
+  // Claim reserves a ready TD of a pool for a session, in the daemon's own
+  // record. The guest is asked nothing: it learns of the claim from the bind.
   rpc Claim(ClaimRequest) returns (Claimed);
-  // Bind hands a claimed TD its bind and returns the guest's evidence, fresh
-  // over the bind's own nonce.
-  rpc Bind(BindRequest) returns (Bound);
+  // Bind hands a claimed TD its bind and returns the guest's receipt for it.
+  // The guest raises its fence as the bind arrives: no connection opened to
+  // it before survives. The first message carries the bind, and may carry
+  // the session's first command, sealed for the guest; a command may also
+  // come alone in the next message. The first answer is the receipt. If the
+  // guest took a command, a second answer follows with its sealed result. A
+  // call whose bind came with no command ends once its caller has closed its
+  // side, and one repeated because its answer was lost sends the same
+  // command with the bind: the guest answers both as it answered the first.
+  rpc Bind(stream BindRequest) returns (stream Bound);
   // Connect carries bytes to and from the TLS port of a bound TD, and
   // terminates nothing: the caller's TLS session ends in the guest.
   rpc Connect(stream Bytes) returns (stream Bytes);
@@ -56,8 +63,12 @@ message BindRequest {
   // c8s-bind/v1, canonical JSON, and its signature.
   bytes bind = 3;
   bytes signature = 4;
-  // Disks arrive with the disk slots.
-  reserved 5;
+  // Disks and layers arrive with the disk slots.
+  reserved 5, 6;
+  // The session's first command, sealed to the guest's one-time KEM key
+  // under the bind: with the bind, or alone in the next message of the call.
+  // The daemon carries it unread.
+  bytes command = 7;
 }
 
 message Bound {
@@ -68,6 +79,14 @@ message Bound {
   // over the same nonce is in the evidence if the guest had it by then, and
   // in what GetEvidence returns once it has.
   bytes receipt = 2;
+  // In a later message than the receipt: the first command's output and
+  // status, sealed back to whoever sealed the command.
+  bytes command_result = 3;
+  // What became of a first command: taken, unopened or too_late, as the
+  // guest says. With the receipt for a command that came with the bind, and
+  // in a message of its own for one that came after. A result follows only
+  // what was taken.
+  string command = 4;
 }
 
 // Evidence is what a guest says of itself, relayed unread. Each part is

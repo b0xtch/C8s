@@ -37,12 +37,19 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type SessionsClient interface {
-	// Claim reserves a ready TD of a pool for a session and fences it: no
-	// connection opened to the guest before the claim survives it.
+	// Claim reserves a ready TD of a pool for a session, in the daemon's own
+	// record. The guest is asked nothing: it learns of the claim from the bind.
 	Claim(ctx context.Context, in *ClaimRequest, opts ...grpc.CallOption) (*Claimed, error)
-	// Bind hands a claimed TD its bind and returns the guest's evidence, fresh
-	// over the bind's own nonce.
-	Bind(ctx context.Context, in *BindRequest, opts ...grpc.CallOption) (*Bound, error)
+	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
+	// The guest raises its fence as the bind arrives: no connection opened to
+	// it before survives. The first message carries the bind, and may carry
+	// the session's first command, sealed for the guest; a command may also
+	// come alone in the next message. The first answer is the receipt. If the
+	// guest took a command, a second answer follows with its sealed result. A
+	// call whose bind came with no command ends once its caller has closed its
+	// side, and one repeated because its answer was lost sends the same
+	// command with the bind: the guest answers both as it answered the first.
+	Bind(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BindRequest, Bound], error)
 	// Connect carries bytes to and from the TLS port of a bound TD, and
 	// terminates nothing: the caller's TLS session ends in the guest.
 	Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[Bytes, Bytes], error)
@@ -71,19 +78,22 @@ func (c *sessionsClient) Claim(ctx context.Context, in *ClaimRequest, opts ...gr
 	return out, nil
 }
 
-func (c *sessionsClient) Bind(ctx context.Context, in *BindRequest, opts ...grpc.CallOption) (*Bound, error) {
+func (c *sessionsClient) Bind(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BindRequest, Bound], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(Bound)
-	err := c.cc.Invoke(ctx, Sessions_Bind_FullMethodName, in, out, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[0], Sessions_Bind_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	x := &grpc.GenericClientStream[BindRequest, Bound]{ClientStream: stream}
+	return x, nil
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_BindClient = grpc.BidiStreamingClient[BindRequest, Bound]
 
 func (c *sessionsClient) Connect(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[Bytes, Bytes], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[0], Sessions_Connect_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[1], Sessions_Connect_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -118,12 +128,19 @@ func (c *sessionsClient) GetEvidence(ctx context.Context, in *EvidenceRequest, o
 // All implementations must embed UnimplementedSessionsServer
 // for forward compatibility.
 type SessionsServer interface {
-	// Claim reserves a ready TD of a pool for a session and fences it: no
-	// connection opened to the guest before the claim survives it.
+	// Claim reserves a ready TD of a pool for a session, in the daemon's own
+	// record. The guest is asked nothing: it learns of the claim from the bind.
 	Claim(context.Context, *ClaimRequest) (*Claimed, error)
-	// Bind hands a claimed TD its bind and returns the guest's evidence, fresh
-	// over the bind's own nonce.
-	Bind(context.Context, *BindRequest) (*Bound, error)
+	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
+	// The guest raises its fence as the bind arrives: no connection opened to
+	// it before survives. The first message carries the bind, and may carry
+	// the session's first command, sealed for the guest; a command may also
+	// come alone in the next message. The first answer is the receipt. If the
+	// guest took a command, a second answer follows with its sealed result. A
+	// call whose bind came with no command ends once its caller has closed its
+	// side, and one repeated because its answer was lost sends the same
+	// command with the bind: the guest answers both as it answered the first.
+	Bind(grpc.BidiStreamingServer[BindRequest, Bound]) error
 	// Connect carries bytes to and from the TLS port of a bound TD, and
 	// terminates nothing: the caller's TLS session ends in the guest.
 	Connect(grpc.BidiStreamingServer[Bytes, Bytes]) error
@@ -145,8 +162,8 @@ type UnimplementedSessionsServer struct{}
 func (UnimplementedSessionsServer) Claim(context.Context, *ClaimRequest) (*Claimed, error) {
 	return nil, status.Error(codes.Unimplemented, "method Claim not implemented")
 }
-func (UnimplementedSessionsServer) Bind(context.Context, *BindRequest) (*Bound, error) {
-	return nil, status.Error(codes.Unimplemented, "method Bind not implemented")
+func (UnimplementedSessionsServer) Bind(grpc.BidiStreamingServer[BindRequest, Bound]) error {
+	return status.Error(codes.Unimplemented, "method Bind not implemented")
 }
 func (UnimplementedSessionsServer) Connect(grpc.BidiStreamingServer[Bytes, Bytes]) error {
 	return status.Error(codes.Unimplemented, "method Connect not implemented")
@@ -196,23 +213,12 @@ func _Sessions_Claim_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Sessions_Bind_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(BindRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SessionsServer).Bind(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Sessions_Bind_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SessionsServer).Bind(ctx, req.(*BindRequest))
-	}
-	return interceptor(ctx, in, info, handler)
+func _Sessions_Bind_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(SessionsServer).Bind(&grpc.GenericServerStream[BindRequest, Bound]{ServerStream: stream})
 }
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_BindServer = grpc.BidiStreamingServer[BindRequest, Bound]
 
 func _Sessions_Connect_Handler(srv interface{}, stream grpc.ServerStream) error {
 	return srv.(SessionsServer).Connect(&grpc.GenericServerStream[Bytes, Bytes]{ServerStream: stream})
@@ -269,10 +275,6 @@ var Sessions_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Sessions_Claim_Handler,
 		},
 		{
-			MethodName: "Bind",
-			Handler:    _Sessions_Bind_Handler,
-		},
-		{
 			MethodName: "Destroy",
 			Handler:    _Sessions_Destroy_Handler,
 		},
@@ -282,6 +284,12 @@ var Sessions_ServiceDesc = grpc.ServiceDesc{
 		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Bind",
+			Handler:       _Sessions_Bind_Handler,
+			ServerStreams: true,
+			ClientStreams: true,
+		},
 		{
 			StreamName:    "Connect",
 			Handler:       _Sessions_Connect_Handler,

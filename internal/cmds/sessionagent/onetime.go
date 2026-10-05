@@ -141,3 +141,30 @@ func (o *oneTime) gone() bool {
 	defer o.mu.Unlock()
 	return o.signing == nil && o.kem == nil
 }
+
+// open opens a first command sealed to the one-time KEM key, under bind, and
+// erases the key: it opens one command, or none. A second call finds no key.
+func (o *oneTime) open(bind *session.SignedBind, sealed []byte) (*session.OpenedFirstCommand, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.kem == nil {
+		return nil, errKEMGone
+	}
+	var opened *session.OpenedFirstCommand
+	var err error
+	inSecret(func() {
+		key, e := hpke.MLKEM768X25519().NewPrivateKey(o.kem)
+		if e != nil {
+			err = e
+			return
+		}
+		opened, err = session.OpenFirstCommand(key, bind, sealed)
+	})
+	clear(o.kem)
+	o.kem, o.used = nil, true
+	return opened, err
+}
+
+// errKEMGone is a first command that came after the guest erased the key it
+// would have opened under.
+var errKEMGone = errors.New("the guest's one-time KEM key is gone")

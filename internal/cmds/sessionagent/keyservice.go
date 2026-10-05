@@ -190,6 +190,7 @@ func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind, receipt *
 	}
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
 	defer cancel()
+	asked := time.Now()
 	answer, err := ks.client.Acquire(ctx, &keyservice.AcquireRequest{
 		Bind: bind.Raw, BindSignature: bind.Signature, Receipt: receipt,
 		EncryptionKey: ks.key.Public(), EncryptionKeySignature: ks.signature,
@@ -198,6 +199,7 @@ func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind, receipt *
 	if err != nil {
 		return fmt.Errorf("take the bind's stored credentials: %w", err)
 	}
+	answered := time.Since(asked)
 	sealed := map[string][]byte{}
 	for _, c := range answer.Credentials {
 		sealed[c.Name] = c.Ciphertext
@@ -221,6 +223,7 @@ func (a *Agent) acquire(ctx context.Context, bind *session.SignedBind, receipt *
 		}
 	}
 	recordStep(ctx, stepCredentials, time.Since(began))
-	a.log.Info("took stored credentials from the key service", "count", len(names))
+	a.log.Info("took stored credentials from the key service", "count", len(names),
+		"took_us", time.Since(began).Microseconds(), "answered_us", answered.Microseconds())
 	return nil
 }

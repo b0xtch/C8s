@@ -56,3 +56,18 @@ func NewTestMemory(reserveMB int, rest bool, read func() ([]byte, error), accept
 // OneTimeKeysGone reports whether the guest has erased both of its one-time
 // keys.
 func OneTimeKeysGone(a *Agent) bool { return a.oneTime.gone() }
+
+// OneTimeKEMGone reports whether the guest has erased its one-time KEM key.
+func OneTimeKEMGone(a *Agent) bool {
+	a.oneTime.mu.Lock()
+	defer a.oneTime.mu.Unlock()
+	return a.oneTime.kem == nil
+}
+
+// CommandState is what became of the guest's first command so far: empty
+// while one may still come.
+func CommandState(a *Agent) string {
+	a.command.mu.Lock()
+	defer a.command.mu.Unlock()
+	return a.command.state
+}

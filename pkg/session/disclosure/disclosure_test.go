@@ -50,10 +50,14 @@ func TestEncodeTakesWhatAGuestSays(t *testing.T) {
 		"a guest with no event yet": {disclosure.MessageState, session.StateResponse{
 			Phase: session.PhaseReady, InstanceKey: []byte("key"), Launch: []byte("launch"), Signature: "c2ln", Events: []string{},
 		}},
-		"a fence":           {disclosure.MessageFence, session.FenceResponse{Phase: session.PhaseReady, Closed: 3}},
 		"a bind's answer":   {disclosure.MessageBound, session.BindResponse{Phase: session.PhaseRunning, Admission: steps, Attestation: attestation()}},
 		"a bind sent again": {disclosure.MessageBound, session.BindResponse{Phase: session.PhaseRunning, Replayed: true}},
-		"the platform":      {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: "platform"}},
+		"a bind that came with a command": {disclosure.MessageBound, session.BindResponse{
+			Phase: session.PhaseRunning, Command: session.CommandTaken, Admission: steps, Attestation: attestation(),
+		}},
+		"a command's sealed answer":    {disclosure.MessageCommand, session.CommandAnswer{Command: session.CommandTaken, Answer: []byte("ciphertext")}},
+		"a command that came too late": {disclosure.MessageCommand, session.CommandAnswer{Command: session.CommandTooLate}},
+		"the platform":                 {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: "platform"}},
 	} {
 		want, err := json.Marshal(tc.value)
 		if err != nil {
@@ -92,11 +96,11 @@ func TestEncodeHoldsBackWhatTheSchemaDoesNotList(t *testing.T) {
 		"a null code":                {disclosure.MessageRefusal, map[string]any{"error": nil}},
 		"a list for a message":       {disclosure.MessageRefusal, []string{secret}},
 		"a message of no schema":     {"log", map[string]any{"line": secret}},
-		"a phase outside the list":   {disclosure.MessageFence, map[string]any{"phase": secret, "closed": 0}},
-		"a negative counter":         {disclosure.MessageFence, map[string]any{"phase": "ready", "closed": -1}},
-		"a counter beyond its bound": {disclosure.MessageFence, map[string]any{"phase": "ready", "closed": 1 << 20}},
-		"a counter with a fraction":  {disclosure.MessageFence, map[string]any{"phase": "ready", "closed": 1.5}},
-		"a counter as text":          {disclosure.MessageFence, map[string]any{"phase": "ready", "closed": secret}},
+		"a phase outside the list":   {disclosure.MessageBound, map[string]any{"phase": secret}},
+		"a negative counter":         {disclosure.MessageStep, map[string]any{"name": "start", "us": -1}},
+		"a counter beyond its bound": {disclosure.MessageStep, map[string]any{"name": "start", "us": 1 << 40}},
+		"a counter with a fraction":  {disclosure.MessageStep, map[string]any{"name": "start", "us": 1.5}},
+		"a counter as text":          {disclosure.MessageStep, map[string]any{"name": "start", "us": secret}},
 		"a flag as text":             {disclosure.MessageBound, map[string]any{"phase": "running", "replayed": secret}},
 		"a step outside the list": {disclosure.MessageBound, session.BindResponse{
 			Phase: session.PhaseRunning, Admission: []session.AdmissionStep{{Name: secret, Micros: 1}},
@@ -137,8 +141,17 @@ func TestEncodeHoldsBackWhatTheSchemaDoesNotList(t *testing.T) {
 		"evidence beyond its bound": {disclosure.MessageAttestation, map[string]any{
 			"evidence": map[string]any{"platform": "tdx", "evidence": map[string]any{"quote": long}}, "phase": "running", "launch": "bGF1bmNo", "signature": "c2ln", "events": []string{},
 		}},
-		"a platform CA outside the list": {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: secret}},
-		"a value that does not render":   {disclosure.MessageRefusal, map[string]any{"error": make(chan int)}},
+		"a platform CA outside the list":  {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: secret}},
+		"a command's fate in words":       {disclosure.MessageCommand, map[string]any{"command": secret}},
+		"a command's answer in the clear": {disclosure.MessageCommand, map[string]any{"command": "taken", "answer": secret + " !"}},
+		"a command's answer with its result beside it": {disclosure.MessageCommand, map[string]any{
+			"command": "taken", "answer": "AAAA", "stdout": secret,
+		}},
+		"a command's answer beyond its bound": {disclosure.MessageCommand, session.CommandAnswer{
+			Command: session.CommandTaken, Answer: make([]byte, 4<<20+1),
+		}},
+		"a command's fate in a bind's answer, in words": {disclosure.MessageBound, map[string]any{"phase": "running", "command": secret}},
+		"a value that does not render":                  {disclosure.MessageRefusal, map[string]any{"error": make(chan int)}},
 	} {
 		got, err := disclosure.Encode(tc.message, tc.value)
 		if err == nil {
@@ -224,7 +237,7 @@ func checkField(t *testing.T, message string, field *disclosure.Field, messages 
 			t.Errorf("%s: a code with no list", at)
 		}
 	case disclosure.KindFlag, disclosure.KindDigest:
-	case disclosure.KindCounter, disclosure.KindPublic:
+	case disclosure.KindCounter, disclosure.KindPublic, disclosure.KindSealed:
 		if field.Max <= 0 {
 			t.Errorf("%s: no bound", at)
 		}

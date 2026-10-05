@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"sync"
 	"time"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
@@ -18,8 +20,9 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/types"
 )
 
-// maxGuestAnswer bounds what the daemon reads of one answer of a guest.
-const maxGuestAnswer = 4 << 20
+// maxGuestAnswer bounds what the daemon reads of one answer of a guest: its
+// evidence, or a first command's sealed answer in base64.
+const maxGuestAnswer = 8 << 20
 
 // guestClient is how the daemon talks to the agents of its TDs. It verifies
 // nothing: the daemon is outside the trust boundary, relays what a guest says
@@ -27,7 +30,7 @@ const maxGuestAnswer = 4 << 20
 //
 // It keeps a connection to each guest between requests, so that a claim and
 // the bind after it cost no handshake: a guest takes a bind on the connection
-// its fence was raised on. A connection the guest closed since is replaced
+// its host has kept since it became ready. A connection the guest closed since is replaced
 // by the next request, which every request here may be sent again for.
 type guestClient struct {
 	http *http.Client
@@ -83,27 +86,51 @@ func (r *refusal) Error() string {
 // errBusy is a guest's "try again".
 var errBusy = errors.New("the guest is busy")
 
-// do sends one request and returns the answer's body and the certificate the
-// guest served it under.
-func (g *guestClient) do(ctx context.Context, addr, method, path string, body []byte) (data, leaf []byte, err error) {
+// send sends one request and returns the guest's answer, unread.
+func (g *guestClient) send(ctx context.Context, addr, method, path string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, "https://"+addr+path, bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if method != http.MethodGet {
-		// A guest answers a fence or a bind sent twice as it answered the
-		// first. This has the transport send one again when the kept
+		// A guest answers a bind sent twice as it answered the first. This
+		// has the transport send one again when the kept
 		// connection it chose turns out to be closed.
 		req.Header.Set("Idempotency-Key", "repeatable")
 	}
-	resp, err := g.http.Do(req)
+	return g.http.Do(req)
+}
+
+// answered is nil for an answer that is one, errBusy for a guest that says to
+// come back, and the guest's refusal otherwise, which it reads from the body.
+func answered(resp *http.Response) error {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return nil
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return errBusy
+	}
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	var answer types.ErrorResponse
+	_ = json.Unmarshal(data, &answer)
+	// A guest refuses with a code. The words for it are this side's.
+	return &refusal{status: resp.StatusCode, code: answer.Error, message: disclosure.Describe(answer.Error)}
+}
+
+// do sends one request and returns the answer's body and the certificate the
+// guest served it under.
+func (g *guestClient) do(ctx context.Context, addr, method, path string, body []byte) (data, leaf []byte, err error) {
+	resp, err := g.send(ctx, addr, method, path, body)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
+	if err := answered(resp); err != nil {
+		return nil, nil, err
+	}
 	data, err = io.ReadAll(io.LimitReader(resp.Body, maxGuestAnswer+1))
 	if err != nil {
 		return nil, nil, err
@@ -114,16 +141,7 @@ func (g *guestClient) do(ctx context.Context, addr, method, path string, body []
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		leaf = resp.TLS.PeerCertificates[0].Raw
 	}
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return data, leaf, nil
-	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
-		return nil, nil, errBusy
-	}
-	var answer types.ErrorResponse
-	_ = json.Unmarshal(data, &answer)
-	// A guest refuses with a code. The words for it are this side's.
-	return nil, nil, &refusal{status: resp.StatusCode, code: answer.Error, message: disclosure.Describe(answer.Error)}
+	return data, leaf, nil
 }
 
 // state asks the guest what it says of itself, and under which certificate.
@@ -140,32 +158,14 @@ func (g *guestClient) state(ctx context.Context, addr string) (*session.StateRes
 }
 
 // ready returns what the guest says of itself once it serves and waits for a
-// bind, with whatever its launch document has it prepare done. Nil is a
-// guest that is not there yet.
-func (g *guestClient) ready(ctx context.Context, addr string) *session.StateResponse {
-	state, _, err := g.state(ctx, addr)
+// bind, with whatever its launch document has it prepare done, and the
+// certificate it said it under. Nil is a guest that is not there yet.
+func (g *guestClient) ready(ctx context.Context, addr string) (state *session.StateResponse, leaf []byte) {
+	state, leaf, err := g.state(ctx, addr)
 	if err != nil || state.Phase != session.PhaseReady || !state.Prepared {
-		return nil
+		return nil, nil
 	}
-	return state
-}
-
-// fence has a ready guest cut every other connection it accepted so far. The
-// answer says whether the guest is still nobody's, and leaf is the
-// certificate it came under.
-func (g *guestClient) fence(ctx context.Context, addr string) (leaf []byte, err error) {
-	data, leaf, err := g.do(ctx, addr, http.MethodPost, session.PathFence, nil)
-	if err != nil {
-		return nil, err
-	}
-	var answer session.FenceResponse
-	if err := json.Unmarshal(data, &answer); err != nil {
-		return nil, fmt.Errorf("the guest's answer to the fence: %w", err)
-	}
-	if answer.Phase != session.PhaseReady {
-		return nil, fmt.Errorf("the guest is %s, not ready: somebody bound it", answer.Phase)
-	}
-	return leaf, nil
+	return state, leaf
 }
 
 // collateral is the vendor's documents as the guest keeps them, or nil.
@@ -223,32 +223,126 @@ func attested(leaf []byte, att *session.AttestResponse) (*sessionv1alpha1.Eviden
 	}, nil
 }
 
-// bind hands the guest its bind and returns the guest's answer: its receipt
-// for the bind, as it sent it, and its evidence. The evidence holds the quote
-// over the bind's nonce if the guest had it by then. Otherwise it holds the
-// certificate and the phase alone: the receipt says the rest, and the quote
-// comes with the guest's evidence once the guest has it.
-func (g *guestClient) bind(ctx context.Context, addr string, bind, signature []byte) (evidence *sessionv1alpha1.Evidence, receipt []byte, err error) {
-	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature)})
+// commandWait waits for the sealed answer of a first command a guest took
+// with its bind: the second document of the guest's answer.
+type commandWait func() (*session.CommandAnswer, error)
+
+// bound is a guest's answer to a bind, as the daemon relays it.
+type boundAnswer struct {
+	evidence *sessionv1alpha1.Evidence
+	receipt  []byte
+	// command is what became of a first command that came with the bind,
+	// and wait how its sealed answer is waited for, when it was taken.
+	command string
+	wait    commandWait
+}
+
+// bind hands the guest its bind, with a first command sealed for it if one
+// came, and returns the guest's answer: its receipt for the bind, as it sent
+// it, and its evidence. The evidence holds the quote over the bind's nonce if
+// the guest had it by then. Otherwise it holds the certificate and the phase
+// alone: the receipt says the rest, and the quote comes with the guest's
+// evidence once the guest has it. A guest that took the command sends its
+// sealed answer after that, once the command has run. wrote, if given, is
+// called once the bind has been written to the guest's connection.
+func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, command []byte, wrote func()) (*boundAnswer, error) {
+	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature), Command: command})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	data, leaf, err := g.do(ctx, addr, http.MethodPost, session.PathBind, body)
+	if wrote != nil {
+		ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(info httptrace.WroteRequestInfo) {
+			if info.Err == nil {
+				wrote()
+			}
+		}})
+	}
+	resp, err := g.send(ctx, addr, http.MethodPost, session.PathBind, body)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
+	}
+	// The answer is one document, or two for a command that was taken. The
+	// body stays open until the last is read.
+	documents := json.NewDecoder(io.LimitReader(resp.Body, maxGuestAnswer))
+	if err := answered(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
 	}
 	var answer session.BindResponse
-	if err := json.Unmarshal(data, &answer); err != nil {
-		return nil, nil, fmt.Errorf("the guest's answer to the bind: %w", err)
+	if err := documents.Decode(&answer); err != nil {
+		resp.Body.Close()
+		return nil, fmt.Errorf("the guest's answer to the bind: %w", err)
 	}
+	var leaf []byte
+	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
+		leaf = resp.TLS.PeerCertificates[0].Raw
+	}
+	out := &boundAnswer{command: answer.Command}
 	if answer.Receipt != nil {
-		if receipt, err = json.Marshal(answer.Receipt); err != nil {
-			return nil, nil, err
+		if out.receipt, err = json.Marshal(answer.Receipt); err != nil {
+			resp.Body.Close()
+			return nil, err
 		}
 	}
 	if answer.Attestation != nil {
-		evidence, err = attested(leaf, answer.Attestation)
-		return evidence, receipt, err
+		if out.evidence, err = attested(leaf, answer.Attestation); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+	} else {
+		out.evidence = &sessionv1alpha1.Evidence{Certificate: leaf, Phase: string(answer.Phase)}
 	}
-	return &sessionv1alpha1.Evidence{Certificate: leaf, Phase: string(answer.Phase)}, receipt, nil
+	if answer.Command != session.CommandTaken {
+		// Read to its end, so that the connection is kept for the next request.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return out, nil
+	}
+	var once sync.Once
+	var result session.CommandAnswer
+	var failed error
+	out.wait = func() (*session.CommandAnswer, error) {
+		once.Do(func() {
+			defer resp.Body.Close()
+			if failed = documents.Decode(&result); failed != nil {
+				failed = fmt.Errorf("the guest's answer to the first command: %w", failed)
+				return
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+		})
+		if failed != nil {
+			return nil, failed
+		}
+		return &result, nil
+	}
+	return out, nil
+}
+
+// command hands a guest that is taking its bind a first command that
+// followed the bind, and waits for what became of it.
+//
+// It goes on a connection of its own, since the bind's is taken until the
+// guest has answered. A bind ends every connection its guest accepted before
+// it arrived, and one made as the bind was written may be among them: it
+// breaks, or the guest refuses what came on it unread. A second, made after
+// that, is one the guest lets in, and the guest answers a command it is sent
+// twice as it answered the first.
+func (g *guestClient) command(ctx context.Context, addr string, sealed []byte) (*session.CommandAnswer, error) {
+	body, err := json.Marshal(session.CommandRequest{Command: sealed})
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := g.do(ctx, addr, http.MethodPost, session.PathBindCommand, body)
+	var refused *refusal
+	if err != nil && ctx.Err() == nil && (!errors.As(err, &refused) || refused.code == string(disclosure.Fenced)) {
+		data, _, err = g.do(ctx, addr, http.MethodPost, session.PathBindCommand, body)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var answer session.CommandAnswer
+	if err := json.Unmarshal(data, &answer); err != nil {
+		return nil, fmt.Errorf("the guest's answer to the first command: %w", err)
+	}
+	return &answer, nil
 }

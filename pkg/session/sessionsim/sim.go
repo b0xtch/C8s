@@ -14,11 +14,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +42,13 @@ type Sandbox interface {
 	Dial(ctx context.Context, port int) (net.Conn, error)
 }
 
+// Preparing is a Sandbox that is told when its guest prepares the image a
+// bind names: after the guest measured the bind, and before it measures the
+// image or starts anything. A test holds a bind there.
+type Preparing interface {
+	Prepare(ctx context.Context, image *session.Sandbox) error
+}
+
 // Guest is one guest that nobody has bound, served on loopback.
 type Guest struct {
 	// URL is the agent's address: https://127.0.0.1:<port>.
@@ -61,8 +69,9 @@ type Guest struct {
 	keyService *session.KeyService
 	// stop ends the guest.
 	stop func()
-	// accepted counts the connections the guest's agent accepted.
-	accepted *atomic.Int64
+	// reached is what reached the guest's agent: the connections it
+	// accepted and the requests it was sent.
+	reached *reached
 }
 
 // Close ends the guest before its test does, as a host ends a guest: its
@@ -233,10 +242,11 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 		runner = &simulated{ProcessRunner: process, sandbox: sandbox, ctx: ctx}
 	}
 	keys := filepath.Join(bundle, session.OpkeyDir)
+	seen := &reached{asked: map[string]int{}, said: map[string]int{}}
 	agent, err := sessionagent.Stage(ctx, sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(keys, session.PubkeyFile), LaunchDir: keys,
 		CredentialDir: credentials, TEE: sessiontest.TEE{TD: td}, Runner: runner, Bare: sandbox == nil,
-		Engine: sessiontest.Engine{}, KeyServiceDial: dial,
+		Engine: sessiontest.Engine{}, KeyServiceDial: dial, Logger: slog.New(said{Handler: slog.Default().Handler(), reached: seen}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -251,9 +261,15 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	if err != nil {
 		t.Fatal(err)
 	}
-	accepted := new(atomic.Int64)
 	srv := agent.Server()
-	go func() { _ = agent.Serve(srv, countingListener{Listener: ln, accepted: accepted}) }()
+	inner := srv.Handler
+	srv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.mu.Lock()
+		seen.asked[r.URL.Path]++
+		seen.mu.Unlock()
+		inner.ServeHTTP(w, r)
+	})
+	go func() { _ = agent.Serve(srv, countingListener{Listener: ln, reached: seen}) }()
 	go agent.OpenKeyService(ctx)
 	stop := sync.OnceFunc(func() {
 		_ = srv.Close()
@@ -262,27 +278,98 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	t.Cleanup(stop)
 	return &Guest{
 		URL: "https://" + ln.Addr().String(), ManifestPath: manifest, LaunchKeyPath: filepath.Join(keys, session.PubkeyFile),
-		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop, accepted: accepted,
+		td: td, launchKey: launchKey, pinned: pinned, keyService: keyService, stop: stop, reached: seen,
 	}
 }
 
-// countingListener counts the connections a guest accepted.
+// reached is what reached a guest's agent, and what the agent logged.
+type reached struct {
+	mu       sync.Mutex
+	accepted int
+	conns    []net.Conn
+	asked    map[string]int
+	said     map[string]int
+}
+
+// said counts a guest's log records by their message, and passes them on.
+type said struct {
+	slog.Handler
+	reached *reached
+}
+
+func (s said) Handle(ctx context.Context, record slog.Record) error {
+	s.reached.mu.Lock()
+	s.reached.said[record.Message]++
+	s.reached.mu.Unlock()
+	return s.Handler.Handle(ctx, record)
+}
+
+func (s said) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return said{Handler: s.Handler.WithAttrs(attrs), reached: s.reached}
+}
+
+func (s said) WithGroup(name string) slog.Handler {
+	return said{Handler: s.Handler.WithGroup(name), reached: s.reached}
+}
+
+// countingListener keeps the connections a guest accepted.
 type countingListener struct {
 	net.Listener
-	accepted *atomic.Int64
+	reached *reached
 }
 
 func (l countingListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err == nil {
-		l.accepted.Add(1)
+		l.reached.mu.Lock()
+		l.reached.accepted++
+		l.reached.conns = append(l.reached.conns, conn)
+		l.reached.mu.Unlock()
 	}
 	return conn, err
 }
 
 // Accepted is how many connections the guest has accepted since it began to
 // serve: what a test of who connects to a guest, and how often, counts.
-func (p *Guest) Accepted() int { return int(p.accepted.Load()) }
+func (p *Guest) Accepted() int {
+	p.reached.mu.Lock()
+	defer p.reached.mu.Unlock()
+	return p.reached.accepted
+}
+
+// Asked is how many requests the guest's agent was sent for path, or for any
+// path when path is empty.
+func (p *Guest) Asked(path string) int {
+	p.reached.mu.Lock()
+	defer p.reached.mu.Unlock()
+	if path != "" {
+		return p.reached.asked[path]
+	}
+	total := 0
+	for _, n := range p.reached.asked {
+		total += n
+	}
+	return total
+}
+
+// Logged is how many times the guest's agent logged message.
+func (p *Guest) Logged(message string) int {
+	p.reached.mu.Lock()
+	defer p.reached.mu.Unlock()
+	return p.reached.said[message]
+}
+
+// Cut closes every connection the guest has accepted so far, as a guest does
+// with one that sat idle, or a road with one it drops.
+func (p *Guest) Cut() {
+	p.reached.mu.Lock()
+	conns := p.reached.conns
+	p.reached.conns = nil
+	p.reached.mu.Unlock()
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+}
 
 // simulated is the runner of a guest whose sandbox is the test's own.
 type simulated struct {
@@ -293,8 +380,11 @@ type simulated struct {
 	image *session.Sandbox
 }
 
-func (s *simulated) Prepare(_ context.Context, image *session.Sandbox, _ *session.Egress) error {
+func (s *simulated) Prepare(ctx context.Context, image *session.Sandbox, _ *session.Egress) error {
 	s.image = image
+	if preparing, ok := s.sandbox.(Preparing); ok {
+		return preparing.Prepare(ctx, image)
+	}
 	return nil
 }
 

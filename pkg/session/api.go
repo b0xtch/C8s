@@ -14,15 +14,15 @@ import (
 // PathCredentials and PathForward require an operatorauth token signed by a
 // key the guest's bind authorizes for that route. PathState answers anyone
 // with what is public anyway: see StateResponse. PathBind is authorized by the
-// bind's own signature. PathFence answers anyone too: see FenceResponse. So
-// does PathCollateral: see CollateralResponse.
+// bind's own signature. PathCollateral answers anyone too: see
+// CollateralResponse.
 const (
 	AgentPort = 8443
 
 	PathHealth      = "/healthz"
 	PathState       = "/v1/state"
 	PathBind        = "/v1/bind"
-	PathFence       = "/v1/fence"
+	PathBindCommand = "/v1/bind/command"
 	PathAttest      = "/v1/attest"
 	PathExec        = "/v1/exec"
 	PathCredentials = "/v1/credentials/"
@@ -70,13 +70,16 @@ const MaxForwardRequestBytes = 256
 
 // Wire limits, shared so client and agent refuse the same things.
 const (
-	MaxRequestBytes  = 2 << 20
-	MaxExecArgs      = 256
-	MaxExecArgBytes  = 128 * 1024
-	MaxExecStdin     = 1 << 20
-	MaxExecOutput    = 1 << 20
-	MaxExecTimeout   = 600
-	DefaultExecLimit = 60
+	MaxRequestBytes = 2 << 20
+	// MaxBindRequestBytes bounds a bind as it is posted: the bind, and a
+	// first command sealed for it.
+	MaxBindRequestBytes = 4 << 20
+	MaxExecArgs         = 256
+	MaxExecArgBytes     = 128 * 1024
+	MaxExecStdin        = 1 << 20
+	MaxExecOutput       = 1 << 20
+	MaxExecTimeout      = 600
+	DefaultExecLimit    = 60
 )
 
 // AttestRequest asks for evidence bound to this nonce and the instance key.
@@ -155,6 +158,41 @@ const (
 type BindRequest struct {
 	Bind      []byte `json:"bind"`
 	Signature string `json:"signature"`
+	// Command is the session's first command, sealed to the guest's one-time
+	// KEM key: see SealFirstCommand. The guest opens it while it takes the
+	// bind, runs it once the sandbox runs, and sends its sealed answer after
+	// its answer to the bind, as a second document: see CommandAnswer.
+	Command []byte `json:"command,omitempty"`
+}
+
+// What became of a first command that came with a bind or after it.
+const (
+	// CommandTaken: the guest opened it, and runs it once the sandbox runs.
+	CommandTaken = string(disclosure.CommandTaken)
+	// CommandUnopened: it did not open under the guest's one-time KEM key
+	// and this bind. The guest read nothing of it and erased the key.
+	CommandUnopened = string(disclosure.CommandUnopened)
+	// CommandTooLate: it came after the guest had erased its one-time KEM
+	// key, which it does before the sandbox runs anything, or after another
+	// had been tried. It was not opened: its sender sends it over a
+	// connection of its own.
+	CommandTooLate = string(disclosure.CommandTooLate)
+)
+
+// CommandRequest hands a guest that is taking its bind the session's first
+// command, for a sender that had not sealed it when it sent the bind.
+type CommandRequest struct {
+	Command []byte `json:"command"`
+}
+
+// CommandAnswer is the sealed answer to a session's first command, as
+// FirstCommand.Open opens it. It follows the guest's answer to the bind the
+// command came with, as a second document, and answers PathBindCommand.
+type CommandAnswer struct {
+	// Command says what became of the command: CommandTaken with Answer, or
+	// why there is none.
+	Command string `json:"command"`
+	Answer  []byte `json:"answer,omitempty"`
 }
 
 // BindResponse reports the guest's phase once the bind is measured and its
@@ -163,6 +201,11 @@ type BindResponse struct {
 	Phase Phase `json:"phase"`
 	// Replayed: the guest was already bound by this same bind.
 	Replayed bool `json:"replayed,omitempty"`
+	// Command says what became of a first command that came with the bind:
+	// CommandTaken, CommandUnopened or CommandTooLate. After CommandTaken a
+	// second document follows this one, once the command has run: a
+	// CommandAnswer.
+	Command string `json:"command,omitempty"`
 	// Admission is how the guest spent the time between measuring the bind
 	// and running its sandbox, step by step in order.
 	Admission []AdmissionStep `json:"admission,omitempty"`
@@ -188,29 +231,6 @@ type BindResponse struct {
 type AdmissionStep struct {
 	Name   string `json:"name"`
 	Micros int64  `json:"us"`
-}
-
-// FenceResponse answers POST PathFence, which a guest's host sends when it
-// claims the guest for a session.
-//
-// A guest that is bound says so, and nothing changes. A guest still unbound
-// closes every other connection it accepted before the request and takes no
-// bind from one, then answers ready. Whoever held a connection to the guest
-// before, and whatever they had sent on it, can bind it no more: a bind after
-// this answer arrived on the connection that carried this request, or on one
-// opened after it.
-//
-// An answer of ready also says the guest has read no bind. One that is
-// reading a bind when the request comes answers 409 instead and changes
-// nothing: it holds a caller's bytes, so its host treats it as bound and
-// does not claim it.
-//
-// The route needs no key. It ends connections to a guest that belongs to
-// nobody, which its host can do anyway.
-type FenceResponse struct {
-	Phase Phase `json:"phase"`
-	// Closed is how many connections the fence ended.
-	Closed int `json:"closed"`
 }
 
 // ExecRequest runs one command in the sandbox context. ID makes the call

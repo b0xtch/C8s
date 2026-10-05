@@ -9,24 +9,25 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/streamend"
 )
 
-// fence tracks the connections the agent has accepted, so that an unbound
-// guest can end all of them at one point in time: the moment its host claims
-// it for a session. See session.FenceResponse.
+// fence tracks the connections the agent has accepted, so that a guest can
+// end all of them at one point in time: the moment its bind arrives.
 //
-// Every connection belongs to the epoch it was accepted in. Raising the fence
-// starts a new epoch and closes the connections of the earlier ones, all but
-// the one the fence was raised on, which becomes the new epoch's first:
-// whoever claims the guest may send its bind the same way. A bind is let in
-// only from a connection of the current epoch, before any of it is read, and
-// counts as in flight until the agent is done with it. The fence is not
-// raised over a bind in flight: the guest then holds something a caller sent
-// it, and is no longer as it was booted.
+// A pooled guest is nobody's until then, and whoever reached it before may
+// still hold a connection to it. The first bind to arrive raises the fence:
+// every connection but the one it came on is closed, so nothing sent to the
+// guest before its bind reaches the session. Every connection belongs to the
+// epoch it was accepted in, and raising the fence starts a new one, which the
+// bind's connection moves into. From then on a bind is let in only from that
+// connection or from one accepted since: a bind sent again after a lost
+// answer, which the guest answers as it answered the first.
 type fence struct {
 	mu    sync.Mutex
 	epoch uint64
 	conns map[*fencedConn]struct{}
-	// binds counts the binds let in and not yet finished.
-	binds int
+	// raised says a bind has arrived, and keeper is the connection it came
+	// on: nil for a bind handed to the agent with no connection.
+	raised bool
+	keeper *fencedConn
 }
 
 // fencedConn is one accepted connection and the epoch it was accepted in. It
@@ -76,63 +77,43 @@ func (f *fence) forget(c *fencedConn) {
 	delete(f.conns, c)
 }
 
-// enter lets a bind in from c, or reports that c is of an epoch the fence
-// ended. The caller has read none of the bind yet, and calls leave when the
-// agent is done with it.
-func (f *fence) enter(c *fencedConn) bool {
+// arrive is a bind arriving on c, before any of it is read. The first raises
+// the fence: it closes every connection accepted so far but c, and reports
+// how many. A later one is admitted only from the connection the first came
+// on or from one accepted since. A connection the fence ended whose request
+// was already on its way is not.
+func (f *fence) arrive(c *fencedConn) (admitted bool, closed int) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.epoch != 0 && (c == nil || c.epoch != f.epoch) {
-		return false
-	}
-	f.binds++
-	return true
-}
-
-func (f *fence) leave() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.binds--
-}
-
-// raise starts a new epoch and closes every connection of an earlier one but
-// keep, the connection the request to raise it came on, which it moves into
-// the new epoch. It returns how many it closed. With a bind in flight it does
-// neither, and reports false.
-func (f *fence) raise(keep *fencedConn) (closed int, ok bool) {
-	f.mu.Lock()
-	if f.binds > 0 {
+	if f.raised {
+		admitted = c == f.keeper || (c != nil && c.epoch == f.epoch)
 		f.mu.Unlock()
-		return 0, false
+		return admitted, 0
 	}
+	f.raised, f.keeper = true, c
 	f.epoch++
 	var stale []*fencedConn
-	for c := range f.conns {
-		if c != keep {
-			stale = append(stale, c)
+	for other := range f.conns {
+		if other != c {
+			stale = append(stale, other)
 		}
 	}
-	if keep != nil {
-		keep.epoch = f.epoch
+	if c != nil {
+		c.epoch = f.epoch
 	}
 	f.mu.Unlock()
 	// Outside the lock: Close takes it to forget the connection.
-	for _, c := range stale {
-		_ = c.Close()
+	for _, other := range stale {
+		_ = other.Close()
 	}
-	return len(stale), true
+	return true, len(stale)
 }
 
-// admits reports whether a bind may be taken from c. Before the fence was
-// ever raised, any connection will do, tracked or not. After, only the one it
-// was last raised on and those accepted since.
-func (f *fence) admits(c *fencedConn) bool {
+// follows reports whether c may send what follows a bind: a bind has arrived,
+// and c is the connection it came on or one accepted since.
+func (f *fence) follows(c *fencedConn) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.epoch == 0 {
-		return true
-	}
-	return c != nil && c.epoch == f.epoch
+	return f.raised && (c == f.keeper || (c != nil && c.epoch == f.epoch))
 }
 
 // fenceConnKey is the context key a request's connection is found under.

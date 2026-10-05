@@ -108,9 +108,8 @@ type Agent struct {
 	// stagedAt is when the launch document was measured.
 	stagedAt time.Time
 	// binding orders bind requests: the first decides what the rest find.
-	// The fence is raised under it too.
 	binding sync.Mutex
-	// fence cuts an unbound guest's connections when its host claims it.
+	// fence cuts a guest's connections when its bind arrives.
 	fence fence
 	// bound is closed when the first bind's sandbox has been admitted, or has
 	// failed to be.
@@ -147,6 +146,8 @@ type Agent struct {
 	// oneTime are the keys the guest makes for its one bind and erases
 	// before anything of the tenant runs.
 	oneTime *oneTime
+	// command is the first command the guest may take with its bind.
+	command firstCommand
 	// issued is the last certificate the guest issued under its one-time
 	// keys, DER, and readyCert the one it had when its bind came: what its
 	// state serves from then on, so that its receipt can be checked for as
@@ -477,8 +478,9 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	if err != nil {
 		return nil, nil, err
 	}
-	// What signing left on the heap is erased by a collection, which runs
-	// beside what follows and is done before the sandbox starts.
+	// What signing left on the heap, and opening a first command before it,
+	// is erased by a collection, which runs beside what follows and is done
+	// before the sandbox starts.
 	collected := make(chan struct{})
 	go func() {
 		defer close(collected)
@@ -491,8 +493,9 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	if err := a.acquire(ctx, bind, receipt); err != nil {
 		return nil, nil, err
 	}
-	// Nothing of the tenant has run yet, and the next step runs it.
-	a.oneTime.eraseKEM()
+	// Nothing of the tenant has run yet, and the next step runs it. A first
+	// command that has not come by now is not opened any more.
+	a.closeCommand()
 	<-collected
 	a.oneTime.collect()
 	if sandbox != nil {
@@ -623,10 +626,9 @@ var errNoSandbox = errors.New("this guest runs a session's code inside a sandbox
 var (
 	errAlreadyBound = errors.New("this guest is already bound by another bind")
 	errRetired      = errors.New("this guest takes no bind any more and is shutting down")
-	errFenced       = errors.New("this connection was opened before the guest was claimed, and the guest takes no bind from it")
+	errFenced       = errors.New("this connection was opened before the guest's bind arrived, and the guest takes no bind from it")
 	errNotReady     = errors.New("this guest takes no bind yet: its key service has not judged it")
 	errNoMachine    = errors.New("this guest's launch document lists no machine it may be, so it takes no bind")
-	errBindInFlight = errors.New("this guest is reading a bind: it is not as it was booted")
 	errBindTooLate  = errors.New("this guest waited for a bind longer than its launch document allows")
 	errClockLeft    = errors.New("this guest's kernel left the " + ownClockSource + " clocksource, so it cannot tell how long it waited for a bind")
 )
@@ -669,20 +671,23 @@ func refused(code disclosure.Code, err error) *bindRefusal { return &bindRefusal
 // The sender is given the guest's receipt for the bind, and the evidence for
 // the bind's nonce with it if the guest has it by then: see admit.
 func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replayed bool, answer *BindAnswer, err error) {
+	return a.BindWith(ctx, raw, signature, nil)
+}
+
+// BindWith is Bind for a bind that comes with the session's first command,
+// sealed to the guest's one-time KEM key (session.SealFirstCommand). The
+// guest opens it while it takes the bind and runs it once the sandbox runs:
+// the answer says what became of it, and CommandAnswer waits for its result.
+// A bind sent again runs nothing again.
+func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, command []byte) (replayed bool, answer *BindAnswer, err error) {
 	a.binding.Lock()
 	a.measured.RLock()
 	current, retired := a.bind, a.retired
 	a.measured.RUnlock()
-	// The server refuses such a bind before it reads it (letIn). This holds
-	// the same for a caller that hands the agent a bind directly: an unbound
-	// guest that was claimed does not look at what came before, so it stays
-	// as it was booted and does not end over it.
-	if current == nil && !retired && !a.fence.admits(connOf(ctx)) {
-		a.binding.Unlock()
-		return false, nil, errFenced
-	}
-	// The same for a bind that comes before the guest takes any, and for
-	// one to a guest that takes none.
+	// The server refuses such binds before it reads them (letIn). This holds
+	// the same for a caller that hands the agent a bind directly: a guest
+	// that takes no bind, or none yet, does not look at one, so it stays as
+	// it was booted and does not end over it.
 	if current == nil && !retired && a.unpinned {
 		a.binding.Unlock()
 		return false, nil, errNoMachine
@@ -690,6 +695,13 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	if current == nil && !retired && !a.takesBinds() {
 		a.binding.Unlock()
 		return false, nil, errNotReady
+	}
+	// The first bind to arrive raises the fence, here if the server did not:
+	// nothing sent to the guest before it reaches the session. One from a
+	// connection the fence ended is not looked at.
+	if admitted, _ := a.fence.arrive(connOf(ctx)); !admitted && !retired {
+		a.binding.Unlock()
+		return false, nil, errFenced
 	}
 	if current != nil || retired {
 		a.binding.Unlock()
@@ -701,9 +713,11 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 		}
 		select {
 		case <-a.bound:
-			// As the first time: the receipt, and the quote if it is there.
+			// As the first time: the receipt, the quote if it is there, and
+			// what became of the first command. A command that comes with a
+			// bind sent again is not opened: the key for it is gone.
 			a.measured.RLock()
-			again := &BindAnswer{Receipt: a.receipt, Attestation: a.bindQuote}
+			again := &BindAnswer{Receipt: a.receipt, Attestation: a.bindQuote, Command: a.commandFor(command)}
 			a.measured.RUnlock()
 			return true, again, nil
 		case <-ctx.Done():
@@ -740,6 +754,12 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 		a.readyCert = *der
 	}
 	a.measured.Unlock()
+	// A first command that came with the bind is opened now, with the guest's
+	// other one-time key, which is erased by it: before any command that
+	// follows the bind is looked at. It is run once the sandbox runs.
+	if len(command) > 0 {
+		a.takeCommand(bind, command)
+	}
 	a.binding.Unlock()
 	a.log.Info("bound", "bind_digest", session.DocumentDigest(raw), "sandbox", bind.Doc.Policy.Sandbox != nil)
 
@@ -751,14 +771,28 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	if err != nil {
 		return false, nil, a.fail(err)
 	}
-	return false, &BindAnswer{Receipt: receipt, Attestation: evidence}, nil
+	// The sandbox runs: so does the first command, if the guest took one,
+	// whoever is still there to hear its answer.
+	go a.runCommand(context.WithoutCancel(ctx))
+	return false, &BindAnswer{Receipt: receipt, Attestation: evidence, Command: a.commandFor(command)}, nil
 }
 
-// BindAnswer is what a guest answers a bind it took with: its receipt, and
-// the evidence over the bind's nonce if it has that already.
+// CommandAnswer waits for the sealed answer of the first command the guest
+// took, with its bind or just after.
+func (a *Agent) CommandAnswer(ctx context.Context) (*session.CommandAnswer, error) {
+	return a.commandAnswer(ctx)
+}
+
+// BindAnswer is what a guest answers a bind it took with: its receipt, the
+// evidence over the bind's nonce if it has that already, and what became of
+// a first command that came with the bind.
 type BindAnswer struct {
 	Receipt     *session.SignedReceipt
 	Attestation *session.AttestResponse
+	// Command is session.CommandTaken, CommandUnopened or CommandTooLate for
+	// a bind that came with a command, and empty for one that came with
+	// none.
+	Command string
 }
 
 // acceptable checks a bind for this guest: well-formed, signed by the
@@ -863,36 +897,6 @@ func (a *Agent) ExpireUnbound() {
 	if expired {
 		_ = a.fail(errBindTooLate)
 	}
-}
-
-// Fence is what a guest does when its host claims it for a session. A bound
-// guest reports its phase and changes nothing. An unbound one closes every
-// connection it accepted so far, except the one ctx came on, and from then on
-// takes a bind only from a connection accepted later. ok is false for a guest
-// on its way out.
-//
-// An answer of ready is settled: the guest has read no bind, and no bind sent
-// before the fence can take effect. A guest that is reading one, or has read
-// one it has not acted on yet, answers errBindInFlight and changes nothing.
-// Its host treats that as bound.
-func (a *Agent) Fence(ctx context.Context) (phase session.Phase, closed int, ok bool, err error) {
-	a.binding.Lock()
-	defer a.binding.Unlock()
-	a.measured.RLock()
-	phase, _ = a.stateLocked()
-	bound, retired := a.bind != nil, a.retired
-	a.measured.RUnlock()
-	switch {
-	case retired:
-		return phase, 0, false, nil
-	case bound:
-		return phase, 0, true, nil
-	}
-	closed, raised := a.fence.raise(connOf(ctx))
-	if !raised {
-		return phase, 0, true, errBindInFlight
-	}
-	return phase, closed, true, nil
 }
 
 // fail records the error that ends the guest and returns it.

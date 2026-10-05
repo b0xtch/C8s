@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -140,6 +141,13 @@ func (h *host) bind(c *daemon.Client, o *owner, name string, claimed *daemon.Cla
 	if err != nil {
 		return nil, err
 	}
+	return h.judge(c, claimed.TD, ready, bind, answer)
+}
+
+// judge is what a binder does with the guest's answer to its bind: it
+// verifies the guest's receipt, and then the quote that follows it.
+func (h *host) judge(c *daemon.Client, td string, ready *session.ReadyTD, bind *session.SignedBind, answer *session.Relayed) (*started, error) {
+	h.t.Helper()
 	binding := session.Binding{LaunchKey: h.LaunchKey, Launch: ready.Launch, Bind: bind}
 	policy := binding.Policy(h.Identity)
 	receipt, err := session.VerifyBoundReceipt(policy, ready, bind, answer)
@@ -147,7 +155,7 @@ func (h *host) bind(c *daemon.Client, o *owner, name string, claimed *daemon.Cla
 		return nil, err
 	}
 	if len(answer.Evidence) == 0 {
-		if answer, err = c.BoundEvidence(ctx(h.t), claimed.TD); err != nil {
+		if answer, err = c.BoundEvidence(ctx(h.t), td); err != nil {
 			return nil, err
 		}
 	}
@@ -166,7 +174,7 @@ func (h *host) bind(c *daemon.Client, o *owner, name string, claimed *daemon.Cla
 	if err != nil {
 		return nil, err
 	}
-	return &started{td: claimed.TD, ready: ready, bind: bind, answer: answer, receipt: receipt, policy: policy, verdict: verdict}, nil
+	return &started{td: td, ready: ready, bind: bind, answer: answer, receipt: receipt, policy: policy, verdict: verdict}, nil
 }
 
 // drive is a client of the session's guest, reached through the daemon with
@@ -511,29 +519,70 @@ func TestOnlyABoundTDCarriesConnections(t *testing.T) {
 	}
 }
 
-// A claim fences the guest: a connection opened before it is cut.
-func TestClaimFencesTheGuest(t *testing.T) {
-	h := newHost(t, 1, nil)
+// A claim is the daemon's own record and asks the guest nothing: the guest
+// learns of it from the bind, and raises its fence then. A connection
+// somebody opened before the bind outlives the claim and is cut by the bind.
+func TestBindFencesTheGuestAndAClaimAsksItNothing(t *testing.T) {
+	h := newHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
 	eventually(t, "the pool's TD boots", func() bool { return h.Runner.Booted() >= 1 })
+	td := h.Runner.Last()
 	// Somebody on the host reached the guest before it was claimed.
-	early, err := tls.Dial("tcp", h.Runner.Last().Address(), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a stranger's connection
+	early, err := tls.Dial("tcp", td.Address(), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a stranger's connection
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer early.Close()
-	if _, err := h.AsOrchestrator().Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 10*time.Second); err != nil {
+	answers := func() bool {
+		req, err := http.NewRequest(http.MethodGet, "https://guest"+session.PathState, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = early.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := req.Write(early); err != nil {
+			return false
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(early), req)
+		if err != nil {
+			return false
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}
+	c, o := h.AsOrchestrator(), newOwner(t)
+	eventually(t, "the pool's TD is ready", func() bool {
+		_, err := c.Evidence(ctx(t), "none")
+		return status.Code(err) == codes.NotFound && td.Asked(session.PathState) > 0
+	})
+	asked := td.Asked("")
+	claimed, err := c.Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 10*time.Second)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_ = early.SetReadDeadline(time.Now().Add(10 * time.Second))
-	if _, err := early.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("the connection opened before the claim outlived it: %v", err)
+	if got := td.Asked(""); got != asked {
+		t.Fatalf("the claim had the guest asked %d times", got-asked)
+	}
+	if len(claimed.Evidence.Certificate) == 0 || len(claimed.Evidence.Launch) == 0 {
+		t.Fatalf("the claim relayed %+v", claimed.Evidence)
+	}
+	if !answers() {
+		t.Fatal("the connection opened before the claim did not outlive it")
+	}
+	if _, err := h.bind(c, o, "s1", claimed); err != nil {
+		t.Fatal(err)
+	}
+	if got := td.Asked(session.PathBind); got != 1 {
+		t.Fatalf("the guest was sent %d binds", got)
+	}
+	if answers() {
+		t.Fatal("the connection opened before the bind outlived it")
 	}
 }
 
-// The daemon holds one connection to each guest it keeps ready. A claim asks
-// the guest for its fence over it and relays what the guest said of itself
-// when it became ready, and the bind follows on the same connection: between
-// the daemon and the guest a session starts with no handshake.
+// The daemon holds one connection to each guest it keeps ready. A claim
+// relays what the guest said of itself over it when it became ready, and the
+// bind goes over the same connection: between the daemon and the guest a
+// session starts with no handshake and one request.
 func TestSessionStartsOverTheKeptConnection(t *testing.T) {
 	h := newHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
 	o := newOwner(t)
@@ -555,40 +604,26 @@ func TestSessionStartsOverTheKeptConnection(t *testing.T) {
 	}
 }
 
-// A guest closes a connection that sat idle, and one that it was claimed
-// away from. The daemon's next request then goes over a new one, and a
-// session still starts.
+// A guest closes a connection that sat idle, and a road drops one. The
+// daemon's bind then goes over a new one, and a session still starts.
 func TestKeptConnectionIsReplacedWhenItIsGone(t *testing.T) {
 	h := newHost(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
 	eventually(t, "the pool's TD boots", func() bool { return h.Runner.Booted() >= 1 })
 	td := h.Runner.Last()
-	eventually(t, "the daemon reaches its guest", func() bool { return td.Accepted() >= 1 })
-	// Somebody else claims the guest's attention: a fence from another
-	// connection closes the daemon's.
-	other, err := tls.Dial("tcp", td.Address(), &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a probe: nothing about this peer is trusted
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
-	req, err := http.NewRequest(http.MethodPost, "https://guest"+session.PathFence, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := req.Write(other); err != nil {
-		t.Fatal(err)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(other), req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("the other fence: %v, %v", resp, err)
-	}
-	resp.Body.Close()
-
+	c := h.AsOrchestrator()
+	eventually(t, "the pool's TD is ready", func() bool {
+		_, err := c.Evidence(ctx(t), "none")
+		return status.Code(err) == codes.NotFound && td.Asked(session.PathCollateral) > 0
+	})
+	// What the daemon kept of the guest is still good: the claim needs no
+	// connection. The bind does, and makes one.
+	td.Cut()
 	o := newOwner(t)
-	if _, err := h.begin(h.AsOrchestrator(), o, "s1"); err != nil {
+	if _, err := h.begin(c, o, "s1"); err != nil {
 		t.Fatalf("a session after the kept connection was closed: %v", err)
 	}
-	if got := td.Accepted(); got < 3 {
-		t.Fatalf("the guest accepted %d connections: the daemon's first, the other's and a new one of the daemon's make 3", got)
+	if got := td.Accepted(); got != 2 {
+		t.Fatalf("the guest accepted %d connections: the daemon's first and the one its bind made make 2", got)
 	}
 }
 
