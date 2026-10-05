@@ -20,7 +20,13 @@
 # first command goes over vsock to an agent in the guest, which is how a
 # session's first command is reached: the baseline to hold a session to. That
 # command is the work a session's is: the shell of the sandbox image, reading
-# a file of the credential's size from a read-only drive.
+# a file of the credential's size from a read-only drive. Each round then
+# also takes the leanest guest Firecracker boots, the agent as init on that
+# shell's own tree, three ways: a load of its snapshot, which is the snapshot
+# baseline at its strongest, a cold boot to its first command, and a start in
+# such a guest booted ahead and left idle, as a platform with confidentiality
+# off can keep a pool of them. A start in that guest is one message to its
+# agent, with the credential and the first command.
 #
 # With C8S_SIM_BIN and the three settings that go with it, the run takes the
 # document's second baseline too: the same start in guests that boot with no
@@ -203,8 +209,11 @@ ref=$(cat "$store_dir/ref") store=$store_dir/images.store
 if [ -n "$fc" ]; then
     [ -x "$fc/firecracker" ] && [ -f "$fc_sample" ] || { echo "$fc holds no firecracker, or $fc_sample is missing" >&2; exit 2; }
     fc=$(readlink -f "$fc")
-    # The snapshot is taken with the agent this run names, or with none.
+    # The snapshot is taken with the agent this run names, or with none, and
+    # the lean guest is made of the session's shell: a burst's run leaves the
+    # tree of its sandbox image here, which that guest would take.
     rm -f "$fc/fcagent" "$fc/busybox"
+    sudo -n rm -rf "${fc:?}/image" "${fc:?}/image.env"
     if [ -n "$fc_agent" ]; then
         [ -f "$fc_agent" ] || { echo "C8S_FIRECRACKER_AGENT=$fc_agent is not a file" >&2; exit 2; }
         [ -f "$fc_busybox" ] || { echo "C8S_FIRECRACKER_BUSYBOX=$fc_busybox is not a file" >&2; exit 2; }
@@ -615,7 +624,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
         "$([ "$pin_power" = 1 ] && echo "pinned (governor performance, idle states past C1E off, turbo on)" || echo "as the host had it")" "$others" "$busy"
     baseline="not sampled"
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
-    [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, its first command $(first_command) as a session's is, and over its serial console (a floor), interleaved"
+    [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, its first command $(first_command) as a session's is, from a snapshot's load, from its leanest guest booted cold and from one booted ahead and idle, and over its serial console (a floor), interleaved"
     printf 'baseline %s; ' "$baseline"
     if [ -n "$SIM" ]; then
         printf 'second baseline: the same start in guests with no TEE and one simulated in software, taking turns with the TD side round by round in an order that alternates, each turn beginning with every pool full and idle; '
@@ -662,6 +671,10 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
 records=$out/timing.jsonl
 if [ -n "$fc" ]; then
     (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" snapshot "$credential_bytes") >> "$records" || die "the Firecracker snapshot"
+    if [ -n "$fc_agent" ]; then
+        (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean "$credential_bytes") >> "$records" || die "the lean Firecracker guest"
+        (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean-snapshot) >> "$records" || die "the lean Firecracker guest's snapshot"
+    fi
 fi
 for side in "${sides[@]}"; do
     d=${dir[$side]}
@@ -704,6 +717,9 @@ for (( n = 0; n < rounds; n++ )); do
             (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" load) >> "$records" || die "a Firecracker snapshot load"
             if [ -n "$fc_agent" ]; then
                 (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" load-vsock) >> "$records" || die "a Firecracker snapshot load over vsock"
+                (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean-load) >> "$records" || die "a load of the lean Firecracker guest's snapshot"
+                (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean-cold) >> "$records" || die "a cold boot of the lean Firecracker guest"
+                (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean-pool "$rest") >> "$records" || die "a start from a Firecracker guest booted ahead"
             fi
             sleep 1
         fi
@@ -903,6 +919,16 @@ for r in rows:
 for kind, label, how in (("fc-cold", "Firecracker cold", "serial console: a floor"), ("fc-load", "Firecracker snapshot load", "serial console: a floor"),
                          ("fc-load-vsock", "Firecracker snapshot load", "vsock to an agent in the guest")):
     show(label + " to first command", [r.get("first_cmd_us", r["first_cmd_ms"] * 1000) / 1000 for r in rows if r.get("kind") == kind], f"ms ({how})")
-show("Firecracker later command", [r["next_cmd_us"] / 1000 for r in rows if r.get("next_cmd_us")], "ms (vsock to an agent in the guest)")
+show("Firecracker later command", [r["next_cmd_us"] / 1000 for r in rows if r.get("next_cmd_us") and r.get("kind") == "fc-load-vsock"], "ms (vsock to an agent in the guest)")
+for r in rows:
+    if r.get("kind") == "fc-lean":
+        print(f"Firecracker's lean guest: the agent as init on {'the sandbox image' if r.get('image') else 'the session shell'}'s own tree, {r['bytes']} bytes, booted with: {r['boot_args']}")
+show("Firecracker lean snapshot's load", [r["first_cmd_us"] / 1000 for r in rows if r.get("kind") == "fc-lean-load"], "ms (VMM start to the first command's answer, over vsock: the snapshot baseline at its strongest)")
+show("  its later command", [r["next_cmd_us"] / 1000 for r in rows if r.get("kind") == "fc-lean-load"], "ms (on a connection of its own)")
+show("Firecracker lean guest, cold", [r["first_cmd_us"] / 1000 for r in rows if r.get("kind") == "fc-lean-cold"], "ms (VMM start to the first command's answer, over vsock)")
+show("  of which to its agent serving", [r["agent_up_us"] / 1000 for r in rows if r.get("kind") == "fc-lean-cold"], "ms")
+pooled = [r for r in rows if r.get("kind") == "fc-lean-pool"]
+show("Firecracker start, booted ahead", [r["start_us"] / 1000 for r in pooled], f"ms (one message to an idle guest's agent, on a connection made ahead, to the first command's answer; idle {pooled[0]['idle_s'] if pooled else 0:g} s)")
+show("  its later command", [r["next_cmd_us"] / 1000 for r in pooled], "ms (on a connection of its own)")
 EOF
 head -1 "$out/env.txt" | tee -a "$out/summary.txt"
