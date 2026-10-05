@@ -338,6 +338,7 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		traced(ctx, "answered")
 		if !replayed {
 			trace.log(a.log)
+			defer trace.ended(a.log)
 		}
 		var sealed chan *session.SealedReply
 		if answer.Sealed == session.SealedTaken {
