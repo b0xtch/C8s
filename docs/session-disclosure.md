@@ -77,7 +77,9 @@ choosing where the host can read it.
 - **An end leaves a code.** A guest that ends itself first tells its
   launcher why, in one message of the schema over vsock: the phase it had
   reached and a code from a list. The init sends it, since it sees the agent
-  end however it ends, and then powers the guest off. When the agent ends the
+  end however it ends, and then powers the guest off at once, with no sync
+  first, since the root's contents die with its key and the guest hands the
+  host what it keeps, a layer or record, before then. When the agent ends the
   guest for a reason of its own, such as its age limit, its lease lost, a
   bind refused, a guard's refusal, each guard with a code of its own, or the
   end of the process the policy named, it exits with that reason's code for

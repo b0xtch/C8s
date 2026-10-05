@@ -126,9 +126,9 @@ guest's own API on its TLS port.
 - **running to ended.** A session whose policy names a process for its
   sandbox ends when that process ends. The guest takes no new connection
   then, and for a few seconds at most gives the answers it still owes, such
-  as the bind's, with its quote, and a command's, which the end killed. It
-  ends with the code for it, and the process's status stays in the session's
-  logs, for its owner.
+  as the bind's, with its quote, and a command's, which the end killed, and
+  gives the process's status to each call that waits on the process, such as
+  the one that sent it. Then it ends with the code for it.
 
 **A session's life**, as the daemon sees it: new, live (running or held),
 sealing, sealed, restoring, live again, and so on until destroyed. The
