@@ -133,8 +133,13 @@ func newContainer(t *testing.T, o containerOptions) *container {
 	t.Helper()
 	crun, busybox := containerFixtures(t)
 	c := &container{registry: imagestoretest.NewRegistry(t)}
+	// A test that gives its image a command has the session run it. Any
+	// other names no process, as most sessions do: the image still holds a
+	// command, which then does not run.
 	if len(o.image.Entrypoint)+len(o.image.Cmd) == 0 {
 		o.image.Cmd = []string{"/bin/sleep", "100000"}
+	} else if o.sandbox.Process == "" {
+		o.sandbox.Process = session.ProcessImage
 	}
 	c.manifest = c.registry.Image([][]byte{imagestoretest.BusyboxLayer(busybox)}, imagestoretest.ImageOptions{Config: &o.image})
 	o.sandbox.Image = c.registry.Ref(c.manifest.Digest)
@@ -236,8 +241,7 @@ func ownerOf(t *testing.T, path string) (uid, gid uint32) {
 // credential and driven through the authenticated API.
 func TestImageSandboxAttestReleaseExec(t *testing.T) {
 	c := newContainer(t, containerOptions{
-		image:   ocispec.ImageConfig{Cmd: []string{"/bin/sh", "-c", "echo up > /tmp/started; exec /bin/sleep 100000"}, Env: []string{"FROM_IMAGE=1", "BOTH=image"}, WorkingDir: "/srv"},
-		sandbox: session.Sandbox{Env: map[string]string{"FROM_DOC": "2", "BOTH": "doc"}},
+		image: ocispec.ImageConfig{Cmd: []string{"/bin/sh", "-c", "echo up > /tmp/started; exec /bin/sleep 100000"}, Env: []string{"FROM_IMAGE=1", "BOTH=image"}, WorkingDir: "/srv"},
 	})
 	c.start(t)
 	// Every step of the admission is timed, and a registry that answers the
@@ -284,7 +288,7 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 			{"grep '^Seccomp:' /proc/1/status | grep -c 2", "1"},
 			{"id -u; id -g", "0\n0"},
 			{"pwd", "/srv"},
-			{`echo "$FROM_IMAGE $FROM_DOC $BOTH"`, "1 2 doc"},
+			{`echo "$FROM_IMAGE $BOTH"`, "1 image"},
 			{"stat -c %u:%g /home/app/data", "1000:1000"},
 			{"cat /home/app/data", "mine"},
 		} {
@@ -475,8 +479,7 @@ func (c *container) warmUsed() int64 {
 // it could not start, and its end at its limit with everything it started.
 func TestCommandsRunAsProcessesStartedAhead(t *testing.T) {
 	c := newContainer(t, containerOptions{
-		image:   ocispec.ImageConfig{Env: []string{"FROM_IMAGE=1", "BOTH=image"}, WorkingDir: "/srv"},
-		sandbox: session.Sandbox{Env: map[string]string{"FROM_DOC": "2", "BOTH": "doc"}},
+		image: ocispec.ImageConfig{Env: []string{"FROM_IMAGE=1", "BOTH=image"}, WorkingDir: "/srv"},
 	})
 	c.start(t)
 	client := c.client(t, c.owner)
@@ -502,13 +505,13 @@ func TestCommandsRunAsProcessesStartedAhead(t *testing.T) {
 	}
 
 	resp := run("directory and environment", session.ExecRequest{
-		Argv: []string{"/bin/sh", "-c", `pwd; echo "$FROM_IMAGE $FROM_DOC $BOTH $MINE"; echo "$C8S_CREDENTIALS_DIR"`}, Cwd: "/tmp", Env: map[string]string{"BOTH": "request", "MINE": "3"},
+		Argv: []string{"/bin/sh", "-c", `pwd; echo "$FROM_IMAGE $BOTH $MINE"; echo "$C8S_CREDENTIALS_DIR"`}, Cwd: "/tmp", Env: map[string]string{"BOTH": "request", "MINE": "3"},
 	})
-	if got := strings.TrimSpace(string(resp.Stdout)); resp.ExitCode != 0 || got != "/tmp\n1 2 request 3\n"+c.credDir {
+	if got := strings.TrimSpace(string(resp.Stdout)); resp.ExitCode != 0 || got != "/tmp\n1 request 3\n"+c.credDir {
 		t.Errorf("request directory and environment: exit %d, %q, stderr %q", resp.ExitCode, got, resp.Stderr)
 	}
-	resp = run("the image's directory and the bind's environment", sh(`pwd; echo "$BOTH"`))
-	if got := strings.TrimSpace(string(resp.Stdout)); got != "/srv\ndoc" {
+	resp = run("the image's directory and environment", sh(`pwd; echo "$BOTH"`))
+	if got := strings.TrimSpace(string(resp.Stdout)); got != "/srv\nimage" {
 		t.Errorf("default directory and environment: %q", got)
 	}
 	// A command named without a directory is found in the PATH of its
@@ -761,7 +764,7 @@ func TestImageSandboxRefusals(t *testing.T) {
 	}{
 		"a layer the registry changed":      {containerOptions{tamper: flipLayer}, "unexpected commit digest", false},
 		"a user that is not numeric":        {containerOptions{image: ocispec.ImageConfig{User: "app"}}, "numeric", false},
-		"a command the image does not have": {containerOptions{sandbox: session.Sandbox{Command: []string{"/bin/absent"}}}, "not found", true},
+		"a command the image does not have": {containerOptions{image: ocispec.ImageConfig{Cmd: []string{"/bin/absent"}}}, "not found", true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			c := newContainer(t, tc.o)

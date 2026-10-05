@@ -1,26 +1,32 @@
 //go:build unix
 
-// Package sandboxinit is the first process of a session's sandbox until its
-// session is bound.
+// Package sandboxinit is the first process of a session's sandbox: all of it
+// until the session is bound, and from then on too unless the bind names a
+// process for the session.
 //
 // A guest's agent makes the sandbox's container before any bind arrives, with
 // this program as its process: the container's namespaces, mounts and limits
 // then exist, and nothing of an image has run. When the bind says what the
-// sandbox runs, the agent sends one message, and this program becomes the
-// image's process in place: same process, same id, no runtime in between.
+// sandbox runs, the agent sends one message. For a session that names no
+// process of its own, the message says to stay: this program remains the
+// sandbox's first process and reaps what the session's commands leave behind.
+// For one that names its image's command, this program becomes that process
+// in place: same process, same id, no runtime in between.
 //
 // The runtime preserves two descriptors for it. ProgramFD is this program's
 // own file, which is how a container that does not hold the file starts it.
 // ControlFD is one end of a socket pair. The agent writes a Process to it and
 // shuts its side down. This program answers with one line, Taken, once it
-// has the message and has found the command, and then becomes the process.
-// If it cannot, it says why on a line and exits. Neither descriptor outlives
-// it: the image's process inherits no way back to the agent.
+// has the message and has found the command, and then becomes the process,
+// or stays. If it cannot, it says why on a line and exits. Neither descriptor
+// outlives its answer: the image's process inherits no way back to the
+// agent, and a program that stays closes both.
 //
 // The agent may pass one more descriptor with its message, the write end of
-// a pipe. This program does nothing with it but keep it, closed at its exec:
-// the agent's end then reads the end of the pipe the moment this process has
-// become the image's, or is gone, and need not look for either.
+// a pipe. This program does nothing with it but keep it, closed at its exec
+// or when it stays: the agent's end then reads the end of the pipe the
+// moment this process has become the image's, stays, or is gone, and need
+// not look for any of them.
 //
 // The agent also starts this program for a command, ahead of the command
 // (see the agent's warmCommand). A process that ends without a word, before
@@ -34,6 +40,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 
@@ -62,8 +69,11 @@ const (
 	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 
-// Process is what the sandbox's first process becomes.
+// Process is what the sandbox's first process becomes, or that it stays.
 type Process struct {
+	// Stay has this program stay the sandbox's first process and reap what
+	// ends under it. It goes with no command.
+	Stay bool `json:"stay,omitempty"`
 	// Argv is the command and its arguments. A command named without a
 	// directory is looked up in the PATH that Env sets.
 	Argv []string `json:"argv"`
@@ -73,8 +83,12 @@ type Process struct {
 	Cwd string `json:"cwd"`
 }
 
-// Main reads the agent's message and becomes the process it names. It
-// returns only if it could not, with the status to exit with.
+// errStays is how become says that the message was to stay, and was taken.
+var errStays = errors.New("stay")
+
+// Main reads the agent's message and becomes the process it names, or stays
+// as the sandbox's first process until the sandbox is ended. It returns only
+// if it could do neither, with the status to exit with.
 func Main() int {
 	// Before anything else: a process this one starts by mistake inherits
 	// neither.
@@ -89,19 +103,53 @@ func Main() int {
 	if control == nil {
 		return FailureStatus
 	}
+	taken := &taking{fd: ControlFD}
 	err := become(struct {
 		io.Reader
 		io.Writer
-	}{&taking{fd: ControlFD}, control})
+	}{taken, control})
+	if errors.Is(err, errStays) {
+		// Nothing more is said to the agent, and nothing of it is kept.
+		_ = control.Close()
+		_ = unix.Close(ProgramFD)
+		taken.release()
+		stay()
+	}
 	// Reached only when the exec did not happen.
 	fmt.Fprintf(control, "%v\n", err)
 	return FailureStatus
+}
+
+// stay reaps every process that ends as this one's child, which for a
+// sandbox's first process is every orphan in it. It does not return: the
+// sandbox ends when its agent kills it.
+func stay() {
+	ended := make(chan os.Signal, 1)
+	signal.Notify(ended, unix.SIGCHLD)
+	for {
+		for {
+			pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if pid <= 0 || err != nil {
+				break
+			}
+		}
+		<-ended
+	}
 }
 
 func become(control io.ReadWriter) error {
 	p, err := Read(control)
 	if err != nil {
 		return err
+	}
+	if p.Stay {
+		if _, err := io.WriteString(control, Taken+"\n"); err != nil {
+			return fmt.Errorf("tell the agent the message is taken: %w", err)
+		}
+		return errStays
 	}
 	if p.Cwd != "" {
 		if err := os.Chdir(p.Cwd); err != nil {
@@ -129,7 +177,15 @@ func become(control io.ReadWriter) error {
 // descriptors that come with it, closed at this program's exec.
 type taking struct {
 	fd   int
-	kept int
+	kept []int
+}
+
+// release closes the descriptors that came with the message.
+func (t *taking) release() {
+	for _, fd := range t.kept {
+		_ = unix.Close(fd)
+	}
+	t.kept = nil
 }
 
 func (t *taking) Read(p []byte) (int, error) {
@@ -163,12 +219,12 @@ func (t *taking) keep(control []byte) {
 			continue
 		}
 		for _, fd := range passed {
-			if t.kept >= maxPassed {
+			if len(t.kept) >= maxPassed {
 				_ = unix.Close(fd)
 				continue
 			}
 			unix.CloseOnExec(fd)
-			t.kept++
+			t.kept = append(t.kept, fd)
 		}
 	}
 }
@@ -180,7 +236,13 @@ func (t *taking) keep(control []byte) {
 // ended before it was told anything.
 func ReadAnswer(control io.Reader) (taken bool, reason string) {
 	data, _ := io.ReadAll(io.LimitReader(control, MaxAnswer))
-	text := string(data)
+	return ParseAnswer(data)
+}
+
+// ParseAnswer reads what an init has said so far: whether it took its
+// message, and its reason if it gave one after or instead.
+func ParseAnswer(said []byte) (taken bool, reason string) {
+	text := string(said)
 	if rest, ok := strings.CutPrefix(text, Taken+"\n"); ok {
 		taken, text = true, rest
 	}
@@ -199,6 +261,12 @@ func Read(control io.Reader) (*Process, error) {
 	var p Process
 	if err := json.Unmarshal(data, &p); err != nil {
 		return nil, fmt.Errorf("the process to become: %w", err)
+	}
+	if p.Stay {
+		if len(p.Argv) > 0 {
+			return nil, errors.New("a process that stays is told no command")
+		}
+		return &p, nil
 	}
 	if len(p.Argv) == 0 || p.Argv[0] == "" {
 		return nil, errors.New("the process to become names no command")

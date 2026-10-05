@@ -4,6 +4,7 @@ package sessionagent
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -269,8 +270,7 @@ func (r *ImageRunner) makeAhead(ctx context.Context, entry *prestagedImage) {
 	}
 	process, err := sandboxProcess(entry.config, &session.Sandbox{Image: entry.ref}, r.cfg.CredentialDir)
 	if err != nil {
-		// The image's own command does not run as it stands. A bind may
-		// still give it one.
+		// The image names a user the sandbox cannot run as.
 		r.cfg.Logger.Info("no container made ahead", "image", entry.ref, "reason", err)
 		return
 	}
@@ -666,8 +666,10 @@ func (r *ImageRunner) unmake(made *madeSandbox) {
 	_ = os.RemoveAll(made.rootfs)
 }
 
-// Start has the container's init become the sandbox's process: the image's
-// command, with the bind's overrides, in the container that was made for it.
+// Start tells the container's init what the bind decided. With no process of
+// the session's, the init stays as the sandbox's first process and reaps what
+// commands leave. With the image's command, the init becomes that process, in
+// the container that was made for it.
 func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	w, started := r.sandbox()
 	switch {
@@ -684,7 +686,12 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	}
 	began := time.Now()
 	sandboxNet.serve(w.egress)
-	message, err := json.Marshal(sandboxinit.Process{Argv: w.process.Args, Env: w.process.Env, Cwd: w.process.Cwd})
+	stays := len(w.process.Args) == 0
+	told := sandboxinit.Process{Stay: true}
+	if !stays {
+		told = sandboxinit.Process{Argv: w.process.Args, Env: w.process.Env, Cwd: w.process.Cwd}
+	}
+	message, err := json.Marshal(told)
 	if err != nil {
 		return err
 	}
@@ -716,30 +723,54 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	r.mu.Lock()
 	r.started = true
 	r.mu.Unlock()
-	told := time.Since(began)
-	// The init says why when it could not become the process.
-	refused := make(chan string, 1)
+	sent := time.Since(began)
+	// The init says why when it could not become the process, or stay.
+	var refused chan string
 	answered := make(chan time.Duration, 1)
-	go func() {
-		_, reason := sandboxinit.ReadAnswer(control)
-		answered <- time.Since(began)
-		refused <- reason
-	}()
-	if err := r.await(ctx, w.made, sandboxNet, false, refused, execed); err != nil {
+	if stays {
+		// An init that stays says so and lets the pipe go. Its end of the
+		// socket need not close then: the runtime may hold it too. So what
+		// it has said by the pipe's end is read without waiting for more.
+		select {
+		case <-execed:
+			answered <- time.Since(began)
+		case <-w.made.exited:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(startTimeout):
+			return fmt.Errorf("the sandbox's init had not answered after %s", startTimeout)
+		}
+		said := make([]byte, sandboxinit.MaxAnswer)
+		n, _, err := unix.Recvfrom(int(control.Fd()), said, unix.MSG_DONTWAIT)
+		if err != nil {
+			n = 0
+		}
+		if taken, reason := sandboxinit.ParseAnswer(said[:n]); !taken {
+			return fmt.Errorf("the sandbox's init does not stay: %s", cmp.Or(reason, "it ended without a word"))
+		}
+	} else {
+		refused = make(chan string, 1)
+		go func() {
+			_, reason := sandboxinit.ReadAnswer(control)
+			answered <- time.Since(began)
+			refused <- reason
+		}()
+	}
+	if err := r.await(ctx, w.made, sandboxNet, stays, refused, execed); err != nil {
 		if reason := readTrimmed(w.made.logPath); reason != "" {
 			err = fmt.Errorf("%w: %s", err, reason)
 		}
 		return err
 	}
-	took := time.Since(began)
+	lasted := time.Since(began)
 	// When the init's end of the socket closed, if it has by now: at its
-	// exec, unless something else still holds that end.
+	// exec or once it stays, unless something else still holds that end.
 	var closed time.Duration
 	select {
 	case closed = <-answered:
 	default:
 	}
-	r.cfg.Logger.Info("sandbox started", "took_us", took.Microseconds(), "told_us", told.Microseconds(), "closed_us", closed.Microseconds())
+	r.cfg.Logger.Info("sandbox started", "took_us", lasted.Microseconds(), "told_us", sent.Microseconds(), "closed_us", closed.Microseconds(), "init_stays", stays)
 	return nil
 }
 

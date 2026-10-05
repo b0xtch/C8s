@@ -65,13 +65,6 @@
 #   C8S_BURST_SIDES          the sides that take turns, of td, load and pool
 #                            (default "td load pool"): fewer for a trial
 #   C8S_BURST_COMMAND        each session's first command (default "node -v")
-#   C8S_BURST_SANDBOX        the process each session's sandbox runs, in
-#                            place of the image's own (default "sleep
-#                            infinity"). A session ends when its sandbox's
-#                            process does, and an image's own may end at
-#                            once: node's reads its program from a standard
-#                            input that is empty. Set and empty, each
-#                            sandbox runs the image's own
 #   C8S_BURST_TD_MIB         host memory a pooled TD is taken to need before
 #                            its pool is started (default 1024), and
 #   C8S_BURST_RESERVE_MIB    what the pool must leave of the host's available
@@ -136,8 +129,6 @@ sessions=${C8S_BURST_SESSIONS:-100}
 depth=${C8S_BURST_POOL:-$sessions}
 rounds=${C8S_BURST_ROUNDS:-4}
 first_command=${C8S_BURST_COMMAND:-node -v}
-# Set and empty, it leaves each sandbox the image's own process.
-sandbox_command=${C8S_BURST_SANDBOX-sleep infinity}
 rest=${C8S_TIMING_REST:-5}
 # The bytes of the credential warmstart seals with each bind.
 credential_bytes=48
@@ -640,7 +631,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
 
 args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
     --pool agents --image-manifest "$manifest" --launch-key "$out/bundle/opkeydata/pubkey" --authority-key "$out/authority.key"
-    --tenant acme --session-prefix "b" --sandbox-image "$ref" --sandbox-command "$sandbox_command" --collateral-cache "$out/collateral"
+    --tenant acme --session-prefix "b" --sandbox-image "$ref" --collateral-cache "$out/collateral"
     --rounds 1 --burst "$sessions" --burst-ready "$depth" --first-command "$first_command" --commands 0
     --sealed-credential api-token --claim-with-bind --before-round "$out/before-td" --after-answers "$out/after-td" --wait 60m --timeout 2m
     # A session of a burst sends nothing over a connection of its own, so

@@ -20,8 +20,15 @@ import (
 // under test: what a container's runtime would start.
 const asInit = "C8S_SANDBOXINIT_TEST_AS_INIT"
 
+// beforeInit, where a platform's tests set it, runs in the program under
+// test before it is the init.
+var beforeInit func()
+
 func TestMain(m *testing.M) {
 	if os.Getenv(asInit) == "1" {
+		if beforeInit != nil {
+			beforeInit()
+		}
 		os.Exit(sandboxinit.Main())
 	}
 	os.Exit(m.Run())
@@ -31,6 +38,12 @@ func TestMain(m *testing.M) {
 // socket pair where a runtime would preserve them, and returns the agent's
 // end.
 func start(t *testing.T) (*exec.Cmd, *os.File) {
+	t.Helper()
+	return startWith(t)
+}
+
+// startWith is start with more variables in the init's environment.
+func startWith(t *testing.T, env ...string) (*exec.Cmd, *os.File) {
 	t.Helper()
 	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -47,7 +60,7 @@ func start(t *testing.T) (*exec.Cmd, *os.File) {
 	}
 	defer self.Close()
 	cmd := exec.Command(os.Args[0])
-	cmd.Env = []string{asInit + "=1"}
+	cmd.Env = append([]string{asInit + "=1"}, env...)
 	cmd.ExtraFiles = []*os.File{self, theirs}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
@@ -333,5 +346,73 @@ func TestPassedDescriptorClosesWithAnInitThatFailed(t *testing.T) {
 	// what failed, and it says so.
 	if _, reason := sandboxinit.ReadAnswer(agent); !strings.Contains(reason, "command not found") {
 		t.Fatalf("the init's reason: %q", reason)
+	}
+}
+
+// An init told to stay says that it took the message and stays: it is the
+// sandbox's first process for as long as the sandbox lasts. It keeps neither
+// its socket to the agent nor the descriptor passed with the message, so the
+// agent reads the end of both while the init still runs.
+func TestInitStaysWhenToldTo(t *testing.T) {
+	cmd, agent := start(t)
+	stays, theirs, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stays.Close()
+	data, err := json.Marshal(sandboxinit.Process{Stay: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Sendmsg(int(agent.Fd()), data, unix.UnixRights(int(theirs.Fd())), nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Close()
+	if err := unix.Shutdown(int(agent.Fd()), unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	said := make(chan [2]any, 1)
+	go func() {
+		taken, reason := sandboxinit.ReadAnswer(agent)
+		said <- [2]any{taken, reason}
+	}()
+	select {
+	case answer := <-said:
+		if answer[0] != true || answer[1] != "" {
+			t.Fatalf("the init answered taken %v, reason %q", answer[0], answer[1])
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("an init that stays kept its socket to the agent open")
+	}
+	select {
+	case <-ended(stays):
+	case <-time.After(10 * time.Second):
+		t.Fatal("an init that stays kept the descriptor passed with its message")
+	}
+	gone := make(chan error, 1)
+	go func() { gone <- cmd.Wait() }()
+	select {
+	case err := <-gone:
+		t.Fatalf("an init told to stay ended: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	<-gone
+}
+
+// A message that says to stay names no command: an init does not guess
+// which of the two was meant.
+func TestInitRefusesToStayAndBecomeACommand(t *testing.T) {
+	cmd, agent := start(t)
+	send(t, agent, sandboxinit.Process{Stay: true, Argv: []string{"true"}, Env: []string{"PATH=/usr/bin:/bin"}})
+	err := cmd.Wait()
+	var status *exec.ExitError
+	if !errorsAs(err, &status) || status.ExitCode() != sandboxinit.FailureStatus {
+		t.Fatalf("the init ended with %v, want status %d", err, sandboxinit.FailureStatus)
+	}
+	if taken, reason := sandboxinit.ReadAnswer(agent); taken || !strings.Contains(reason, "told no command") {
+		t.Fatalf("the init answered taken %v, reason %q", taken, reason)
 	}
 }

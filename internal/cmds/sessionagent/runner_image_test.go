@@ -19,19 +19,23 @@ import (
 
 const testCredentialDir = "/run/c8s/credentials"
 
-func TestSandboxProcessCommandAndArgs(t *testing.T) {
+// A sandbox's arguments are its image's command only when the bind names
+// that as the session's process. With none named there are none, whatever
+// the image holds, and an image with no command is no fault.
+func TestSandboxProcessIsTheImagesCommandWhenTheBindNamesIt(t *testing.T) {
 	image := ocispec.ImageConfig{Entrypoint: []string{"/entry"}, Cmd: []string{"default"}}
 	for _, c := range []struct {
-		name string
-		w    session.Sandbox
-		want []string
+		name  string
+		image ocispec.ImageConfig
+		w     session.Sandbox
+		want  []string
 	}{
-		{"image defaults", session.Sandbox{}, []string{"/entry", "default"}},
-		{"command drops the default arguments", session.Sandbox{Command: []string{"/other"}}, []string{"/other"}},
-		{"args replace the default arguments", session.Sandbox{Args: []string{"a", "b"}}, []string{"/entry", "a", "b"}},
-		{"command and args", session.Sandbox{Command: []string{"/other"}, Args: []string{"a"}}, []string{"/other", "a"}},
+		{"no process named", image, session.Sandbox{}, nil},
+		{"no process named, of an image with no command", ocispec.ImageConfig{}, session.Sandbox{}, nil},
+		{"the image's command", image, session.Sandbox{Process: session.ProcessImage}, []string{"/entry", "default"}},
+		{"the image's command, an entrypoint alone", ocispec.ImageConfig{Entrypoint: []string{"/entry"}}, session.Sandbox{Process: session.ProcessImage}, []string{"/entry"}},
 	} {
-		p, err := sandboxProcess(image, &c.w, testCredentialDir)
+		p, err := sandboxProcess(c.image, &c.w, testCredentialDir)
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
@@ -39,22 +43,24 @@ func TestSandboxProcessCommandAndArgs(t *testing.T) {
 			t.Errorf("%s: argv %v, want %v", c.name, p.Args, c.want)
 		}
 	}
-	if _, err := sandboxProcess(ocispec.ImageConfig{}, &session.Sandbox{}, testCredentialDir); err == nil {
-		t.Error("a sandbox with no command at all was accepted")
+	if _, err := sandboxProcess(ocispec.ImageConfig{}, &session.Sandbox{Process: session.ProcessImage}, testCredentialDir); err == nil {
+		t.Error("the command of an image that names none was taken as a session's process")
 	}
 }
 
+// What runs in a sandbox has the image's environment and working directory,
+// with the sandbox's own proxy and credential directory in place of whatever
+// the image says of either.
 func TestSandboxProcessEnvironment(t *testing.T) {
-	image := ocispec.ImageConfig{Entrypoint: []string{"/e"}, Env: []string{"A=1", "B=2", "malformed"}, WorkingDir: "/srv"}
-	w := &session.Sandbox{Env: map[string]string{"B": "3", "C": "4", "C8S_CREDENTIALS_DIR": "/elsewhere"}}
-	p, err := sandboxProcess(image, w, testCredentialDir)
+	image := ocispec.ImageConfig{Entrypoint: []string{"/e"}, Env: []string{"A=1", "B=2", "malformed", "C8S_CREDENTIALS_DIR=/elsewhere"}, WorkingDir: "/srv"}
+	p, err := sandboxProcess(image, &session.Sandbox{}, testCredentialDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Sorted as whole strings, as the bare-command runner sorts its own.
 	const proxy, direct = "http://127.0.0.1:3128", "localhost,127.0.0.1,::1"
 	want := []string{
-		"A=1", "B=3", "C8S_CREDENTIALS_DIR=" + testCredentialDir, "C=4",
+		"A=1", "B=2", "C8S_CREDENTIALS_DIR=" + testCredentialDir,
 		"HTTPS_PROXY=" + proxy, "HTTP_PROXY=" + proxy, "NODE_USE_ENV_PROXY=1", "NO_PROXY=" + direct, "PATH=" + defaultSandboxPath,
 		"http_proxy=" + proxy, "https_proxy=" + proxy, "no_proxy=" + direct,
 	}
@@ -65,23 +71,13 @@ func TestSandboxProcessEnvironment(t *testing.T) {
 		t.Fatalf("cwd %q", p.Cwd)
 	}
 
-	// The image's own proxy is for some other network and is replaced. The
-	// document's is its author's choice and stands.
-	image.Env = []string{"HTTPS_PROXY=http://corp.example:8080", "HTTP_PROXY=http://corp.example:8080"}
-	w = &session.Sandbox{Env: map[string]string{"HTTP_PROXY": "http://127.0.0.1:9999"}}
-	if p, err = sandboxProcess(image, w, testCredentialDir); err != nil {
+	// The image's own proxy is for some other network and is replaced.
+	image.Env = []string{"HTTPS_PROXY=http://corp.example:8080", "HTTP_PROXY=http://corp.example:8080", "PATH=/opt/bin"}
+	image.WorkingDir = ""
+	if p, err = sandboxProcess(image, &session.Sandbox{}, testCredentialDir); err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(p.Env, "HTTPS_PROXY="+proxy) || !slices.Contains(p.Env, "HTTP_PROXY=http://127.0.0.1:9999") {
-		t.Fatalf("env %v", p.Env)
-	}
-
-	image.Env = []string{"PATH=/opt/bin"}
-	w = &session.Sandbox{WorkingDir: "/work"}
-	if p, err = sandboxProcess(image, w, testCredentialDir); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Contains(p.Env, "PATH=/opt/bin") || p.Cwd != "/work" {
+	if !slices.Contains(p.Env, "HTTPS_PROXY="+proxy) || !slices.Contains(p.Env, "HTTP_PROXY="+proxy) || !slices.Contains(p.Env, "PATH=/opt/bin") || p.Cwd != "/" {
 		t.Fatalf("env %v cwd %q", p.Env, p.Cwd)
 	}
 }
@@ -221,7 +217,7 @@ func TestSandboxSpecIsolation(t *testing.T) {
 
 func TestExecProcessRunsInTheSandboxContext(t *testing.T) {
 	main, err := sandboxProcess(ocispec.ImageConfig{Cmd: []string{"/bin/app"}, Env: []string{"A=1"}, User: "1000:1000", WorkingDir: "/srv"},
-		&session.Sandbox{}, testCredentialDir)
+		&session.Sandbox{Process: session.ProcessImage}, testCredentialDir)
 	if err != nil {
 		t.Fatal(err)
 	}

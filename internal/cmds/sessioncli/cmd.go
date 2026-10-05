@@ -84,9 +84,9 @@ See docs/sessions.md.`,
 // sandboxFlags say what runs in a guest and who may drive it: what a bind
 // decides.
 type sandboxFlags struct {
-	image, workingDir                                                              string
-	command, args, env, egress, credentials, execKeys, credentialKeys, forwardKeys []string
-	forwardPorts                                                                   []int
+	image, process                                             string
+	egress, credentials, execKeys, credentialKeys, forwardKeys []string
+	forwardPorts                                               []int
 	// stored are the credentials the guest takes from its key service, and
 	// keyService the file that pins that key service.
 	stored     []string
@@ -97,11 +97,8 @@ type sandboxFlags struct {
 const egressNone = "none"
 
 func (w *sandboxFlags) register(f *pflag.FlagSet, besides string) {
-	f.StringVar(&w.image, "sandbox-image", "", "OCI image the guest pulls and runs, as name@sha256:<digest>")
-	f.StringArrayVar(&w.command, "command", nil, "sandbox entrypoint override, one element per flag")
-	f.StringArrayVar(&w.args, "arg", nil, "sandbox argument, one element per flag")
-	f.StringArrayVar(&w.env, "env", nil, "sandbox environment NAME=value (not for secrets)")
-	f.StringVar(&w.workingDir, "working-dir", "", "sandbox working directory")
+	f.StringVar(&w.image, "sandbox-image", "", "OCI image the session's commands run in, as name@sha256:<digest>")
+	f.StringVar(&w.process, "sandbox-process", "", "the session's own process, whose end ends the session: \""+session.ProcessImage+"\" for the image's command. Without it the sandbox runs nothing until a command is sent, and stays")
 	f.StringArrayVar(&w.egress, "egress", nil, "destination the sandbox may connect to, as host:port, *.domain:port or address:port (repeatable); \"none\" allows none. Without it the sandbox may connect to any public destination. A private address is reached only if named here")
 	f.StringArrayVar(&w.credentials, "credential", nil, "credential NAME[:MAXBYTES] the sandbox may be handed after attestation")
 	f.StringArrayVar(&w.stored, "stored-credential", nil, "credential NAME[:MAXBYTES] the guest takes from the key service when it is bound: one the tenant stored there with 'c8s session key-service credential put' (needs --key-service)")
@@ -114,23 +111,12 @@ func (w *sandboxFlags) register(f *pflag.FlagSet, besides string) {
 
 func (w *sandboxFlags) sandbox() (*session.Sandbox, error) {
 	if w.image == "" {
-		if len(w.command)+len(w.args)+len(w.env)+len(w.egress)+len(w.forwardPorts) > 0 || w.workingDir != "" {
-			return nil, errors.New("--command, --arg, --env, --egress, --forward-port and --working-dir need --sandbox-image")
+		if len(w.egress)+len(w.forwardPorts) > 0 || w.process != "" {
+			return nil, errors.New("--sandbox-process, --egress and --forward-port need --sandbox-image")
 		}
 		return nil, nil
 	}
-	sandbox := &session.Sandbox{Image: w.image, Command: w.command, Args: w.args, WorkingDir: w.workingDir}
-	if len(w.env) > 0 {
-		sandbox.Env = map[string]string{}
-		for _, kv := range w.env {
-			k, v, ok := strings.Cut(kv, "=")
-			if !ok {
-				return nil, fmt.Errorf("--env %q must be NAME=value", kv)
-			}
-			sandbox.Env[k] = v
-		}
-	}
-	return sandbox, nil
+	return &session.Sandbox{Image: w.image, Process: w.process}, nil
 }
 
 // egressPolicy is the sandbox's allowlist, or nil when the flags set none.

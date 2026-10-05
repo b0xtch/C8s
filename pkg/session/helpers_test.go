@@ -67,7 +67,7 @@ func bindOptions(t *testing.T, authority, instance *ecdsa.PrivateKey) session.Bi
 		Authority: authority, InstanceKey: &instance.PublicKey,
 		Tenant: "acme", Session: "sbx-1", NotAfter: time.Now().Add(time.Hour),
 		Policy: session.BindPolicy{
-			Sandbox:     &session.Sandbox{Image: sandboxImage, Command: []string{"/bin/agent"}, Env: map[string]string{"MODE": "serve"}},
+			Sandbox:     &session.Sandbox{Image: sandboxImage, Process: session.ProcessImage},
 			Access:      session.Access{Exec: []string{access}, Credentials: []string{access}},
 			Credentials: []session.Credential{{Name: "test-token", MaxBytes: 128}},
 		},

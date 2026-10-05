@@ -54,20 +54,16 @@ const (
 	sandboxOOMScoreAdj = 500
 )
 
-// sandboxProcess is the sandbox's main process: the image's defaults with
-// the launch document's overrides. Command replaces the image's entrypoint and
-// drops its default arguments; args replace the default arguments alone.
+// sandboxProcess is what everything in the sandbox runs as: the image's
+// user, environment and working directory, with the sandbox's capabilities.
+// Its arguments are the session's own process: the image's command when the
+// bind names that, and none otherwise, for a sandbox whose init stays.
 func sandboxProcess(image ocispec.ImageConfig, w *session.Sandbox, credentialDir string) (*specs.Process, error) {
-	entrypoint, args := image.Entrypoint, image.Cmd
-	if len(w.Command) > 0 {
-		entrypoint, args = w.Command, nil
-	}
-	if len(w.Args) > 0 {
-		args = w.Args
-	}
-	argv := slices.Concat(entrypoint, args)
-	if len(argv) == 0 {
-		return nil, errors.New("the image names no command and the launch document gives none")
+	var argv []string
+	if w.Process == session.ProcessImage {
+		if argv = slices.Concat(image.Entrypoint, image.Cmd); len(argv) == 0 {
+			return nil, errors.New("the bind names the image's command as the session's process, and the image names none")
+		}
 	}
 	user, err := sandboxUser(image.User)
 	if err != nil {
@@ -80,20 +76,14 @@ func sandboxProcess(image ocispec.ImageConfig, w *session.Sandbox, credentialDir
 		}
 	}
 	// After the image's: a proxy an image names for some other network is
-	// unreachable here. Before the document's: its author knows this one.
+	// unreachable here.
 	for k, v := range egressProxyEnv() {
-		env[k] = v
-	}
-	for k, v := range w.Env {
 		env[k] = v
 	}
 	env["C8S_CREDENTIALS_DIR"] = credentialDir
 	cwd := "/"
 	if image.WorkingDir != "" {
 		cwd = image.WorkingDir
-	}
-	if w.WorkingDir != "" {
-		cwd = w.WorkingDir
 	}
 	score := sandboxOOMScoreAdj
 	return &specs.Process{

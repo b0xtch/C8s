@@ -51,31 +51,7 @@
               "type": "string"
             },
             {
-              "name": "command",
-              "type": "list",
-              "optional": true,
-              "item": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "args",
-              "type": "list",
-              "optional": true,
-              "item": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "env",
-              "type": "map",
-              "optional": true,
-              "item": {
-                "type": "string"
-              }
-            },
-            {
-              "name": "workingDir",
+              "name": "process",
               "type": "string",
               "optional": true
             }

@@ -3,7 +3,6 @@ package session
 import (
 	"crypto/ecdsa"
 	"fmt"
-	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -16,16 +15,21 @@ var (
 	envNameRE    = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
-// Sandbox is the one OCI image the guest runs for its session: the agent or
-// harness and its tools. Command, args and env are exact: the host chooses
-// none of them.
+// ProcessImage is the Sandbox.Process of a session whose own process is its
+// image's command.
+const ProcessImage = "image"
+
+// Sandbox is the one OCI image the guest runs its session in: the agent or
+// harness and its tools. It carries no command line and no environment: a
+// bind holds no secret and either can, so a command is sent as any other is.
 type Sandbox struct {
 	// Image must be digest-pinned: name@sha256:<64 hex>.
-	Image      string            `json:"image"`
-	Command    []string          `json:"command,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
-	WorkingDir string            `json:"workingDir,omitempty"`
+	Image string `json:"image"`
+	// Process is the session's own process, whose end ends the session.
+	// Empty is none: only the guest's init runs in the sandbox, and stays.
+	// ProcessImage is the image's command, with its environment, user and
+	// working directory.
+	Process string `json:"process,omitempty"`
 }
 
 // Access lists who may drive a bound guest. Nothing is implicit: the authority
@@ -189,37 +193,8 @@ func (w *Sandbox) validate() error {
 	if _, err := w.Digest(); err != nil {
 		return err
 	}
-	for name, list := range map[string][]string{"command": w.Command, "args": w.Args} {
-		if len(list) > maxArgs {
-			return fmt.Errorf("%s has more than %d entries", name, maxArgs)
-		}
-		for _, arg := range list {
-			if len(arg) > maxArgBytes || strings.ContainsRune(arg, 0) {
-				return fmt.Errorf("%s entries must be at most %d bytes with no NUL", name, maxArgBytes)
-			}
-		}
-	}
-	if len(w.Command) > 0 && w.Command[0] == "" {
-		return fmt.Errorf("command[0] must not be empty")
-	}
-	if len(w.Env) > maxEnvVars {
-		return fmt.Errorf("env has more than %d entries", maxEnvVars)
-	}
-	total := 0
-	for k, v := range w.Env {
-		if !envNameRE.MatchString(k) {
-			return fmt.Errorf("env name %q is not a valid identifier", k)
-		}
-		if strings.ContainsRune(v, 0) {
-			return fmt.Errorf("env %s contains NUL", k)
-		}
-		total += len(k) + len(v)
-	}
-	if total > maxEnvBytes {
-		return fmt.Errorf("env exceeds %d bytes", maxEnvBytes)
-	}
-	if w.WorkingDir != "" && (!path.IsAbs(w.WorkingDir) || path.Clean(w.WorkingDir) != w.WorkingDir) {
-		return fmt.Errorf("workingDir must be an absolute, clean path")
+	if w.Process != "" && w.Process != ProcessImage {
+		return fmt.Errorf("process %q is not one a sandbox runs: none, or %q for its image's command", w.Process, ProcessImage)
 	}
 	return nil
 }

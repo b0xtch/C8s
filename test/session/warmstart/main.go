@@ -115,7 +115,7 @@ type options struct {
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
-	sandboxCommand                     string
+	sandboxProcess                     string
 	members                            string
 	sealedCredential, first            string
 	acceptTCB, collateralCache, before string
@@ -290,7 +290,7 @@ func main() {
 	flag.StringVar(&o.tenant, "tenant", "acme", "the tenant")
 	flag.StringVar(&o.prefix, "session-prefix", "warm", "each session is named <prefix>-<round>")
 	flag.StringVar(&o.sandboxImage, "sandbox-image", "", "OCI image each session runs, as name@sha256:<digest>")
-	flag.StringVar(&o.sandboxCommand, "sandbox-command", "", "the process each session's sandbox runs, as words separated by spaces, in place of the image's own: a session ends when that process does")
+	flag.StringVar(&o.sandboxProcess, "sandbox-process", "", "each session's own process, whose end ends the session: \"image\" for the image's command. Without it a sandbox runs nothing until a command is sent")
 	flag.StringVar(&o.keyService, "key-service", "", "pin of the key service the sessions trust")
 	flag.StringVar(&o.stored, "stored-credential", "", "a credential each guest takes from the key service at its bind (needs --key-service); the first command then reads it")
 	flag.StringVar(&o.members, "key-service-member", "", "instance keys, as sha256:<hex> and comma-separated, to name in each bind as the key service's replicas in place of the one this side judged: for a test of a guest that can reach none of them")
@@ -366,8 +366,8 @@ func run(o *options) error {
 	if o.ready == 0 {
 		o.ready = o.burst
 	}
-	if o.sandboxCommand != "" && o.sandboxImage == "" {
-		return errors.New("--sandbox-command names the process of a --sandbox-image")
+	if o.sandboxProcess != "" && o.sandboxImage == "" {
+		return errors.New("--sandbox-process names the process of a --sandbox-image")
 	}
 	if o.firstRound < 0 {
 		return errors.New("--first-round is no negative number")
@@ -703,7 +703,7 @@ func one(ctx context.Context, o *options, round int, name string, with *together
 	}
 	policy := session.BindPolicy{Access: session.Access{Exec: []string{string(accessPub)}, Credentials: []string{string(accessPub)}}}
 	if o.sandboxImage != "" {
-		policy.Sandbox = &session.Sandbox{Image: o.sandboxImage, Command: strings.Fields(o.sandboxCommand)}
+		policy.Sandbox = &session.Sandbox{Image: o.sandboxImage, Process: o.sandboxProcess}
 	}
 	argv := []string{"true"}
 	if o.stored != "" {

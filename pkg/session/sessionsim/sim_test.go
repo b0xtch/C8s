@@ -112,7 +112,7 @@ func TestPoolIsBoundAndDriven(t *testing.T) {
 		Authority: authority, InstanceKey: ready.InstanceKey,
 		Tenant: "acme", Session: "sbx-1", NotAfter: time.Now().Add(time.Minute),
 		Policy: session.BindPolicy{
-			Sandbox:     &session.Sandbox{Image: image, Args: []string{"--serve"}},
+			Sandbox:     &session.Sandbox{Image: image, Process: session.ProcessImage},
 			Access:      session.Access{Credentials: []string{accessPub}, Forward: []string{accessPub}},
 			Credentials: []session.Credential{{Name: "task", MaxBytes: 64}},
 			Forward:     &session.Forward{Ports: []int{8080}},
@@ -124,7 +124,7 @@ func TestPoolIsBoundAndDriven(t *testing.T) {
 	if _, err := unbound.Bind(ctx, bind); err != nil {
 		t.Fatalf("Bind: %v", err)
 	}
-	if sandbox.image == nil || sandbox.image.Image != image || len(sandbox.image.Args) != 1 {
+	if sandbox.image == nil || sandbox.image.Image != image || sandbox.image.Process != session.ProcessImage {
 		t.Fatalf("the sandbox was started with %+v", sandbox.image)
 	}
 

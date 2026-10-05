@@ -21,6 +21,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sandboxinit"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/imagestore"
 	"github.com/confidential-dot-ai/c8s/internal/imagestore/imagestoretest"
@@ -269,19 +270,19 @@ func (s *staged) first(t *testing.T) (pid int, command string) {
 }
 
 // The container of the first image a pool lists is made before any bind,
-// with the sandbox's init as its process. A bind that names that image has a
-// process to start and nothing else: the init becomes the image's command in
-// place, or the command the bind gives, in the bind's environment, and what
-// it becomes inherits nothing of the init's.
+// with the sandbox's init as its process. A bind that names that image has
+// nothing else to do than tell the init what the session is. With no process
+// named, the init stays: the same process, with no descriptor of the agent's
+// left, which reaps what a command leaves behind. With the image's command
+// named, the init becomes that command in place, and what it becomes
+// inherits nothing of the init's.
 func TestContainerMadeAheadBecomesTheSandbox(t *testing.T) {
 	for name, tc := range map[string]struct {
-		change func(*session.Sandbox)
-		want   string
+		process string
+		stays   bool
 	}{
-		"the image's own command": {func(*session.Sandbox) {}, "/bin/sleep 100000"},
-		"a command of the bind's": {func(w *session.Sandbox) {
-			w.Command, w.Args, w.Env = []string{"sleep"}, []string{"4242"}, map[string]string{"GREETING": "hello"}
-		}, "sleep 4242"},
+		"no process named":    {"", true},
+		"the image's command": {session.ProcessImage, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newStaged(t, stagedOptions{stored: []string{"a", "b"}, prestage: []string{"a", "b"}})
@@ -295,8 +296,7 @@ func TestContainerMadeAheadBecomesTheSandbox(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			sandbox := &session.Sandbox{Image: elsewhere(s.image["a"].Digest)}
-			tc.change(sandbox)
+			sandbox := &session.Sandbox{Image: elsewhere(s.image["a"].Digest), Process: tc.process}
 			bind := s.bindFor(t, ready, func(o *session.BindOptions) { o.Policy.Sandbox = sandbox })
 			resp, err := client.Bind(ctxT(t), bind)
 			if err != nil {
@@ -305,24 +305,51 @@ func TestContainerMadeAheadBecomesTheSandbox(t *testing.T) {
 			if steps := stepNames(resp.Admission); steps != "prestaged,measure,start" {
 				t.Errorf("admission steps: %s", steps)
 			}
-			if pid, command := s.first(t); pid != made || command != tc.want {
-				t.Fatalf("after the bind the container's first process is %d running %q, want %d running %q", pid, command, made, tc.want)
+			pid, command := s.first(t)
+			if pid != made {
+				t.Fatalf("after the bind the container's first process is %d, and the one made ahead was %d", pid, made)
+			}
+			if tc.stays != strings.HasPrefix(command, "/proc/self/fd/") || !tc.stays && command != "/bin/sleep 100000" {
+				t.Fatalf("after the bind the container's first process runs %q", command)
 			}
 			tenant := s.boundClient(t, ready, bind)
 			if got := s.which(t, tenant); got != "a a" {
 				t.Errorf("the sandbox is image %q", got)
 			}
-			out, err := tenant.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `ls /proc/1/fd | tr '\n' ' '; tr '\0' '\n' < /proc/1/environ | grep -c GREETING`}})
+			out, err := tenant.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `ls /proc/1/fd | tr '\n' ' '`}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			fields := strings.Fields(string(out.Stdout))
-			greeted := "0"
-			if sandbox.Env != nil {
-				greeted = "1"
+			if fields := strings.Fields(string(out.Stdout)); !slices.Equal(fields, []string{"0", "1", "2"}) && !tc.stays {
+				t.Errorf("the sandbox's process holds descriptors %v, want 0 1 2", fields)
 			}
-			if want := []string{"0", "1", "2", greeted}; !slices.Equal(fields, want) {
-				t.Errorf("the sandbox's process holds descriptors and a greeting %v, want %v", fields, want)
+			if tc.stays {
+				// A runtime's own descriptors may be among an init's: the two
+				// the agent gave it are not, by the numbers it knew them by.
+				for _, fd := range strings.Fields(string(out.Stdout)) {
+					if fd == strconv.Itoa(sandboxinit.ProgramFD) || fd == strconv.Itoa(sandboxinit.ControlFD) {
+						t.Errorf("an init that stays holds descriptor %s of the agent's: %s", fd, out.Stdout)
+					}
+				}
+				// A command that leaves a child behind: the child ends, and
+				// the init has reaped it when the sandbox is next looked at.
+				if _, err := tenant.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `(sleep 0.2 &) ; exit 0`}}); err != nil {
+					t.Fatal(err)
+				}
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					out, err := tenant.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `grep -l '^State:.Z' /proc/[0-9]*/status 2>/dev/null | wc -l`}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if strings.TrimSpace(string(out.Stdout)) == "0" {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("the sandbox still holds %s processes that ended and were not reaped", strings.TrimSpace(string(out.Stdout)))
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
 			}
 			if n := s.registry.Requests.Load(); n != 0 {
 				t.Errorf("the registry was sent %d requests", n)
