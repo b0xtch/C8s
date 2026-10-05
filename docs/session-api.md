@@ -473,18 +473,18 @@ reach, no new HTTP method and no cloud metadata endpoint.
    extends RTMR[3] with its digest. Then it signs a receipt over the binder's
    nonce with its one-time key, naming the bind's digest, the events the bind
    has it extend, the sandbox's image among them, and the phase it will be in
-   once the sandbox runs, and erases that key. It extends the image's digest
-   after signing, but the receipt leaves the guest only once RTMR[3] holds
-   every event it names. Then, while it takes the quote over the binder's
-   nonce, it asks the key service, at a replica the bind names, for the
-   credentials the bind says come from there, showing it the receipt, and
-   starts the sandbox on the root file system it made before any bind, under
-   a key it generated, without waiting for that answer. Before the sandbox
-   runs anything of the tenant, it puts in place the key service's
-   credentials, tries the message sealed to its one-time KEM key if one came
-   by then, puts in place the credentials that message carries, and erases
-   that key. It answers with the receipt, and sends the quote after it on the
-   same call as soon as it has it, so that a start never waits on the
+   once the sandbox runs, and uses that key for nothing more. It extends the
+   image's digest after signing, but the receipt leaves the guest only once
+   RTMR[3] holds every event it names. Then, while it takes the quote over the
+   binder's nonce, it asks the key service, at a replica the bind names, for
+   the credentials the bind says come from there, showing it the receipt, and
+   starts the sandbox on the root file system it made before any bind, under a
+   key it generated, without waiting for that answer. Before the sandbox runs
+   anything of the tenant, it puts in place the key service's credentials,
+   tries the message sealed to its one-time KEM key if one came by then, puts
+   in place the credentials that message carries, and erases both one-time
+   keys at once. It answers with the receipt, and sends the quote after it on
+   the same call as soon as it has it, so that a start never waits on the
    evidence requests the daemon relays, which every caller shares; from then
    on the quote is in the evidence it serves too. The binder holds the quote
    to the receipt. A guest whose admission fails after it extended RTMR[3]
