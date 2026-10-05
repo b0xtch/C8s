@@ -105,9 +105,9 @@ Each lever must keep the rules in
 | continuous mode | QEMU's COLO on the same VM, for the delay it adds to output | the epoch each sandbox sustains, the wait it adds to an output, and the CPU and writes it costs, against the same session in commit mode |
 | moving a session between hosts | QEMU's live migration of the same VM, and Firecracker's snapshot create, copy and load | a seal in continuous mode on one host to the first effect on another, at 1, 4 and 16 GiB |
 | the root's file system | ext4 on the same dm-crypt | btrfs with SHA-256 checksums and with BLAKE2b, for the work inside |
-| ending a TD | ending a VM | the host's time to free the TD's memory, per GiB, and what it costs the TDs beside it |
+| ending a TD | ending a VM | the host's time to free the TD's memory, per GiB, and its key ID, and what that costs the guests beside it and those starting |
 | idle memory per session | host memory per idle VM | the same, private and shared apart, per idle TD and per tenant-VM session |
-| sessions per host | until the host refuses or slows | the same |
+| sessions per host | until the host refuses or slows | the same, and what bounds it first: memory, CPU or the hardware's key IDs |
 | work inside | CPU, memory bandwidth, network and storage throughput | the same |
 
 Targets: warm activation and the first command at or below the baseline's
@@ -147,9 +147,13 @@ memory-acceptance floor; work inside within the published floors.
 - **The same settings.** Power settings (governor, C-states, turbo) are pinned
   and recorded, versions are named, and the sides interleave round by round
   within one run. Nothing else runs on the host during a run: no TD or VM but
-  the sides' own, and a side that waits keeps its guests idle, with no boot in
-  flight, on cores apart from those of the side being measured, as the record
-  lists.
+  the sides' own, and a side that waits keeps its guests idle, with no boot or
+  ending in flight, on cores apart from those of the side being measured, as
+  the record lists. Where the host cannot hold every side's guests at once,
+  as with pools for a burst of 100, the sides take turns instead, each side's
+  guests up only in its own turns, and a turn begins only once the host has
+  taken apart the guests of the turn before, their memory freed and a TD's
+  key ID free again, which the record times.
 - **Like for like.** Both sides reach their first command the same way, and
   the command does the same work on each. A baseline driven over a serial
   console, with no platform channel, is a floor, and is labeled as one. Work
@@ -162,7 +166,11 @@ memory-acceptance floor; work inside within the published floors.
   A reflink measured on a file system mounted from a file on another tests
   correctness, not speed. A round is left out only for a reason its record
   names, such as the first of each side, which runs with its caches cold, and
-  the record counts what it left out.
+  the record counts what it left out. A start that fails or loses its guest
+  is never left out: it counts against the success rate, even where a retry
+  on another guest would save it. A start succeeds only when its first
+  command answers as it should and, for a session, its binder keeps its
+  verdict.
 - **Departures.** A run that departs from any of this names each departure in
   the first line of its record, and every number the departure touches
   carries it.
