@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	containerdlog "github.com/containerd/log"
 	"github.com/spf13/cobra"
@@ -146,18 +147,23 @@ func newRunCmd() *cobra.Command {
 			if cfg.TEE, err = OpenTEE(cfg.Platform); err != nil {
 				return err
 			}
-			var checks []func(context.Context) error
-			// The schemas on the measured root are the ones this agent keeps
-			// to, or this is not the image that was published.
-			checks = append(checks, func(context.Context) error { return schemas.Check() })
+			// Before the guest serves, everything. The schemas on the
+			// measured root are the ones this agent keeps to, or this is not
+			// the image that was published.
+			checks := []guestCheck{{"schemas", func(context.Context) error { return schemas.Check() }}}
 			if !allowConsole {
 				consoles := ConsoleGuard{Consoles: consolesPath}
-				checks = append(checks, func(context.Context) error { return consoles.Check() })
+				checks = append(checks, guestCheck{"consoles", func(context.Context) error { return consoles.Check() }})
 			}
 			// The machine is the one a session guest is given, device by
 			// device, or the guest ends before it stages anything.
 			devices := DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}
-			checks = append(checks, func(context.Context) error { return devices.Check() })
+			checks = append(checks, guestCheck{"devices", func(context.Context) error { return devices.Check() }})
+			// Before a sandbox starts, what can have changed since. The
+			// schemas are on a root no write reaches, and the kernel takes no
+			// console, no device and no code after it has booted: its image
+			// is built without hot plug and without modules.
+			var atBind []guestCheck
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.
@@ -165,16 +171,11 @@ func newRunCmd() *cobra.Command {
 				// Listed before the guest serves, and from then on held to
 				// the kernel's count of its changes.
 				filter := &RulesetWatch{Guard: guard, Generation: rulesetGeneration}
-				checks = append(checks, filter.Check, listeners.Check)
+				atBind = []guestCheck{{"filter", filter.Check}, {"listeners", listeners.Check}}
+				checks = append(checks, atBind...)
 			}
-			cfg.Guard = func(ctx context.Context) error {
-				for _, check := range checks {
-					if err := check(ctx); err != nil {
-						return err
-					}
-				}
-				return nil
-			}
+			cfg.Guard = func(ctx context.Context) error { return runChecks(ctx, nil, checks) }
+			cfg.BindGuard = func(ctx context.Context) error { return runChecks(ctx, cfg.Logger, atBind) }
 			// Unreadable reads as none, which a document with a bind deadline
 			// refuses.
 			cfg.ClockSource = func() string {
@@ -248,6 +249,29 @@ func newRunCmd() *cobra.Command {
 	f.StringSliceVar(&plainHTTP, "sandbox-plain-http", nil, "registries (host:port) reached without TLS, for a dev image's local registry; an image is verified by its digest either way")
 	_ = cmd.MarkFlagRequired("platform")
 	return cmd
+}
+
+// guestCheck is one thing a guest checks of itself.
+type guestCheck struct {
+	name  string
+	check func(context.Context) error
+}
+
+// runChecks runs checks in order and stops at the first that fails. With a
+// log it says how long each took.
+func runChecks(ctx context.Context, log *slog.Logger, checks []guestCheck) error {
+	took := make([]any, 0, 2*len(checks))
+	for _, c := range checks {
+		began := time.Now()
+		if err := c.check(ctx); err != nil {
+			return err
+		}
+		took = append(took, c.name+"_us", time.Since(began).Microseconds())
+	}
+	if log != nil && len(took) > 0 {
+		log.Info("checked before a sandbox", took...)
+	}
+	return nil
 }
 
 // lookupUser resolves the unprivileged sandbox account. Running tenant

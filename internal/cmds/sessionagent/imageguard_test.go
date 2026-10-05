@@ -133,6 +133,37 @@ func TestLockedKernelHasNoConsole(t *testing.T) {
 	}
 }
 
+// A guest checks its devices and its console once, before it serves, and
+// its binds rest on that: the kernel takes no device a host adds later, and
+// loads no code that could add a console or a driver. Both fragments say so,
+// and this holds the two kernels' resolved configurations to it.
+func TestGuestKernelTakesNoDeviceAndNoCodeOnceItRuns(t *testing.T) {
+	const kernels = "../../../session-guest-image/kernel/"
+	for _, name := range []string{"config-x86_64-session.snapshot", "config-x86_64-session-dev.snapshot"} {
+		config := kernelConfig(t, kernels+name)
+		for _, symbol := range []string{"HOTPLUG_PCI", "HOTPLUG_PCI_PCIE", "HOTPLUG_PCI_ACPI", "PCIEPORTBUS", "MODULES", "MEMORY_HOTPLUG"} {
+			if value, set := config[symbol]; set {
+				t.Errorf("%s: the kernel has CONFIG_%s=%s, and a guest's bind rests on a check made before it served", name, symbol, value)
+			}
+		}
+	}
+	for _, name := range []string{"session.config", "session-dev.config"} {
+		fragment, err := os.ReadFile(kernels + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, _, marked := strings.Cut(string(fragment), "# end of common\n")
+		if !marked {
+			t.Fatalf("%s has no end of its common block", name)
+		}
+		for _, line := range []string{"# CONFIG_HOTPLUG_PCI is not set\n", "# CONFIG_PCIEPORTBUS is not set\n", "# CONFIG_MODULES is not set\n"} {
+			if !strings.Contains(common, line) {
+				t.Errorf("%s does not say %q in the block both kernels share", name, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
 // The guest's packet filter is its nftables ruleset and nothing beside it:
 // no iptables table of the old kind, and no xtables match inside nftables.
 // The agent lists the ruleset once and from then on asks the kernel for its

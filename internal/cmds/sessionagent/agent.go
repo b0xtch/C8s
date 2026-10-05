@@ -46,9 +46,11 @@ type Config struct {
 	// image for sessions leaves it off, and its agent takes no bind without a
 	// sandbox image.
 	Bare bool
-	// Guard, when set, is asked before the guest serves and again before a
-	// sandbox starts. An error from it ends the guest.
-	Guard func(context.Context) error
+	// Guard, when set, is asked before the guest serves, and BindGuard
+	// before a sandbox starts: of what the first checked, the part that can
+	// have changed since. An error from either ends the guest.
+	Guard     func(context.Context) error
+	BindGuard func(context.Context) error
 	// ClockSource reads the kernel's current clocksource. A guest that must
 	// end if it is not bound in time needs one the host cannot slow:
 	// "tsc". The kernel can leave it while the guest runs, so it is asked
@@ -453,9 +455,9 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		}
 		// Asked before the image is measured: a guest that will not start
 		// its sandbox does not say it admitted one.
-		if a.cfg.Guard != nil {
+		if a.cfg.BindGuard != nil {
 			began := time.Now()
-			if err := a.cfg.Guard(ctx); err != nil {
+			if err := a.cfg.BindGuard(ctx); err != nil {
 				return nil, nil, fmt.Errorf("before starting the sandbox: %w", err)
 			}
 			recordStep(ctx, stepChecks, time.Since(began))

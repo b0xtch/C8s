@@ -689,7 +689,7 @@ func TestAGuestTheClientRefusedGetsNothing(t *testing.T) {
 	}
 }
 
-// The guard speaks before the guest serves and again before a sandbox
+// One guard speaks before the guest serves and another before a sandbox
 // starts. A guest whose packet filter is not the image's does neither.
 func TestGuardIsAskedBeforeServingAndBeforeTheSandbox(t *testing.T) {
 	wrong := errors.New("the packet filter in force is not the one this image loads")
@@ -706,10 +706,15 @@ func TestGuardIsAskedBeforeServingAndBeforeTheSandbox(t *testing.T) {
 		t.Fatal("the guest serves with the wrong packet filter")
 	}
 
-	// Right at boot, wrong by the time the sandbox is to start.
+	// Right at boot, wrong by the time the sandbox is to start. What is
+	// asked before the guest serves is not asked again.
 	p := newPool(t)
-	var asked atomic.Int32
+	var asked, served atomic.Int32
 	p.cfg.Guard = func(context.Context) error {
+		served.Add(1)
+		return nil
+	}
+	p.cfg.BindGuard = func(context.Context) error {
 		asked.Add(1)
 		return wrong
 	}
@@ -728,6 +733,9 @@ func TestGuardIsAskedBeforeServingAndBeforeTheSandbox(t *testing.T) {
 	}
 	if asked.Load() != 1 || p.runner.recorded() != "prepare "+sandboxImage {
 		t.Fatalf("guard asked %d times, runner steps %s", asked.Load(), p.runner.recorded())
+	}
+	if served.Load() > 1 {
+		t.Fatalf("what is checked before the guest serves was checked %d times", served.Load())
 	}
 	seed := runtimemeasure.Seed(p.bundle.LaunchKey)
 	bound := runtimemeasure.FromDigestsSeeded(seed, []string{session.DocumentDigest(p.bundle.Launch), session.DocumentDigest(bind.Raw)})

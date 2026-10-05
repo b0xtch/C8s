@@ -34,8 +34,8 @@ const (
 	// stepClear: the fetched blobs removed.
 	stepClear = string(disclosure.StepClear)
 	// stepChecks: what the guest checks of itself before it admits a
-	// sandbox: its schemas, its console, its devices, its packet filter and
-	// its listeners.
+	// sandbox: that its packet filter is the one it listed before it served,
+	// and where its own services listen.
 	stepChecks = string(disclosure.StepChecks)
 	// stepMeasure: the sandbox extended into the register.
 	stepMeasure = string(disclosure.StepMeasure)
