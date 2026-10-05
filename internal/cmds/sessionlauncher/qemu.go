@@ -41,6 +41,12 @@ const (
 	// for a caller that owns the guest's network, such as a daemon that keeps
 	// each guest in a namespace of its own.
 	NetworkFD = "fd"
+	// NetworkNone gives the guest no network device. It is reached on ports
+	// of its socket to the host, which the launcher publishes on TCP ports of
+	// the host, and reaches only what its launcher carries a connection to.
+	// This is a key service replica's network: its class lists no such
+	// device, and a replica that finds one ends.
+	NetworkNone = "none"
 )
 
 // The addresses of QEMU's user-mode network, said to QEMU and to the guest
@@ -83,7 +89,9 @@ type Config struct {
 	Network      string
 	// Interface is the interface a tap guest takes over.
 	Interface string
-	// Forwards are the guest TCP ports published in user mode.
+	// Forwards are the guest's ports published on the host: TCP ports of the
+	// guest in user mode, and ports of the guest's socket to the host for a
+	// guest with no network device.
 	Forwards []Forward
 	// TapFD and VhostFD are descriptors this process inherited, for an fd
 	// guest: an open tap and vhost-net for it. VhostFD is -1 for none.
@@ -337,8 +345,17 @@ func (c *Config) validate() error {
 			return fmt.Errorf("--guest-mac must be a unicast Ethernet address")
 		}
 		c.MAC = mac.String()
+	case NetworkNone:
+		if c.VsockCID == 0 && !c.VsockAuto {
+			return fmt.Errorf("--network none needs --vsock-cid: the guest's socket to the host is its only road")
+		}
+		for _, forward := range c.Forwards {
+			if err := forward.validate(); err != nil {
+				return fmt.Errorf("--port: %w", err)
+			}
+		}
 	default:
-		return fmt.Errorf("--network must be %s, %s or %s", NetworkTap, NetworkUser, NetworkFD)
+		return fmt.Errorf("--network must be %s, %s, %s or %s", NetworkTap, NetworkUser, NetworkFD, NetworkNone)
 	}
 	// 0-2 are reserved and 0xffffffff is VMADDR_CID_ANY.
 	if c.VsockCID != 0 && (c.VsockCID < 3 || c.VsockCID == 0xffffffff) {

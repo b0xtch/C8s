@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,7 +48,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	// The guest is the one that enforces this. Checking here only turns a
 	// bundle that could never boot into an immediate, legible failure.
-	platform, pinned, described, err := describe(pub, launch, string(signature))
+	platform, pinned, replica, described, err := describe(pub, launch, string(signature))
 	if err != nil {
 		return fmt.Errorf("launch bundle in %s: %w", cfg.LaunchDir, err)
 	}
@@ -128,6 +129,39 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		}
 		defer carrier.ln.Close()
 		described = append(described, "key_service_port", host.KeyServicePort)
+	}
+	// A guest with no network device is reached on ports of its socket to
+	// the host, which the launcher publishes on the host.
+	var carriers []*relay
+	if cfg.Network == NetworkNone {
+		for _, forward := range cfg.Forwards {
+			publisher, err := publishRelay(forward, cfg.guestCID(), log)
+			if err != nil {
+				return fmt.Errorf("--port %d: %w", forward.Host, err)
+			}
+			defer publisher.ln.Close()
+			carriers = append(carriers, publisher)
+		}
+	}
+	// A key service replica judges guests by the vendor's documents, which
+	// it takes from the vendor itself. One with a vsock device is carried
+	// there by its launcher, and needs no network device for it.
+	if cid := cfg.guestCID(); replica && cid != 0 {
+		services, err := session.VendorServices(cfg.Platform)
+		if err != nil {
+			return err
+		}
+		host.VendorPorts = map[string]uint32{}
+		for _, service := range services {
+			road, port, err := vendorRelay(service, cid, log)
+			if err != nil {
+				return fmt.Errorf("vendor relay: %w", err)
+			}
+			defer road.ln.Close()
+			carriers = append(carriers, road)
+			host.VendorPorts[service] = port
+		}
+		described = append(described, "vendor_services", len(services))
 	}
 	// A TD with a vsock device asks its launcher for Intel's documents for
 	// its platform. The launcher looks for them now, ahead of the ask.
@@ -221,11 +255,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 			log.Info("the VMM is kept off the first CPU of each package", "cpus", off)
 		}
 		if carrier != nil {
-			carrying, stop := context.WithCancel(ctx)
-			go carrier.run(carrying)
-			defer stop()
+			carriers = append(carriers, carrier)
+		}
+		carrying, stop := context.WithCancel(ctx)
+		var relays sync.WaitGroup
+		for _, each := range carriers {
+			relays.Go(func() { each.run(carrying) })
 		}
 		err = cmd.Wait()
+		// Each relay says what it carried once its connections have ended.
+		stop()
+		relays.Wait()
 	}
 	// The scratch disk held only ciphertext under a key that died with the
 	// guest; removing it just returns the space.
@@ -244,17 +284,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 
 // describe reads a bundle's launch document: a session pool's, or a key
 // service's, which boots from a bundle of the same layout. It returns the
-// platform the document is for, the key service a pool's document pins, and
-// what to log of it.
-func describe(pub, launch []byte, signature string) (platform string, pinned *session.KeyService, described []any, err error) {
+// platform the document is for, the key service a pool's document pins,
+// whether the document is a key service replica's, and what to log of it.
+func describe(pub, launch []byte, signature string) (platform string, pinned *session.KeyService, replica bool, described []any, err error) {
 	doc, err := session.VerifySigned(pub, launch, signature)
 	if err == nil {
-		return doc.Image.Platform, doc.KeyService, []any{"pool", doc.Pool, "class", doc.Class}, nil
+		return doc.Image.Platform, doc.KeyService, false, []any{"pool", doc.Pool, "class", doc.Class}, nil
 	}
 	if service, serviceErr := keyservice.VerifySigned(pub, launch, signature); serviceErr == nil {
-		return service.Image.Platform, nil, []any{"key_service_pools", len(service.Pools)}, nil
+		return service.Image.Platform, nil, true, []any{"key_service_pools", len(service.Pools)}, nil
 	}
-	return "", nil, nil, err
+	return "", nil, false, nil, err
 }
 
 // avoidCPUs lists the CPUs this guest's VMM is kept off: on TDX, the ones the

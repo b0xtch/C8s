@@ -103,11 +103,22 @@ func TestLoadFailsWhenTheNetworkDoesNotApply(t *testing.T) {
 	if err := load(cfg); err == nil || !strings.Contains(err.Error(), "no network device") {
 		t.Fatalf("load: %v", err)
 	}
-	// A load with nothing to apply a network with stages the files and stops.
-	cfg, _ = loadFixture(t, `{"network":{"address":"10.42.0.12/24"}}`)
+	// A load with nothing to apply a network with stages the files and stops:
+	// the load step of a guest whose class has no network device. Whatever
+	// its host asks for, it sets no interface and writes no resolver, and
+	// its service finds the roads its host named.
+	cfg, _ = loadFixture(t, `{"network":{"address":"10.42.0.12/24","dns":["10.42.0.1"]},"vendor_ports":{"api.trustedservices.intel.com:443":70125}}`)
+	resolvers := cfg.ResolvConf
 	cfg.Network, cfg.ResolvConf = nil, ""
 	if err := load(cfg); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := os.Stat(resolvers); err == nil {
+		t.Fatal("a guest with no network device wrote resolvers")
+	}
+	staged, err := session.ReadHostConfig(filepath.Join(cfg.LaunchDir, session.HostConfigFile))
+	if err != nil || staged == nil || staged.VendorPorts["api.trustedservices.intel.com:443"] != 70125 {
+		t.Fatalf("the staged request: %+v, %v", staged, err)
 	}
 }
 

@@ -87,6 +87,33 @@ func TestDeviceGuard(t *testing.T) {
 		t.Fatal("a console that says it is a network device was taken")
 	}
 
+	// A guest of a class with no network device has the same bus without
+	// one. A network device on it is another machine's, and so is whatever a
+	// session guest would not be given.
+	replica := sessionBus()
+	delete(replica, "0000:00:04.0")
+	if err := (DeviceGuard{Devices: pciBus(t, replica), NoNetwork: true}).Check(); err != nil {
+		t.Fatalf("a guest with no network device: %v", err)
+	}
+	if err := (DeviceGuard{Devices: pciBus(t, replica)}).Check(); err != nil {
+		t.Fatalf("a session guest's check on a bus with no network device: %v", err)
+	}
+	err := (DeviceGuard{Devices: pciBus(t, sessionBus()), NoNetwork: true}).Check()
+	if err == nil || !strings.Contains(err.Error(), "0000:00:04.0 (1af4:1041, class 020000) is none a guest of this class is given") {
+		t.Fatalf("a guest of a class with no network device took one: %v", err)
+	}
+	replica["0000:00:06.0"] = [3]string{"0x1af4", "0x1043", "0x078000"}
+	if err := (DeviceGuard{Devices: pciBus(t, replica), NoNetwork: true}).Check(); err == nil {
+		t.Fatal("a guest with no network device took a console that it has none of")
+	}
+	if err := (DeviceGuard{Devices: pciBus(t, replica), NoNetwork: true, Console: true}).Check(); err != nil {
+		t.Fatalf("a dev guest with no network device: %v", err)
+	}
+	replica["0000:00:07.0"] = [3]string{"0x8086", "0x10d3", "0x020000"}
+	if err := (DeviceGuard{Devices: pciBus(t, replica), NoNetwork: true, Console: true}).Check(); err == nil {
+		t.Fatal("a guest with no network device took a network card of its host's choosing")
+	}
+
 	// A bus the guest cannot read, or one with nothing on it, is no session
 	// guest's.
 	if err := (DeviceGuard{Devices: filepath.Join(t.TempDir(), "absent")}).Check(); err == nil {

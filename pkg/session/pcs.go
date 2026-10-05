@@ -3,14 +3,19 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
+	"slices"
+	"time"
 
 	"github.com/google/go-tdx-guest/pcs"
 
@@ -24,37 +29,96 @@ const maxCollateralBody = 256 << 10
 
 // pcsGetter asks Intel's service for one document: one request, an answer
 // taken only from where it was asked, and a body that is bounded.
-type pcsGetter struct{}
+type pcsGetter struct {
+	// client is how the service is reached. Nil is this process's own road.
+	client *http.Client
+}
 
 var pcsClient = &http.Client{
 	// A redirect is an answer from somewhere else.
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
 
-func (g pcsGetter) Get(url string) (map[string][]string, []byte, error) {
-	return g.GetContext(context.Background(), url)
+// vendorDialer opens the connection a verifier's TLS session to Intel's
+// service runs on.
+type vendorDialer = func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// pcsClientOver is a client that reaches Intel's service over connections
+// dial opens. Each still carries a TLS session that ends at Intel, held to
+// the system's roots, so whoever carries the bytes reads and changes none.
+func pcsClientOver(dial vendorDialer, roots *tls.Config) *http.Client {
+	return &http.Client{
+		CheckRedirect: pcsClient.CheckRedirect,
+		Transport: &http.Transport{
+			// No proxy from the environment: the road is the one given.
+			DialContext:           dial,
+			TLSClientConfig:       roots,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          4,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+		},
+	}
 }
 
-func (pcsGetter) GetContext(ctx context.Context, url string) (map[string][]string, []byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// VendorServices lists where a verifier of the platform's evidence asks the
+// vendor for its documents, each as host:port. A host that carries such a
+// verifier's connections, because the verifier has no network of its own,
+// carries them there and nowhere else.
+func VendorServices(platform string) ([]string, error) {
+	if platform != string(teetypes.PlatformTDX) {
+		return nil, fmt.Errorf("no vendor service is known for platform %q", platform)
+	}
+	root, err := rootCRLURL()
+	if err != nil {
+		return nil, err
+	}
+	var services []string
+	for _, document := range []string{pcs.TcbInfoURL("000000000000"), pcs.QeIdentityURL(), pcs.PckCrlURL("platform"), root} {
+		u, err := url.Parse(document)
+		if err != nil || u.Scheme != "https" || u.Hostname() == "" {
+			return nil, fmt.Errorf("the vendor's document %q is not at an https address", document)
+		}
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		if service := net.JoinHostPort(u.Hostname(), port); !slices.Contains(services, service) {
+			services = append(services, service)
+		}
+	}
+	return services, nil
+}
+
+func (g pcsGetter) Get(document string) (map[string][]string, []byte, error) {
+	return g.GetContext(context.Background(), document)
+}
+
+func (g pcsGetter) GetContext(ctx context.Context, document string) (map[string][]string, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, document, nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	resp, err := pcsClient.Do(req)
+	client := g.client
+	if client == nil {
+		client = pcsClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("%s answered %s", url, resp.Status)
+		return nil, nil, fmt.Errorf("%s answered %s", document, resp.Status)
 	}
 	body, err := readutil.ReadAll(resp.Body, maxCollateralBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read the answer of %s: %w", url, err)
+		return nil, nil, fmt.Errorf("read the answer of %s: %w", document, err)
 	}
 	// Intel's service answers some requests it will not serve with nothing.
 	if len(body) == 0 {
-		return nil, nil, fmt.Errorf("%s answered with no document", url)
+		return nil, nil, fmt.Errorf("%s answered with no document", document)
 	}
 	return resp.Header, body, nil
 }

@@ -45,7 +45,7 @@ func startRelay(t *testing.T, own func(net.Conn) bool, dial func(context.Context
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	r := &relay{ln: ln, own: own, dial: dial, log: quiet}
+	r := &relay{name: "test", ln: ln, own: own, dial: dial, slots: relayed, log: quiet}
 	go func() {
 		defer close(done)
 		r.run(ctx)

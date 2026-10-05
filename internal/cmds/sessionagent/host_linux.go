@@ -4,6 +4,7 @@ package sessionagent
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"path/filepath"
 
@@ -24,6 +25,10 @@ type hostDials struct {
 	// Collateral reaches the host's answer to an ask for Intel's documents.
 	// Nil is a host that offers none.
 	Collateral func(context.Context) (net.Conn, error)
+	// Vendor reaches the vendor's service at the host name and port asked
+	// for, on a connection the host carries: for a TLS session that ends at
+	// the vendor. Nil is a host that names no such road.
+	Vendor func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // readHostDials reads which ports the host named.
@@ -39,7 +44,33 @@ func readHostDials(launchDir string) (hostDials, error) {
 	if port := host.CollateralPort; port != 0 {
 		dials.Collateral = func(context.Context) (net.Conn, error) { return dialHost(port) }
 	}
+	if ports := host.VendorPorts; len(ports) > 0 {
+		dials.Vendor = func(_ context.Context, _, addr string) (net.Conn, error) {
+			port, ok := ports[addr]
+			if !ok {
+				return nil, fmt.Errorf("this guest's host carries no connection to %s", addr)
+			}
+			return dialHost(port)
+		}
+	}
 	return dials, nil
+}
+
+// VendorDial is how a guest with no network device reaches the vendor's
+// service: over the connections its host carries, as the host's file in
+// launchDir names them. Without any it is a dialer that reaches nothing,
+// since such a guest has no other road.
+func VendorDial(launchDir string) (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+	dials, err := readHostDials(launchDir)
+	if err != nil {
+		return nil, err
+	}
+	if dials.Vendor != nil {
+		return dials.Vendor, nil
+	}
+	return func(_ context.Context, _, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("this guest's host named no road to the vendor's service, and %s is not reached", addr)
+	}, nil
 }
 
 // dialHost connects to a vsock port of the guest's host.

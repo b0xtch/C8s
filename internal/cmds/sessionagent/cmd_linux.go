@@ -74,7 +74,7 @@ func newHoldCmd() *cobra.Command {
 
 func newLoadCmd() *cobra.Command {
 	cfg := LoadConfig{}
-	var allowConsole bool
+	var allowConsole, noNetwork bool
 	cmd := &cobra.Command{
 		Use:   "load",
 		Short: "Copy this boot's launch files off the opkeydata volume and apply the host's network request",
@@ -82,17 +82,24 @@ func newLoadCmd() *cobra.Command {
 		RunE: func(*cobra.Command, []string) error {
 			// The first thing the guest does with what its host built: before
 			// it reads a file the host handed it or sets an address the host
-			// asked for, the machine is one a session guest is given.
-			if err := (DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}).Check(); err != nil {
+			// asked for, the machine is one a guest of its class is given.
+			if err := (DeviceGuard{Devices: pciDevicesPath, Console: allowConsole, NoNetwork: noNetwork}).Check(); err != nil {
 				return err
 			}
-			cfg.Network = applyNetwork
+			// A guest of a class without a network has no interface to set,
+			// whatever its host asks for.
+			if noNetwork {
+				cfg.ResolvConf = ""
+			} else {
+				cfg.Network = applyNetwork
+			}
 			return Load(cfg)
 		},
 	}
 	cmd.Flags().StringVar(&cfg.LaunchDir, "launch-dir", defaultLaunchDir, "where launch.yaml and its signature are staged for the agent")
 	cmd.Flags().StringVar(&cfg.ResolvConf, "resolv-conf", defaultResolvConf, "where the host's resolvers are written; the image's /etc/resolv.conf links to it")
 	cmd.Flags().BoolVar(&allowConsole, "allow-console", false, "take a virtio console among the guest's devices (dev images)")
+	cmd.Flags().BoolVar(&noNetwork, "no-network", false, "this image's class has no network device: take none among the guest's devices, and set no interface (the key service's image)")
 	return cmd
 }
 

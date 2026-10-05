@@ -16,6 +16,7 @@ import (
 
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/keyservice"
+	"github.com/confidential-dot-ai/c8s/internal/vsock"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	api "github.com/confidential-dot-ai/c8s/pkg/session/keyservice"
 )
@@ -42,8 +43,29 @@ func NewCmd() *cobra.Command {
 	return cmd
 }
 
+// hostOnly takes connections from the guest's host alone: the launcher that
+// carries every connection of a replica.
+type hostOnly struct{ net.Listener }
+
+func (l hostOnly) Accept() (net.Conn, error) {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if peer, ok := conn.(*vsock.Conn); ok && peer.Peer() == vsock.HostCID {
+			return conn, nil
+		}
+		_ = conn.Close()
+	}
+}
+
+// accepted bounds the connections that wait for the replica to take them.
+const accepted = 128
+
 func newRunCmd() *cobra.Command {
-	var platform, pubkey, launchDir, listen, collateral string
+	var platform, pubkey, launchDir, collateral string
+	var port uint32
 	var allowConsole bool
 	cmd := &cobra.Command{
 		Use:   "run",
@@ -67,8 +89,16 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 			}
 			// The load step checked the guest's devices before it read a
 			// file of the host's. A replica checks them again before it
-			// serves, as a session guest's agent does.
-			if err := (sessionagent.DeviceGuard{Devices: pciDevicesPath, Console: allowConsole}).Check(); err != nil {
+			// serves, as a session guest's agent does. Its class has no
+			// network device: every connection of a replica is one its
+			// launcher carries over the guest's socket to the host.
+			if err := (sessionagent.DeviceGuard{Devices: pciDevicesPath, Console: allowConsole, NoNetwork: true}).Check(); err != nil {
+				return err
+			}
+			// Its road to the vendor's service, for the documents it judges
+			// guests by. The TLS session on it ends at the vendor.
+			vendor, err := sessionagent.VendorDial(launchDir)
+			if err != nil {
 				return err
 			}
 			tee, err := sessionagent.OpenTEE(platform)
@@ -92,24 +122,24 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 			service, err := keyservice.New(warm, keyservice.Config{
 				Launch: measured.Launch, Signature: measured.Signature, LaunchKey: measured.LaunchKey,
 				TEE:    tee,
-				Engine: session.NewEngine(session.EngineOptions{CollateralCacheDir: collateral}),
+				Engine: session.NewEngine(session.EngineOptions{CollateralCacheDir: collateral, Dial: vendor}),
 				Logger: log,
 			})
 			cancel()
 			if err != nil {
 				return err
 			}
-			ln, err := net.Listen("tcp", listen)
+			ln, err := vsock.Listen(port, accepted)
 			if err != nil {
-				return fmt.Errorf("listen %s: %w", listen, err)
+				return fmt.Errorf("listen on vsock port %d: %w", port, err)
 			}
-			log.Info("key service serving", "listen", listen)
-			return service.Serve(ctx, ln)
+			log.Info("key service serving", "vsock_port", port)
+			return service.Serve(ctx, hostOnly{ln})
 		},
 	}
 	f := cmd.Flags()
 	f.StringVar(&platform, "platform", "", "TEE this image was built for: tdx or snp (required)")
-	f.StringVar(&listen, "listen", fmt.Sprintf(":%d", api.Port), "RA-TLS bind address")
+	f.Uint32Var(&port, "vsock-port", api.Port, "port of the guest's socket to its host that the replica serves RA-TLS on: its launcher publishes it")
 	f.StringVar(&pubkey, "pubkey", defaultPubkeyPath, "launch public key staged by the measured initrd")
 	f.StringVar(&launchDir, "launch-dir", defaultLaunchDir, "directory holding launch.yaml and launch.yaml.sig")
 	f.StringVar(&collateral, "collateral-cache", defaultCollateralDir, "RAM-backed directory that keeps the vendor's documents between judgments")

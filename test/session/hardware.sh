@@ -204,13 +204,13 @@ serving() {
     done
     return 1
 }
-# ends_unserved <step> <log> <port> <launcher arguments...>: a guest launched
-# so must end by itself, and before it serves.
+# ends_unserved <step> <log> <port> <network> <launcher arguments...>: a guest
+# launched so, with that network, must end by itself, and before it serves.
 ends_unserved() {
-    local step=$1 log=$2 at=$3 began served=0 code
-    shift 3
+    local step=$1 log=$2 at=$3 network=$4 began served=0 code
+    shift 4
     began=$(date +%s%N)
-    sudo -n timeout 120 "$C8S" "${launcher[@]}" "$@" --network user --port "127.0.0.1:$at:8443" > "$out/$log.log" 2>&1 &
+    sudo -n timeout 120 "$C8S" "${launcher[@]}" "$@" --network "$network" --port "127.0.0.1:$at:8443" > "$out/$log.log" 2>&1 &
     probe_pid=$!
     while kill -0 "$probe_pid" 2>/dev/null; do
         [ "$(curl -sk --max-time 1 "https://127.0.0.1:$at/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
@@ -226,10 +226,12 @@ ends_unserved() {
         record FAIL "$step" "served $served, exit $code: $(tail -c 300 "$out/$log.log" | tr '\n' ' ')"
     fi
 }
-# launch_ks <bundle> <work directory> <log>: a key service's TD, on its port.
+# launch_ks <bundle> <work directory> <log>: a key service's TD. A replica has
+# no network device: its launcher publishes the port it serves on its socket
+# to the host, and carries its connections to Intel's service.
 launch_ks() {
     sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$1/opkeydata" --work-dir "$2" \
-        --name "c8s-key-service-$run" "${ks_shape[@]}" --network user --port "127.0.0.1:$ks_port:8443" > "$3" 2>&1 &
+        --name "c8s-key-service-$run" "${ks_shape[@]}" --network none --port "127.0.0.1:$ks_port:8443" > "$3" 2>&1 &
     ks_pid=$!
 }
 
@@ -257,13 +259,22 @@ expect 2 "an owner sends nothing to a key service whose document lists no machin
 check "it said the document lists no machine" grep -q "lists no machine" "$out/register-unpinned.err"
 stop_pid "$ks_pid"; ks_pid=""
 
+# A replica's class has no network device. A host that gives it one has built
+# another machine, and the replica ends before it reads a file of its host's.
+# The document lists no machine, so nothing but the device ends it.
+ends_unserved "a key service that is given a network device ends before it serves" ks-network "$ks_port" user \
+    --image-dir "$KSIMG" --launch-dir "$out/ks-probe/opkeydata" --work-dir "$out/ks-network-vm" --name "c8s-key-service-network-$run" "${ks_shape[@]}"
+if [ "$dev" = 1 ]; then
+    check "it said which device" grep -a -q "1af4:1041.*is none a guest of this class is given" "$out/ks-network.log"
+fi
+
 # A replica on a machine its document does not list ends before it serves.
 # The document here lists the value with one digit changed, which stands for
 # a host that built another machine.
 other_ks_machine=$( [ "${ks_machine:0:1}" = 0 ] && echo 1 || echo 0 )${ks_machine:1}
 expect 0 "a key service bundle that lists another machine" ks-bundle-other "$C8S" session key-service launch-config new --out "$out/ks-other" \
     --key "$out/ks-probe/launch.key" "${ks_pool[@]}" --machine "$other_ks_machine"
-ends_unserved "a key service on a machine its document does not list ends before it serves" ks-other-machine "$ks_port" \
+ends_unserved "a key service on a machine its document does not list ends before it serves" ks-other-machine "$ks_port" none \
     --image-dir "$KSIMG" --launch-dir "$out/ks-other/opkeydata" --work-dir "$out/ks-other-vm" --name "c8s-key-service-other-$run" "${ks_shape[@]}"
 if [ "$dev" = 1 ]; then
     check "it said its machine is none its document lists" grep -a -q "is none of the 1 its launch document lists" "$out/ks-other-machine.log"
@@ -324,7 +335,7 @@ launch_key=$out/bundle/opkeydata/pubkey
 other_machine=$( [ "${machine:0:1}" = 0 ] && echo 1 || echo 0 )${machine:1}
 expect 0 "a bundle that lists another machine" bundle-other "$C8S" session launch-config new --out "$out/bundle-other" \
     --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --machine "$other_machine"
-ends_unserved "a guest on a machine its document does not list ends before it serves" other-machine "$probe_port" \
+ends_unserved "a guest on a machine its document does not list ends before it serves" other-machine "$probe_port" user \
     --image-dir "$IMG" --launch-dir "$out/bundle-other/opkeydata" --work-dir "$out/other-vm" --name "c8s-session-other-$run" "${shape[@]}"
 if [ "$dev" = 1 ]; then
     check "it said its machine is none its document lists" grep -a -q "is none of the 1 its launch document lists" "$out/other-machine.log"
@@ -348,11 +359,11 @@ done
 exec qemu-system-x86_64 "$@"
 WRAP
 chmod 0755 "$wrapper"
-ends_unserved "a guest with a device its class does not have ends before it serves" swapped-device "$probe_port" \
+ends_unserved "a guest with a device its class does not have ends before it serves" swapped-device "$probe_port" user \
     --qemu "$wrapper" --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/swapped-vm" --name "c8s-session-swapped-$run" "${shape[@]}"
 rm -f "$wrapper"
 if [ "$dev" = 1 ]; then
-    check "it said which device" grep -a -q "8086:10d3.*is none a session guest is given" "$out/swapped-device.log"
+    check "it said which device" grep -a -q "8086:10d3.*is none a guest of this class is given" "$out/swapped-device.log"
 fi
 # Reference values and a pin that differ from the real ones in one digit.
 python3 - "$manifest" "$out/manifest-other.json" "$pin" "$out/ks-pin-other.json" <<'EOF'
@@ -614,4 +625,11 @@ check "drain ends every TD" [ "$(guests td-)" = 0 ]
 check "no tap is left" [ -z "$(ip -o link show | grep c8st)" ]
 stop_pid "$ks_pid"; ks_pid=""
 check "the key service's TD is gone" [ "$(guests "c8s-key-service-$run")" = 0 ]
+# The replica had no network device, and it judged this run's guests: every
+# document of Intel's it judged them by came over a connection its launcher
+# carried, and so did every guest and owner that reached it.
+check "its launcher carried the key service's connections to Intel's service" \
+    grep -q '"relay":"vendor [^"]*","connections":[1-9]' "$out/ks.log"
+check "its launcher carried the connections the key service took" \
+    grep -q '"relay":"published port [0-9]*","connections":[1-9]' "$out/ks.log"
 finish

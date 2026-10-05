@@ -66,7 +66,7 @@ network daemon, no DHCP client, no resolver and no login program.
 | 2 | The state volume: dm-crypt over the scratch disk under a key made this boot and kept nowhere, a fresh file system, and a writable layer over each directory listed in `/usr/lib/confai/state.d`. Without a scratch disk, a tmpfs | init |
 | 3 | The launch key: read from the `opkeydata` volume, staged read-only, and its digest extended into RTMR[3] (TDX) or checked against HOST_DATA (SEV-SNP). A guest with a key it cannot bind stops | init |
 | 4 | The kernel's file systems, the settings in `sysctl.d`, the loopback interface, a control group for the service | init |
-| 5 | `c8s-session-guest session-agent load`: a check of the guest's devices, then the launch files off the volume and the host's network request set on the one interface | step |
+| 5 | `c8s-session-guest session-agent load`: a check of the guest's devices, then the launch files off the volume and the host's network request set on the one interface. The key service's image has no interface, and its step sets none | step |
 | 6 | `nft -f /etc/c8s-session/firewall.nft` | step |
 | 7 | The agent, or the key service in its image | service |
 
@@ -84,9 +84,16 @@ The kernel has drivers for those devices and for no other: no network card,
 no SCSI or ATA, no input, no sensor, and no code that takes a device plugged
 in later.
 
+A key service replica's launcher builds it the same machine without the
+network device. A replica serves on a port of its socket to the host, which
+its launcher publishes on a port of the host, and it asks Intel's service
+over connections its launcher carries. Each of those is a TLS session that
+ends in the replica or at Intel, so the launcher reads none of it.
+
 Before the guest reads a file its host handed it, the load step
 lists the functions on its PCI bus and ends the guest if one is of another
-kind. The agent does the same before it serves. A TD's RTMR[0] records the
+kind: in the key service's image, a network device is one. The agent does
+the same before it serves, and so does a replica. A TD's RTMR[0] records the
 shape its host declared, which the launch document lists and the agent
 checks, and a TD whose document lists no machine takes no bind
 ([session-daemon.md](../docs/session-daemon.md#the-pools-machine)).
@@ -128,7 +135,7 @@ private to shared one page at a time during boot.
 |---|---|
 | `C8S_PLATFORM` | Required: `tdx` or `snp`. The agent refuses to stage on the other TEE. |
 | `C8S_DEV=1` | Debug image: a console that the kernel, the init and the agent log to, a bind accepted with no sandbox image, and a sandbox image accepted from a plain-HTTP registry at `10.0.2.2:5000` for tests. A different measurement and host-readable logs. Never ship. |
-| `C8S_ROLE=key-service` | Build the [key service](../docs/session-key-service.md)'s image: this image with `c8s-session-guest session-key-service run` as its measured service where the agent is. It has reference values of its own. |
+| `C8S_ROLE=key-service` | Build the [key service](../docs/session-key-service.md)'s image: this image with `c8s-session-guest session-key-service run` as its measured service where the agent is, and a load step that takes no network device. It has reference values of its own. |
 | `C8S_NAME` | Output name (default `c8s-session` or `c8s-key-service`, with `-dev` for a dev build) |
 | `C8S_MEMORY` | Default memory recorded in the manifest (default `1G`) |
 | `C8S_BINARY` | Stage this prebuilt linux/amd64 `c8s-session-guest` and skip the compile |

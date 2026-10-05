@@ -29,8 +29,12 @@ var consoleDevice = pciKind{0x1af4, 0x1043}
 
 const consoleClass = 0x0780
 
-// DeviceGuard checks that the guest's PCI bus holds nothing but what a
-// session guest is given. RTMR[0] records the shape its host declared to the
+// networkDevice is the one kind a guest of a class without a network does
+// not have.
+var networkDevice = pciKind{0x1af4, 0x1041}
+
+// DeviceGuard checks that the guest's PCI bus holds nothing but what a guest
+// of its class is given. RTMR[0] records the shape its host declared to the
 // firmware, and does not say what stands behind each slot: a host can put
 // another device in one. The guest's kernel has a driver for none but its
 // own, so such a device meets no code, and a guest that finds one is not on
@@ -40,6 +44,11 @@ type DeviceGuard struct {
 	Devices string
 	// Console allows the virtio console a dev guest has.
 	Console bool
+	// NoNetwork is the class of a guest that has no network device: a key
+	// service replica, which serves and asks through its launcher alone. A
+	// network device on its bus is then another machine's, like any other
+	// device its class does not list.
+	NoNetwork bool
 }
 
 // Check fails if the bus holds a function of another kind, or one that says
@@ -81,11 +90,14 @@ func (g DeviceGuard) Check() error {
 		}
 		kind := pciKind{uint16(vendor), uint16(device)}
 		want, known := sessionDevices[kind]
+		if g.NoNetwork && kind == networkDevice {
+			known = false
+		}
 		if !known && g.Console && kind == consoleDevice {
 			want, known = consoleClass, true
 		}
 		if !known || uint16(class>>8) != want {
-			return fmt.Errorf("PCI function %s (%04x:%04x, class %06x) is none a session guest is given: its host built another machine",
+			return fmt.Errorf("PCI function %s (%04x:%04x, class %06x) is none a guest of this class is given: its host built another machine",
 				name, vendor, device, class)
 		}
 	}

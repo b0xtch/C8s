@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"slices"
 	"strings"
 	"time"
@@ -137,6 +138,11 @@ type EngineOptions struct {
 	// documents somebody hands over, and one nobody handed over is a fetch
 	// that failed, at once.
 	HandedCollateralOnly bool
+	// Dial, when set, opens every connection to Intel's service: for a
+	// verifier whose only road there is one its host carries, such as a
+	// guest with no network device (see VendorServices). The TLS session on
+	// it ends at Intel and is held to the system's roots, as on any road.
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // noRoad is Intel's service as a verifier with no road to it finds it.
@@ -163,8 +169,12 @@ type dcapEngine struct {
 // verdict. The platform, its TDX module and its quoting enclave must each be
 // UpToDate, unless the context names another status: see WithAcceptedTCB.
 func NewEngine(opts EngineOptions) Engine {
+	getter := pcsGetter{}
+	if opts.Dial != nil {
+		getter.client = pcsClientOver(opts.Dial, nil)
+	}
 	var fetch trust.HTTPSGetter = &trust.RetryHTTPSGetter{
-		Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: pcsGetter{},
+		Timeout: 30 * time.Second, MaxRetryDelay: 5 * time.Second, Getter: getter,
 	}
 	if opts.HandedCollateralOnly {
 		fetch = noRoad{}

@@ -39,7 +39,8 @@ case "$ROLE" in
     key-service)
         # The key service's image is this one with another measured service
         # where the agent is: the same boot, the same launch files, the same
-        # inbound filter.
+        # inbound filter. A replica has no network device: it serves on its
+        # socket to the host, and asks Intel's service over it.
         SERVICE=(/usr/local/bin/c8s-session-guest session-key-service run "--platform=$PLATFORM")
         if [ "$DEV" = 1 ]; then
             SERVICE+=(--allow-console)
@@ -53,6 +54,11 @@ esac
 LOAD=(/usr/local/bin/c8s-session-guest session-agent load)
 if [ "$DEV" = 1 ]; then
     LOAD+=(--allow-console)
+fi
+if [ "$ROLE" = key-service ]; then
+    # The step's check takes no network device among a replica's devices,
+    # and the step sets no interface.
+    LOAD+=(--no-network)
 fi
 
 # Every word above is a fixed string or the validated platform: none needs

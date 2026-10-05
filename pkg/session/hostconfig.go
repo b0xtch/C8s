@@ -8,7 +8,10 @@ import (
 	"io"
 	"io/fs"
 	"math"
+	"net"
 	"net/netip"
+	"regexp"
+	"strconv"
 )
 
 // HostConfigFile is the unsigned file the launcher places beside the signed
@@ -35,7 +38,17 @@ type HostConfig struct {
 	// a host that has none now. Zero is no port: the guest serves none, and
 	// its verifiers ask Intel.
 	CollateralPort uint32 `json:"collateral_port,omitempty"`
+	// VendorPorts are vsock ports of the host on which the guest's launcher
+	// carries a connection to the vendor's service, by the service's
+	// host:port (see VendorServices). They are for a guest that judges
+	// others' evidence and has no network device: a key service replica. Its
+	// TLS session on such a connection ends at the vendor, so the launcher
+	// can keep a document from the guest and can give it none.
+	VendorPorts map[string]uint32 `json:"vendor_ports,omitempty"`
 }
+
+// maxVendorPorts bounds the services a host names roads to.
+const maxVendorPorts = 8
 
 // HostNetwork is a static address for the guest's one interface. Absent, the
 // guest configures no interface: it has no DHCP client.
@@ -96,6 +109,18 @@ func (c *HostConfig) Validate() error {
 	if c.CollateralPort == math.MaxUint32 {
 		return fmt.Errorf("collateral_port %d is no port", c.CollateralPort)
 	}
+	if len(c.VendorPorts) > maxVendorPorts {
+		return fmt.Errorf("vendor_ports names more than %d services", maxVendorPorts)
+	}
+	for service, port := range c.VendorPorts {
+		host, number, err := net.SplitHostPort(service)
+		if n, numErr := strconv.ParseUint(number, 10, 16); err != nil || numErr != nil || n == 0 || !hostNameRE.MatchString(host) {
+			return fmt.Errorf("vendor_ports names %q, which is no host name and port", service)
+		}
+		if port == 0 || port == math.MaxUint32 {
+			return fmt.Errorf("vendor_ports gives %s port %d, which is no port", service, port)
+		}
+	}
 	n := c.Network
 	if n == nil {
 		return nil
@@ -132,6 +157,10 @@ func (c *HostConfig) Validate() error {
 	}
 	return nil
 }
+
+// hostNameRE is a DNS name in lowercase: labels of letters, digits and inner
+// hyphens.
+var hostNameRE = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$`)
 
 // parseHostAddr accepts a plain unicast address: no zone, which is free text.
 func parseHostAddr(s string) (netip.Addr, error) {

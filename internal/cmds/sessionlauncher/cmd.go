@@ -83,10 +83,10 @@ misbehaves produces a guest that will not boot or will not verify.`,
 	f.StringVar(&memory, "memory", "1G", "guest memory, e.g. 2G or 1536M")
 	f.StringVar(&lowMemory, "low-memory", "0", "how much of the guest's memory sits below 4 GiB, e.g. 512M; the rest sits above, where a confidential guest's firmware accepts none of it before the kernel runs, so a guest whose kernel accepts memory as it uses it starts with this much. 0 leaves the machine's own split. It changes RTMR[0]")
 	f.StringVar(&scratch, "scratch", "8G", "encrypted scratch disk size; 0 leaves writable state on a 2G RAM tmpfs")
-	f.StringVar(&cfg.Network, "network", NetworkTap, "tap: the guest takes over an interface of this network namespace, as a pod's launcher hands its guest the pod's own; user: QEMU user-mode stack with forwarded ports; fd: a tap the caller opened, with the address the caller states")
+	f.StringVar(&cfg.Network, "network", NetworkTap, "tap: the guest takes over an interface of this network namespace, as a pod's launcher hands its guest the pod's own; user: QEMU user-mode stack with forwarded ports; fd: a tap the caller opened, with the address the caller states; none: no network device, with ports of the guest's socket to the host published here (--port, needs --vsock-cid), as a key service replica has it")
 	f.StringVar(&cfg.Interface, "interface", "eth0", "interface the guest takes over (--network tap)")
 	f.StringArrayVar(&ports, "port", []string{strconv.Itoa(session.AgentPort)},
-		"guest TCP port to publish (--network user): [address:]host:guest, or one port for both")
+		"guest port to publish on the host: [address:]host:guest, or one port for both. A TCP port of the guest with --network user, a port of the guest's socket to the host with --network none")
 	f.IntVar(&cfg.TapFD, "tap-fd", 3, "inherited descriptor of the guest's tap (--network fd)")
 	f.IntVar(&cfg.VhostFD, "vhost-fd", -1, "inherited descriptor of vhost-net for that tap (--network fd); -1 for none")
 	f.StringVar(&cfg.Guest.Address, "guest-address", "", "address the guest configures, in CIDR form (--network fd)")

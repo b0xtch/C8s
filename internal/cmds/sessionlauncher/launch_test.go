@@ -376,8 +376,12 @@ func TestConfigValidate(t *testing.T) {
 		"user without ports":  func(c *Config) { c.Forwards = nil },
 		"bad port":            func(c *Config) { c.Forwards = []Forward{{Host: 70000, Guest: 8443}} },
 		"reserved vsock cid":  func(c *Config) { c.VsockCID = 2 },
-		"name with comma":     func(c *Config) { c.Name = "a,b" },
-		"empty name":          func(c *Config) { c.Name = "" },
+		"no device, no vsock": func(c *Config) { c.Network, c.VsockCID, c.VsockAuto = NetworkNone, 0, false },
+		"no device, bad port": func(c *Config) {
+			c.Network, c.VsockAuto, c.Forwards = NetworkNone, true, []Forward{{Host: 8443, Guest: 0}}
+		},
+		"name with comma": func(c *Config) { c.Name = "a,b" },
+		"empty name":      func(c *Config) { c.Name = "" },
 	} {
 		cfg := baseConfig()
 		mutate(&cfg)
@@ -395,6 +399,33 @@ func TestConfigValidate(t *testing.T) {
 		if err := cfg.validate(); err != nil {
 			t.Fatalf("%dM below 4 GiB: %v", low, err)
 		}
+	}
+}
+
+// A guest with no network device is given none: no back end, no card. Its
+// socket to the host is its only road, so the mode needs one, and the ports
+// it publishes are the launcher's to carry, of which QEMU is told nothing.
+func TestQEMUArgsNoNetworkDevice(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Network, cfg.VsockCID = NetworkNone, 7
+	cfg.Forwards = []Forward{{Address: "127.0.0.1", Host: 18543, Guest: 8443}}
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(mustArgs(t, &cfg, nil), " ")
+	for _, absent := range []string{"-netdev", "virtio-net", "hostfwd", "18543", "-nic"} {
+		if strings.Contains(args, absent) {
+			t.Fatalf("a guest with no network device was given %q:\n%s", absent, args)
+		}
+	}
+	if !strings.Contains(args, "vhost-vsock-pci,guest-cid=7") {
+		t.Fatalf("a guest with no network device has no socket to its host:\n%s", args)
+	}
+	// With no port to publish it is a guest nobody reaches, which is its
+	// launcher's caller's business.
+	cfg.Forwards, cfg.VsockCID, cfg.VsockAuto = nil, 0, true
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("a guest with no network device and no published port: %v", err)
 	}
 }
 
