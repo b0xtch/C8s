@@ -23,6 +23,7 @@ import (
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
@@ -400,16 +401,21 @@ const (
 // its quoting service failed, tries again a few times and then says that it
 // gave up: that is session.ErrNoBindQuote. Until then it is waited for until
 // ctx ends. Either way its binder asks it for an attestation itself.
+//
+// A daemon relays so many evidence requests at once, for every caller
+// together. One it has no room for is asked again after the same pause, so
+// that a binder that started many sessions at once waits its turn for each
+// quote and loses none.
 func (c *Client) BoundEvidence(ctx context.Context, td string) (*session.Relayed, error) {
 	for pause := quotePause; ; pause = min(2*pause, quotePauseMost) {
 		evidence, err := c.Evidence(ctx, td)
-		if err != nil {
+		switch {
+		case status.Code(err) == codes.ResourceExhausted:
+		case err != nil:
 			return nil, err
-		}
-		if len(evidence.Evidence) > 0 {
+		case len(evidence.Evidence) > 0:
 			return evidence, nil
-		}
-		if evidence.BindQuote == session.BindQuoteGivenUp {
+		case evidence.BindQuote == session.BindQuoteGivenUp:
 			return nil, session.ErrNoBindQuote
 		}
 		select {
