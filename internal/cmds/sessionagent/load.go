@@ -3,6 +3,7 @@ package sessionagent
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,6 +25,9 @@ type LoadConfig struct {
 	// Network applies the host's network request to the guest's interface.
 	// Nil applies nothing.
 	Network func(*session.HostNetwork) error
+	// More names further files of the volume that are copied beside those,
+	// each with the most it may hold. No image built for a TEE has any.
+	More map[string]int64
 }
 
 // load copies this boot's launch files off the opkeydata volume and applies
@@ -37,7 +41,9 @@ func load(cfg LoadConfig) error {
 	if err := os.MkdirAll(cfg.LaunchDir, 0o700); err != nil {
 		return err
 	}
-	for name, limit := range map[string]int64{session.DocumentFile: session.MaxDocumentSize, session.SignatureFile: 4096} {
+	files := map[string]int64{session.DocumentFile: session.MaxDocumentSize, session.SignatureFile: 4096}
+	maps.Copy(files, cfg.More)
+	for name, limit := range files {
 		data, err := session.ReadBounded(filepath.Join(cfg.SourceDir, name), limit)
 		if err != nil {
 			return fmt.Errorf("opkeydata: %w", err)

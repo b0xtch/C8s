@@ -1,3 +1,5 @@
+//go:build !c8s_simtee
+
 package sessioninit
 
 import (

@@ -228,7 +228,7 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	// A deadline counted on a clock the host feeds is no deadline. The TSC of
 	// a confidential guest keeps its own time, also while the guest is paused.
-	if source := cfg.clockSource(); doc.AgeLimitSeconds > 0 && source != ownClockSource {
+	if source := cfg.clockSource(); doc.AgeLimitSeconds > 0 && !ownClock(source) {
 		return nil, fmt.Errorf("the launch document bounds how long this guest waits for a bind, and its clocksource is %q, not %s", source, ownClockSource)
 	}
 	// The chain ends at the launch document until a bind extends it.
@@ -836,7 +836,7 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 	}
 	// The deadline was counted on whatever clock the kernel used since the
 	// guest staged. If that is no longer its own, the count means nothing.
-	if a.doc.AgeLimitSeconds > 0 && a.cfg.clockSource() != ownClockSource {
+	if a.doc.AgeLimitSeconds > 0 && !ownClock(a.cfg.clockSource()) {
 		return nil, nil, refused(disclosure.BindClock, errClockLeft)
 	}
 	// The two ways a bind fails to verify are told apart: it is no bind, or

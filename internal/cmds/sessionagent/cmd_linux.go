@@ -96,6 +96,7 @@ func newLoadCmd() *cobra.Command {
 			} else {
 				cfg.Network = applyNetwork
 			}
+			cfg.More = hardwareFiles()
 			return Load(cfg)
 		},
 	}
@@ -140,7 +141,9 @@ func newRunCmd() *cobra.Command {
 			var err error
 			// For the key service a launch document may pin. The guest has no
 			// road to the vendor: it asks its host for the vendor's documents.
-			cfg.Engine = session.NewEngine(session.EngineOptions{HandedCollateralOnly: true})
+			if cfg.Engine, err = GuestEngine(); err != nil {
+				return err
+			}
 			dials, err := readHostDials(cfg.LaunchDir)
 			if err != nil {
 				return err

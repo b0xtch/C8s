@@ -118,11 +118,15 @@ stops has forgotten it all, and the unit that runs it powers the guest off.`,
 			if err != nil {
 				return fmt.Errorf("stage launch document: %w", err)
 			}
+			engine, err := sessionagent.ReplicaEngine(session.EngineOptions{CollateralCacheDir: collateral, Dial: vendor})
+			if err != nil {
+				return err
+			}
 			warm, cancel := context.WithTimeout(ctx, time.Minute)
 			service, err := keyservice.New(warm, keyservice.Config{
 				Launch: measured.Launch, Signature: measured.Signature, LaunchKey: measured.LaunchKey,
 				TEE:    tee,
-				Engine: session.NewEngine(session.EngineOptions{CollateralCacheDir: collateral, Dial: vendor}),
+				Engine: engine,
 				Logger: log,
 			})
 			cancel()

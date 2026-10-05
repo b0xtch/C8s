@@ -320,3 +320,43 @@ func TestClaimsFromTDReport(t *testing.T) {
 		t.Fatal("accepted a short TDREPORT")
 	}
 }
+
+// A load copies the further files its image names, each within its bound,
+// and a guest whose host left one out does not go on.
+func TestLoadCopiesTheFurtherFilesItsImageNames(t *testing.T) {
+	cfg, _ := loadFixture(t, "")
+	cfg.More = map[string]int64{"more.json": 8}
+	if err := load(cfg); err == nil || !strings.Contains(err.Error(), "more.json") {
+		t.Fatalf("a volume without a file the image names: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.SourceDir, "more.json"), []byte("12345678"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := load(cfg); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(cfg.LaunchDir, "more.json"))
+	if err != nil || string(got) != "12345678" {
+		t.Fatalf("the further file as staged: %q, %v", got, err)
+	}
+	if info, err := os.Stat(filepath.Join(cfg.LaunchDir, "more.json")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("the further file's mode: %v, %v", info, err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg.SourceDir, "more.json"), []byte("123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := load(cfg); err == nil {
+		t.Fatal("a further file beyond its bound was copied")
+	}
+	// Named by its image alone: a file the host adds to the volume stays there.
+	plain, _ := loadFixture(t, "")
+	if err := os.WriteFile(filepath.Join(plain.SourceDir, "more.json"), []byte("1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := load(plain); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(plain.LaunchDir, "more.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a file no image names was copied off the volume: %v", err)
+	}
+}

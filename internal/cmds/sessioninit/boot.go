@@ -446,6 +446,9 @@ func bindLaunchKey(p platform) error {
 	if err := p.Mount("", staged, "", msBind|msRemount|msReadOnly, ""); err != nil {
 		return fmt.Errorf("make %s read-only: %w", launchKeyDir, err)
 	}
+	if bound, err := bindSimulated(p, key); bound || err != nil {
+		return err
+	}
 	switch {
 	case p.Exists(rtmr3Path):
 		digest := sha512.Sum384(key)

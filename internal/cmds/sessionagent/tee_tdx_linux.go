@@ -1,12 +1,10 @@
-//go:build linux
+//go:build linux && !c8s_simtee
 
 package sessionagent
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,8 +22,6 @@ import (
 )
 
 const (
-	tdxGuestDevice = "/dev/tdx_guest"
-
 	// TDX_CMD_GET_REPORT0 = _IOWR('T', 1, struct tdx_report_req): 64 bytes of
 	// REPORTDATA in, a 1024-byte TDREPORT out.
 	tdxCmdGetReport0 = 0xC4405401
@@ -54,20 +50,6 @@ type tdxTEE struct {
 	vsockRetryAt atomic.Int64
 }
 
-// OpenTEE returns the native TEE interface for platform ("tdx" or "snp").
-func OpenTEE(platform string) (TEE, error) {
-	switch platform {
-	case "tdx":
-		if _, err := os.Stat(tdxGuestDevice); err != nil {
-			return nil, fmt.Errorf("this is not a TDX guest: %w", err)
-		}
-		return &tdxTEE{}, nil
-	default:
-		// SEV-SNP needs /dev/sev-guest report and extended-report support here.
-		return nil, fmt.Errorf("platform %q has no in-guest attester yet", platform)
-	}
-}
-
 func (t *tdxTEE) Family() teetypes.Family { return teetypes.FamilyTDX }
 
 func (t *tdxTEE) Register() (runtimemeasure.Register, error) {
@@ -93,19 +75,6 @@ func (t *tdxTEE) Evidence(_ context.Context, reportData []byte) (teetypes.Attest
 		return teetypes.AttestationEvidence{}, err
 	}
 	return tdxEnvelope(quote)
-}
-
-// tdxEnvelope is a quote as a session's verifier takes it. The firmware's
-// event log stays out: a verifier holds the quote's registers to published
-// values and replays no log, and the log is many times the quote's size.
-func tdxEnvelope(quote []byte) (teetypes.AttestationEvidence, error) {
-	evidence, err := json.Marshal(struct {
-		Quote string `json:"quote"`
-	}{base64.StdEncoding.EncodeToString(quote)})
-	if err != nil {
-		return teetypes.AttestationEvidence{}, err
-	}
-	return teetypes.AttestationEvidence{Platform: teetypes.PlatformTDX, Evidence: evidence}, nil
 }
 
 // quote prefers the direct vsock path to the host's QGS (milliseconds) and
