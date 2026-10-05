@@ -409,6 +409,12 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	// What this command sends its guest goes on the vendor's documents as it
 	// fetched them itself: those it can name are on their way meanwhile.
 	session.Prefetch(engine)
+	// The bind names the replica of the key service this command judged,
+	// before it claims a guest: a key service out of reach costs no claim.
+	members, err := judgedMembers(ctx, keyService, engine)
+	if err != nil {
+		return finish(exitCode(err), fmt.Errorf("the key service's replica was not judged, and nothing was claimed: %w", err))
+	}
 
 	began := time.Now()
 	claimed, err := retried(ctx, func() (*daemon.Claimed, error) {
@@ -453,7 +459,7 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	}
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: authority, InstanceKey: ready.InstanceKey,
-		Tenant: s.tenant, Session: s.session, NotAfter: time.Now().Add(s.ttl), Policy: policy, KeyService: keyService,
+		Tenant: s.tenant, Session: s.session, NotAfter: time.Now().Add(s.ttl), Policy: policy, KeyService: keyService, Members: members,
 	})
 	if err != nil {
 		release()

@@ -410,6 +410,48 @@ open the guest refuses a bind on its headers, unread, and says it is not
 ready; the daemon offers it to no claim. A pool whose key service is out of
 reach therefore fills with TDs that boot and are never ready.
 
+Those documents are the ones a guest's host chose to hand it, and a host can
+hand over a set from before a platform's key was revoked ([A stand-in for
+the key service](session-threat-model.md#keys-and-the-key-service)). So a
+guest sends its key service nothing secret before its bind, and from its
+bind on deals with none but the replicas the bind names
+([Which replicas a guest trusts](session-key-service.md#which-replicas-a-guest-trusts)):
+
+```text
+ binder                         guest (TD)                   key service
+   |                               | open, at boot: judged on what its host
+   |                               | handed it ------------------> replica R
+   | judge R, on documents fetched from the vendor itself        |
+   | <======================= RA-TLS, evidence =================>|
+   |                               |                             |
+   | Bind(keyService: pin, members: [R])                         |
+   | ----------------------------> | its session is with R:      |
+   |                               | acquire ------------------> R
+   |                               |                             |
+   |                               | its session is with another replica:
+   |                               | new connection, and a far end whose
+   |                               | key is not R's is sent nothing;
+   |                               | after three such, bind_no_member
+```
+
+A binder judges the replica that answers at the pin's address as it judges
+a guest it sends a secret, on the vendor's documents as it fetched them
+within the last hour, and its bind names that replica's instance key under
+`keyService.members`. `keyservice.Members` keeps that verdict for a binder
+that starts many sessions, judges again every minute over a new connection,
+and on the path of a bind when the verdict no longer stands. `c8s session
+start` and `bind` judge the replica before they claim or sign, so a key
+service out of reach costs the pool no claim. A bind that names a key service
+and no replica is no bind.
+
+The guest takes the step before the bind has any other effect. If its
+session is with a replica the bind names, nothing happens. Otherwise it opens
+a session with one that the bind names, over a new connection that it drops
+as soon as the handshake shows another key, and after three attempts refuses
+the bind with `bind_no_member` and ends, as a guest does that refused any
+bind. A bind that names no key service closes the guest's session with its
+pool's, and the guest deals with no replica after it.
+
 ## Restarts and draining
 
 A TD's launcher runs in a session of its own and outlives the daemon. The
@@ -482,11 +524,15 @@ changes on the host while it runs.
 - Of the key service: leases and generations, more than one replica, the
   ledger, recovery, a change of a tenant's authority, and deleting a stored
   credential. A replica that stops has forgotten its tenants and their
-  credentials. A guest judges the key service by the vendor documents its own
-  launcher answers with, so the two share a platform for now. With no lease
-  there is nothing yet to refuse a running session whose platform the vendor
-  revokes: the key service keeps the evidence each bound guest acquired with
-  for that judgment, and a repeat of an acquire is held to it.
+  credentials. Before its bind a guest judges the key service by the vendor
+  documents its own launcher answers with, so the two share a platform for
+  now. A bind names one replica: the membership statements by which a guest
+  follows a key service whose replicas change come with the replicas. A
+  bind's `notAfter` is judged by the guest's own clock, which is its host's:
+  the key service serves no time yet. With no lease there is nothing yet to
+  refuse a running session whose platform the vendor revokes: the key
+  service keeps the evidence each bound guest acquired with for that
+  judgment, and a repeat of an acquire is held to it.
 - Offering each ready TD to one watcher at a time. Binders that watch one
   pool are all shown the same TDs and sign for the one shown first, so two
   that start a session at the same moment collide, and one signs again.

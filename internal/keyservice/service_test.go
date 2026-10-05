@@ -213,7 +213,10 @@ func (g *guest) certificate() *tls.Certificate {
 	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: g.key, Leaf: leaf}
 }
 
-func (g *guest) open() error { return g.client.Open(within(g.t), g.launch, g.signature) }
+func (g *guest) open() error {
+	_, err := g.client.Open(within(g.t), g.launch, g.signature)
+	return err
+}
 
 // bind is a bind for the guest under o's authority, with one stored
 // credential declared. mutate may change it before it is signed.
@@ -221,7 +224,7 @@ func (g *guest) bind(o *owner, ks *keyservicetest.Sim, mutate func(*session.Bind
 	g.t.Helper()
 	opts := session.BindOptions{
 		Authority: o.key, InstanceKey: &g.key.PublicKey, Tenant: "acme", Session: "s1", NotAfter: time.Now().Add(time.Minute),
-		KeyService: ks.Pin,
+		KeyService: ks.Pin, Members: ks.Members,
 		Policy: session.BindPolicy{
 			Access: session.Access{Exec: []string{string(o.pub)}, Credentials: []string{string(o.pub)}},
 			Credentials: []session.Credential{
@@ -301,6 +304,14 @@ func newWorld(t *testing.T) *world {
 // stored credential, and returns the client of a key the bind grants.
 func (w *world) start(t *testing.T, g *sessionsim.Guest) (*session.Client, error) {
 	t.Helper()
+	binder, _, err := w.startNaming(t, g, w.ks.Members)
+	return binder, err
+}
+
+// startNaming is start under a bind that names these replicas of the key
+// service. It also returns the guest's instance key, as a bind names one.
+func (w *world) startNaming(t *testing.T, g *sessionsim.Guest, members []string) (*session.Client, string, error) {
+	t.Helper()
 	access := newOwner(t)
 	identity, err := runtimemeasure.LoadImageManifest(g.ManifestPath)
 	if err != nil {
@@ -324,7 +335,7 @@ func (w *world) start(t *testing.T, g *sessionsim.Guest) (*session.Client, error
 	}
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: w.owner.key, InstanceKey: ready.InstanceKey, Tenant: "acme", Session: "s1", NotAfter: time.Now().Add(time.Minute),
-		KeyService: w.ks.Pin,
+		KeyService: w.ks.Pin, Members: members,
 		Policy: session.BindPolicy{
 			Access:      session.Access{Exec: []string{string(access.pub)}, Credentials: []string{string(access.pub)}},
 			Credentials: []session.Credential{{Name: "token", MaxBytes: 64, Source: session.SourceKeyService}},
@@ -335,7 +346,7 @@ func (w *world) start(t *testing.T, g *sessionsim.Guest) (*session.Client, error
 	}
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
 	_, _, err = binder.BindAttested(within(t), bind, binding.Policy(identity))
-	return binder, err
+	return binder, bind.Doc.InstanceKey, err
 }
 
 // road is the way a pool's guests reach their key service, which a test
@@ -500,7 +511,7 @@ func TestGuestRefusesABindForAnotherKeyService(t *testing.T) {
 		t.Fatal(err)
 	}
 	bind, err := session.NewBind(session.BindOptions{
-		Authority: w.owner.key, InstanceKey: ready.InstanceKey, Tenant: "acme", Session: "s1", KeyService: other.Pin,
+		Authority: w.owner.key, InstanceKey: ready.InstanceKey, Tenant: "acme", Session: "s1", KeyService: other.Pin, Members: other.Members,
 		Policy: session.BindPolicy{Access: session.Access{Exec: []string{string(w.owner.pub)}}},
 	})
 	if err != nil {
@@ -539,7 +550,7 @@ func TestReleaseRule(t *testing.T) {
 		"a bind signed by another authority":   {g.bind(stranger, w.ks, nil), []string{"token"}, 403},
 		"a bind of a tenant nobody registered": {g.bind(w.owner, w.ks, func(o *session.BindOptions) { o.Tenant = "nobody" }), []string{"token"}, 403},
 		"a bind that names no key service": {g.bind(w.owner, w.ks, func(o *session.BindOptions) {
-			o.KeyService = nil
+			o.KeyService, o.Members = nil, nil
 			o.Policy.Credentials = o.Policy.Credentials[1:]
 		}), nil, 403},
 		"a bind past its time":                      {g.bind(w.owner, w.ks, func(o *session.BindOptions) { o.NotAfter = time.Now().Add(-time.Minute) }), []string{"token"}, 403},
@@ -671,7 +682,7 @@ func TestOnlyServedPoolsOpenASession(t *testing.T) {
 	}
 
 	// A caller with no certificate is no guest.
-	if err := client(t, w.ks.Pin).Open(within(t), late.launch, late.signature); status(err) != 401 {
+	if _, err := client(t, w.ks.Pin).Open(within(t), late.launch, late.signature); status(err) != 401 {
 		t.Fatalf("an open with no certificate: %v", err)
 	}
 	// A debug guest's evidence is refused before any policy is asked.

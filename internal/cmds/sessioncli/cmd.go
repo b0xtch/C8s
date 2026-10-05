@@ -34,6 +34,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
+	"github.com/confidential-dot-ai/c8s/pkg/session/keyservice"
 )
 
 // Exit codes are a CI contract, shared with `c8s verify` where they overlap.
@@ -203,6 +204,22 @@ func servedBy(pin, pool *session.KeyService) error {
 		return &session.VerificationError{Err: errors.New("the pool's guests open their sessions with another key service than --key-service pins, or with none")}
 	}
 	return nil
+}
+
+// judgedMembers judges the replica of the pinned key service that answers,
+// as for a release: on the vendor's documents as engine fetched them itself.
+// The bind names it, and its guest then deals with that replica alone. Nil
+// for a session that trusts no key service.
+func judgedMembers(ctx context.Context, pin *session.KeyService, engine session.Engine) ([]string, error) {
+	if pin == nil {
+		return nil, nil
+	}
+	replicas, err := keyservice.NewMembers(keyservice.Options{Pin: pin, Engine: engine})
+	if err != nil {
+		return nil, err
+	}
+	defer replicas.Close()
+	return replicas.Named(ctx)
 }
 
 func (w *sandboxFlags) keys() (access session.Access, err error) {
@@ -1091,7 +1108,10 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 		Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true,
 		AcceptTCBStatus: b.acceptedTCB(),
 	}
-	client, err := session.NewClient(b.url, readyPolicy, b.engine(), signer, road...)
+	// One engine: what it fetched of the vendor's documents for one verdict
+	// serves the next.
+	engine := b.engine()
+	client, err := session.NewClient(b.url, readyPolicy, engine, signer, road...)
 	if err != nil {
 		return finish(ExitUsage, err)
 	}
@@ -1108,9 +1128,14 @@ func runBind(ctx context.Context, b *bindFlags, asJSON bool, stdout, stderr io.W
 	if err := servedBy(keyService, ready.Document.KeyService); err != nil {
 		return finish(ExitRefused, err)
 	}
+	// The bind names the replica of the key service this command judged.
+	members, err := judgedMembers(ctx, keyService, engine)
+	if err != nil {
+		return finish(exitCode(err), fmt.Errorf("the key service's replica was not judged, and nothing was signed: %w", err))
+	}
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: authority, InstanceKey: ready.InstanceKey,
-		Tenant: b.tenant, Session: b.session, NotAfter: time.Now().Add(b.ttl), Policy: policy, KeyService: keyService,
+		Tenant: b.tenant, Session: b.session, NotAfter: time.Now().Add(b.ttl), Policy: policy, KeyService: keyService, Members: members,
 	})
 	if err != nil {
 		return finish(ExitUsage, err)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -65,8 +66,10 @@ func TestStoredCredentialReachesASessionStartedThroughADaemon(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pinned := loaded.Bind.Doc.KeyService; !pinned.Equal(host.KeyService.Pin) {
-		t.Fatalf("the bind pins %+v", pinned)
+	// The bind names the key service, and the replica of it this command
+	// judged before it claimed a guest.
+	if named := loaded.Bind.Doc.KeyService; !named.Pin().Equal(host.KeyService.Pin) || !slices.Equal(named.Members, host.KeyService.Members) {
+		t.Fatalf("the bind names %+v", named)
 	}
 	flags := &trust{binding: s.out, manifest: s.manifest, timeout: s.timeout, engineForTest: s.engineForTest}
 	stdout.Reset()
@@ -110,6 +113,107 @@ func TestStartHoldsThePoolToTheOwnersKeyService(t *testing.T) {
 	stdout.Reset()
 	if code := runStart(context.Background(), s, true, &stdout, &stderr); code != ExitUnavailable {
 		t.Fatalf("a start for a tenant the key service does not know: exit %d: %s", code, stdout.String())
+	}
+}
+
+// A start that names a key service judges the replica that answers before it
+// claims a guest, since its bind names that replica: a key service it cannot
+// reach, or one that is not what the pin says, costs the pool no claim.
+func TestStartJudgesItsKeyServicesReplicaBeforeItClaims(t *testing.T) {
+	host := sessiondtest.NewHostWithKeyService(t, 1, func(c *sessiond.Config) { c.Capacity = 1 })
+	// An address nobody serves.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gone := *host.KeyService.Pin
+	gone.URL = "https://" + ln.Addr().String()
+	_ = ln.Close()
+	// The key service that answers, held to another image than it runs.
+	other := *host.KeyService.Pin
+	flipped := []byte(other.Image.Measurement)
+	flipped[0] = map[bool]byte{true: '1', false: '0'}[flipped[0] == '0']
+	other.Image.Measurement = string(flipped)
+
+	// record is the daemon's record of the pool's one guest, once it has one.
+	record := func() []byte {
+		t.Helper()
+		records, err := filepath.Glob(filepath.Join(host.Config.StateDir, "tds", "*", "td.json"))
+		if err != nil || len(records) > 1 {
+			t.Fatalf("the daemon keeps %d records, %v", len(records), err)
+		}
+		if len(records) == 0 {
+			return nil
+		}
+		// A record is replaced whole: one read is of one version.
+		data, err := os.ReadFile(records[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	for deadline := time.Now().Add(20 * time.Second); !bytes.Contains(record(), []byte(`"state":"ready"`)); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the pool's guest never became ready")
+		}
+	}
+	for name, tc := range map[string]struct {
+		pin  *session.KeyService
+		want int
+	}{
+		"a key service out of reach":           {&gone, ExitUnavailable},
+		"a key service that is not the pinned": {&other, ExitRefused},
+	} {
+		s := starting(t, host, "sbx-1")
+		s.w.credentials, s.w.stored, s.w.keyService = nil, []string{"api-token"}, pinFile(t, tc.pin)
+		s.wait = 0
+		var stdout, stderr bytes.Buffer
+		if code := runStart(context.Background(), s, true, &stdout, &stderr); code != tc.want || !strings.Contains(stdout.String(), "nothing was claimed") {
+			t.Fatalf("%s: exit %d: %s", name, code, stdout.String())
+		}
+		if _, err := os.Stat(s.out); !os.IsNotExist(err) {
+			t.Fatalf("%s: the start wrote a binding", name)
+		}
+		// The pool's one guest was claimed by nobody, not even for a moment:
+		// no record of the daemon's holds a claim, or one that was given
+		// back.
+		if kept := record(); !bytes.Contains(kept, []byte(`"state":"ready"`)) || bytes.Contains(kept, []byte(`"claim"`)) || bytes.Contains(kept, []byte(`"released"`)) {
+			t.Fatalf("%s: the pool's guest was claimed: %s", name, kept)
+		}
+	}
+}
+
+// A bind sent to a guest by its address names the key service's replica its
+// sender judged, as a start through a daemon does, and the guest takes its
+// stored credential from that replica.
+func TestDirectBindNamesTheKeyServicesReplica(t *testing.T) {
+	pool := sessionsim.NewPool(t)
+	ks := keyservicetest.New(t, pool)
+	guest := pool.Boot(t, nil, ks.Pin)
+	b := unbound(t, guest)
+	pin := pinFile(t, ks.Pin)
+	b.w.credentials, b.w.stored, b.w.keyService = nil, []string{"api-token:64"}, pin
+	tenant := &tenantFlags{pin: pin, tenant: "acme", authorityKey: b.authorityKey}
+	tenant.timeout, tenant.engineForTest = b.timeout, b.engineForTest
+	var stdout, stderr bytes.Buffer
+	if code := runTenantRegister(context.Background(), tenant, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("tenant register exit %d: %s", code, stderr.String())
+	}
+	if code := runStoredCredentialPut(context.Background(), tenant, "api-token", []byte("hunter2"), &stdout, &stderr); code != ExitOK {
+		t.Fatalf("credential put exit %d: %s", code, stderr.String())
+	}
+	bind(t, b)
+	loaded, err := session.LoadBinding(b.out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if named := loaded.Bind.Doc.KeyService; !named.Pin().Equal(ks.Pin) || !slices.Equal(named.Members, ks.Members) {
+		t.Fatalf("the bind names %+v", named)
+	}
+	stdout.Reset()
+	show := session.ExecRequest{Argv: []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/api-token"`}}
+	if code := runExec(context.Background(), driving(b), show, &stdout, &stderr); code != 0 || stdout.String() != "hunter2" {
+		t.Fatalf("exec exit %d stdout %q stderr %q", code, stdout.String(), stderr.String())
 	}
 }
 

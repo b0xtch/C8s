@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,6 +29,11 @@ const (
 	// presents to its key service is replaced, or a quarter of its life for
 	// one that lives less than four hours.
 	certRenewAhead = time.Hour
+	// memberAttempts is how many connections a guest opens at its bind to
+	// find a replica of its key service that the bind names, when its
+	// session is with another, and memberTimeout bounds each.
+	memberAttempts = 3
+	memberTimeout  = 10 * time.Second
 )
 
 // renewAhead is how long before its end the guest replaces cert, the
@@ -49,6 +55,10 @@ type keyService struct {
 	mu sync.Mutex
 	// open is closed once the session is open.
 	open chan struct{}
+	// replica is the replica the session was last opened with, by its
+	// instance key as a bind gives one: a replica keeps a guest's session to
+	// itself. mu guards it.
+	replica string
 	// cert is the certificate the guest presents to the key service: its
 	// instance key, with evidence of it.
 	certMu sync.Mutex
@@ -142,11 +152,13 @@ func (a *Agent) openKeyService(ctx context.Context) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
 	defer cancel()
-	if err := ks.client.Open(ctx, a.launch, a.signature); err != nil {
+	replica, err := ks.client.Open(ctx, a.launch, a.signature)
+	if err != nil {
 		return fmt.Errorf("open a session with the key service: %w", err)
 	}
+	ks.replica = replica
 	close(ks.open)
-	a.log.Info("opened a session with the key service")
+	a.log.Info("opened a session with the key service", "replica", replica)
 	return nil
 }
 
@@ -206,7 +218,7 @@ func (a *Agent) KeepKeyServiceOpen(ctx context.Context) {
 		if bound {
 			return
 		}
-		if err := a.reopenKeyService(ctx); err != nil {
+		if err := a.reopenKeyService(ctx, "under a new certificate"); err != nil {
 			a.log.Warn("the session with the key service was not opened again", "error", err, "retry_in", keyServiceRetry.String())
 			select {
 			case <-ctx.Done():
@@ -218,19 +230,71 @@ func (a *Agent) KeepKeyServiceOpen(ctx context.Context) {
 }
 
 // reopenKeyService opens the guest's session with its key service over a new
-// connection, which presents the guest's newest certificate.
-func (a *Agent) reopenKeyService(ctx context.Context) error {
+// connection, which presents the guest's newest certificate and ends at
+// whichever replica answers: one the client is held to, if it is held to
+// some. why says what for, in the guest's log.
+func (a *Agent) reopenKeyService(ctx context.Context, why string) error {
 	ks := a.keyService
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
 	defer cancel()
 	ks.client.Close()
-	if err := ks.client.Open(ctx, a.launch, a.signature); err != nil {
+	replica, err := ks.client.Open(ctx, a.launch, a.signature)
+	if err != nil {
 		return err
 	}
-	a.log.Info("opened the session with the key service again, under a new certificate")
+	ks.replica = replica
+	a.log.Info("opened the session with the key service again, "+why, "replica", replica)
 	return nil
+}
+
+// holdToMembers has the guest deal with its key service, from its bind on,
+// through none but the replicas the bind names. Before its bind a guest
+// judges its key service on the vendor's documents as its host hands them
+// over, which a host can choose from before a revocation. The binder judged
+// the replicas it names on documents it fetched itself, and its authority
+// signed the bind.
+//
+// A guest whose session is with another replica opens one with a replica the
+// bind names, and fails if it reaches none: its host leads it elsewhere, or
+// the binder's list is of replicas that are gone. A connection that ends at
+// a key the bind does not name is sent nothing. A bind that names no key
+// service leaves the guest with none to deal with.
+func (a *Agent) holdToMembers(ctx context.Context, bind *session.SignedBind) error {
+	ks := a.keyService
+	if ks == nil {
+		return nil
+	}
+	var members []string
+	if named := bind.Doc.KeyService; named != nil {
+		members = named.Members
+	}
+	ks.mu.Lock()
+	ks.client.Hold(members)
+	with := ks.replica
+	ks.mu.Unlock()
+	if len(members) == 0 {
+		a.log.Info("the bind names no key service, and the guest deals with its pool's no more")
+		return nil
+	}
+	if slices.Contains(members, with) {
+		return nil
+	}
+	a.log.Warn("the session with the key service is with a replica the bind does not name", "replica", with, "named", len(members))
+	var err error
+	for range memberAttempts {
+		attempt, cancel := context.WithTimeout(ctx, memberTimeout)
+		err = a.reopenKeyService(attempt, "with a replica the bind names")
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return fmt.Errorf("no replica of the key service that the bind names was reached: %w", err)
 }
 
 // acquire takes the credentials the bind declares as its key service's and

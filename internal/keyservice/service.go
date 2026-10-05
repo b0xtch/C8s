@@ -101,6 +101,10 @@ type Service struct {
 	guests  map[string]*guest
 }
 
+// Replica is the replica's instance key, as a bind names one: the digest
+// of the key its certificate carries.
+func (s *Service) Replica() string { return s.audience }
+
 // pool is a pool the launch document lists, as a policy for its guests.
 type pool struct {
 	policy session.Policy

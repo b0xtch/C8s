@@ -72,6 +72,9 @@ const (
 	// BindKeyService: the bind trusts a key service the guest's launch
 	// document does not pin.
 	BindKeyService Code = "bind_key_service"
+	// BindNoMember: the guest's session with its key service is with a
+	// replica the bind does not name, and it reached none the bind names.
+	BindNoMember Code = "bind_no_member"
 	// BindNoMachine: the guest's launch document lists no machine the guest
 	// may be, and the guest takes no bind under such a document.
 	BindNoMachine Code = "bind_no_machine"
@@ -91,7 +94,7 @@ const (
 var Refusals = []Code{
 	Busy, TooLarge, Malformed, Unauthorized, NotFound, MethodNotAllowed, Fenced, NotReady, AlreadyBound, Retired,
 	BindTooLate, BindClock, BindInvalid, BindSignature, BindOtherGuest, BindExpired,
-	BindNoSandbox, BindKeyService, BindNoMachine, BindIncomplete, BindFailed, NoCollateral, Internal,
+	BindNoSandbox, BindKeyService, BindNoMember, BindNoMachine, BindIncomplete, BindFailed, NoCollateral, Internal,
 }
 
 // describe says each code in words, for whoever reads a refusal. The words
@@ -115,6 +118,7 @@ var describe = map[Code]string{
 	BindExpired:      "the bind is past its time",
 	BindNoSandbox:    "the bind names no sandbox image, and this guest runs a session's code inside one only",
 	BindKeyService:   "the bind trusts a key service that the guest's launch document does not pin",
+	BindNoMember:     "the guest reached no replica of its key service that the bind names",
 	BindNoMachine:    "the guest's launch document lists no machine the guest may be, so the guest takes no bind",
 	BindIncomplete:   "the bind is not complete yet",
 	BindFailed:       "the guest took the bind, could not act on it, and is shutting down",

@@ -33,6 +33,9 @@ const SourceBinder = "binder"
 // maxServiceURL bounds a pinned service's URL.
 const maxServiceURL = 255
 
+// MaxKeyServiceMembers bounds the replicas of its key service a bind names.
+const MaxKeyServiceMembers = 16
+
 // KeyService pins a key service: where it is reached and what it must be. A
 // pool's launch document names the one its TDs open their sessions with, and
 // a bind names the one its session trusts.
@@ -52,6 +55,59 @@ type KeyService struct {
 	// pins the key service accepts them of it, and a bind's pin equals its
 	// guest's only if it names the same ones.
 	AcceptTCBStatus []string `yaml:"acceptTCBStatus,omitempty" json:"acceptTCBStatus,omitempty"`
+}
+
+// BindKeyService is the key service a bind names for its session: the pin,
+// which a guest holds to the one in its launch document, and the replicas of
+// that key service its binder judged.
+//
+// A guest has no road to the vendor, so before its bind it judges its key
+// service on the vendor's documents as its host hands them over. A host that
+// holds the keys of a platform the vendor has since revoked passes that with
+// a key service of its own and documents from before the revocation. The
+// binder judges the replicas on documents it fetched itself, and the
+// authority's signature on the bind carries its verdict to the guest.
+type BindKeyService struct {
+	// URL, Image, LaunchKey and AcceptTCBStatus are the pin, member for
+	// member as KeyService has them: see Pin.
+	URL             string   `json:"url"`
+	Image           Image    `json:"image"`
+	LaunchKey       string   `json:"launchKey"`
+	AcceptTCBStatus []string `json:"acceptTCBStatus,omitempty"`
+	// Members are the replicas the binder judged as for a release: on the
+	// vendor's documents as it fetched them from the vendor within the last
+	// hour. Each is a replica's instance key, as sha256:<hex> of its PKIX
+	// encoding. From its bind on the guest takes nothing from a replica, and
+	// sends it nothing, unless the bind names it. They are no part of the
+	// pin.
+	Members []string `json:"members"`
+}
+
+// Pin is the key service the bind names, as a launch document pins one: what
+// a guest holds to the pin it booted under. Nil for a bind that names none.
+func (k *BindKeyService) Pin() *KeyService {
+	if k == nil {
+		return nil
+	}
+	return &KeyService{URL: k.URL, Image: k.Image, LaunchKey: k.LaunchKey, AcceptTCBStatus: k.AcceptTCBStatus}
+}
+
+func (k *BindKeyService) validate() error {
+	if err := k.Pin().validate(); err != nil {
+		return err
+	}
+	if n := len(k.Members); n == 0 || n > MaxKeyServiceMembers {
+		return fmt.Errorf("members must name 1..%d replicas of the key service, each one its binder judged", MaxKeyServiceMembers)
+	}
+	for i, member := range k.Members {
+		if !instanceKeyRE.MatchString(member) {
+			return errors.New("members: each must be sha256:<64 lowercase hex>")
+		}
+		if slices.Contains(k.Members[:i], member) {
+			return fmt.Errorf("members: %s is named twice", member)
+		}
+	}
+	return nil
 }
 
 // LoadKeyServicePin reads a pin from the JSON file 'c8s session key-service
@@ -199,20 +255,42 @@ func (p imagePins) Verify(r *teetypes.VerificationResult) error {
 // Like VerifyServingCert it is no freshness proof. The TLS handshake that
 // presented the certificate proves the key is live.
 func VerifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, machine *Machine, now time.Time) error {
-	rtmr0, err := ServiceMachine(ctx, pin, engine, leaf, document, now)
+	_, err := verifyService(ctx, pin, engine, leaf, document, machine, now)
+	return err
+}
+
+// VerifyServiceToRelease is VerifyService for a verifier whose verdict lets
+// others rely on the service: a binder that names a key service's replica in
+// its bind, after which the bind's guest takes credentials from that replica.
+// The verdict rests on the vendor's documents as this verifier fetched them
+// from the vendor itself within the last hour, and on none that was handed
+// over. It returns until when the verdict stands.
+func VerifyServiceToRelease(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, machine *Machine, now time.Time) (time.Time, error) {
+	res, err := verifyService(ctx, pin, engine, leaf, document, machine, now)
 	if err != nil {
-		return err
+		return time.Time{}, err
+	}
+	until := stands(now, leaf, res)
+	if err := standsNot(now, until, leaf, res); err != nil {
+		return time.Time{}, err
+	}
+	return until, nil
+}
+
+func verifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, machine *Machine, now time.Time) (*teetypes.VerificationResult, error) {
+	res, rtmr0, err := serviceResult(ctx, pin, engine, leaf, document, now)
+	if err != nil {
+		return nil, err
 	}
 	switch {
 	case !pin.Image.HasMachineRegister():
-		return nil
 	case machine == nil:
 		// Its host may have built it any machine: see Policy.AllowNoMachine.
-		return refuse("the key service's launch document lists no machine the key service may be")
+		return nil, refuse("the key service's launch document lists no machine the key service may be")
 	case !machine.Allows(rtmr0):
-		return refuse("the key service's machine (RTMR[0] %x) is none of the %d its launch document lists", rtmr0, len(machine.RTMR0))
+		return nil, refuse("the key service's machine (RTMR[0] %x) is none of the %d its launch document lists", rtmr0, len(machine.RTMR0))
 	}
-	return nil
+	return res, nil
 }
 
 // ServiceMachine verifies a service as VerifyService does, except for its
@@ -221,21 +299,26 @@ func VerifyService(ctx context.Context, pin *KeyService, engine Engine, leaf *x5
 // the value that document then lists. Nothing may be sent to a service on
 // this verdict.
 func ServiceMachine(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, now time.Time) ([]byte, error) {
+	_, rtmr0, err := serviceResult(ctx, pin, engine, leaf, document, now)
+	return rtmr0, err
+}
+
+func serviceResult(ctx context.Context, pin *KeyService, engine Engine, leaf *x509.Certificate, document string, now time.Time) (*teetypes.VerificationResult, []byte, error) {
 	identity, err := pin.Image.Identity()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	policy := Policy{Image: identity, LaunchKey: []byte(pin.LaunchKey), AcceptTCBStatus: pin.AcceptTCBStatus}
 	res, err := servingCertResult(ctx, policy, engine, leaf, now, nil, [][]string{{document}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !pin.Image.HasMachineRegister() {
-		return nil, nil
+		return res, nil, nil
 	}
 	rtmr0, err := res.Claims.RTMR(0)
 	if err != nil {
-		return nil, &VerificationError{Err: fmt.Errorf("the key service's evidence carries no RTMR[0]: %w", err)}
+		return nil, nil, &VerificationError{Err: fmt.Errorf("the key service's evidence carries no RTMR[0]: %w", err)}
 	}
-	return rtmr0, nil
+	return res, rtmr0, nil
 }

@@ -38,6 +38,12 @@
 // TD: this side's bind finds the TD gone and it signs for the next, and a
 // record gives the lost attempt's time, which is what a collision costs.
 //
+// With --key-service each bind names the replica of that key service this
+// side judged, as for a release, which its guest then holds its key service
+// to. The replica is judged before the first round and again each minute,
+// beside the rounds: a record of kind "members" gives the first judgment's
+// time, and one more is printed for each that failed.
+//
 // Every verdict here lets a secret go, so it rests on the vendor's documents
 // as this process fetched them within the hour: it asks the vendor again as
 // they come due and judges the waiting guests on what came, each minute, and
@@ -84,6 +90,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
+	"github.com/confidential-dot-ai/c8s/pkg/session/keyservice"
 )
 
 type options struct {
@@ -119,6 +126,17 @@ type refresh struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// judged is one judgment of the key service's replica this side names in
+// its binds: kind "members". The first is made before any round.
+type judged struct {
+	Kind string `json:"kind"`
+	At   int64  `json:"at_unix_us"`
+	Took int64  `json:"took_us"`
+	// Named are the replicas the binds name from here on.
+	Named []string `json:"named,omitempty"`
+	Error string   `json:"error,omitempty"`
+}
+
 // record is one round. Every time is in microseconds.
 type record struct {
 	Kind    string `json:"kind"`
@@ -143,6 +161,9 @@ type record struct {
 	// command: the receipt, or with --quote-first the quote.
 	Claim      int64 `json:"claim_us"`
 	ReadyCheck int64 `json:"ready_check_us"`
+	// Members is the finding of the key service's replicas the bind names:
+	// of this side's verdict on them, made before the round.
+	Members int64 `json:"members_us,omitempty"`
 	// ReadyAhead says the check of the unbound guest was made before the
 	// claim, on what the daemon showed this side when the guest became
 	// ready. ReadyCheck is then the finding of that verdict alone, and
@@ -354,6 +375,40 @@ func run(o *options) error {
 	if err != nil {
 		return err
 	}
+	// The replica of the key service each bind names: judged before the
+	// first round, and kept current beside the rounds.
+	var replicas *keyservice.Members
+	if pin != nil {
+		if replicas, err = keyservice.NewMembers(keyservice.Options{Pin: pin, Engine: engine}); err != nil {
+			return fmt.Errorf("--key-service: %w", err)
+		}
+		defer replicas.Close()
+		began := time.Now()
+		judging, cancel := context.WithTimeout(context.Background(), time.Minute)
+		member, err := replicas.Judge(judging)
+		cancel()
+		rec := &judged{Kind: "members", At: began.UnixMicro(), Took: micros(began)}
+		if err != nil {
+			// A round that needs the replica says what it could not do.
+			rec.Error = err.Error()
+		} else {
+			rec.Named = []string{member.Key}
+		}
+		if err := emit(rec); err != nil {
+			return err
+		}
+		keeping, stop := context.WithCancel(context.Background())
+		defer stop()
+		go replicas.KeepCurrent(keeping, func(took time.Duration, err error) {
+			_ = emit(&judged{Kind: "members", At: time.Now().Add(-took).UnixMicro(), Took: took.Microseconds(), Error: err.Error()})
+		})
+	}
+	named := func(ctx context.Context) ([]string, error) {
+		if pin == nil {
+			return nil, nil
+		}
+		return replicas.Named(ctx)
+	}
 	if o.watchReady {
 		watcher := host
 		if o.watchCert != "" {
@@ -386,7 +441,7 @@ func run(o *options) error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
-		rec, err := one(ctx, o, round, host, ender, engine, verdicts, identity, launchKey, authority, pin, accepted)
+		rec, err := one(ctx, o, round, host, ender, engine, verdicts, identity, launchKey, authority, pin, named, accepted)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("round %d: %w", round, err)
@@ -424,7 +479,8 @@ func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *sess
 
 // one starts one session and runs its commands. ender is who ends it.
 func one(ctx context.Context, o *options, round int, host, ender *daemon.Client, engine session.Engine, verdicts *session.ReadyVerdicts,
-	identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey, pin *session.KeyService, accepted []string,
+	identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey, pin *session.KeyService,
+	named func(context.Context) ([]string, error), accepted []string,
 ) (*record, error) {
 	rec := &record{Kind: "session", Round: round, Session: fmt.Sprintf("%s-%d", o.prefix, round)}
 
@@ -541,6 +597,7 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	var ready *session.ReadyTD
 	var bind *session.SignedBind
 	var first *session.SealedMessage
+	var members []string
 	signed := func() error {
 		ready = judged.ReadyTD
 		if pin != nil && !pin.Equal(ready.Document.KeyService) {
@@ -550,9 +607,19 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		if judged.Ahead {
 			rec.ReadyJudged = judged.Took.Microseconds()
 		}
+		// The replicas of the key service this side judged, for the bind to
+		// name: found judged, as the guest was.
+		if pin != nil {
+			step = time.Now()
+			if members, err = named(ctx); err != nil {
+				return fmt.Errorf("the key service's replica: %w", err)
+			}
+			rec.Members = micros(step)
+		}
 		step = time.Now()
 		if bind, err = session.NewBind(session.BindOptions{
-			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: rec.Session, Policy: policy, KeyService: pin,
+			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: rec.Session, Policy: policy,
+			KeyService: pin, Members: members,
 		}); err != nil {
 			return err
 		}
@@ -579,7 +646,8 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		pause := time.Now()
 		other := rec.Session + "-taken"
 		theirs, err := session.NewBind(session.BindOptions{
-			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: other, Policy: policy, KeyService: pin,
+			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: other, Policy: policy,
+			KeyService: pin, Members: members,
 		})
 		if err != nil {
 			return nil, err

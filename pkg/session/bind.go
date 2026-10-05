@@ -72,9 +72,10 @@ type Bind struct {
 	// clock starts from a host-supplied value, so this binds an honest host only.
 	NotAfter string     `json:"notAfter"`
 	Policy   BindPolicy `json:"policy"`
-	// KeyService, when set, pins the key service the session trusts: the one
-	// the guest takes the policy's stored credentials from.
-	KeyService *KeyService `json:"keyService,omitempty"`
+	// KeyService, when set, names the key service the session trusts: the
+	// one the guest takes the policy's stored credentials from, and the
+	// replicas of it that the binder judged.
+	KeyService *BindKeyService `json:"keyService,omitempty"`
 }
 
 // BindPolicy is what the owner decides about its TD, one area to a member.
@@ -317,8 +318,12 @@ type BindOptions struct {
 	// from now.
 	NotAfter time.Time
 	Policy   BindPolicy
-	// KeyService is the key service the session trusts, or nil.
+	// KeyService is the key service the session trusts, or nil. Members are
+	// the replicas of it that the binder judged as for a release
+	// (keyservice.Members), each by its instance key as a bind gives one: a
+	// bind that names a key service names at least one.
 	KeyService *KeyService
+	Members    []string
 }
 
 // NewBind renders and signs a bind.
@@ -358,7 +363,16 @@ func NewBind(opts BindOptions) (*SignedBind, error) {
 		Nonce:         hex.EncodeToString(nonce),
 		NotAfter:      notAfter.UTC().Format(bindTimeLayout),
 		Policy:        opts.Policy,
-		KeyService:    opts.KeyService,
+	}
+	switch {
+	case opts.KeyService != nil:
+		pin := opts.KeyService
+		doc.KeyService = &BindKeyService{
+			URL: pin.URL, Image: pin.Image, LaunchKey: pin.LaunchKey, AcceptTCBStatus: pin.AcceptTCBStatus,
+			Members: slices.Clone(opts.Members),
+		}
+	case len(opts.Members) > 0:
+		return nil, errors.New("a bind names the replicas of a key service only with the key service")
 	}
 	if err := doc.Validate(); err != nil {
 		return nil, err

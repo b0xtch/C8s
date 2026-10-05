@@ -747,6 +747,12 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, seal
 		}
 	}
 	bind, events, refusal := a.acceptable(raw, signature)
+	if refusal == nil {
+		// Whoever sent the bind may leave: the guest ends up the same.
+		if err := a.holdToMembers(context.WithoutCancel(ctx), bind); err != nil {
+			refusal = refused(disclosure.BindNoMember, err)
+		}
+	}
 	traced(ctx, "accepted")
 	if err := refusal; err != nil {
 		a.measured.Lock()
@@ -851,7 +857,7 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 	}
 	// The guest holds one key service to a pin, its pool's, and opened its
 	// session with that one before it was anybody's.
-	if pin := bind.Doc.KeyService; pin != nil && !pin.Equal(a.doc.KeyService) {
+	if pin := bind.Doc.KeyService.Pin(); pin != nil && !pin.Equal(a.doc.KeyService) {
 		return nil, nil, refused(disclosure.BindKeyService, errors.New("the bind trusts a key service that this guest's launch document does not pin"))
 	}
 	if time.Now().After(bind.Doc.Expiry().Add(tokenClockSkew)) {

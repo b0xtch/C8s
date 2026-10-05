@@ -207,6 +207,13 @@
           "item": {
             "type": "string"
           }
+        },
+        {
+          "name": "members",
+          "type": "list",
+          "item": {
+            "type": "string"
+          }
         }
       ]
     }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 
@@ -60,6 +62,23 @@ type Client struct {
 	// key is the digest of the instance key the connection ends at: the
 	// audience of every token sent on it.
 	key string
+	// held says the client deals with none but members, the replicas whose
+	// instance keys a bind named: see Hold.
+	held    bool
+	members []string
+}
+
+// NotMemberError is a connection that ended at a replica which is none the
+// client is held to. The handshake showed its key, and nothing was sent to
+// it.
+type NotMemberError struct {
+	// Replica is the instance key the connection ended at, as a bind gives
+	// one.
+	Replica string
+}
+
+func (e *NotMemberError) Error() string {
+	return fmt.Sprintf("the key service's replica %s is none the bind names", e.Replica)
 }
 
 // StatusError is an answer of the key service that is no success.
@@ -106,21 +125,47 @@ func (c *Client) drop() {
 	}
 }
 
-// connect opens a connection and holds its far end to the pin and to the
+// Hold has the client deal, from here on, with none but the replicas of
+// these instance keys, each given as a bind gives one: what a guest does
+// with the replicas its bind names. A connection that ends at any other key
+// is dropped as soon as the handshake has shown it, before the client sends
+// a request, with NotMemberError, and the one the client has is dropped now
+// if it is such a one. An empty list is a client that deals with nobody any
+// more.
+func (c *Client) Hold(members []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.held, c.members = true, slices.Clone(members)
+	if c.conn != nil && !slices.Contains(c.members, c.key) {
+		c.drop()
+	}
+}
+
+// connect opens a connection and holds its far end to the replicas the
+// client may deal with, if it is held to some, to the pin, and to the
 // machines its launch document lists. The caller holds the lock.
 func (c *Client) connect(ctx context.Context) error {
 	_, err := c.reach(ctx, true)
 	return err
 }
 
-// reach opens a connection, asks its far end for the launch document it
-// measured, and judges the evidence in its certificate against the pin. With
-// held it also holds the far end to the machines that document lists, which
-// every caller that goes on to send something requires. Without, it returns
-// what the far end's RTMR[0] holds. The caller holds the lock.
-func (c *Client) reach(ctx context.Context, held bool) (machine []byte, err error) {
-	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
+// far is what the far end of a new connection showed of itself: the
+// certificate it served under and the launch document it says it measured,
+// which the pinned launch key signed.
+type far struct {
+	leaf   *x509.Certificate
+	digest string
+	doc    *Document
+}
+
+// meet opens a connection and asks its far end for the launch document it
+// measured. Nothing is judged yet, and nothing else was sent. With members
+// the far end is first held to the replicas the client deals with: the
+// handshake proved it holds the key of the certificate it served under, and
+// a key that is none of those replicas' is sent no request at all. The
+// caller holds the lock, and drops the connection if it judges the far end
+// to be another than it wants.
+func (c *Client) meet(ctx context.Context, members bool) (*far, error) {
 	raw, err := c.opts.Dial(ctx, "tcp", c.addr)
 	if err != nil {
 		return nil, fmt.Errorf("reach the key service: %w", err)
@@ -144,41 +189,94 @@ func (c *Client) reach(ctx context.Context, held bool) (machine []byte, err erro
 		return nil, fmt.Errorf("reach the key service: %w", err)
 	}
 	c.conn, c.read = conn, bufio.NewReader(conn)
-	fail := func(err error) ([]byte, error) {
+	fail := func(err error) (*far, error) {
 		c.drop()
 		return nil, err
+	}
+	certs := conn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return fail(&session.VerificationError{Err: errors.New("the key service presented no certificate")})
+	}
+	if c.key, err = session.InstanceKeyDigest(certs[0].PublicKey); err != nil {
+		return fail(&session.VerificationError{Err: fmt.Errorf("the key service's certificate: %w", err)})
+	}
+	if members && c.held && !slices.Contains(c.members, c.key) {
+		return fail(&NotMemberError{Replica: c.key})
 	}
 	// What anyone may ask: the document the key service says it measured.
 	var state StateResponse
 	if err := c.exchange(ctx, http.MethodGet, PathState, nil, "", &state); err != nil {
 		return fail(err)
 	}
-	certs := conn.ConnectionState().PeerCertificates
-	if len(certs) == 0 {
-		return fail(&session.VerificationError{Err: errors.New("the key service presented no certificate")})
-	}
-	leaf := certs[0]
 	doc, err := VerifySigned([]byte(c.opts.Pin.LaunchKey), state.Launch, state.Signature)
 	if err != nil {
 		return fail(&session.VerificationError{Err: fmt.Errorf("the key service's launch document: %w", err)})
+	}
+	return &far{leaf: certs[0], digest: session.DocumentDigest(state.Launch), doc: doc}, nil
+}
+
+// reach opens a connection, asks its far end for the launch document it
+// measured, and judges the evidence in its certificate against the pin. With
+// held it first holds the far end to the replicas the client deals with, and
+// then to the machines that document lists, which every caller that goes on
+// to send something requires. Without, it returns what the far end's RTMR[0]
+// holds. The caller holds the lock.
+func (c *Client) reach(ctx context.Context, held bool) (machine []byte, err error) {
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	met, err := c.meet(ctx, held)
+	if err != nil {
+		return nil, err
 	}
 	judging := ctx
 	if c.opts.Judging != nil {
 		judging = c.opts.Judging(ctx)
 	}
-	digest := session.DocumentDigest(state.Launch)
 	if held {
-		err = session.VerifyService(judging, c.opts.Pin, c.opts.Engine, leaf, digest, doc.Machine, c.opts.Now())
+		err = session.VerifyService(judging, c.opts.Pin, c.opts.Engine, met.leaf, met.digest, met.doc.Machine, c.opts.Now())
 	} else {
-		machine, err = session.ServiceMachine(judging, c.opts.Pin, c.opts.Engine, leaf, digest, c.opts.Now())
+		machine, err = session.ServiceMachine(judging, c.opts.Pin, c.opts.Engine, met.leaf, met.digest, c.opts.Now())
 	}
 	if err != nil {
-		return fail(fmt.Errorf("the key service is not the one pinned: %w", err))
-	}
-	if c.key, err = session.InstanceKeyDigest(leaf.PublicKey); err != nil {
-		return fail(err)
+		c.drop()
+		return nil, fmt.Errorf("the key service is not the one pinned: %w", err)
 	}
 	return machine, nil
+}
+
+// Member is a replica of the pinned key service as a binder judged it, for
+// its binds to name.
+type Member struct {
+	// Key is the replica's instance key, as a bind gives one.
+	Key string
+	// Until is until when the verdict stands: an hour from when this
+	// verifier fetched the vendor's documents under it, and no longer than
+	// the replica's certificate.
+	Until time.Time
+}
+
+// Member reaches the key service over a new connection and judges the
+// replica that answers as for a release: against the pin, the machines its
+// launch document lists, and the vendor's documents as this client's engine
+// fetched them from the vendor within the last hour, whatever context the
+// client judges its other calls under (Options.Judging). The connection is
+// kept for the client's next call.
+func (c *Client) Member(ctx context.Context) (*Member, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.drop()
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	met, err := c.meet(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	until, err := session.VerifyServiceToRelease(ctx, c.opts.Pin, c.opts.Engine, met.leaf, met.digest, met.doc.Machine, c.opts.Now())
+	if err != nil {
+		c.drop()
+		return nil, fmt.Errorf("the key service is not the one pinned: %w", err)
+	}
+	return &Member{Key: c.key, Until: until}, nil
 }
 
 // exchange sends one request on the connection and reads its answer. The
@@ -240,11 +338,17 @@ func (e *connectionError) Unwrap() error { return e.err }
 // the last one failed. Every call it carries may be made twice: the key
 // service answers a repeat as it answered the first.
 func (c *Client) do(ctx context.Context, method, path string, in any, signer operatorauth.AudienceAuthorizer, out any) error {
+	_, err := c.doAt(ctx, method, path, in, signer, out)
+	return err
+}
+
+// doAt is do, and returns the replica that answered: the instance key the
+// connection ended at, as a bind gives one.
+func (c *Client) doAt(ctx context.Context, method, path string, in any, signer operatorauth.AudienceAuthorizer, out any) (replica string, err error) {
 	var body []byte
 	if in != nil {
-		var err error
 		if body, err = json.Marshal(in); err != nil {
-			return err
+			return "", err
 		}
 	}
 	c.mu.Lock()
@@ -252,7 +356,7 @@ func (c *Client) do(ctx context.Context, method, path string, in any, signer ope
 	for attempt := 0; ; attempt++ {
 		if c.conn == nil {
 			if err := c.connect(ctx); err != nil {
-				return err
+				return "", err
 			}
 		}
 		authorization := ""
@@ -260,17 +364,18 @@ func (c *Client) do(ctx context.Context, method, path string, in any, signer ope
 			var err error
 			// The token is for the key service this connection ends at.
 			if authorization, err = signer.AuthorizationFor(c.key, method, path, body); err != nil {
-				return err
+				return "", err
 			}
 		}
+		replica = c.key
 		err := c.exchange(ctx, method, path, body, authorization, out)
 		var broken *connectionError
 		if !errors.As(err, &broken) {
-			return err
+			return replica, err
 		}
 		c.drop()
 		if attempt > 0 || ctx.Err() != nil {
-			return err
+			return "", err
 		}
 	}
 }
@@ -302,9 +407,11 @@ func (c *Client) Machine(ctx context.Context) ([]byte, error) {
 }
 
 // Open opens the calling guest's session with the key service: the guest's
-// launch document, under the certificate the client presents.
-func (c *Client) Open(ctx context.Context, launch []byte, signature string) error {
-	return c.do(ctx, http.MethodPost, PathOpen, OpenRequest{Launch: launch, Signature: signature}, nil, nil)
+// launch document, under the certificate the client presents. It returns the
+// replica the session is with, by its instance key as a bind gives one: a
+// replica keeps a guest's session to itself.
+func (c *Client) Open(ctx context.Context, launch []byte, signature string) (replica string, err error) {
+	return c.doAt(ctx, http.MethodPost, PathOpen, OpenRequest{Launch: launch, Signature: signature}, nil, nil)
 }
 
 // Acquire presents the calling guest's bind and returns what it releases,

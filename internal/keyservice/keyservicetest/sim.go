@@ -25,14 +25,55 @@ import (
 
 // Sim is a running key service that serves the pools it was made for.
 type Sim struct {
-	// Pin is what a pool's launch document and an owner's bind pin of it.
-	Pin *session.KeyService
+	// Pin is what a pool's launch document and an owner's bind pin of it,
+	// and Members what a bind names as its replicas: this one.
+	Pin     *session.KeyService
+	Members []string
 	// Bundle is its launch bundle directory.
 	Bundle string
 	// Service is the replica itself.
 	Service *keyservice.Service
 	// Machine is what the replica's RTMR[0] holds.
 	Machine [48]byte
+
+	// addr is where this replica listens, and the rest what a twin is made
+	// from: the image's registers as they are before a launch is measured
+	// into them, the launch document and its options.
+	addr      string
+	image     registers
+	launch    []byte
+	signature string
+	pub       []byte
+	with      Options
+}
+
+// registers are what an image measures to, in any TD that boots it.
+type registers struct {
+	mrtd [48]byte
+	rtmr [3][48]byte
+}
+
+func registersOf(td *sessiontest.TD) registers {
+	return registers{mrtd: td.MRTD, rtmr: [3][48]byte{td.RTMR[0], td.RTMR[1], td.RTMR[2]}}
+}
+
+// Dial is a road to this replica whatever address is asked for: what a test
+// gives a client or a pool whose pin names another replica's address.
+func (s *Sim) Dial(ctx context.Context, network, _ string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, s.addr)
+}
+
+// Twin boots another replica of the same key service: the same image, under
+// the same launch document, with an instance key of its own, and nothing of
+// what the first holds. Its pin is the first's, which names the first's
+// address, so a connection is led to the twin by its Dial.
+func (s *Sim) Twin(t testing.TB) *Sim {
+	t.Helper()
+	td := sessiontest.NewTD()
+	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = s.image.mrtd, s.image.rtmr[0], s.image.rtmr[1], s.image.rtmr[2]
+	twin := serve(t, td, s.launch, s.signature, s.pub, s.with)
+	twin.Pin, twin.Bundle = s.Pin, s.Bundle
+	return twin
 }
 
 // Options change the key service New boots.
@@ -91,6 +132,21 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 		return data
 	}
 	pub, launch, signature := read(session.PubkeyFile), read(session.DocumentFile), read(session.SignatureFile)
+	sim := serve(t, td, launch, string(signature), pub, with)
+	sim.Bundle = opts.Dir
+	pin, err := api.Pin(opts.Dir, "https://"+sim.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sim.Pin = pin
+	return sim
+}
+
+// serve boots one replica in td under the launch document and serves it on
+// loopback until the test ends.
+func serve(t testing.TB, td *sessiontest.TD, launch []byte, signature string, pub []byte, with Options) *Sim {
+	t.Helper()
+	image := registersOf(td)
 	// What the measured initrd does with the launch key, and the key service
 	// with its launch document.
 	td.SeedLaunchKey(pub)
@@ -101,7 +157,7 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	service, err := keyservice.New(ctx, keyservice.Config{
-		Launch: launch, Signature: string(signature), LaunchKey: pub,
+		Launch: launch, Signature: signature, LaunchKey: pub,
 		TEE: sessiontest.TEE{TD: td}, Engine: with.Engine, Now: with.Now,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
@@ -121,9 +177,8 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 		cancel()
 		<-done
 	})
-	pin, err := api.Pin(opts.Dir, "https://"+ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
+	return &Sim{
+		Members: []string{service.Replica()}, Service: service, Machine: td.RTMR[0],
+		addr: ln.Addr().String(), image: image, launch: launch, signature: signature, pub: pub, with: with,
 	}
-	return &Sim{Pin: pin, Bundle: opts.Dir, Service: service, Machine: td.RTMR[0]}
 }
