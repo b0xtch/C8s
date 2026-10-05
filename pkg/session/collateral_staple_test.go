@@ -90,16 +90,16 @@ func except(docs []CollateralDocument, url string, change func(*CollateralDocume
 
 // A verifier with nothing kept and no way to Intel reaches a verdict on
 // documents the guest's host handed over, and the verdict says what it rests
-// on. The root CA CRL among them carries it only where nothing is released.
+// on. They carry it only where nothing secret is sent on the verdict.
 func TestStapledCollateralCarriesAColdVerifier(t *testing.T) {
 	env, reportData := fixture(t)
 	k := keptCollateral(t)
 	at := k.newest.Add(10 * time.Minute)
 
-	t.Run("a verdict that releases nothing rests on all four", func(t *testing.T) {
+	t.Run("a verdict that sends nothing secret rests on all four", func(t *testing.T) {
 		service, asked := k.intel(true), 0
 		engine := k.cold(t, at, service)
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
 		res, err := engine.VerifyEvidence(ctx, env, reportData)
 		if err != nil || service.calls != 0 || asked != 1 {
 			t.Fatalf("%v, after %d fetches and %d questions to the source", err, service.calls, asked)
@@ -114,38 +114,42 @@ func TestStapledCollateralCarriesAColdVerifier(t *testing.T) {
 		}
 	})
 
-	t.Run("one that releases something takes the root CA CRL from Intel alone", func(t *testing.T) {
+	t.Run("one that may send a secret takes every document from Intel alone", func(t *testing.T) {
 		service, asked := k.intel(false), 0
 		engine := k.cold(t, at, service)
+		// The source is there, and is not asked.
 		ctx := WithCollateralSource(lenient(), handing(&asked, k.documents()...))
 		res, err := engine.VerifyEvidence(ctx, env, reportData)
-		if err != nil || !slices.Equal(service.asked, []string{fixtureRootCRLURL}) {
-			t.Fatalf("%v, after asking Intel for %v", err, service.asked)
+		if err != nil || service.calls != len(k.files) || asked != 0 {
+			t.Fatalf("%v, after %d fetches and %d questions to the source", err, service.calls, asked)
 		}
-		if finding := CollateralOf(res); !finding.Stapled || finding.RootCRLStapled {
+		if finding := CollateralOf(res); finding.Stapled || finding.RootCRLStapled || finding.Stale || !finding.Fetched.Equal(at) {
 			t.Fatalf("finding %+v", finding)
 		}
 
 		down := k.intel(true)
 		res, err = k.cold(t, at, down).VerifyEvidence(ctx, env, reportData)
-		if !isOutage(err) || !slices.Contains(down.asked, fixtureRootCRLURL) {
-			t.Fatalf("%+v, %v after asking Intel for %v: want an outage and no verdict", res, err, down.asked)
+		if !isOutage(err) || down.calls == 0 || asked != 0 {
+			t.Fatalf("%+v, %v after asking Intel for %v and the source %d times: want an outage and no verdict", res, err, down.asked, asked)
 		}
 	})
 
 	t.Run("what was handed over is kept, apart from Intel's own answers", func(t *testing.T) {
 		service, asked := k.intel(false), 0
 		first := k.cold(t, at, service)
-		ctx := WithCollateralSource(lenient(), handing(&asked, k.documents()...))
-		if _, err := first.VerifyEvidence(ctx, env, reportData); err != nil {
-			t.Fatal(err)
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+		if _, err := first.VerifyEvidence(ctx, env, reportData); err != nil || service.calls != 0 {
+			t.Fatalf("%v, after %d fetches", err, service.calls)
 		}
-		// Another process, the same directory, nobody to hand anything over.
-		second := k.engineAt(at.Add(time.Minute), k.intel(true), false)
+		// Another process, the same directory, nobody to hand anything over:
+		// the three that carry Intel's date are there. The root CA CRL, whose
+		// age nothing bounds, is kept for nobody, and is asked of Intel.
+		again := k.intel(false)
+		second := k.engineAt(at.Add(time.Minute), again, false)
 		second.cache.dir = first.cache.dir
-		res, err := second.VerifyEvidence(lenient(), env, reportData)
-		if err != nil || second.fetch.(*intel).calls != 0 {
-			t.Fatalf("%v, after %d fetches", err, second.fetch.(*intel).calls)
+		res, err := second.VerifyEvidence(AllowHandedDocuments(lenient()), env, reportData)
+		if err != nil || !slices.Equal(again.asked, []string{fixtureRootCRLURL}) {
+			t.Fatalf("%v, after asking Intel for %v", err, again.asked)
 		}
 		if finding := CollateralOf(res); !finding.Stapled || finding.RootCRLStapled {
 			t.Fatalf("finding %+v", finding)
@@ -158,13 +162,26 @@ func TestStapledCollateralCarriesAColdVerifier(t *testing.T) {
 		if _, ok := second.cache.kept(fixtureRootCRLURL); !ok {
 			t.Fatal("the root CA CRL this verifier fetched is not kept")
 		}
+		// A verdict that may send a secret rests on none of what the
+		// directory keeps as handed over: Intel is asked for those three.
+		own := k.intel(false)
+		third := k.engineAt(at.Add(time.Minute), own, false)
+		third.cache.dir = first.cache.dir
+		res, err = third.VerifyEvidence(lenient(), env, reportData)
+		slices.Sort(own.asked)
+		if want := []string{fixturePCKCRLURL, fixtureQEIdentityURL, fixtureTCBInfoURL}; err != nil || !slices.Equal(own.asked, sorted(want)) {
+			t.Fatalf("%v, after asking Intel for %v, want %v", err, own.asked, want)
+		}
+		if finding := CollateralOf(res); finding.Stapled || finding.Stale {
+			t.Fatalf("finding %+v", finding)
+		}
 	})
 
 	t.Run("an engine told to take Intel's documents from Intel asks nobody else", func(t *testing.T) {
 		service, asked := k.intel(false), 0
 		engine := k.cold(t, at, service)
 		engine.ownOnly = true
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
 		res, err := engine.VerifyEvidence(ctx, env, reportData)
 		if err != nil || asked != 0 || service.calls != len(k.files) {
 			t.Fatalf("%v, after %d fetches and %d questions to the source", err, service.calls, asked)
@@ -182,7 +199,7 @@ func TestStapleIsHeldToIntelsDate(t *testing.T) {
 	k := keptCollateral(t)
 	verify := func(t *testing.T, at time.Time) (*intel, error) {
 		service, asked := k.intel(false), 0
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
 		_, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData)
 		return service, err
 	}
@@ -231,7 +248,7 @@ func TestStapleThatIsNotIntelsIsFetchedAnew(t *testing.T) {
 
 	t.Run("it is fetched anew and that run decides", func(t *testing.T) {
 		service, asked := k.intel(false), 0
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, bent...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, bent...)))
 		res, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData)
 		if err != nil || service.calls != len(k.files) {
 			t.Fatalf("%v, after %d fetches", err, service.calls)
@@ -242,7 +259,7 @@ func TestStapleThatIsNotIntelsIsFetchedAnew(t *testing.T) {
 	})
 	t.Run("with no way to Intel it is an outage, never a verdict", func(t *testing.T) {
 		asked := 0
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, bent...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, bent...)))
 		res, err := k.cold(t, at, k.intel(true)).VerifyEvidence(ctx, env, reportData)
 		if !isOutage(err) {
 			t.Fatalf("%+v, %v: want an outage and no verdict", res, err)
@@ -253,7 +270,7 @@ func TestStapleThatIsNotIntelsIsFetchedAnew(t *testing.T) {
 		moved := except(k.documents(), fixtureTCBInfoURL, func(doc *CollateralDocument) {
 			doc.URL = pcs.TcbInfoURL("00906ed50000")
 		})
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, moved...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, moved...)))
 		if _, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData); err != nil {
 			t.Fatal(err)
 		}
@@ -272,7 +289,7 @@ func TestStapleThatIsNotIntelsIsFetchedAnew(t *testing.T) {
 		huge = except(huge, fixtureRootCRLURL, func(doc *CollateralDocument) {
 			doc.Body = make([]byte, maxCollateralBody+1)
 		})
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, huge...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, huge...)))
 		if _, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData); err != nil {
 			t.Fatal(err)
 		}
@@ -289,7 +306,7 @@ func TestStapleThatIsNotIntelsIsFetchedAnew(t *testing.T) {
 				t.Fatalf("fixture: the document is %d bytes", len(doc.Body))
 			}
 		})
-		ctx = withStapledRoot(WithCollateralSource(lenient(), handing(&asked, largest...)))
+		ctx = AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, largest...)))
 		if _, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData); err != nil || service.calls != 0 {
 			t.Fatalf("the largest document: %v, after asking Intel for %v", err, service.asked)
 		}
@@ -341,7 +358,7 @@ func TestRepeatedMemberIsNoDocument(t *testing.T) {
 	t.Run("handed over", func(t *testing.T) {
 		service, asked := k.intel(false), 0
 		docs := except(k.documents(), fixtureQEIdentityURL, func(doc *CollateralDocument) { doc.Body = forged })
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, docs...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, docs...)))
 		got := advisories(t, ctx, k.cold(t, at, service))
 		if slices.Contains(got, forgedAdvisory) || !slices.Equal(service.asked, []string{fixtureQEIdentityURL}) {
 			t.Fatalf("advisories %v after asking Intel for %v", got, service.asked)
@@ -367,9 +384,9 @@ func TestRepeatedMemberIsNoDocument(t *testing.T) {
 				file.Body = forged
 			}
 		})
-		// A kept document carries a verdict past the hour when Intel cannot
-		// be asked. This one is no document.
-		res, err := k.engineAt(k.newest.Add(2*time.Hour), k.intel(true), false).VerifyEvidence(lenient(), env, reportData)
+		// A kept document carries a verdict that sends nothing secret past
+		// the hour when Intel cannot be asked. This one is no document.
+		res, err := k.engineAt(k.newest.Add(2*time.Hour), k.intel(true), false).VerifyEvidence(AllowHandedDocuments(lenient()), env, reportData)
 		if !isOutage(err) {
 			t.Fatalf("%+v, %v: want an outage and no verdict", res, err)
 		}
@@ -476,7 +493,7 @@ func TestTCBEvaluationFloor(t *testing.T) {
 			k := keptCollateral(t)
 			service, asked := k.intel(false), 0
 			docs := except(k.documents(), url, func(doc *CollateralDocument) { *doc = evaluated(t, *doc, "19") })
-			ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, docs...)))
+			ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, docs...)))
 			// Not looked at, so Intel is asked for this one alone. A document
 			// taken and then found unsigned would have all four fetched anew.
 			if _, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData); err != nil || !slices.Equal(service.asked, []string{url}) {
@@ -506,7 +523,7 @@ func TestTCBEvaluationFloor(t *testing.T) {
 		})
 		service, asked := k.intel(false), 0
 		engine := k.engineAt(at, service, false)
-		ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+		ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
 		if _, err := engine.VerifyEvidence(ctx, env, reportData); err != nil {
 			t.Fatal(err)
 		}
@@ -609,6 +626,41 @@ func TestOneFetchForAllWhoWait(t *testing.T) {
 	}
 }
 
+// A renewal that finds a verification's fetch of a document on its way
+// waits for that one, and keeps its answer for the next verification: the
+// flight keeps nothing by itself, and the verification that started it may
+// yet fail.
+func TestRenewalKeepsWhatAVerificationsFetchBrought(t *testing.T) {
+	const url = "https://pcs.example/crl"
+	ctx := lenient()
+	// The renewal has to find the flight on its way: tried until it did.
+	for attempt := 1; ; attempt++ {
+		getter := newGate()
+		cache := newCollateralCache("")
+		first := cache.fly(ctx, getter, url, false)
+		<-getter.arrived
+		done := make(chan error, 1)
+		go func() { done <- cache.renew(ctx, getter, []string{url}) }()
+		time.Sleep(time.Duration(attempt) * 10 * time.Millisecond)
+		close(getter.open)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		<-first.done
+		settle(t, cache)
+		if getter.asked() != 1 {
+			if attempt == 8 {
+				t.Fatal("the renewal never found the verification's fetch on its way")
+			}
+			continue
+		}
+		if entry, ok := cache.ahead(url); !ok || string(entry.body) != "body" {
+			t.Fatal("a renewal that waited on a verification's fetch kept nothing for the next verification")
+		}
+		return
+	}
+}
+
 // awaitAhead waits for a fetch ahead of need to land.
 func awaitAhead(t *testing.T, cache *collateralCache, url string) {
 	t.Helper()
@@ -642,11 +694,12 @@ func settle(t *testing.T, cache *collateralCache) {
 	}
 }
 
-// The root CA CRL is the one document nobody can hand over for a verdict
-// that releases something, and the one a verifier can name before it has seen
-// evidence. Fetched when the verifier starts, it is there when that verdict
-// is due.
-func TestPrefetchBringsTheRootCRL(t *testing.T) {
+// Nobody can hand a verifier a document for a verdict that may send a
+// secret. Three of the four it can name before it has seen evidence: the
+// root CA CRL, the quoting enclave's identity and the PCK CRL. Fetched when
+// the verifier starts, they are there when that verdict is due, and so is
+// the TCB info of a platform it judged within the last day.
+func TestPrefetchBringsWhatAVerifierCanNameAhead(t *testing.T) {
 	env, reportData := fixture(t)
 	k := keptCollateral(t)
 	at := k.newest.Add(10 * time.Minute)
@@ -654,35 +707,63 @@ func TestPrefetchBringsTheRootCRL(t *testing.T) {
 	if err != nil || url != fixtureRootCRLURL {
 		t.Fatalf("the pinned root names %q, %v; a real verification asked for %s", url, err, fixtureRootCRLURL)
 	}
-
-	service, asked := k.intel(false), 0
-	engine := k.cold(t, at, service)
-	Prefetch(engine)
-	awaitAhead(t, engine.cache, url)
-	if !slices.Equal(service.asked, []string{url}) {
-		t.Fatalf("a prefetch asked Intel for %v", service.asked)
+	named := sorted([]string{fixtureQEIdentityURL, fixturePCKCRLURL, fixtureRootCRLURL})
+	asked := func(service *intel) []string {
+		service.mu.Lock()
+		defer service.mu.Unlock()
+		return sorted(service.asked)
 	}
-	// Asked again before anything used it: there is one already.
+
+	service := k.intel(false)
+	now := at
+	engine := k.cold(t, at, service)
+	engine.cache.now = func() time.Time { return now }
+	Prefetch(engine)
+	for _, url := range named {
+		awaitAhead(t, engine.cache, url)
+	}
+	if got := asked(service); !slices.Equal(got, named) {
+		t.Fatalf("a prefetch asked Intel for %v, want %v", got, named)
+	}
+	// Asked again before anything used them: they are there already.
 	Prefetch(engine)
 	settle(t, engine.cache)
-	ctx := WithCollateralSource(lenient(), handing(&asked, k.documents()...))
-	res, err := engine.VerifyEvidence(ctx, env, reportData)
-	if err != nil || len(service.asked) != 1 {
-		t.Fatalf("%v, after asking Intel for %v", err, service.asked)
+	res, err := engine.VerifyEvidence(lenient(), env, reportData)
+	if got := asked(service); err != nil || !slices.Equal(got, sorted(append(slices.Clone(named), fixtureTCBInfoURL))) {
+		t.Fatalf("%v, after asking Intel for %v: want the platform's TCB info and nothing else again", err, got)
 	}
-	if finding := CollateralOf(res); finding.RootCRLStapled || !finding.Stapled {
+	if finding := CollateralOf(res); finding.Stapled || finding.Stale || !finding.Fetched.Equal(at) {
 		t.Fatalf("finding %+v", finding)
 	}
-	// It verified, so it is kept as Intel's answer, and nothing is fetched
-	// ahead again while it is young.
-	if _, ok := engine.cache.lookup(url); !ok {
-		t.Fatal("the prefetched document was not kept once it verified")
+	// They verified, so they are kept as Intel's answers, and nothing is
+	// fetched ahead again while they are young.
+	for _, url := range append(slices.Clone(named), fixtureTCBInfoURL) {
+		if _, ok := engine.cache.lookup(url); !ok {
+			t.Fatalf("%s was not kept once it verified", url)
+		}
 	}
 	Prefetch(engine)
 	settle(t, engine.cache)
-	if _, err := engine.VerifyEvidence(lenient(), env, reportData); err != nil || len(service.asked) != 1 {
-		t.Fatalf("%v, after asking Intel for %v", err, service.asked)
+	if _, err := engine.VerifyEvidence(lenient(), env, reportData); err != nil || len(asked(service)) != len(k.files) {
+		t.Fatalf("%v, after asking Intel for %v", err, asked(service))
 	}
+	// Once they are of an age to be renewed, a prefetch brings the next of
+	// each, the judged platform's TCB info among them.
+	now = at.Add(collateralRenewAfter)
+	Prefetch(engine)
+	settle(t, engine.cache)
+	if got := asked(service); len(got) != 2*len(k.files) {
+		t.Fatalf("a prefetch of documents due for renewal had Intel asked for %v in all", got)
+	}
+	// A day after the last verdict on that platform, its TCB info is asked
+	// for no more: the three every platform needs still are.
+	now = at.Add(collateralIdleFor)
+	Prefetch(engine)
+	settle(t, engine.cache)
+	if got := asked(service); len(got) != 3*len(k.files)-1 {
+		t.Fatalf("a day after the last verdict a prefetch had Intel asked for %v in all", got)
+	}
+	now = at
 
 	// A fetch ahead of need that failed brought nothing.
 	down := k.cold(t, at, k.intel(true))
@@ -694,7 +775,6 @@ func TestPrefetchBringsTheRootCRL(t *testing.T) {
 
 	// One that nothing used within its hour is not used after it, nor is one
 	// from after now: a clock that moved.
-	now := at
 	unused := k.cold(t, at, service)
 	unused.cache.now = func() time.Time { return now }
 	Prefetch(unused)
@@ -709,15 +789,26 @@ func TestPrefetchBringsTheRootCRL(t *testing.T) {
 			t.Fatalf("a document fetched ahead is used %s after it came", moved)
 		}
 	}
-	service.mu.Lock()
-	service.asked = service.asked[:1]
-	service.mu.Unlock()
-
-	// An engine that fetches nothing is asked for nothing.
+	// An engine that fetches nothing is asked for nothing, and one with no
+	// road to Intel starts no fetch.
 	Prefetch(fakeEngine{})
-	if len(service.asked) != 1 {
-		t.Fatalf("an engine that fetches nothing had Intel asked for %v", service.asked)
+	guest := NewEngine(EngineOptions{HandedCollateralOnly: true}).(*dcapEngine)
+	Prefetch(guest)
+	if err := guest.Renew(context.Background()); err != nil {
+		t.Fatalf("an engine with no road to Intel was asked to renew: %v", err)
 	}
+	guest.cache.mu.Lock()
+	flights := len(guest.cache.flights)
+	guest.cache.mu.Unlock()
+	if flights != 0 {
+		t.Fatalf("an engine with no road to Intel started %d fetches", flights)
+	}
+}
+
+func sorted(urls []string) []string {
+	out := slices.Clone(urls)
+	slices.Sort(out)
+	return out
 }
 
 type fakeEngine struct{ Engine }
@@ -891,7 +982,7 @@ func TestCollateralPlatform(t *testing.T) {
 	}
 	// What it fetched carries a verifier that has nothing.
 	questions := 0
-	ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&questions, docs...)))
+	ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&questions, docs...)))
 	env2, reportData := fixture(t)
 	if _, err := k.cold(t, k.newest.Add(time.Minute), k.intel(true)).VerifyEvidence(ctx, env2, reportData); err != nil {
 		t.Fatalf("with what the host fetched: %v", err)
@@ -986,7 +1077,7 @@ func TestTheDocumentJudgedIsTheOneServed(t *testing.T) {
 	asked := 0
 	engine := k.engineAt(at, k.intel(true), false)
 	engine.freshOnly = true
-	ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
+	ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, k.documents()...)))
 	res, err := engine.VerifyEvidence(ctx, env, reportData)
 	if err != nil {
 		t.Fatalf("judged on a copy it was not served: %v", err)
@@ -1043,7 +1134,7 @@ func TestVerifierFetchesFromIntelAlone(t *testing.T) {
 	docs = slices.DeleteFunc(docs, func(doc CollateralDocument) bool { return doc.URL == fixtureRootCRLURL })
 
 	service, asked := k.intel(false), 0
-	ctx := withStapledRoot(WithCollateralSource(lenient(), handing(&asked, docs...)))
+	ctx := AllowHandedDocuments(WithCollateralSource(lenient(), handing(&asked, docs...)))
 	res, err := k.cold(t, at, service).VerifyEvidence(ctx, env, reportData)
 	if err != nil {
 		t.Fatal(err)
@@ -1106,11 +1197,11 @@ func TestEngineCountsTheDocumentsItComesToHold(t *testing.T) {
 	if counter.Documents() != 0 {
 		t.Fatalf("an engine that holds nothing counts %d documents", counter.Documents())
 	}
-	// A first verdict takes the four in: three that were handed over, and
-	// the root CA CRL from Intel, since the verdict lets a secret go.
+	// A first verdict takes the four in, from Intel: it may send a secret,
+	// and nobody is asked to hand anything over.
 	ctx := WithCollateralSource(lenient(), handing(&asked, k.documents()...))
-	if _, err := engine.VerifyEvidence(ctx, env, reportData); err != nil {
-		t.Fatal(err)
+	if _, err := engine.VerifyEvidence(ctx, env, reportData); err != nil || asked != 0 {
+		t.Fatalf("%v, after %d questions to the source", err, asked)
 	}
 	first := counter.Documents()
 	if first != uint64(len(k.files)) {
@@ -1130,20 +1221,53 @@ func TestEngineCountsTheDocumentsItComesToHold(t *testing.T) {
 		t.Fatal("the engine keeps no root CA CRL")
 	}
 	engine.cache.store(fixtureRootCRLURL, collateralEntry{header: crl.header, body: crl.body, fetched: at})
-	handed := k.document(t, fixtureTCBInfoURL)
-	engine.cache.storeStapled(fixtureTCBInfoURL, collateralEntry{header: handed.Header, body: handed.Body, fetched: at})
 	if got := counter.Documents(); got != first {
-		t.Fatalf("documents the engine already held moved its count from %d to %d", first, got)
+		t.Fatalf("a document the engine already held moved its count from %d to %d", first, got)
 	}
-	// Another document under a URL is one: Intel's own answer for what was
-	// handed over before, and a newer body in place of an older.
-	engine.cache.store(fixtureTCBInfoURL, collateralEntry{header: handed.Header, body: handed.Body, fetched: at})
-	if got := counter.Documents(); got != first+1 {
-		t.Fatalf("Intel's own answer for a document that was handed over: the count went from %d to %d", first, got)
+	// What is handed over is held apart from Intel's own answers, and is
+	// counted where it is held: once.
+	handed := k.document(t, fixtureTCBInfoURL)
+	for range 2 {
+		engine.cache.storeStapled(fixtureTCBInfoURL, collateralEntry{header: handed.Header, body: handed.Body, fetched: at})
+		if got := counter.Documents(); got != first+1 {
+			t.Fatalf("a document that was handed over: the count went from %d to %d", first, got)
+		}
 	}
-	engine.cache.store(fixtureRootCRLURL, collateralEntry{header: crl.header, body: append([]byte("newer "), crl.body...), fetched: at})
+	// A newer body in place of an older is another document.
+	newer := collateralEntry{header: crl.header, body: append([]byte("newer "), crl.body...), fetched: at}
+	engine.cache.store(fixtureRootCRLURL, newer)
 	if got := counter.Documents(); got != first+2 {
 		t.Fatalf("a newer root CA CRL: the count went from %d to %d", first+1, got)
+	}
+	// One that a fetch ahead of need brought is counted when it arrives, so
+	// that whoever keeps a verdict on the older one judges again, and is
+	// not counted again when a verification takes it in.
+	ahead := collateralEntry{header: crl.header, body: append([]byte("newest "), crl.body...), fetched: at.Add(time.Second)}
+	engine.cache.keepAhead(fixtureRootCRLURL, ahead)
+	engine.cache.keepAhead(fixtureRootCRLURL, ahead)
+	if got := counter.Documents(); got != first+3 {
+		t.Fatalf("a newer root CA CRL fetched ahead: the count went from %d to %d", first+2, got)
+	}
+	// The same document fetched ahead once more, before any verification
+	// took the first in, is none.
+	engine.cache.keepAhead(fixtureRootCRLURL, collateralEntry{header: crl.header, body: ahead.body, fetched: at.Add(2 * time.Second)})
+	if got := counter.Documents(); got != first+3 {
+		t.Fatalf("the document that waits, fetched ahead again, moved the count from %d to %d", first+3, got)
+	}
+	// Another one, while that one waits, is.
+	later := collateralEntry{header: crl.header, body: append([]byte("later "), crl.body...), fetched: at.Add(3 * time.Second)}
+	engine.cache.keepAhead(fixtureRootCRLURL, later)
+	if got := counter.Documents(); got != first+4 {
+		t.Fatalf("a second document fetched ahead while one waited: the count went from %d to %d", first+3, got)
+	}
+	engine.cache.store(fixtureRootCRLURL, later)
+	if got := counter.Documents(); got != first+4 {
+		t.Fatalf("taking in a document that was counted when it arrived moved the count from %d to %d", first+4, got)
+	}
+	// The document the engine holds, fetched ahead once more, is none.
+	engine.cache.keepAhead(fixtureRootCRLURL, collateralEntry{header: crl.header, body: later.body, fetched: at.Add(time.Minute)})
+	if got := counter.Documents(); got != first+4 {
+		t.Fatalf("the document the engine holds, fetched ahead again, moved the count from %d to %d", first+4, got)
 	}
 	// Another process over the same directory comes to hold what it reads
 	// there, and counts it.

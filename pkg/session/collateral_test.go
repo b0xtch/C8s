@@ -97,9 +97,18 @@ func TestCollateralIsCachedOnlyAfterItVerified(t *testing.T) {
 	if inner.calls != 2 {
 		t.Fatalf("inner getter was asked %d times, want 2 (cached reads must not fetch)", inner.calls)
 	}
+	// A verification is served one document for a URL, however often it
+	// asks and whatever the clock does meanwhile. The next one fetches what
+	// has run out, once.
 	now = now.Add(collateralTTL)
-	if _, _, err := later.Get(url); err != nil || inner.calls != 3 {
-		t.Fatalf("an expired entry must be fetched again: calls=%d, %v", inner.calls, err)
+	if _, _, err := later.Get(url); err != nil || inner.calls != 2 {
+		t.Fatalf("a verification was served a second document for one URL: calls=%d, %v", inner.calls, err)
+	}
+	next := &fetchRecorder{cache: cache, inner: inner}
+	for range 2 {
+		if _, _, err := next.Get(url); err != nil || inner.calls != 3 {
+			t.Fatalf("an expired entry must be fetched again, once: calls=%d, %v", inner.calls, err)
+		}
 	}
 }
 

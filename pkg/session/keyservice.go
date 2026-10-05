@@ -239,15 +239,3 @@ func ServiceMachine(ctx context.Context, pin *KeyService, engine Engine, leaf *x
 	}
 	return rtmr0, nil
 }
-
-// AllowStapledRootCRL marks a verification that may rest on a root CA CRL
-// from the context's collateral source, where the verifier has no road to
-// the vendor: a guest judging its key service. The vendor signs that list
-// once a year, so its dates do not say whether a newer one is out, and a
-// host could withhold a newer one for as long as the old one is valid.
-func AllowStapledRootCRL(ctx context.Context) context.Context { return withStapledRoot(ctx) }
-
-// StapledRootCRLAllowed reports whether a verification under ctx may rest on
-// a root CA CRL that somebody other than the vendor handed over: its verdict
-// then lets no secret go. An engine reads it as it reads Offline.
-func StapledRootCRLAllowed(ctx context.Context) bool { return ctx.Value(stapledRootKey{}) != nil }

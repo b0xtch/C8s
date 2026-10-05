@@ -27,9 +27,11 @@ import (
 // hour.
 const collateralTTL = time.Hour
 
-// collateralRenewAfter is how old a document in use may get before the next
-// one is fetched behind the verification that used it. A verifier that keeps
-// verifying then never waits for Intel.
+// collateralRenewAfter is how old a document may get before the next one is
+// fetched: behind the verification that used it, or when a verifier that
+// keeps verdicts asks for what is due (Renew). Such a verifier then never
+// waits for Intel, and has a quarter of an hour in which Intel may fail to
+// answer before a verdict of its ends.
 const collateralRenewAfter = 45 * time.Minute
 
 // stapleWindow is how long after Intel signed a document a verifier takes it
@@ -65,21 +67,19 @@ type CollateralFinding struct {
 	Fetched time.Time `json:"fetched"`
 	// Stapled: a document behind this finding was handed over by somebody
 	// other than Intel, the guest's host for one. Intel signed each within
-	// the two hours before.
+	// the two hours before, but a document stays within its dates after
+	// Intel replaces it, and a host can hand over one from before a key was
+	// revoked. The engine rests only a verdict that sends its guest nothing
+	// secret on one (AllowHandedDocuments), and no verdict that does stands
+	// on this finding: see stands.
 	Stapled bool `json:"stapled,omitempty"`
 	// RootCRLStapled: the root CA CRL was among them. Intel signs that one
-	// once a year, so its dates do not show it is the last, and a newer one
-	// that revokes a certificate under this finding would go unseen. The
-	// engine rests only a verdict that releases nothing on it.
+	// once a year, so not even its dates bound its age.
 	RootCRLStapled bool `json:"root_crl_stapled,omitempty"`
-	// RootCRLFetched is when this verifier had the root CA CRL from Intel:
-	// the CRL's own dates do not say how old it is. A verdict stands no
-	// longer than the reuse period after it: see stands. Zero when the CRL
-	// was handed over.
-	RootCRLFetched time.Time `json:"root_crl_fetched,omitzero"`
 	// Stale: Intel could not be reached to renew a document past the reuse
 	// period, and the finding rests on the one that was kept. Intel's own
-	// date on it still held.
+	// date on it still held. Like Stapled, only under a verdict that sends
+	// nothing secret.
 	Stale bool `json:"stale,omitempty"`
 	// Expires is the earlier of Intel's next-update dates on the TCB info and
 	// the quoting enclave identity: past it the finding has nothing under it.
@@ -104,24 +104,37 @@ type CollateralSource func(ctx context.Context) []CollateralDocument
 
 type (
 	collateralSourceKey struct{}
-	stapledRootKey      struct{}
+	handedKey           struct{}
 )
 
-// WithCollateralSource returns a context under which an engine that is short
-// of one of Intel's documents asks source for it first. What source hands
-// over is held to Intel's signature like any other, to Intel's own date on
-// it, and to the TCB evaluation the engine last had from Intel itself.
+// WithCollateralSource returns a context whose source hands Intel's
+// documents over to an engine that may take them from somebody other than
+// Intel (AllowHandedDocuments) and is short of one. What source hands over is
+// held to Intel's signature like any other, to Intel's own date on it, and to
+// the TCB evaluation the engine last had from Intel itself.
 func WithCollateralSource(ctx context.Context, source CollateralSource) context.Context {
 	return context.WithValue(ctx, collateralSourceKey{}, source)
 }
 
-// withStapledRoot marks a verification whose verdict releases nothing: it may
-// rest on a root CA CRL from the context's source. Intel signs that one once
-// a year, so its dates say nothing of whether a newer one is out, and a
-// verdict that releases a secret needs one the verifier fetched itself.
-func withStapledRoot(ctx context.Context) context.Context {
-	return context.WithValue(ctx, stapledRootKey{}, true)
+// AllowHandedDocuments marks a verification whose verdict sends its guest
+// nothing secret: it may rest on Intel's documents as somebody other than
+// Intel handed them over, the root CA CRL among them, and on one this
+// verifier kept past the reuse period when Intel cannot be asked. Such a
+// verdict is enough to sign a bind, which holds no secret, and for a verifier
+// with no road to Intel, such as a guest judging its key service.
+//
+// Without the mark an engine serves a verification only what it fetched from
+// Intel itself within the reuse period, or nothing: a document stays within
+// its dates after Intel replaces it, so one that was handed over may be from
+// before a key was revoked or a TCB recovered.
+func AllowHandedDocuments(ctx context.Context) context.Context {
+	return context.WithValue(ctx, handedKey{}, true)
 }
+
+// HandedDocumentsAllowed reports whether a verification under ctx may rest
+// on documents that somebody other than the vendor handed over: its verdict
+// then sends no secret. An engine reads it as it reads Offline.
+func HandedDocumentsAllowed(ctx context.Context) bool { return ctx.Value(handedKey{}) != nil }
 
 // collateralKind is which of Intel's documents a URL names.
 type collateralKind int
@@ -293,6 +306,11 @@ type collateralCache struct {
 	// from whoever handed one over: one for each that is another document
 	// than the one it held for that URL before.
 	taken uint64
+	// lastUsed is when a verification last rested on the document of a URL,
+	// and listed says the directory was read for those of earlier processes:
+	// see known.
+	lastUsed map[string]time.Time
+	listed   bool
 }
 
 type collateralEntry struct {
@@ -324,6 +342,7 @@ func newCollateralCache(dir string) *collateralCache {
 		now: time.Now, dir: dir,
 		entries: map[string]collateralEntry{}, stapled: map[string]collateralEntry{},
 		arrived: map[string]collateralEntry{}, flights: map[string]*flight{},
+		lastUsed: map[string]time.Time{},
 	}
 }
 
@@ -450,12 +469,114 @@ func (c *collateralCache) floor(url string) int {
 func (c *collateralCache) store(url string, entry collateralEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.holdLocked(c.entries, url, entry)
+	if ahead, ok := c.arrived[url]; ok && bytes.Equal(ahead.body, entry.body) {
+		// Counted when it arrived.
+		c.entries[url] = entry
+	} else {
+		c.holdLocked(c.entries, url, entry)
+	}
 	// What a fetch ahead of need brought is this one, or older.
 	delete(c.arrived, url)
 	if c.dir != "" {
 		c.write(c.path(url), url, entry)
 	}
+}
+
+// arriveLocked keeps entry as what a fetch ahead of need brought for url,
+// and counts it if it is another document than this verifier has from Intel
+// for url: whoever keeps a verdict on the one it has learns that a newer one
+// is here, before any verification took it. The caller holds the lock.
+func (c *collateralCache) arriveLocked(url string, entry collateralEntry) {
+	had, kept := c.entries[url]
+	ahead, waiting := c.arrived[url]
+	if (!kept || !bytes.Equal(had.body, entry.body)) && (!waiting || !bytes.Equal(ahead.body, entry.body)) {
+		c.taken++
+	}
+	c.arrived[url] = entry
+}
+
+// maxListedFiles bounds the files of a directory that are read for the URLs
+// they keep: a verifier keeps four documents a platform.
+const maxListedFiles = 256
+
+// collateralIdleFor is how long after the last verification that rested on a
+// document a verifier goes on asking Intel for the next one. A platform that
+// left the fleet is then asked about for a day more, and no longer.
+const collateralIdleFor = 24 * time.Hour
+
+// used notes that a verification rested on the documents of urls just now.
+func (c *collateralCache) used(urls []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := c.now()
+	for _, url := range urls {
+		c.lastUsed[url] = now
+	}
+}
+
+// known returns the URLs of the documents a verification of this verifier
+// rested on within the last day: in this process or, by the directory, in
+// one before it.
+func (c *collateralCache) known() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.listed && c.dir != "" {
+		c.listed = true
+		c.listLocked()
+	}
+	now := c.now()
+	urls := make([]string, 0, len(c.lastUsed))
+	for url, at := range c.lastUsed {
+		if age := now.Sub(at); age >= 0 && age < collateralIdleFor {
+			urls = append(urls, url)
+		} else {
+			delete(c.lastUsed, url)
+		}
+	}
+	return urls
+}
+
+// listLocked notes the documents the directory keeps as used when they were
+// fetched: whichever process kept one rested a verification on it. The
+// caller holds the lock.
+func (c *collateralCache) listLocked() {
+	names, err := filepath.Glob(filepath.Join(c.dir, "*.json"))
+	if err != nil {
+		return
+	}
+	for i, name := range names {
+		if i == maxListedFiles {
+			return
+		}
+		if strings.HasSuffix(name, ".stapled.json") {
+			continue
+		}
+		data, err := ReadBounded(name, maxCollateralFile)
+		if err != nil {
+			continue
+		}
+		var file collateralFile
+		if json.Unmarshal(data, &file) != nil || len(file.Body) == 0 || c.path(file.URL) != name {
+			continue
+		}
+		if at, ok := c.lastUsed[file.URL]; !ok || file.Fetched.After(at) {
+			c.lastUsed[file.URL] = file.Fetched
+		}
+	}
+}
+
+// due reports whether this verifier has no document from Intel for url,
+// held or brought ahead of need, that is younger than the age at which the
+// next one is fetched.
+func (c *collateralCache) due(url string) bool {
+	if entry, ok := c.kept(url); ok && c.now().Sub(entry.fetched) < collateralRenewAfter {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.arrived[url]
+	age := c.now().Sub(entry.fetched)
+	return !ok || age < 0 || age >= collateralRenewAfter
 }
 
 // storeStapled keeps a document somebody handed over, apart from what this
@@ -536,7 +657,7 @@ func (c *collateralCache) fly(ctx context.Context, getter trust.HTTPSGetter, url
 		f.entry, f.err = collateralEntry{header: header, body: body, fetched: c.now()}, err
 		delete(c.flights, url)
 		if err == nil && ahead {
-			c.arrived[url] = f.entry
+			c.arriveLocked(url, f.entry)
 		}
 		c.mu.Unlock()
 		close(f.done)
@@ -562,7 +683,7 @@ func (c *collateralCache) keepAhead(url string, entry collateralEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if old, ok := c.arrived[url]; !ok || entry.fetched.After(old.fetched) {
-		c.arrived[url] = entry
+		c.arriveLocked(url, entry)
 	}
 }
 
@@ -577,6 +698,35 @@ func (c *collateralCache) prefetch(getter trust.HTTPSGetter, url string) {
 		return
 	}
 	c.fly(context.Background(), getter, url, true)
+}
+
+// renew asks Intel anew for each of urls that is due, one flight a URL, and
+// returns once every answer is here and kept for the next verification. An
+// error is the first fetch that failed: the others are kept all the same.
+func (c *collateralCache) renew(ctx context.Context, getter trust.HTTPSGetter, urls []string) error {
+	flights := map[string]*flight{}
+	for _, url := range urls {
+		if c.due(url) {
+			flights[url] = c.fly(ctx, getter, url, true)
+		}
+	}
+	var first error
+	for url, f := range flights {
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if f.err != nil {
+			if first == nil {
+				first = fmt.Errorf("fetch %s: %w", url, f.err)
+			}
+			continue
+		}
+		// A flight a verification started keeps nothing ahead.
+		c.keepAhead(url, f.entry)
+	}
+	return first
 }
 
 // fetchRecorder serves one verification's collateral: from the cache when it
@@ -596,11 +746,11 @@ type fetchRecorder struct {
 	// freshOnly makes a document Intel cannot be asked for anew a failed
 	// fetch, where the recorder would go on with the one it kept.
 	freshOnly bool
+	// handed serves documents that somebody other than Intel handed over,
+	// kept by the cache or from source: see AllowHandedDocuments.
+	handed bool
 	// source, when set, is asked once for documents somebody else fetched.
 	source CollateralSource
-	// stapledRoot takes from source a document whose dates do not bound its
-	// age too: see withStapledRoot.
-	stapledRoot bool
 	// only, when set, says which URLs this verification is served. Where the
 	// root CA CRL is comes from a certificate in another document's header,
 	// which whoever handed that document over wrote: without this a host
@@ -623,8 +773,9 @@ type fetchRecorder struct {
 	// verifier can tell.
 	oldest time.Time
 	// stale: a kept document past the reuse period was served, because Intel
-	// could not be asked for a new one.
-	stale bool
+	// could not be asked for a new one. outdated: one was at hand and was
+	// not served, because this verification takes none.
+	stale, outdated bool
 	// stapled and rootStapled: a document from somebody other than Intel was
 	// served, and one whose dates do not bound its age among them.
 	stapled, rootStapled bool
@@ -645,6 +796,15 @@ func (r *fetchRecorder) GetContext(ctx context.Context, url string) (map[string]
 		// was handed over named the URL, and Intel's own will not.
 		return nil, nil, fmt.Errorf("%s is none of Intel's documents", url)
 	}
+	// One document a URL for one verification: what it was served once it
+	// is served again, as when the checks run after a memo of them did not
+	// stand.
+	r.mu.Lock()
+	had, again := r.docs[url]
+	r.mu.Unlock()
+	if again {
+		return had.header, had.body, nil
+	}
 	kind := kindOf(url)
 	if !r.anew {
 		if entry, ok := r.reuse(ctx, url, kind); ok {
@@ -661,10 +821,13 @@ func (r *fetchRecorder) GetContext(ctx context.Context, url string) (map[string]
 		// Intel being out of reach is no reason to drop a document Intel
 		// signed: it is verified like any other, Intel's own date on it
 		// included, and the verdict says how old it is.
-		if entry, ok := r.cache.kept(url); ok && !r.anew && !r.freshOnly && fromIntel(kind, entry.body) == nil {
-			r.stale = true
-			r.served(url, entry, true)
-			return entry.header, entry.body, nil
+		if entry, ok := r.cache.kept(url); ok && !r.anew && fromIntel(kind, entry.body) == nil {
+			if !r.freshOnly {
+				r.stale = true
+				r.served(url, entry, true)
+				return entry.header, entry.body, nil
+			}
+			r.outdated = true
 		}
 		// The URL makes the message specific enough to recognise later.
 		err = fmt.Errorf("fetch %s: %w", url, err)
@@ -722,6 +885,9 @@ func (r *fetchRecorder) reuse(ctx context.Context, url string, kind collateralKi
 		r.served(url, kept, true)
 		return kept, true
 	}
+	if !r.handed {
+		return collateralEntry{}, false
+	}
 	return r.staple(ctx, url, kind)
 }
 
@@ -734,7 +900,7 @@ func (r *fetchRecorder) staple(ctx context.Context, url string, kind collateralK
 		r.served(url, entry, true)
 		return entry, true
 	}
-	if r.source == nil || (kind == kindUndated && !r.stapledRoot) {
+	if r.source == nil {
 		return collateralEntry{}, false
 	}
 	doc, ok := r.ask(ctx)[url]
@@ -820,10 +986,15 @@ func (r *fetchRecorder) finding() (*CollateralFinding, error) {
 	if finding.Expires.IsZero() {
 		return nil, errors.New("the collateral was verified but its documents are not at hand")
 	}
-	if url, err := rootCRLURL(); err == nil {
-		finding.RootCRLFetched = r.docs[url].fetched
-	}
 	return finding, nil
+}
+
+// refusedOutdated reports whether a fetch that failed left this verification
+// short of a document the verifier holds past the reuse period.
+func (r *fetchRecorder) refusedOutdated() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.outdated
 }
 
 // body returns the document this verification was served for url: the bytes
@@ -869,4 +1040,9 @@ func (r *fetchRecorder) commit() {
 	for url, entry := range r.taken {
 		r.cache.storeStapled(url, entry)
 	}
+	urls := make([]string, 0, len(r.docs))
+	for url := range r.docs {
+		urls = append(urls, url)
+	}
+	r.cache.used(urls)
 }

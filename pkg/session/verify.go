@@ -122,14 +122,18 @@ type EngineOptions struct {
 	// at every use.
 	CollateralCacheDir string
 	// FreshCollateralOnly refuses to go on with a kept document that is past
-	// the reuse period when Intel cannot be asked for a new one. Without it
-	// the engine uses the kept document for as long as Intel's own date on
-	// it allows, and the finding says so: see CollateralFinding.Stale.
+	// the reuse period when Intel cannot be asked for a new one, also for a
+	// verdict that sends nothing secret (AllowHandedDocuments). Without it
+	// the engine uses the kept document under such a verdict for as long as
+	// Intel's own date on it allows, and the finding says so: see
+	// CollateralFinding.Stale. A verdict that may send a secret never rests
+	// on one.
 	FreshCollateralOnly bool
-	// OwnCollateralOnly takes Intel's documents from Intel's service alone.
-	// Without it the engine also takes one that somebody else hands over,
-	// within two hours of Intel's own date on it, and the finding says so:
-	// see WithCollateralSource and CollateralFinding.Stapled.
+	// OwnCollateralOnly takes Intel's documents from Intel's service alone,
+	// also for a verdict that sends nothing secret. Without it the engine
+	// takes one that somebody else hands over under such a verdict, within
+	// two hours of Intel's own date on it, and the finding says so: see
+	// WithCollateralSource and CollateralFinding.Stapled.
 	OwnCollateralOnly bool
 	// HandedCollateralOnly never asks Intel's service: the engine of a
 	// verifier with no road to it, such as a guest. It judges by the
@@ -210,11 +214,13 @@ type Prefetcher interface {
 	Prefetch()
 }
 
-// Prefetch has engine start fetching, behind the caller, the one document of
-// Intel's that a verdict which releases a secret takes from Intel alone: the
-// root CA CRL. A verifier that calls this when it starts finds the document
-// there, or on its way, when its first such verdict is due. An engine that
-// fetches nothing ignores it.
+// Prefetch has engine start fetching, behind the caller, the documents of
+// Intel's that a verdict which may send a secret takes from Intel alone, as
+// far as it can name them before it has seen evidence: the root CA CRL, the
+// quoting enclave's identity, the PCK CRL, and the TCB info of each platform
+// it judged within the last day. A verifier that calls this when it starts
+// finds them there, or on their way, when its first such verdict is due. An
+// engine that fetches nothing ignores it.
 func Prefetch(engine Engine) {
 	if p, ok := engine.(Prefetcher); ok {
 		p.Prefetch()
@@ -223,43 +229,55 @@ func Prefetch(engine Engine) {
 
 // Prefetch implements Prefetcher.
 func (e *dcapEngine) Prefetch() {
-	if url, err := rootCRLURL(); err == nil {
+	for _, url := range e.current() {
 		e.cache.prefetch(e.fetch, url)
 	}
 }
 
-// Refetcher is an engine that fetches the root CA CRL anew when asked, for
-// the next verification to take in place of the one it holds: see
+// Renewer is an engine that asks the vendor anew, when asked, for each of
+// its documents that is due: those a verification of it rested on within the
+// last day and that it fetched three quarters of an hour ago or longer. The
+// next verification takes what came in place of what the engine holds. A
+// verifier that keeps verdicts calls it every minute or so and judges again
+// once the engine's count of documents moved (DocumentCounter), so that no
+// verdict of its ends for want of a document: see ReadyVerdicts.Refresh and
 // Client.Renew.
-type Refetcher interface {
-	Refetch(ctx context.Context) error
+type Renewer interface {
+	Renew(ctx context.Context) error
 }
 
-// Refetch implements Refetcher. It returns once the CRL is here, and waits
-// for a fetch of it already on its way in place of starting another.
-func (e *dcapEngine) Refetch(ctx context.Context) error {
-	url, err := rootCRLURL()
-	if err != nil {
-		return err
+// Renew implements Renewer. It returns once every document that was due is
+// here, and waits for a fetch already on its way in place of starting
+// another. An error is a document the vendor did not answer with.
+func (e *dcapEngine) Renew(ctx context.Context) error {
+	return e.cache.renew(ctx, e.fetch, e.current())
+}
+
+// current returns where Intel keeps the documents this engine keeps current:
+// the three whose address is the same for every platform, and those a
+// verification rested on within the last day. An engine with no road to
+// Intel keeps none.
+func (e *dcapEngine) current() []string {
+	if _, none := e.fetch.(noRoad); none {
+		return nil
 	}
-	f := e.cache.fly(ctx, e.fetch, url, true)
-	select {
-	case <-f.done:
-	case <-ctx.Done():
-		return ctx.Err()
+	urls := []string{pcs.QeIdentityURL(), pcs.PckCrlURL("platform")}
+	if root, err := rootCRLURL(); err == nil {
+		urls = append(urls, root)
 	}
-	if f.err != nil {
-		return f.err
+	for _, url := range e.cache.known() {
+		// A directory's word for a URL is anybody's: only Intel's are asked.
+		if intelDocument(url) && !slices.Contains(urls, url) {
+			urls = append(urls, url)
+		}
 	}
-	// A flight a verification started keeps nothing ahead.
-	e.cache.keepAhead(url, f.entry)
-	return nil
+	return urls
 }
 
 // DocumentCounter is an engine that counts the vendor's documents it came to
-// hold, from the vendor or from whoever handed one over. While the count
-// stands, the documents a verdict was made under are the newest the engine
-// holds: see ReadyVerdicts.
+// hold: from the vendor, also ahead of the verification that will take one,
+// or from whoever handed one over. While the count stands, the documents a
+// verdict was made under are the newest the engine holds: see ReadyVerdicts.
 type DocumentCounter interface {
 	Documents() uint64
 }
@@ -339,7 +357,13 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	if len(params.ExpectedReportData) > 64 {
 		return nil, &VerificationError{Err: fmt.Errorf("expected report data is %d bytes, and a TD's is 64", len(params.ExpectedReportData))}
 	}
-	res, err := attestationtdx.VerifyQuoteBytes(raw, params, teetypes.PlatformTDX, attestationtdx.Options{})
+	roots, err := intelRoots()
+	if err != nil {
+		return nil, err
+	}
+	// One clock for the certificates in the quote and, below, for the
+	// documents it is judged against.
+	res, err := attestationtdx.VerifyQuoteBytes(raw, params, teetypes.PlatformTDX, attestationtdx.Options{TrustedRoots: roots, Now: e.cache.now()})
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
@@ -361,10 +385,6 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	// on the platform and the documents, and on nothing in the quote's body
 	// that is not checked here as well, so its outcome is kept for a short
 	// while: see chainmemo.go.
-	roots, err := intelRoots()
-	if err != nil {
-		return nil, err
-	}
 	platform, onePlatform := platformOfTDQuote(raw)
 	fetches, err := e.withCollateral(ctx, func(fetches *fetchRecorder) error {
 		// One clock for how old a kept document is and for Intel's dates on it.
@@ -382,6 +402,9 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	})
 	// Intel PCS being unreachable says nothing about the evidence.
 	if fetches.caused(err) {
+		if fetches.refusedOutdated() {
+			return nil, fmt.Errorf("%w: %w", ErrStaleDocuments, err)
+		}
 		return nil, fmt.Errorf("TDX collateral unavailable: %w", err)
 	}
 	if err != nil && !authenticCollateral(err) {
@@ -438,17 +461,22 @@ func authenticCollateral(err error) bool {
 }
 
 // withCollateral runs check with collateral from the cache where the cache
-// has it, and from whoever ctx names to hand it over where it has not.
+// has it from Intel within the reuse period and, for a verdict that sends
+// nothing secret (AllowHandedDocuments), from whoever ctx names to hand it
+// over where it has not. Any other verdict rests on what this verifier
+// fetched from Intel itself within the reuse period, or is none.
+//
 // Collateral that Intel was not asked for and that does not pass says nothing
 // about the evidence: a file can be damaged, a document handed over can be
 // anything, and either can be older than what the quote needs. The check then
 // runs once more with everything fetched anew, and that run's verdict stands.
 // It returns the recorder of the run whose result it returns.
 func (e *dcapEngine) withCollateral(ctx context.Context, check func(*fetchRecorder) error) (*fetchRecorder, error) {
-	fetches := &fetchRecorder{ctx: ctx, cache: e.cache, inner: e.fetch, freshOnly: e.freshOnly, only: intelDocument}
-	if !e.ownOnly {
+	lenient := HandedDocumentsAllowed(ctx)
+	fetches := &fetchRecorder{ctx: ctx, cache: e.cache, inner: e.fetch, freshOnly: e.freshOnly || !lenient, only: intelDocument}
+	if lenient && !e.ownOnly {
+		fetches.handed = true
 		fetches.source, _ = ctx.Value(collateralSourceKey{}).(CollateralSource)
-		fetches.stapledRoot = StapledRootCRLAllowed(ctx)
 	}
 	err := check(fetches)
 	if err == nil || authenticCollateral(err) || fetches.caused(err) || !fetches.fromCache() {

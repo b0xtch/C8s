@@ -404,6 +404,9 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 	engine := s.engine()
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
+	// What this command sends its guest goes on the vendor's documents as it
+	// fetched them itself: those it can name are on their way meanwhile.
+	session.Prefetch(engine)
 
 	began := time.Now()
 	claimed, err := retried(ctx, func() (*daemon.Claimed, error) {
@@ -429,9 +432,9 @@ func runStart(ctx context.Context, s *startFlags, asJSON bool, stdout, stderr io
 		AcceptTCBStatus: s.acceptedTCB(),
 	}
 	// What goes with the bind is sealed on this verdict, so it is then made
-	// as one that lets a secret go: on a root CA CRL this command had from
-	// the vendor itself, where a verdict that only leads to a bind may rest
-	// on one the guest's host handed over.
+	// as one that lets a secret go: on the vendor's documents as this command
+	// fetched them itself, where a verdict that only leads to a bind may rest
+	// on those the guest's host handed over.
 	verify := session.VerifyReady
 	if len(s.command) > 0 || len(held) > 0 {
 		verify = session.VerifyReadyToRelease

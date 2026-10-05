@@ -144,9 +144,12 @@ func lenient() context.Context {
 	return WithAcceptedTCB(context.Background(), acceptableTCBStatuses)
 }
 
+// isOutage reports whether err is no verdict for want of a document: Intel
+// could not be asked, with or without an older document at hand.
 func isOutage(err error) bool {
 	var verdict *VerificationError
-	return err != nil && !errors.As(err, &verdict) && strings.Contains(err.Error(), "collateral unavailable")
+	return err != nil && !errors.As(err, &verdict) &&
+		(strings.Contains(err.Error(), "collateral unavailable") || errors.Is(err, ErrStaleDocuments))
 }
 
 // Real evidence judged against Intel's real documents, with no network: what
@@ -188,15 +191,46 @@ func TestVerdictOnKeptCollateral(t *testing.T) {
 		}
 	})
 
-	t.Run("past the hour with Intel out of reach the kept copy is used, and the verdict says so", func(t *testing.T) {
+	t.Run("past the hour with Intel out of reach a verdict that may send a secret is none", func(t *testing.T) {
 		k := keptCollateral(t)
 		service := k.intel(true)
 		res, err := k.engineAt(k.newest.Add(2*time.Hour), service, false).VerifyEvidence(ctx, env, reportData)
+		if !errors.Is(err, ErrStaleDocuments) || res != nil || service.calls == 0 {
+			t.Fatalf("%+v, %v after %d fetches: want Intel asked, and no verdict for want of a newer document", res, err, service.calls)
+		}
+		var verdict *VerificationError
+		if errors.As(err, &verdict) {
+			t.Fatalf("an old document reads as a verdict on the evidence: %v", err)
+		}
+		// One second before the hour is over the kept copy still carries it.
+		within := k.oldest.Add(collateralTTL - time.Second)
+		if within.Before(k.newest) {
+			t.Fatal("fixture: the documents were fetched more than an hour apart")
+		}
+		if _, err := k.engineAt(within, k.intel(true), false).VerifyEvidence(ctx, env, reportData); err != nil {
+			t.Fatalf("a second inside the hour: %v", err)
+		}
+		// At the hour the oldest document is no longer served.
+		if _, err := k.engineAt(k.oldest.Add(collateralTTL), k.intel(true), false).VerifyEvidence(ctx, env, reportData); !errors.Is(err, ErrStaleDocuments) {
+			t.Fatalf("at the hour: %v", err)
+		}
+	})
+
+	t.Run("one that sends nothing secret uses the kept copy, and says so", func(t *testing.T) {
+		k := keptCollateral(t)
+		service := k.intel(true)
+		res, err := k.engineAt(k.newest.Add(2*time.Hour), service, false).VerifyEvidence(AllowHandedDocuments(ctx), env, reportData)
 		if err != nil || service.calls == 0 {
 			t.Fatalf("%v, after %d fetches: Intel must be asked first", err, service.calls)
 		}
-		if finding := CollateralOf(res); !finding.Fetched.Equal(k.oldest) || !finding.Stale {
+		finding := CollateralOf(res)
+		if !finding.Fetched.Equal(k.oldest) || !finding.Stale {
 			t.Fatalf("collateral fetched %s (stale: %v), want %s and stale", finding.Fetched, finding.Stale, k.oldest)
+		}
+		// Nothing secret goes on it all the same.
+		now := k.newest.Add(2 * time.Hour)
+		if err := standsNot(now, stands(now, nil, res), nil, res); !errors.Is(err, ErrStaleDocuments) {
+			t.Fatalf("a verdict on documents two hours old stands for a release: %v", err)
 		}
 		// Nothing new was learned, so nothing is written as if it had been.
 		if oldest, newest := k.fetchedOnDisk(t); !oldest.Equal(k.oldest) || !newest.Equal(k.newest) {
@@ -204,14 +238,14 @@ func TestVerdictOnKeptCollateral(t *testing.T) {
 		}
 	})
 
-	t.Run("a policy that wants fresh collateral gets an outage instead", func(t *testing.T) {
+	t.Run("a policy that wants fresh collateral gets no such verdict either", func(t *testing.T) {
 		k := keptCollateral(t)
-		res, err := k.engineAt(k.newest.Add(2*time.Hour), k.intel(true), true).VerifyEvidence(ctx, env, reportData)
-		if !isOutage(err) {
-			t.Fatalf("%+v, %v: want an outage and no verdict", res, err)
+		res, err := k.engineAt(k.newest.Add(2*time.Hour), k.intel(true), true).VerifyEvidence(AllowHandedDocuments(ctx), env, reportData)
+		if !errors.Is(err, ErrStaleDocuments) || res != nil {
+			t.Fatalf("%+v, %v: want no verdict for want of a newer document", res, err)
 		}
 		// Within the hour that policy is served from the directory like any other.
-		if _, err := k.engineAt(k.newest.Add(10*time.Minute), k.intel(true), true).VerifyEvidence(ctx, env, reportData); err != nil {
+		if _, err := k.engineAt(k.newest.Add(10*time.Minute), k.intel(true), true).VerifyEvidence(AllowHandedDocuments(ctx), env, reportData); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -220,80 +254,120 @@ func TestVerdictOnKeptCollateral(t *testing.T) {
 	// carries a verdict, however it came to be used, and that it does not
 	// says nothing about the evidence.
 	expired := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
-	t.Run("past Intel's own date a kept copy is not used", func(t *testing.T) {
-		k := keptCollateral(t)
-		service := k.intel(true)
-		res, err := k.engineAt(expired, service, false).VerifyEvidence(ctx, env, reportData)
-		if !isOutage(err) || service.calls == 0 {
-			t.Fatalf("%+v, %v after %d fetches: want an outage and no verdict", res, err, service.calls)
-		}
-	})
-	t.Run("nor is one whose file calls it new", func(t *testing.T) {
-		k := keptCollateral(t)
-		k.write(t, func(file *collateralFile) { file.Fetched = expired.Add(-time.Minute) })
-		service := k.intel(true)
-		res, err := k.engineAt(expired, service, false).VerifyEvidence(ctx, env, reportData)
-		if !isOutage(err) || service.calls == 0 {
-			t.Fatalf("%+v, %v after %d fetches: want an outage and no verdict", res, err, service.calls)
-		}
-	})
-	t.Run("nor one from the future", func(t *testing.T) {
-		k := keptCollateral(t)
-		res, err := k.engineAt(k.oldest.Add(-time.Minute), k.intel(true), false).VerifyEvidence(ctx, env, reportData)
-		if !isOutage(err) {
-			t.Fatalf("%+v, %v: a document fetched after now is no document", res, err)
-		}
-	})
+	for name, ctx := range map[string]context.Context{"a verdict that may send a secret": ctx, "one that sends none": AllowHandedDocuments(ctx)} {
+		t.Run("past Intel's own date a kept copy is not used for "+name, func(t *testing.T) {
+			k := keptCollateral(t)
+			service := k.intel(true)
+			res, err := k.engineAt(expired, service, false).VerifyEvidence(ctx, env, reportData)
+			if !isOutage(err) || service.calls == 0 {
+				t.Fatalf("%+v, %v after %d fetches: want an outage and no verdict", res, err, service.calls)
+			}
+		})
+		t.Run("nor is one whose file calls it new, for "+name, func(t *testing.T) {
+			k := keptCollateral(t)
+			k.write(t, func(file *collateralFile) { file.Fetched = expired.Add(-time.Minute) })
+			service := k.intel(true)
+			res, err := k.engineAt(expired, service, false).VerifyEvidence(ctx, env, reportData)
+			if !isOutage(err) || service.calls == 0 {
+				t.Fatalf("%+v, %v after %d fetches: want an outage and no verdict", res, err, service.calls)
+			}
+		})
+		t.Run("nor one from the future, for "+name, func(t *testing.T) {
+			k := keptCollateral(t)
+			res, err := k.engineAt(k.oldest.Add(-time.Minute), k.intel(true), false).VerifyEvidence(ctx, env, reportData)
+			if !isOutage(err) {
+				t.Fatalf("%+v, %v: a document fetched after now is no document", res, err)
+			}
+		})
+	}
 }
 
-// The root CA CRL's own dates do not say how old it is, so the finding says
-// when this verifier had it from Intel. A CRL fetched anew on request is the
-// one the next verification takes, in place of the older one it kept.
-func TestFindingSaysWhenTheRootCRLCameFromIntel(t *testing.T) {
+// A document's own dates do not say whether Intel has replaced it, so the
+// finding says when this verifier had the oldest of them from Intel, and a
+// verifier that keeps verdicts asks Intel again for each that is three
+// quarters of an hour old. What comes is what the next verification takes,
+// in place of the older ones the engine kept.
+func TestRenewBringsTheDocumentsThatAreDue(t *testing.T) {
 	env, reportData := fixture(t)
 	ctx := lenient()
 	k := keptCollateral(t)
-	var root time.Time
+	urls := make([]string, 0, len(k.files))
 	for _, file := range k.files {
-		if file.URL == fixtureRootCRLURL {
-			root = file.Fetched
-		}
+		urls = append(urls, file.URL)
 	}
-	if root.IsZero() {
-		t.Fatal("fixture: no root CA CRL among the documents")
-	}
-	at := k.newest.Add(10 * time.Minute)
-	res, err := k.engineAt(at, k.intel(true), false).VerifyEvidence(ctx, env, reportData)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if finding := CollateralOf(res); !finding.RootCRLFetched.Equal(root) {
-		t.Fatalf("root CA CRL fetched %s, want the kept one's %s", finding.RootCRLFetched, root)
-	}
+	slices.Sort(urls)
 
+	// Young documents are asked for by nobody.
+	young := k.newest.Add(10 * time.Minute)
 	service := k.intel(false)
-	engine := k.engineAt(at, service, false)
-	if err := engine.Refetch(ctx); err != nil {
-		t.Fatal(err)
+	engine := k.engineAt(young, service, false)
+	var renewer Renewer = engine
+	if err := renewer.Renew(ctx); err != nil || service.calls != 0 {
+		t.Fatalf("%v, after asking Intel for %v: nothing was due", err, service.asked)
 	}
-	if !slices.Equal(service.asked, []string{fixtureRootCRLURL}) {
-		t.Fatalf("a refetch asked Intel for %v", service.asked)
-	}
-	res, err = engine.VerifyEvidence(ctx, env, reportData)
-	if err != nil || service.calls != 1 {
+	res, err := engine.VerifyEvidence(ctx, env, reportData)
+	if err != nil || service.calls != 0 || !CollateralOf(res).Fetched.Equal(k.oldest) {
 		t.Fatalf("%v, after %d fetches", err, service.calls)
 	}
-	if finding := CollateralOf(res); !finding.RootCRLFetched.Equal(at) {
-		t.Fatalf("root CA CRL fetched %s, want the refetch at %s", finding.RootCRLFetched, at)
+
+	// One document is due before the others: it alone is asked for.
+	first := k.oldest.Add(collateralRenewAfter)
+	if !first.Before(k.newest.Add(collateralRenewAfter)) {
+		t.Fatal("fixture: the documents must differ in when they were fetched")
+	}
+	service = k.intel(false)
+	engine = k.engineAt(first, service, false)
+	if err := engine.Renew(ctx); err != nil || len(service.asked) == 0 || len(service.asked) == len(urls) {
+		t.Fatalf("%v, after asking Intel for %v: want those that are due and no others", err, service.asked)
 	}
 
-	// With Intel out of reach a refetch fails and the kept CRL stays in use.
-	down := k.engineAt(at, k.intel(true), false)
-	if err := down.Refetch(ctx); err == nil {
-		t.Fatal("a refetch with Intel out of reach succeeded")
+	// All four are due: each is asked for once, and a second request finds
+	// them here.
+	at := k.newest.Add(collateralRenewAfter)
+	service = k.intel(false)
+	engine = k.engineAt(at, service, false)
+	for range 2 {
+		if err := engine.Renew(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if res, err := down.VerifyEvidence(ctx, env, reportData); err != nil || !CollateralOf(res).RootCRLFetched.Equal(at) {
-		t.Fatalf("%v: after a failed refetch the verdict rests on the CRL of %s", err, CollateralOf(res).RootCRLFetched)
+	if got := sorted(service.asked); !slices.Equal(got, urls) {
+		t.Fatalf("a renewal asked Intel for %v, want %v", got, urls)
+	}
+	res, err = engine.VerifyEvidence(ctx, env, reportData)
+	if err != nil || service.calls != len(urls) {
+		t.Fatalf("%v, after %d fetches", err, service.calls)
+	}
+	if finding := CollateralOf(res); !finding.Fetched.Equal(at) || finding.Stale || finding.Stapled {
+		t.Fatalf("finding %+v, want the documents fetched at %s", finding, at)
+	}
+	if oldest, newest := k.fetchedOnDisk(t); !oldest.Equal(at) || !newest.Equal(at) {
+		t.Fatalf("the directory says %s to %s, want %s", oldest, newest, at)
+	}
+
+	// With Intel out of reach a renewal fails, and says so. The kept
+	// documents stay in use for what is left of their hour.
+	k = keptCollateral(t)
+	down := k.engineAt(at, k.intel(true), false)
+	if err := down.Renew(ctx); err == nil {
+		t.Fatal("a renewal with Intel out of reach succeeded")
+	}
+	res, err = down.VerifyEvidence(ctx, env, reportData)
+	if err != nil || !CollateralOf(res).Fetched.Equal(k.oldest) {
+		t.Fatalf("%v: after a failed renewal the verdict rests on what was kept", err)
+	}
+
+	// A directory's word for a URL is anybody's: only Intel's are asked.
+	k = keptCollateral(t)
+	const far = "http://169.254.169.254/latest/meta-data/"
+	cache := newCollateralCache(k.dir)
+	cache.now = func() time.Time { return at }
+	cache.write(cache.path(far), far, collateralEntry{body: []byte("x"), fetched: at.Add(-time.Hour)})
+	service = k.intel(false)
+	engine = k.engineAt(at, service, false)
+	_ = engine.Renew(ctx)
+	if slices.Contains(service.asked, far) || len(service.asked) != len(urls) {
+		t.Fatalf("a renewal asked for %v", service.asked)
 	}
 }
 

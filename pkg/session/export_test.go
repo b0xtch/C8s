@@ -13,7 +13,6 @@ import (
 const (
 	ConnIdle            = connIdle
 	ServingVerdictTTL   = servingVerdictTTL
-	RenewAhead          = renewAhead
 	CredentialFreshness = credentialFreshness
 )
 
@@ -62,10 +61,6 @@ func Stapled(ctx context.Context) (docs []CollateralDocument, ok bool) {
 	}
 	return source(ctx), true
 }
-
-// MayStapleRoot reports whether a judgment's context lets its verdict rest
-// on a root CA CRL from the context's source.
-func MayStapleRoot(ctx context.Context) bool { return StapledRootCRLAllowed(ctx) }
 
 // SetClock has v read the time from now.
 func (v *ReadyVerdicts) SetClock(now func() time.Time) { v.now = now }

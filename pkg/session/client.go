@@ -505,21 +505,22 @@ func (c *Client) remember(fingerprint [sha256.Size]byte, until, now time.Time) {
 	c.verdicts[fingerprint] = until
 }
 
-// renewAhead is how long before its verdict ends a client fetches the root
-// CA CRL anew when asked to renew: time for a fetch that Intel answers
-// slowly, and for one more.
-const renewAhead = 5 * time.Minute
+// RenewAhead is how long before its verdict ends a verifier that keeps one
+// judges again, on documents fetched anew: time for a fetch that Intel
+// answers slowly, and for one more.
+const RenewAhead = 5 * time.Minute
 
 // Renew keeps the verdict on the pinned guest standing for whoever holds the
 // client between commands, such as a session kept for its owner's next ones.
-// Within renewAhead of the verdict's end it has the engine fetch the root CA
-// CRL anew, in one flight with any other fetch of it, and judges the guest's
-// serving certificate again on that CRL: the verdict then stands until an
-// hour after the fetch, and no command waits for Intel. Earlier, before a
-// connection carried the pinned key, or with an engine that fetches nothing,
-// it does nothing. A failure leaves the verdict to end at its time.
+// Within RenewAhead of the verdict's end it has the engine fetch anew the
+// vendor's documents that are due, each in one flight with any other fetch
+// of it, and judges the guest's serving certificate again on them: the
+// verdict then stands until an hour after the oldest fetch, and no command
+// waits for Intel. Earlier, before a connection carried the pinned key, or
+// with an engine that fetches nothing, it does nothing. A failure leaves the
+// verdict to end at its time.
 func (c *Client) Renew(ctx context.Context) error {
-	refetcher, ok := c.engine.(Refetcher)
+	renewer, ok := c.engine.(Renewer)
 	if !ok {
 		return nil
 	}
@@ -529,11 +530,11 @@ func (c *Client) Renew(ctx context.Context) error {
 	c.mu.Lock()
 	leaf, until := c.servingLeaf, c.judgedUntil
 	c.mu.Unlock()
-	if leaf == nil || until.Sub(c.now()) > renewAhead {
+	if leaf == nil || until.Sub(c.now()) > RenewAhead {
 		return nil
 	}
-	if err := refetcher.Refetch(ctx); err != nil {
-		return fmt.Errorf("fetch the root CA CRL anew: %w", err)
+	if err := renewer.Renew(ctx); err != nil {
+		return fmt.Errorf("fetch the vendor's documents anew: %w", err)
 	}
 	now := c.now()
 	res, err := judgeServingCert(c.judging(ctx, true), c.required(), c.engine, leaf, now)
@@ -624,19 +625,18 @@ func (c *Client) AnotherKey() bool {
 	return c.anotherKey
 }
 
-// judging is the context a judgment of this client runs under. An engine that
-// is short of one of Intel's documents may take it from the guest: see
-// stapled. The root CA CRL among them it takes only for a verdict that
-// releases nothing: the handshake gate before the pin, and the check that a
-// guest is unbound, which lead to requests anyone may make and to a bind
-// document, which is not secret. The judgment that pins the guest, and every
-// verdict after it, rests on a root CA CRL this verifier had from Intel.
+// judging is the context a judgment of this client runs under. For a verdict
+// that sends nothing secret, an engine that is short of one of Intel's
+// documents may take it from the guest (see stapled): the handshake gate
+// before the pin, and the check that a guest is unbound, which lead to
+// requests anyone may make and to a bind document, which is not secret. The
+// judgment that pins the guest, and every verdict after it, rests on Intel's
+// documents as this verifier fetched them from Intel within the hour.
 func (c *Client) judging(ctx context.Context, releases bool) context.Context {
-	ctx = WithCollateralSource(ctx, c.stapled)
-	if !releases {
-		ctx = withStapledRoot(ctx)
+	if releases {
+		return ctx
 	}
-	return ctx
+	return AllowHandedDocuments(WithCollateralSource(ctx, c.stapled))
 }
 
 // stapled asks the guest for Intel's documents as its host handed them in,
@@ -703,9 +703,9 @@ func (c *Client) askStaple(ctx context.Context) []CollateralDocument {
 // verifies it. The session runs on a watched transport, which is what tells
 // an end the guest sent from an end the road made.
 func (c *Client) connect(ctx context.Context) (*tls.Conn, *streamend.Transport, error) {
-	// The one document of Intel's that a guest cannot hand over for the
-	// judgment that pins it is on its way while the client reaches the guest.
-	// A client that has its guest pinned may have nothing left to judge.
+	// What the judgment that pins the guest takes from Intel alone is on its
+	// way while the client reaches the guest. A client that has its guest
+	// pinned may have nothing left to judge.
 	if c.pinned() == nil {
 		Prefetch(c.engine)
 	}
@@ -1307,7 +1307,7 @@ func (c *Client) Ready(ctx context.Context) (*ReadyTD, error) {
 		return nil, refuse("the guest's state did not arrive over a verified TLS connection")
 	}
 	began := time.Now()
-	ready, err := verifyReady(c.judging(ctx, false), c.required(), c.engine, tlsState.PeerCertificates[0], &state, time.Now())
+	ready, err := verifyReady(c.judging(ctx, false), c.required(), c.engine, tlsState.PeerCertificates[0], &state, time.Now(), false)
 	if err != nil {
 		return nil, err
 	}

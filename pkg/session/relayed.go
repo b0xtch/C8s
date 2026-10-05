@@ -64,8 +64,10 @@ func (r *Relayed) source(context.Context) []CollateralDocument {
 //
 // It proves neither freshness nor that the key is live. That is enough to
 // sign a bind for the key, which is not secret: only the guest holding the
-// key can take the bind, and VerifyBound judges its answer. It is not enough
-// to seal anything to the guest with that bind: see VerifyReadyToRelease.
+// key can take the bind, and VerifyBound judges its answer. So the verdict
+// may rest on the vendor's documents as the guest's host relayed them. It is
+// not enough to seal anything to the guest with that bind: see
+// VerifyReadyToRelease.
 func VerifyReady(ctx context.Context, policy Policy, engine Engine, r *Relayed, now time.Time) (*ReadyTD, error) {
 	if err := policy.validate(); err != nil {
 		return nil, err
@@ -75,14 +77,18 @@ func VerifyReady(ctx context.Context, policy Policy, engine Engine, r *Relayed, 
 		return nil, refuse("the relayed certificate does not parse: %v", err)
 	}
 	state := &StateResponse{Phase: r.Phase, Launch: r.Launch, Signature: r.Signature, Events: r.Events, Bind: r.Bind}
-	// Nothing is released on this verdict, so the root CA CRL may be relayed.
-	return verifyReady(withStapledRoot(WithCollateralSource(ctx, r.source)), policy, engine, leaf, state, now)
+	// Nothing secret is sent on this verdict.
+	return verifyReady(AllowHandedDocuments(WithCollateralSource(ctx, r.source)), policy, engine, leaf, state, now, false)
 }
 
 // VerifyReadyToRelease is VerifyReady for a verifier whose verdict lets a
 // secret go to the guest, as a key service's does and a binder's that seals a
-// command or credentials with its bind (SealWithBind): the root CA CRL under
-// it is one the verifier fetched itself.
+// command or credentials with its bind (SealWithBind). The verdict rests on
+// the vendor's documents as this verifier fetched them from the vendor itself
+// within the last hour, and on none that was relayed: a host can relay one
+// from before a key was revoked, while it is still within its dates. A
+// verifier that cannot reach the vendor for longer gets ErrStaleDocuments,
+// and sends nothing.
 func VerifyReadyToRelease(ctx context.Context, policy Policy, engine Engine, r *Relayed, now time.Time) (*ReadyTD, error) {
 	if err := policy.validate(); err != nil {
 		return nil, err
@@ -92,14 +98,14 @@ func VerifyReadyToRelease(ctx context.Context, policy Policy, engine Engine, r *
 		return nil, refuse("the relayed certificate does not parse: %v", err)
 	}
 	state := &StateResponse{Phase: r.Phase, Launch: r.Launch, Signature: r.Signature, Events: r.Events, Bind: r.Bind}
-	return verifyReady(WithCollateralSource(ctx, r.source), policy, engine, leaf, state, now)
+	return verifyReady(ctx, policy, engine, leaf, state, now, true)
 }
 
 // verifyReady judges a guest's state and serving certificate as those of a
 // guest nobody has bound. The verdict says until when a secret may be sealed
-// to the guest on it, and that none may when it rests on a root CA CRL
-// somebody handed over.
-func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.Certificate, state *StateResponse, now time.Time) (*ReadyTD, error) {
+// to the guest on it, and that none may when it does not stand as one for a
+// release (standsNot). With release such a verdict is none.
+func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.Certificate, state *StateResponse, now time.Time, release bool) (*ReadyTD, error) {
 	doc, err := VerifySigned(policy.LaunchKey, state.Launch, state.Signature)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
@@ -125,10 +131,14 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 		return nil, refuse("the guest's evidence binds no one-time keys: a receipt for its bind could not be told from one its session signed")
 	}
 	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey, OneTime: oneTime}
-	// Intel signs its root CA CRL once a year, so one that was handed over
-	// may hide a newer one. That is enough for a bind, which is not secret.
-	if finding := CollateralOf(res); finding == nil || !finding.RootCRLStapled {
-		ready.Until = stands(now, leaf, res)
+	// A document that was handed over may hide a newer one. That is enough
+	// for a bind, which is not secret, and for nothing sealed with it.
+	until := stands(now, leaf, res)
+	switch err := standsNot(now, until, leaf, res); {
+	case err == nil:
+		ready.Until = until
+	case release:
+		return nil, err
 	}
 	// Evidence of a TEE with no such register has no machine to report.
 	if machine, err := res.Claims.RTMR(0); err == nil {
@@ -155,8 +165,9 @@ func VerifyBound(ctx context.Context, policy Policy, engine Engine, instanceKey 
 		Evidence: evidence, Launch: r.Launch, Signature: r.Signature, Events: r.Events, Phase: r.Phase,
 		Bind: r.Bind, BindSignature: r.BindSignature,
 	}
-	// The root CA CRL under this verdict is one the verifier fetched itself.
-	return VerifyAttestation(WithCollateralSource(ctx, r.source), policy, engine, instanceKey, bind.Doc.EvidenceNonce(), resp)
+	// A binder goes on to send the guest secrets on this verdict, so it rests
+	// on the vendor's documents as the binder fetched them itself.
+	return VerifyAttestation(ctx, policy, engine, instanceKey, bind.Doc.EvidenceNonce(), resp)
 }
 
 // ErrNoBindQuote is a guest that says it gave up on the quote over its

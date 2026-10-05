@@ -26,8 +26,8 @@ type judgment struct {
 	named bool
 	// docs is how many documents that somebody handed over.
 	docs int
-	// root: the verdict may rest on a root CA CRL from them.
-	root bool
+	// handed: the verdict may rest on what they hand over.
+	handed bool
 }
 
 // asking is the test engine as one with none of Intel's documents: at every
@@ -41,7 +41,7 @@ type asking struct {
 func (e *asking) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
 	docs, named := session.Stapled(ctx)
 	e.mu.Lock()
-	e.seen = append(e.seen, judgment{named: named, docs: len(docs), root: session.MayStapleRoot(ctx)})
+	e.seen = append(e.seen, judgment{named: named, docs: len(docs), handed: session.HandedDocumentsAllowed(ctx)})
 	e.mu.Unlock()
 	return e.Engine.VerifyEvidence(ctx, env, reportData)
 }
@@ -70,9 +70,9 @@ func handedIn(t *testing.T, n int) []byte {
 }
 
 // A client asks its guest for Intel's documents once, on a connection of its
-// own, when a judgment is short of one. A verdict from before the pin may
-// rest on the root CA CRL among them. The judgment that pins the guest, and
-// every verdict after, may not.
+// own, when a judgment that sends nothing secret is short of one: a verdict
+// from before the pin may rest on them. The judgment that pins the guest, and
+// every verdict after, names nobody to ask and rests on none.
 func TestClientTakesIntelsDocumentsFromItsGuest(t *testing.T) {
 	s := serve(t, sessiontest.NewTD(), nil)
 	s.agent.KeepCollateral(handedIn(t, 4))
@@ -95,7 +95,7 @@ func TestClientTakesIntelsDocumentsFromItsGuest(t *testing.T) {
 	if _, err := client.Attest(within(t)); err != nil {
 		t.Fatal(err)
 	}
-	want := []judgment{{named: true, docs: 4, root: true}, {named: true, docs: 4, root: false}}
+	want := []judgment{{named: true, docs: 4, handed: true}, {}}
 	if got := engine.judgments(); !slices.Equal(got, want) {
 		t.Fatalf("the handshake gate and the judgment that pins saw %+v, want %+v", got, want)
 	}
@@ -116,7 +116,7 @@ func TestClientTakesIntelsDocumentsFromItsGuest(t *testing.T) {
 	client.Close()
 	run(t, client)
 	seen := engine.judgments()
-	if last := seen[len(seen)-1]; len(seen) != 3 || !last.named || last.root {
+	if last := seen[len(seen)-1]; len(seen) != 3 || last.named || last.handed {
 		t.Fatalf("after the pin the gate saw %+v", seen)
 	}
 	// It asked the guest once, whatever came after.
@@ -126,9 +126,9 @@ func TestClientTakesIntelsDocumentsFromItsGuest(t *testing.T) {
 }
 
 // The check that a guest is unbound leads to a bind, which is not secret: it
-// may rest on a root CA CRL the guest handed over. The judgment of the bound
+// may rest on the documents the guest handed over. The judgment of the bound
 // guest may not.
-func TestReadyCheckMayRestOnAStapledRootCRL(t *testing.T) {
+func TestReadyCheckMayRestOnHandedDocuments(t *testing.T) {
 	s := serveReady(t, sessiontest.NewTD())
 	s.agent.KeepCollateral(handedIn(t, 4))
 	engine := &asking{}
@@ -142,7 +142,7 @@ func TestReadyCheckMayRestOnAStapledRootCRL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []judgment{{named: true, docs: 4, root: true}, {named: true, docs: 4, root: true}}
+	want := []judgment{{named: true, docs: 4, handed: true}, {named: true, docs: 4, handed: true}}
 	if got := engine.judgments(); !slices.Equal(got, want) {
 		t.Fatalf("the handshake gate and the ready check saw %+v, want %+v", got, want)
 	}
@@ -159,7 +159,7 @@ func TestReadyCheckMayRestOnAStapledRootCRL(t *testing.T) {
 		t.Fatal(err)
 	}
 	seen := engine.judgments()
-	if last := seen[len(seen)-1]; len(seen) != 3 || !last.named || last.root {
+	if last := seen[len(seen)-1]; len(seen) != 3 || last.named || last.handed {
 		t.Fatalf("the judgment of the bound guest saw %+v", seen)
 	}
 }
@@ -310,8 +310,10 @@ func TestStapleAnswerThatIsNone(t *testing.T) {
 			if _, err := client.Attest(within(t)); err != nil {
 				t.Fatalf("the client did not go on: %v", err)
 			}
-			if got := engine.judgments(); len(got) != 2 || got[0].docs != tc.docs || got[1].docs != tc.docs {
-				t.Fatalf("judgments %+v, want %d documents", got, tc.docs)
+			// The gate takes what the guest handed over. The judgment that
+			// pins takes nothing from anybody.
+			if got := engine.judgments(); len(got) != 2 || got[0].docs != tc.docs || got[1] != (judgment{}) {
+				t.Fatalf("judgments %+v, want %d documents at the gate and none after", got, tc.docs)
 			}
 		})
 	}
@@ -329,9 +331,9 @@ func TestGuestWithNoDocumentsToHandOver(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// The gate, and the judgment of each attestation. Each asked, and the
-	// client asked its guest once for all of them.
-	want := []judgment{{named: true, root: true}, {named: true}, {named: true}}
+	// The gate, which asked the guest, and the judgment of each attestation,
+	// which asks nobody.
+	want := []judgment{{named: true, handed: true}, {}, {}}
 	if got := engine.judgments(); !slices.Equal(got, want) {
 		t.Fatalf("judgments %+v, want %+v", got, want)
 	}
@@ -383,7 +385,7 @@ func TestGateVerdictFromBeforeThePinEndsWithIt(t *testing.T) {
 	client.Close()
 	run(t, client)
 	seen := engine.judgments()
-	if last := seen[len(seen)-1]; len(seen) != 3 || last.root {
+	if last := seen[len(seen)-1]; len(seen) != 3 || last.handed {
 		t.Fatalf("the command went out on a verdict from before the pin: %+v", seen)
 	}
 }

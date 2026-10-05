@@ -72,7 +72,7 @@ func (a *Agent) newKeyService(pin *session.KeyService) (*keyService, error) {
 		// service by the documents its host answered with, each held to the
 		// vendor's signature and dates.
 		Judging: func(ctx context.Context) context.Context {
-			return session.AllowStapledRootCRL(session.WithCollateralSource(ctx, a.keptCollateral))
+			return session.AllowHandedDocuments(session.WithCollateralSource(ctx, a.keptCollateral))
 		},
 		Dial: a.cfg.KeyServiceDial,
 		Now:  a.cfg.Now,

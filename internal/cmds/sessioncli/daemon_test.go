@@ -466,9 +466,9 @@ func TestStartSealsTheCredentialsItHolds(t *testing.T) {
 	}
 }
 
-// rooted is an engine whose verdict rests on a root CA CRL the guest's host
-// handed over whenever its verification lets it: a verifier that has none of
-// its own at hand.
+// rooted is an engine whose verdict rests on the vendor's documents as the
+// guest's host handed them over whenever its verification lets it: a
+// verifier that has none of its own at hand.
 type rooted struct{ session.Engine }
 
 func (e rooted) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
@@ -476,9 +476,9 @@ func (e rooted) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvid
 	if err != nil {
 		return nil, err
 	}
-	finding := &session.CollateralFinding{RootCRLFetched: time.Now(), Expires: time.Now().Add(time.Hour)}
-	if session.StapledRootCRLAllowed(ctx) {
-		finding = &session.CollateralFinding{Stapled: true, RootCRLStapled: true, Expires: time.Now().Add(time.Hour)}
+	finding := &session.CollateralFinding{Fetched: time.Now(), Expires: time.Now().Add(time.Hour)}
+	if session.HandedDocumentsAllowed(ctx) {
+		finding = &session.CollateralFinding{Stapled: true, RootCRLStapled: true, Fetched: time.Now(), Expires: time.Now().Add(time.Hour)}
 	}
 	if res.Claims.PlatformData == nil {
 		res.Claims.PlatformData = map[string]any{}
@@ -488,9 +488,10 @@ func (e rooted) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvid
 }
 
 // A start that sends something with its bind judges the guest as a verifier
-// does whose verdict lets a secret go: on a root CA CRL of its own, never on
-// one the guest's host handed over. A start that sends nothing with its bind
-// needs no more than a verdict that leads to a bind.
+// does whose verdict lets a secret go: on documents of its own, never on
+// those the guest's host handed over. A start that sends nothing with its
+// bind needs no more than a verdict that leads to a bind, and judges the
+// bound guest on documents of its own before it sends anything after.
 func TestStartSealsOnAVerdictMadeForRelease(t *testing.T) {
 	host := sessiondtest.NewHost(t, 1, nil)
 	s := starting(t, host, "sbx-1")

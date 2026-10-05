@@ -89,10 +89,10 @@ func TestClaimFindsAGuestJudgedAheadByItsCertificate(t *testing.T) {
 	if engine.asked.Load() != 1 || verdicts.Kept() != 1 {
 		t.Fatalf("after one guest was shown the engine was asked %d times, and %d verdicts are kept", engine.asked.Load(), verdicts.Kept())
 	}
-	// A verdict made to release: the root CA CRL under it is not one the
-	// guest's host handed over.
-	if session.MayStapleRoot(engine.context) {
-		t.Fatal("a verdict made ahead may rest on a root CA CRL that was handed over")
+	// A verdict made to release: it rests on nothing the guest's host
+	// handed over, and its context names nobody to hand anything over.
+	if _, named := session.Stapled(engine.context); named || session.HandedDocumentsAllowed(engine.context) {
+		t.Fatal("a verdict made ahead may rest on documents that were handed over")
 	}
 	// Shown again, it is not judged again.
 	if err := verdicts.Judge(within(t), shown); err != nil || engine.asked.Load() != 1 {
@@ -248,15 +248,14 @@ func TestVerdictMadeAheadIsReusedOnlyWhileItStands(t *testing.T) {
 		}
 	})
 
-	t.Run("it rests on a root CA CRL somebody handed over", func(t *testing.T) {
-		engine := resting{sessiontest.Engine{}, &session.CollateralFinding{RootCRLStapled: true, Expires: time.Now().Add(time.Hour)}}
+	t.Run("it rests on a document somebody handed over", func(t *testing.T) {
+		engine := resting{sessiontest.Engine{}, &session.CollateralFinding{Stapled: true, Expires: time.Now().Add(time.Hour)}}
 		verdicts := watching(t, s, engine)
-		if err := verdicts.Judge(within(t), shown); err != nil {
-			t.Fatal(err)
+		if err := verdicts.Judge(within(t), shown); err == nil || isVerdict(err) || verdicts.Kept() != 0 {
+			t.Fatalf("a verdict nothing may be sealed on was kept: %v, %d kept", err, verdicts.Kept())
 		}
-		judged, err := verdicts.Claimed(within(t), shown)
-		if err != nil || judged.Ahead || !judged.Until.IsZero() {
-			t.Fatalf("a verdict nothing may be sealed on was kept for a claim: %v", err)
+		if judged, err := verdicts.Claimed(within(t), shown); err == nil || isVerdict(err) {
+			t.Fatalf("a claim was given a verdict nothing may be sealed on: %+v, %v", judged, err)
 		}
 	})
 }

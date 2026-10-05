@@ -515,9 +515,9 @@ func (t *trust) collateralFlags(f *pflag.FlagSet) {
 	f.StringVar(&t.collateralCache, "collateral-cache", defaultCollateralCache(),
 		"directory that keeps Intel's collateral between commands, for an hour; every document in it is verified again at each use. Empty fetches the collateral every time")
 	f.BoolVar(&t.freshCollateral, "fresh-collateral-only", false,
-		"when Intel's service cannot be reached, fail where the command would go on with collateral older than an hour that Intel's own date still covers")
+		"when Intel's service cannot be reached, fail also where the command would go on, for a check that sends the guest nothing secret, with collateral older than an hour that Intel's own date still covers. Before anything is released or run it never goes on with such")
 	f.BoolVar(&t.ownCollateral, "own-collateral-only", false,
-		"take Intel's collateral from Intel's service alone. Without it a command that has none asks the guest for the copies its host fetched, and takes each that Intel signed within two hours; the root CA CRL it fetches itself before anything is released or run")
+		"take Intel's collateral from Intel's service alone, also for a check that sends the guest nothing secret. Without it such a check, when the command has none, asks the guest for the copies its host fetched, and takes each that Intel signed within two hours. Before anything is released or run the command fetches all of it itself")
 	f.BoolVar(&t.timing, "timing", false, "print how long each step took, a line each, to standard error")
 	f.StringSliceVar(&t.acceptTCB, "accept-tcb-status", nil,
 		"an Intel TCB status, besides UpToDate, that the guest's platform, its TDX module or its quoting enclave may have, such as OutOfDate or SWHardeningNeeded; repeat for more. Without it each of the three must be UpToDate. Revoked is never accepted")

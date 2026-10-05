@@ -82,20 +82,21 @@ func (p *Guest) Close() { p.stop() }
 // passes the engine of session.NewEngine.
 func Engine() session.Engine { return sessiontest.Engine{} }
 
-// EngineWithRootCRL is Engine with a finding in each verdict, which says
-// the root CA CRL under it was fetched at fetched(). Asked to fetch the CRL
-// anew, for session.Client.Renew, it calls refetch.
-func EngineWithRootCRL(fetched func() time.Time, refetch func(context.Context) error) session.Engine {
-	return rootCRLEngine{fetched: fetched, refetch: refetch}
+// EngineWithDocuments is Engine with a finding in each verdict, which says
+// the oldest of the vendor's documents under it was fetched at fetched().
+// Asked to fetch anew those that are due, for session.Client.Renew and
+// session.ReadyVerdicts.Refresh, it calls renew.
+func EngineWithDocuments(fetched func() time.Time, renew func(context.Context) error) session.Engine {
+	return documentsEngine{fetched: fetched, renew: renew}
 }
 
-type rootCRLEngine struct {
+type documentsEngine struct {
 	sessiontest.Engine
 	fetched func() time.Time
-	refetch func(context.Context) error
+	renew   func(context.Context) error
 }
 
-func (e rootCRLEngine) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+func (e documentsEngine) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
 	res, err := e.Engine.VerifyEvidence(ctx, env, reportData)
 	if err != nil {
 		return nil, err
@@ -103,11 +104,11 @@ func (e rootCRLEngine) VerifyEvidence(ctx context.Context, env teetypes.Attestat
 	if res.Claims.PlatformData == nil {
 		res.Claims.PlatformData = map[string]any{}
 	}
-	res.Claims.PlatformData[session.CollateralClaim] = &session.CollateralFinding{RootCRLFetched: e.fetched()}
+	res.Claims.PlatformData[session.CollateralClaim] = &session.CollateralFinding{Fetched: e.fetched()}
 	return res, nil
 }
 
-func (e rootCRLEngine) Refetch(ctx context.Context) error { return e.refetch(ctx) }
+func (e documentsEngine) Renew(ctx context.Context) error { return e.renew(ctx) }
 
 // NewGuest boots a guest and serves its agent until the test ends. A bind
 // that names an image starts sandbox, and one that names none is refused, as

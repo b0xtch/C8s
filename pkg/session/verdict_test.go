@@ -569,7 +569,7 @@ func TestScopeOfAFixedPolicy(t *testing.T) {
 		Image: identity, LaunchKey: []byte("launch key"), Launch: []byte("launch"), Authority: []byte("authority"),
 		Bind: []byte("bind"), Tenant: "tenant", Session: "session",
 	}
-	const want = "sha256:f4d354d50e931d2880a6883c8332baacc66f9e38719300f04171f4d62c7473ac"
+	const want = "sha256:f35206cce2d66dd5020ffb87d6c3ff6ac0a57aa222fb9d04b177eef549504a2d"
 	if got := session.ScopeOf(policy, sessiontest.Engine{}); got != want {
 		t.Fatalf("scope = %s, want %s", got, want)
 	}

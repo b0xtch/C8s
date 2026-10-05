@@ -26,7 +26,7 @@ const (
 	// verdictRules is part of every scope. Raise it with any change to what a
 	// judgment requires of evidence, so that a verifier never takes the
 	// verdict of an earlier one that required less.
-	verdictRules = 3
+	verdictRules = 4
 )
 
 // Verdict is a client's record that it judged a guest's evidence and found
@@ -131,10 +131,10 @@ func (v *Verdict) usable(scope string, policy Policy) bool {
 }
 
 // stands is until when a judgment made at now stands: for the hour its
-// collateral is reused, counted from when this verifier had the root CA CRL
-// from Intel where it did, and never past the end of the certificate that
-// carried the key or past Intel's date on the collateral under it. leaf and
-// res may be nil.
+// collateral is reused, counted from the oldest fetch among the vendor's
+// documents under it where this verifier had them all from the vendor, and
+// never past the end of the certificate that carried the key or past the
+// vendor's date on the collateral under it. leaf and res may be nil.
 func stands(now time.Time, leaf *x509.Certificate, res *teetypes.VerificationResult) time.Time {
 	until := now.Add(servingVerdictTTL)
 	if leaf != nil && leaf.NotAfter.Before(until) {
@@ -147,27 +147,41 @@ func stands(now time.Time, leaf *x509.Certificate, res *teetypes.VerificationRes
 	if !finding.Expires.IsZero() && finding.Expires.Before(until) {
 		until = finding.Expires
 	}
-	if !finding.RootCRLFetched.IsZero() {
-		if end := finding.RootCRLFetched.Add(servingVerdictTTL); end.Before(until) {
+	// A document that was handed over bounds nothing: no secret is sent on
+	// a verdict that rests on one, however young (standsNot).
+	if !finding.Stapled && !finding.Fetched.IsZero() {
+		if end := finding.Fetched.Add(servingVerdictTTL); end.Before(until) {
 			until = end
 		}
 	}
 	return until
 }
 
-// ErrStaleRootCRL answers a send whose verdict would rest on a root CA CRL
-// this verifier had from Intel longer ago than the reuse period, because
-// Intel could not be asked for a newer one. It says nothing of the guest.
-var ErrStaleRootCRL = errors.New("the root CA CRL this verifier has from Intel is more than an hour old, and Intel could not be asked for a newer one")
+// ErrStaleDocuments answers a verdict that would send a secret on documents
+// this verifier fetched from the vendor longer ago than the reuse period,
+// because the vendor could not be asked for newer ones. It says nothing of
+// the guest.
+var ErrStaleDocuments = errors.New("the vendor's documents this verifier fetched are more than an hour old, and the vendor could not be asked for newer ones")
 
-// standsNot says why a judgment made at now, which stands until, does not
-// stand at all, or returns nil when it does.
+// errHandedDocuments answers a verdict that would send a secret on a
+// document somebody other than the vendor handed over: its caller judged
+// under AllowHandedDocuments, and has nothing to send on that.
+var errHandedDocuments = errors.New("the verdict rests on a document of the vendor's that somebody else handed over, and nothing secret is sent on such a one")
+
+// standsNot says why a judgment made at now, which stands until, lets
+// nothing secret go to its guest, or returns nil when it does: it rests on
+// the vendor's documents as this verifier fetched them from the vendor
+// within the reuse period, and has not run out.
 func standsNot(now, until time.Time, leaf *x509.Certificate, res *teetypes.VerificationResult) error {
+	finding := CollateralOf(res)
+	if finding != nil && finding.Stapled {
+		return errHandedDocuments
+	}
 	if now.Before(until) {
 		return nil
 	}
-	if finding := CollateralOf(res); finding != nil && !finding.RootCRLFetched.IsZero() && !now.Before(finding.RootCRLFetched.Add(servingVerdictTTL)) {
-		return ErrStaleRootCRL
+	if finding != nil && !finding.Fetched.IsZero() && !now.Before(finding.Fetched.Add(servingVerdictTTL)) {
+		return ErrStaleDocuments
 	}
 	if leaf != nil && !now.Before(leaf.NotAfter) {
 		return refuse("the guest's certificate ended at %s", leaf.NotAfter.UTC().Format(time.RFC3339))

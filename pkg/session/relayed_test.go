@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -357,12 +358,13 @@ func (e resting) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvi
 	return res, nil
 }
 
-// A verdict on a ready guest that rests on a root CA CRL the guest's host
-// handed over is enough to sign a bind, and nothing is sealed on it: Intel
-// signs that list once a year, so a newer one that revokes what is under the
-// verdict would go unseen. One that rests on a list this verifier had from
-// Intel lets a secret go for as long as a kept verdict stands.
-func TestNothingIsSealedOnAVerdictThatRestsOnAHandedOverRootCRL(t *testing.T) {
+// A verdict on a ready guest that rests on a document of the vendor's that
+// the guest's host handed over is enough to sign a bind, and nothing is
+// sealed on it: a document stays within its dates after the vendor replaces
+// it, so a newer one that revokes what is under the verdict would go unseen.
+// One that rests on documents this verifier fetched from the vendor lets a
+// secret go for an hour from the oldest fetch.
+func TestNothingIsSealedOnAVerdictThatRestsOnAHandedOverDocument(t *testing.T) {
 	s := serveReady(t, sessiontest.NewTD())
 	now := time.Now()
 	state := relayedState(t, s)
@@ -376,45 +378,70 @@ func TestNothingIsSealedOnAVerdictThatRestsOnAHandedOverRootCRL(t *testing.T) {
 	}
 	later := now.Add(48 * time.Hour)
 
-	handed, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Stapled: true, RootCRLStapled: true, Expires: later}}, state, now)
-	if err != nil {
-		t.Fatalf("VerifyReady on a root CA CRL that was handed over: %v", err)
-	}
-	if !handed.Until.IsZero() {
-		t.Fatalf("a verdict on a handed-over root CA CRL lets a secret go until %s", handed.Until)
-	}
-	// It is a verdict all the same: the bind it leads to is signed.
-	if err := seal(handed); !errors.Is(err, session.ErrNotForRelease) {
-		t.Fatalf("sealing on it: %v, want it refused as not for release", err)
+	// Whichever document was handed over, the root CA CRL or one that
+	// carries the vendor's date, and however young the verifier's own are.
+	for name, finding := range map[string]*session.CollateralFinding{
+		"all four":                {Stapled: true, RootCRLStapled: true, Fetched: now.Add(-time.Minute), Expires: later},
+		"one that carries a date": {Stapled: true, Fetched: now.Add(-time.Minute), Expires: later},
+	} {
+		handed, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, finding}, state, now)
+		if err != nil {
+			t.Fatalf("%s handed over: VerifyReady: %v", name, err)
+		}
+		if !handed.Until.IsZero() {
+			t.Fatalf("%s handed over: the verdict lets a secret go until %s", name, handed.Until)
+		}
+		// It is a verdict all the same: the bind it leads to is signed.
+		if err := seal(handed); !errors.Is(err, session.ErrNotForRelease) {
+			t.Fatalf("%s handed over: sealing on the verdict: %v, want it refused as not for release", name, err)
+		}
+		// A verifier that asked for a verdict to release on is given none,
+		// and no refusal of the guest either.
+		if ready, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, finding}, state, now); err == nil || isVerdict(err) {
+			t.Fatalf("%s handed over: a verdict to release on: %+v, %v", name, ready, err)
+		}
 	}
 
-	own, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Stapled: true, RootCRLFetched: now.Add(-30 * time.Minute), Expires: later}}, state, now)
+	own, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Fetched: now.Add(-30 * time.Minute), Expires: later}}, state, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// For the rest of the hour its root CA CRL is reused, and no longer than
+	// For the rest of the hour its documents are reused, and no longer than
 	// the guest's certificate lasts.
-	if !own.Until.After(now.Add(20*time.Minute)) || own.Until.After(now.Add(31*time.Minute)) || own.Until.After(leaf.NotAfter) {
-		t.Fatalf("a verdict on a root CA CRL of this verifier's own, half an hour old, stands until %s", own.Until.Sub(now))
+	if want := now.Add(30 * time.Minute); !own.Until.Equal(want) || own.Until.After(leaf.NotAfter) {
+		t.Fatalf("a verdict on documents of this verifier's own, the oldest half an hour old, stands until %s, want %s", own.Until, want)
 	}
 	if err := seal(own); err != nil {
 		t.Fatalf("sealing on a verdict made for release: %v", err)
 	}
 
 	// Intel's own date on a document under the verdict ends it sooner.
-	dated, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{RootCRLFetched: now, Expires: now.Add(time.Minute)}}, state, now)
+	dated, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Fetched: now, Expires: now.Add(time.Minute)}}, state, now)
 	if err != nil || !dated.Until.Equal(now.Add(time.Minute)) {
 		t.Fatalf("a verdict under a document that ends in a minute stands until %v, %v", dated.Until, err)
 	}
-	// A list this verifier had from Intel longer ago than it reuses one, with
-	// Intel out of reach for a newer: the verdict's time was up when it was
-	// made.
-	old, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{RootCRLFetched: now.Add(-2 * time.Hour), Stale: true, Expires: later}}, state, now)
+	// Documents this verifier fetched longer ago than it reuses them, with
+	// the vendor out of reach for newer ones: enough for a bind, and the
+	// verdict's time for anything secret was up when it was made.
+	stale := &session.CollateralFinding{Fetched: now.Add(-2 * time.Hour), Stale: true, Expires: later}
+	old, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, stale}, state, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := seal(old); !errors.Is(err, session.ErrNotForRelease) {
-		t.Fatalf("sealing on a verdict whose root CA CRL is two hours old: %v", err)
+		t.Fatalf("sealing on a verdict whose documents are two hours old: %v", err)
+	}
+	if ready, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, stale}, state, now); !errors.Is(err, session.ErrStaleDocuments) || isVerdict(err) {
+		t.Fatalf("a verdict to release on, on documents two hours old: %+v, %v", ready, err)
+	}
+	// To the second: a document fetched an hour ago carries none.
+	edge := &session.CollateralFinding{Fetched: now.Add(-session.ServingVerdictTTL), Expires: later}
+	if _, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, edge}, state, now); !errors.Is(err, session.ErrStaleDocuments) {
+		t.Fatalf("a verdict to release on, on a document fetched an hour ago: %v", err)
+	}
+	edge.Fetched = edge.Fetched.Add(time.Second)
+	if ready, err := session.VerifyReadyToRelease(within(t), s.policy, resting{sessiontest.Engine{}, edge}, state, now); err != nil || !ready.Until.Equal(now.Add(time.Second)) {
+		t.Fatalf("a verdict to release on, a second inside the hour: %v", err)
 	}
 	// An engine that judges by none of the vendor's documents: for as long
 	// as any kept verdict.
@@ -424,5 +451,37 @@ func TestNothingIsSealedOnAVerdictThatRestsOnAHandedOverRootCRL(t *testing.T) {
 	}
 	if err := seal(plain); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Of the judgments a binder makes on what a host relays, only the one that
+// leads to a bind, which holds no secret, may rest on the vendor's documents
+// as the host relayed them. The one a binder seals on, and the one of the
+// bound guest, which leads to everything a binder sends after, are given
+// nobody to take a document from.
+func TestOnlyTheCheckBeforeABindTakesRelayedDocuments(t *testing.T) {
+	s := serveReady(t, sessiontest.NewTD())
+	engine := &asking{}
+	state := relayedState(t, s)
+	state.Collateral = handedIn(t, 3)
+
+	ready, err := session.VerifyReady(within(t), s.policy, engine, state, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.VerifyReadyToRelease(within(t), s.policy, engine, state, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	bind := bindFor(t, s, ready)
+	answer := relayedBind(t, s, bind)
+	answer.Collateral = handedIn(t, 3)
+	bound := s.policy
+	bound.Launch, bound.Bind, bound.AllowReady = ready.Launch, bind.Raw, false
+	if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer); err != nil {
+		t.Fatal(err)
+	}
+	want := []judgment{{named: true, docs: 3, handed: true}, {}, {}}
+	if got := engine.judgments(); !slices.Equal(got, want) {
+		t.Fatalf("the check before a bind, the check to seal on and the check of the bound guest saw %+v, want %+v", got, want)
 	}
 }
