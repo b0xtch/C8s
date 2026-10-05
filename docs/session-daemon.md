@@ -595,6 +595,17 @@ so:
 | An extend of RTMR[3] | a call into the TDX module | a write to a file in memory |
 | Device I/O | through bounce buffers shared with the host | on the guest's own pages |
 
+`test/session/simtee.sh` is this build's hardware test. It starts a session
+in a guest with no TEE under the simulated authority, and requires that a
+release build has no word for the simulation, that a verifier under Intel's
+root or under another simulated authority refuses the session, that a
+launcher declares no registers for a disk its manifest does not name, that a
+simulating image ends in a TD and a TD's image ends without one, and that a
+TD's evidence is refused under the simulated authority. `make test-simtee`
+runs the unit tests of the packages the tag changes in that build.
+`test/session/timing.sh` takes this side in turn with the TD's when it is
+given the development build and its images.
+
 ## What is missing
 
 - The other calls of the design: pools made and changed through the API,

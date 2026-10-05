@@ -20,11 +20,20 @@
 # first command goes over vsock to an agent in the guest, which is how a
 # session's first command is reached: the baseline to hold a session to.
 #
-# Records go to <work>/timing.jsonl, one JSON object a line, and what the host
-# was to <work>/env.txt, whose first line says which rules of the document's
-# method the run kept. The script pins power when asked and samples the one
-# baseline; it takes no second baseline (the same guest and VMM with TDX
-# off), and it runs beside whatever else the host runs, which it counts.
+# With C8S_SIM_BIN and the three settings that go with it, the run takes the
+# document's second baseline too: the same start in guests that boot with no
+# TEE and simulate one in software (a development build made with the
+# c8s_simtee tag, which protects nothing). That side has a key service, a
+# daemon, a pool and an orchestrator of its own, and the two sides take turns
+# round by round, in an order that alternates. A side's round begins only
+# when both pools are full and idle, and each side's guests, the two key
+# services and the programs that drive the rounds keep to CPUs of their own.
+#
+# Records go to <work>/timing.jsonl, one JSON object a line (the simulated
+# side's to <work>/sim/timing.jsonl), and what the host was to <work>/env.txt,
+# whose first line says which rules of the document's method the run kept.
+# The script pins power when asked and samples the baselines it is given; it
+# runs beside whatever else the host runs, which it counts.
 #
 #   C8S_BIN                  the c8s binary (default: build/c8s)
 #   C8S_WARMSTART            the warmstart binary (go build ./test/session/warmstart)
@@ -70,6 +79,24 @@
 #   C8S_TIMING_PIN_POWER=1   for the run, set every CPU's governor to
 #                            performance and turn off idle states deeper than
 #                            C1E; both are put back when the run ends
+#   C8S_SIM_BIN              a c8s binary built with -tags c8s_simtee: with
+#                            it the run takes the second baseline, and needs
+#                            the next three
+#   C8S_SIM_WARMSTART        the warmstart binary built with that tag
+#   C8S_SIM_SESSION_IMAGE    simulating session image directory
+#                            (C8S_SIMTEE=1 session-guest-image/build)
+#   C8S_SIM_KEY_SERVICE_IMAGE
+#                            simulating key service image directory
+#   C8S_TIMING_CPUS          five CPU lists, as taskset takes them, separated
+#                            by spaces: the TD side's guests, the simulated
+#                            side's, the two key services, the Firecracker
+#                            baseline, and the daemons with the programs that
+#                            drive the rounds. Without it a run with the
+#                            second baseline splits the host's cores from the
+#                            third on into those five, 6, 6, 4, 4 and the
+#                            rest, each core with its sibling threads (it
+#                            needs 24 cores for that), and a run of the TD
+#                            side alone pins nothing
 #   C8S_FIRECRACKER          directory written by firecracker-setup.sh
 #   C8S_FIRECRACKER_SAMPLE   the sampling program (default: beside this script)
 #   C8S_FIRECRACKER_AGENT    the baseline's guest agent, built for the guest
@@ -79,7 +106,9 @@
 #                            Not a measured configuration.
 #   C8S_QUOTE_SOCKET, C8S_SESSION_CONFINE, C8S_ACCEPT_TCB, C8S_SESSION_PORT,
 #   C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
-#                            as for hardware.sh
+#                            as for hardware.sh. The simulated side takes the
+#                            daemon's port plus 10, the key service's plus 10
+#                            and C8S_SIM_SESSION_CIDR (10.214.0.0/24)
 #
 # The logs of what runs under sudo are this user's files, written by this
 # shell.
@@ -91,6 +120,15 @@ WARM=${C8S_WARMSTART:?set C8S_WARMSTART to the warmstart binary}
 IMG=${C8S_SESSION_IMAGE:?set C8S_SESSION_IMAGE to a session image directory}
 KSIMG=${C8S_KEY_SERVICE_IMAGE:?set C8S_KEY_SERVICE_IMAGE to a key service image directory}
 store_dir=${C8S_SANDBOX_STORE:?set C8S_SANDBOX_STORE to a directory written by test/session/sandboximage}
+# The second baseline's side, when the run takes it.
+SIM=${C8S_SIM_BIN:-}
+sides=(td)
+if [ -n "$SIM" ]; then
+    SIMWARM=${C8S_SIM_WARMSTART:?C8S_SIM_BIN needs C8S_SIM_WARMSTART, the warmstart binary built with -tags c8s_simtee}
+    SIMIMG=${C8S_SIM_SESSION_IMAGE:?C8S_SIM_BIN needs C8S_SIM_SESSION_IMAGE, a simulating session image directory}
+    SIMKSIMG=${C8S_SIM_KEY_SERVICE_IMAGE:?C8S_SIM_BIN needs C8S_SIM_KEY_SERVICE_IMAGE, a simulating key service image directory}
+    sides=(td sim)
+fi
 rounds=${C8S_TIMING_ROUNDS:-21}
 stored=${C8S_TIMING_STORED:-1}
 sealed=${C8S_TIMING_SEALED:-0}
@@ -104,9 +142,10 @@ if [ "$claim_with_bind" != 1 ] && { [ "$as_binder" = 1 ] || [ "$lose_first" = 1 
     echo "C8S_TIMING_BINDER and C8S_TIMING_LOSE_FIRST need C8S_TIMING_CLAIM_WITH_BIND=1" >&2
     exit 2
 fi
-# How many TDs a round takes from the pool.
+# How many TDs a round takes from a pool, and how many a pool keeps.
 per_round=1
 [ "$lose_first" = 1 ] && per_round=2
+depth=2
 rest=${C8S_TIMING_REST:-3}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
@@ -120,20 +159,26 @@ accept=()
 port=${C8S_SESSION_PORT:-7443}
 ks_port=${C8S_KEY_SERVICE_PORT:-18543}
 cidr=${C8S_SESSION_CIDR:-10.213.0.0/24}
-manifest=$IMG/manifest.json
 
-C8S=$(command -v "$C8S" || true)
-[ -n "$C8S" ] && [ -x "$C8S" ] || { echo "no c8s binary: set C8S_BIN" >&2; exit 2; }
-C8S=$(readlink -f "$C8S")
-WARM=$(readlink -f "$WARM")
-[ -x "$WARM" ] || { echo "$WARM is no program" >&2; exit 2; }
-[ -f "$manifest" ] && [ -f "$KSIMG/manifest.json" ] || { echo "an image directory holds no manifest.json" >&2; exit 2; }
+program() { # program <path>: the program there, or nothing
+    local path
+    path=$(command -v "$1" || true)
+    [ -n "$path" ] && [ -x "$path" ] && readlink -f "$path"
+}
+C8S=$(program "$C8S") || { echo "no c8s binary: set C8S_BIN" >&2; exit 2; }
+WARM=$(program "$WARM") || { echo "C8S_WARMSTART is no program" >&2; exit 2; }
+[ -f "$IMG/manifest.json" ] && [ -f "$KSIMG/manifest.json" ] || { echo "an image directory holds no manifest.json" >&2; exit 2; }
+if [ -n "$SIM" ]; then
+    SIM=$(program "$SIM") || { echo "C8S_SIM_BIN is no program" >&2; exit 2; }
+    SIMWARM=$(program "$SIMWARM") || { echo "C8S_SIM_WARMSTART is no program" >&2; exit 2; }
+    [ -f "$SIMIMG/SIMULATED-TEE" ] && [ -f "$SIMKSIMG/SIMULATED-TEE" ] || { echo "$SIMIMG or $SIMKSIMG is no image built with C8S_SIMTEE=1" >&2; exit 2; }
+    if [ -f "$IMG/SIMULATED-TEE" ] || [ -f "$KSIMG/SIMULATED-TEE" ]; then
+        echo "C8S_SESSION_IMAGE or C8S_KEY_SERVICE_IMAGE is an image built with C8S_SIMTEE=1" >&2
+        exit 2
+    fi
+fi
 sudo -n true 2>/dev/null || { echo "this run needs passwordless sudo" >&2; exit 2; }
 [ "$(cat /sys/module/kvm_intel/parameters/tdx 2>/dev/null)" = Y ] || { echo "this host's KVM runs no TD (kvm_intel.tdx is not Y)" >&2; exit 2; }
-if sudo -n nft list table inet c8s_sessions > /dev/null 2>&1; then
-    echo "the packet filter holds a table inet c8s_sessions: a session daemon runs here, or one left it behind" >&2
-    exit 2
-fi
 ref=$(cat "$store_dir/ref") store=$store_dir/images.store
 [ -n "$ref" ] && [ -f "$store" ] || { echo "$store_dir is no directory written by test/session/sandboximage" >&2; exit 2; }
 if [ -n "$fc" ]; then
@@ -150,15 +195,90 @@ elif [ -n "$fc_agent" ]; then
     exit 2
 fi
 
+# Where each part of the run keeps to: the TD side's guests, the simulated
+# side's, the two key services (the first half the TD side's), the
+# Firecracker baseline, and the daemons with the programs that drive the
+# rounds. Empty lists pin nothing.
+cpus_td="" cpus_sim="" cpus_ks="" cpus_fc="" cpus_drive=""
+if [ -n "${C8S_TIMING_CPUS:-}" ]; then
+    read -r cpus_td cpus_sim cpus_ks cpus_fc cpus_drive <<< "$C8S_TIMING_CPUS"
+    [ -n "$cpus_drive" ] || { echo "C8S_TIMING_CPUS is five CPU lists: the TD side's guests, the simulated side's, the key services, Firecracker, the drivers" >&2; exit 2; }
+elif [ -n "$SIM" ]; then
+    # By cores, each with its sibling threads: the first two are left to the
+    # host, then 6, 6, 4 and 4, and the rest drives.
+    read -r cpus_td cpus_sim cpus_ks cpus_fc cpus_drive < <(python3 -c '
+import glob
+cores = sorted({open(p).read().strip() for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_cpus_list")},
+               key=lambda c: int(c.replace("-", ",").split(",")[0]))
+cut = lambda a, b: ",".join(cores[a:b])
+print(cut(2, 8), cut(8, 14), cut(14, 18), cut(18, 22), cut(22, len(cores)) if len(cores) >= 24 else "")')
+    [ -n "$cpus_drive" ] || { echo "this host has fewer than 24 cores: name the CPUs each part keeps to with C8S_TIMING_CPUS" >&2; exit 2; }
+fi
+half() { # half <first|second> <CPU list>: that half of its entries
+    python3 -c 'import sys
+e = sys.argv[2].split(","); h = len(e) // 2
+print(",".join(e[:h] if sys.argv[1] == "first" else e[h:]))' "$1" "$2"
+}
+# on <CPU list> <command...>: the command in this shell's place, on those
+# CPUs when a list is given. It is called in the background or in a subshell:
+# the process it leaves is the command's own, which a signal then reaches.
+on() {
+    local cpus=$1
+    shift
+    if [ -n "$cpus" ]; then exec taskset -c "$cpus" "$@"; else exec "$@"; fi
+}
+
 out=${C8S_SESSION_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/c8s-session-timing.XXXXXX")}
 mkdir -p "$out/pki" || exit 2
 [ ! -e "$out/timing.jsonl" ] || { echo "$out holds an earlier run" >&2; exit 2; }
 out=$(readlink -f "$out")
 run=$(basename "$out")
-records=$out/timing.jsonl
 echo "records in $out"
 quiet() { "$@" > /dev/null 2>> "$out/setup.err"; }
 die() { echo "FAILED: $*" >&2; tail -c 400 "$out/setup.err" >&2 2>/dev/null; exit 1; }
+
+# What each side is: its programs, its images, where its daemon and its key
+# service listen, its guests' block and the prefix of their taps, its
+# directory, and the CPUs its guests and its key service keep to. The TD
+# side's files are where a run of that side alone has always put them.
+declare -A bin warm img ksimg dport kport block prefix dir guest_cpus ks_cpus label
+declare -A ks_pid daemon_pid probe_pid warm_pid machine ks_machine
+bin[td]=$C8S warm[td]=$WARM img[td]=$IMG ksimg[td]=$KSIMG dport[td]=$port kport[td]=$ks_port block[td]=$cidr prefix[td]="" dir[td]=$out
+guest_cpus[td]=$cpus_td ks_cpus[td]=$cpus_ks label[td]="TD"
+# What a command that judges evidence is told, and a guest's launcher, read
+# by name where a side is stood up.
+# shellcheck disable=SC2034
+trust_td=("${accept[@]}")
+launcher_td=(session-launcher run --platform tdx --vsock-cid auto)
+[ -S "$quote_socket" ] && launcher_td+=(--quote-socket "$quote_socket")
+tee=""
+if [ -n "$SIM" ]; then
+    tee=$out/sim/authority
+    bin[sim]=$SIM warm[sim]=$SIMWARM img[sim]=$SIMIMG ksimg[sim]=$SIMKSIMG dport[sim]=$((port + 10)) kport[sim]=$((ks_port + 10))
+    block[sim]=${C8S_SIM_SESSION_CIDR:-10.214.0.0/24} prefix[sim]=c8su dir[sim]=$out/sim label[sim]="simulated TEE"
+    guest_cpus[sim]=$cpus_sim ks_cpus[sim]=""
+    if [ -n "$cpus_ks" ]; then
+        ks_cpus[td]=$(half first "$cpus_ks") ks_cpus[sim]=$(half second "$cpus_ks")
+    fi
+    # Always UpToDate: the simulated authority has no other status to accept.
+    # shellcheck disable=SC2034
+    trust_sim=(--simulated-tee "$tee")
+    # shellcheck disable=SC2034
+    launcher_sim=(session-launcher run --platform tdx --vsock-cid auto --simulated-tee "$tee")
+fi
+# table <side>: its daemon's table in the host's packet filter.
+table() { echo "c8s_sessions${prefix[$1]:+_${prefix[$1]}}"; }
+for side in "${sides[@]}"; do
+    ks_pid[$side]="" daemon_pid[$side]="" probe_pid[$side]="" warm_pid[$side]=""
+    if sudo -n nft list table inet "$(table "$side")" > /dev/null 2>&1; then
+        echo "the packet filter holds a table inet $(table "$side"): a session daemon runs here, or one left it behind" >&2
+        exit 2
+    fi
+    declare -n each=launcher_$side
+    [ -n "$confine" ] && each+=(--confine "$confine")
+    [ "$dev" = 1 ] && each+=(--console)
+    unset -n each
+done
 
 pki=$out/pki
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key"
@@ -175,7 +295,7 @@ quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key"
 quiet openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem"
 
-ks_pid="" daemon_pid="" probe_pid="" governor="" idle_off=()
+vendor_pid="" governor="" idle_off=()
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
@@ -188,19 +308,20 @@ restore_power() {
     governor=""
 }
 cleanup() {
-    stop_pid "$daemon_pid"; daemon_pid=""
-    [ -f "$out/config.yaml" ] && sudo -n "$C8S" session-daemon drain --config "$out/config.yaml" --wait 3m >> "$out/drain.out" 2>> "$out/daemon.log"
-    sudo -n nft delete table inet c8s_sessions 2>/dev/null
-    stop_pid "$probe_pid"; probe_pid=""
-    stop_pid "$ks_pid"; ks_pid=""
+    local side
+    for side in "${sides[@]}"; do
+        [ -n "${warm_pid[$side]}" ] && kill "${warm_pid[$side]}" 2>/dev/null
+        stop_pid "${daemon_pid[$side]}"; daemon_pid[$side]=""
+        [ -f "${dir[$side]}/config.yaml" ] && sudo -n "${bin[$side]}" session-daemon drain --config "${dir[$side]}/config.yaml" --wait 3m >> "${dir[$side]}/drain.out" 2>> "${dir[$side]}/daemon.log"
+        sudo -n nft delete table inet "$(table "$side")" 2>/dev/null
+        stop_pid "${probe_pid[$side]}"; probe_pid[$side]=""
+        stop_pid "${ks_pid[$side]}"; ks_pid[$side]=""
+    done
+    [ -n "$vendor_pid" ] && kill "$vendor_pid" 2>/dev/null
     restore_power
 }
 trap cleanup EXIT
 
-launcher=(session-launcher run --platform tdx --vsock-cid auto)
-[ -S "$quote_socket" ] && launcher+=(--quote-socket "$quote_socket")
-[ -n "$confine" ] && launcher+=(--confine "$confine")
-[ "$dev" = 1 ] && launcher+=(--console)
 shape=(--vcpus 4 --memory 16G --low-memory 512M --scratch 4G --image-store "$store")
 ks_shape=(--vcpus 2 --memory 4G --low-memory 512M --scratch 2G)
 # serving <pid> <port>: wait until the guest of that launcher serves.
@@ -213,47 +334,26 @@ serving() {
     done
     return 1
 }
-launch_ks() { # launch_ks <bundle> <work directory> <log>
-    sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$1/opkeydata" --work-dir "$2" \
-        --name "c8s-key-service-$run" "${ks_shape[@]}" --network none --port "127.0.0.1:$ks_port:8443" > "$3" 2>&1 &
-    ks_pid=$!
+launch_ks() { # launch_ks <side> <bundle> <work directory> <log>
+    local -n launcher=launcher_$1
+    on "${ks_cpus[$1]}" sudo -n "${bin[$1]}" "${launcher[@]}" --image-dir "${ksimg[$1]}" --launch-dir "$2/opkeydata" --work-dir "$3" \
+        --name "c8s-key-service-$1-$run" "${ks_shape[@]}" --network none --port "127.0.0.1:${kport[$1]}:8443" > "$4" 2>&1 &
+    ks_pid[$1]=$!
 }
 
-# Two machines are read from evidence first, as in hardware.sh: the key
-# service's and the class's, each from one guest under a document that lists
-# none.
-pin=$out/ks-pin.json
-ks_pool=(--image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key.pub" "${accept[@]}")
-quiet "$C8S" session launch-config key --out "$out/pool.key" || die "the pool's key"
-quiet "$C8S" session key-service launch-config new --out "$out/ks-probe" "${ks_pool[@]}" || die "the key service's first bundle"
-launch_ks "$out/ks-probe" "$out/ks-probe-vm" "$out/ks-probe.log"
-serving "$ks_pid" "$ks_port" || die "the key service's probe never served"
-ks_machine=$("$C8S" session key-service launch-config machine --bundle "$out/ks-probe" --url "https://127.0.0.1:$ks_port" "${accept[@]}" 2>> "$out/setup.err") \
-    || die "the key service's machine"
-stop_pid "$ks_pid"; ks_pid=""
-quiet "$C8S" session key-service launch-config new --out "$out/ks" --key "$out/ks-probe/launch.key" "${ks_pool[@]}" --machine "$ks_machine" \
-    || die "the key service's bundle"
-quiet "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}" || die "the pin"
-
-# The sandbox image is unpacked in every pooled TD before anybody binds it.
-pool_doc=(--key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --prestage "$ref")
-probe_port=$((ks_port + 2))
-quiet "$C8S" session launch-config new --out "$out/bundle-probe" "${pool_doc[@]}" || die "the pool's first bundle"
-sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
-    --name "c8s-session-probe-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/probe.log" 2>&1 &
-probe_pid=$!
-serving "$probe_pid" "$probe_port" || die "the pool's probe never served"
-machine=$("$C8S" session launch-config machine --url "https://127.0.0.1:$probe_port" --image-manifest "$manifest" \
-    --launch-key "$out/pool.key.pub" "${accept[@]}" 2>> "$out/setup.err") || die "the class's machine"
-stop_pid "$probe_pid"; probe_pid=""
-quiet "$C8S" session launch-config new --out "$out/bundle" "${pool_doc[@]}" --machine "$machine" || die "the pool's bundle"
-
-launch_ks "$out/ks" "$out/ks-vm" "$out/ks.log"
-serving "$ks_pid" "$ks_port" || die "the key service never served"
-printf 'timing-secret-%s' "$run" > "$out/stored"
-tenant=(--key-service "$pin" --tenant acme --authority-key "$out/authority.key")
-quiet "$C8S" session key-service tenant register "${tenant[@]}" || die "the tenant's registration"
-quiet "$C8S" session key-service credential put api-token "${tenant[@]}" --from-file "$out/stored" || die "the stored credential"
+# The simulated authority, and whoever serves its documents, before anything
+# of that side boots.
+if [ -n "$SIM" ]; then
+    mkdir -p "$out/sim"
+    quiet "$SIM" session simtee new --out "$tee" || die "the simulated authority"
+    on "$cpus_drive" "$SIM" session simtee vendor --dir "$tee" > "$out/sim/vendor.log" 2>&1 &
+    vendor_pid=$!
+    deadline=$(( $(date +%s) + 20 ))
+    until [ -s "$tee/vendor" ]; do
+        kill -0 "$vendor_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ] || die "the simulated authority's documents are not served: $(tail -c 300 "$out/sim/vendor.log")"
+        sleep 0.1
+    done
+fi
 
 # key_digest <certificate>: its public key as a pool's configuration names it.
 key_digest() {
@@ -263,55 +363,113 @@ binder=$(key_digest "$pki/orchestrator.pem")
 own_binder=$(key_digest "$pki/binder.pem")
 authority=sha256:$(openssl pkey -in "$out/authority.key" -pubout -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)
 [ ${#binder} = 71 ] && [ ${#own_binder} = 71 ] && [ ${#authority} = 71 ] || die "the digest of a public key"
-{
-    echo "listen: 127.0.0.1:$port"
-    echo "host: test-host"
-    echo "stateDir: $out/state"
-    echo "capacity: 2"
-    echo "tls: {cert: $pki/server.pem, key: $pki/server.key, clientCA: $pki/ca.pem}"
-    echo "network: {mode: tap, guestCIDR: $cidr}"
-    echo "vmm:"
-    [ -S "$quote_socket" ] && echo "  quoteSocket: $quote_socket"
-    [ -n "$confine" ] && echo "  confine: \"$confine\""
-    [ "$dev" = 1 ] && echo "  console: true"
-    echo "classes:"
-    echo "  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}"
-    echo "pools:"
-    echo "  - imageDir: $IMG"
-    echo "    launchDir: $out/bundle/opkeydata"
-    echo "    depth: 2"
-    echo "    imageStore: $store"
-    # The orchestrator binds its sessions itself, and may watch the pool. A
-    # binder of its own certificate may watch it too, and claim a TD with a
-    # bind under the tenant's authority.
-    echo "    binders:"
-    echo "      - \"$binder\""
-    echo "      - {key: \"$own_binder\", authorities: [\"$authority\"]}"
-} > "$out/config.yaml"
-sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
-daemon_pid=$!
+printf 'timing-secret-%s' "$run" > "$out/stored"
 
-# before-round <n>: return once the pool is full again, the last session's TD
-# is gone and the host has rested, having taken the round's baseline samples.
-cat > "$out/before-round" <<HOOK
-#!/usr/bin/env bash
-deadline=\$(( \$(date +%s) + 300 ))
-until [ "\$(grep -c '"msg":"a TD is ready"' "$out/daemon.log" 2>/dev/null)" -ge \$((\$1 * $per_round + 2)) ] && [ "\$(pgrep -cf '[q]emu-system.*guest=td-')" = 2 ]; do
-    kill -0 $daemon_pid 2>/dev/null || { echo "the daemon ended" >&2; exit 1; }
-    [ "\$(date +%s)" -lt "\$deadline" ] || { echo "the pool never filled" >&2; exit 1; }
-    sleep 0.5
+# stand_up <side>: its key service, its tenant's credential, and its daemon
+# with one pool. Two machines are read from evidence first, as in
+# hardware.sh: the key service's and the class's, each from one guest under
+# a document that lists none.
+stand_up() {
+    local side=$1 d=${dir[$1]} c=${bin[$1]} manifest=${img[$1]}/manifest.json probe_port=$((${kport[$1]} + 2))
+    local -n trust=trust_$1 launcher=launcher_$1
+    local pin=$d/ks-pin.json status=()
+    # The statuses a key service takes of its pool's guests, and a guest of
+    # its key service: the TD side's alone, where the host's platform has one.
+    [ "$side" = td ] && status=("${accept[@]}")
+    mkdir -p "$d"
+    local ks_pool=(--image-manifest "${ksimg[$side]}/manifest.json" --pool "$manifest:$d/pool.key.pub" "${status[@]}")
+    quiet "$c" session launch-config key --out "$d/pool.key" || die "$side: the pool's key"
+    quiet "$c" session key-service launch-config new --out "$d/ks-probe" "${ks_pool[@]}" || die "$side: the key service's first bundle"
+    launch_ks "$side" "$d/ks-probe" "$d/ks-probe-vm" "$d/ks-probe.log"
+    serving "${ks_pid[$side]}" "${kport[$side]}" || die "$side: the key service's probe never served"
+    ks_machine[$side]=$("$c" session key-service launch-config machine --bundle "$d/ks-probe" --url "https://127.0.0.1:${kport[$side]}" "${trust[@]}" 2>> "$out/setup.err") \
+        || die "$side: the key service's machine"
+    stop_pid "${ks_pid[$side]}"; ks_pid[$side]=""
+    quiet "$c" session key-service launch-config new --out "$d/ks" --key "$d/ks-probe/launch.key" "${ks_pool[@]}" --machine "${ks_machine[$side]}" \
+        || die "$side: the key service's bundle"
+    quiet "$c" session key-service pin --bundle "$d/ks" --url "https://127.0.0.1:${kport[$side]}" --out "$pin" "${status[@]}" || die "$side: the pin"
+
+    # The sandbox image is unpacked in every pooled TD before anybody binds it.
+    local pool_doc=(--key "$d/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --prestage "$ref")
+    quiet "$c" session launch-config new --out "$d/bundle-probe" "${pool_doc[@]}" || die "$side: the pool's first bundle"
+    on "${guest_cpus[$side]}" sudo -n "$c" "${launcher[@]}" --image-dir "${img[$side]}" --launch-dir "$d/bundle-probe/opkeydata" --work-dir "$d/probe-vm" \
+        --name "c8s-session-probe-$side-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$d/probe.log" 2>&1 &
+    probe_pid[$side]=$!
+    serving "${probe_pid[$side]}" "$probe_port" || die "$side: the pool's probe never served"
+    machine[$side]=$("$c" session launch-config machine --url "https://127.0.0.1:$probe_port" --image-manifest "$manifest" \
+        --launch-key "$d/pool.key.pub" "${trust[@]}" 2>> "$out/setup.err") || die "$side: the class's machine"
+    stop_pid "${probe_pid[$side]}"; probe_pid[$side]=""
+    quiet "$c" session launch-config new --out "$d/bundle" "${pool_doc[@]}" --machine "${machine[$side]}" || die "$side: the pool's bundle"
+
+    launch_ks "$side" "$d/ks" "$d/ks-vm" "$d/ks.log"
+    serving "${ks_pid[$side]}" "${kport[$side]}" || die "$side: the key service never served"
+    local tenant=(--key-service "$pin" --tenant acme --authority-key "$out/authority.key")
+    quiet "$c" session key-service tenant register "${tenant[@]}" "${trust[@]}" || die "$side: the tenant's registration"
+    quiet "$c" session key-service credential put api-token "${tenant[@]}" "${trust[@]}" --from-file "$out/stored" || die "$side: the stored credential"
+
+    {
+        echo "listen: 127.0.0.1:${dport[$side]}"
+        echo "host: test-host"
+        echo "stateDir: $d/state"
+        echo "capacity: $depth"
+        echo "tls: {cert: $pki/server.pem, key: $pki/server.key, clientCA: $pki/ca.pem}"
+        echo "network: {mode: tap, guestCIDR: ${block[$side]}${prefix[$side]:+, tapPrefix: ${prefix[$side]}}}"
+        echo "vmm:"
+        [ "$side" = td ] && [ -S "$quote_socket" ] && echo "  quoteSocket: $quote_socket"
+        [ "$side" = sim ] && echo "  simulatedTEE: $tee"
+        [ -n "$confine" ] && echo "  confine: \"$confine\""
+        [ "$dev" = 1 ] && echo "  console: true"
+        echo "classes:"
+        echo "  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}"
+        echo "pools:"
+        echo "  - imageDir: ${img[$side]}"
+        echo "    launchDir: $d/bundle/opkeydata"
+        echo "    depth: $depth"
+        echo "    imageStore: $store"
+        # The orchestrator binds its sessions itself, and may watch the pool. A
+        # binder of its own certificate may watch it too, and claim a TD with a
+        # bind under the tenant's authority.
+        echo "    binders:"
+        echo "      - \"$binder\""
+        echo "      - {key: \"$own_binder\", authorities: [\"$authority\"]}"
+    } > "$d/config.yaml"
+    # The daemon's launchers and their VMMs inherit where the daemon keeps to.
+    on "${guest_cpus[$side]}" sudo -n "$c" session-daemon run --config "$d/config.yaml" >> "$d/daemon.log" 2>&1 &
+    daemon_pid[$side]=$!
+}
+for side in "${sides[@]}"; do
+    stand_up "$side"
 done
-sleep $rest
-if [ -n "$fc" ]; then
-    sudo -n python3 "$fc_sample" "$fc" cold >> "$records" || exit 1
-    sudo -n python3 "$fc_sample" "$fc" load >> "$records" || exit 1
-    if [ -n "$fc_agent" ]; then
-        sudo -n python3 "$fc_sample" "$fc" load-vsock >> "$records" || exit 1
-    fi
-    sleep 1
-fi
+
+# A turn begins once every pool is full again, the last sessions' guests are
+# gone and no guest boots: taken[<side>] is how many guests its rounds took.
+declare -A taken
+for side in "${sides[@]}"; do taken[$side]=0; done
+pools_full() {
+    local side full deadline=$(( $(date +%s) + 600 ))
+    while :; do
+        full=1
+        for side in "${sides[@]}"; do
+            kill -0 "${daemon_pid[$side]}" 2>/dev/null || die "the ${label[$side]} side's daemon ended"
+            [ "$(grep -c '"msg":"a TD is ready"' "${dir[$side]}/daemon.log" 2>/dev/null)" -ge $(( ${taken[$side]} + depth )) ] || full=0
+        done
+        [ "$full" = 1 ] && [ "$(pgrep -cf '[q]emu-system.*guest=td-')" = $(( depth * ${#sides[@]} )) ] && return 0
+        [ "$(date +%s)" -lt "$deadline" ] || die "the pools never filled"
+        sleep 0.5
+    done
+}
+
+# before-round <n>: a side's rounds wait here for their turn.
+for side in "${sides[@]}"; do
+    cat > "${dir[$side]}/before-round" <<HOOK
+#!/usr/bin/env bash
+until [ -e "${dir[$side]}/go.\$1" ]; do
+    kill -0 $$ 2>/dev/null || { echo "the run ended" >&2; exit 1; }
+    sleep 0.02
+done
 HOOK
-chmod 0755 "$out/before-round"
+    chmod 0755 "${dir[$side]}/before-round"
+done
 
 if [ "$pin_power" = 1 ]; then
     governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
@@ -323,13 +481,28 @@ if [ "$pin_power" = 1 ]; then
         esac
     done
 fi
-others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$run")
+field() { # field <manifest> <dotted path>: that value of it
+    python3 -c 'import json,sys
+v = json.load(open(sys.argv[1]))
+for k in sys.argv[2].split("."): v = v[k]
+print(v)' "$1" "$2"
+}
+others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-z]*-$run")
+# What else the host runs, as the share of one CPU each process has had since
+# it started: the run's own programs are young and count for little here.
+busy=$(ps -eo pcpu= | awk '{ s += $1 } END { printf "%.0f", s }')
 {
-    printf 'method: power %s; %s other VMs on the host; TDX on in the firmware; ' "$([ "$pin_power" = 1 ] && echo pinned || echo "as the host had it")" "$others"
+    printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU in all (listed below); TDX on in the firmware, for every side; ' "$([ "$pin_power" = 1 ] && echo pinned || echo "as the host had it")" "$others" "$busy"
     baseline="not sampled"
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
     [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
-    printf 'baseline %s; no second baseline; ' "$baseline"
+    printf 'baseline %s; ' "$baseline"
+    if [ -n "$SIM" ]; then
+        printf 'second baseline: the same start in guests with no TEE and one simulated in software, taking turns with the TD side round by round in an order that alternates, each turn beginning with every pool full and idle; '
+    else
+        printf 'no second baseline; '
+    fi
+    [ -n "$cpus_drive" ] && printf 'CPUs: TD guests %s, simulated guests %s, key services %s, Firecracker %s, daemons and drivers %s; ' "$cpus_td" "${cpus_sim:-none}" "$cpus_ks" "$cpus_fc" "$cpus_drive"
     [ "$claim_with_bind" = 1 ] && printf 'no claim: each bind claims its TD%s; ' "$([ "$lose_first" = 1 ] && echo ", and a second bind for that TD comes first")"
     printf 'before the measured path: the vendor'"'"'s documents fetched by the binder (timed beside the rounds); %s%s\n' "$([ "$watch" = 1 ] && echo "each ready TD judged when it became ready (timed beside the rounds)" || echo "each TD judged at its claim")" \
         "$([ "$stored" = 1 ] && echo "; the key service's replica judged by the binder, for its binds to name (timed beside the rounds)")"
@@ -339,87 +512,168 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     echo "power pinned by this run: $pin_power"
     echo "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) driver $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver) no_turbo $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null) preference $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
     echo "idle states of CPU 0: $(for s in /sys/devices/system/cpu/cpu0/cpuidle/state[0-9]*; do printf '%s%s ' "$(cat "$s/name")" "$([ "$(cat "$s/disable")" = 1 ] && echo '(off)')"; done)"
-    echo "TDX module $(cat /sys/firmware/tdx/tdx_module/version 2>/dev/null || sudo -n dmesg 2>/dev/null | grep -o 'TDX module[^,]*' | tail -1)"
+    echo "kvm_intel.tdx $(cat /sys/module/kvm_intel/parameters/tdx); the TDX module is named at the end, by its measurement in a TD's quote"
+    echo "transparent huge pages $(cat /sys/kernel/mm/transparent_hugepage/enabled), defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
     echo "microcode $(grep -m1 microcode /proc/cpuinfo | sed 's/.*: //')"
     qemu-system-x86_64 --version | head -1
     [ -n "$fc" ] && cat "$fc/versions.txt"
-    echo "c8s $("$C8S" --version 2>/dev/null | head -1) sha256 $(sha256sum "$C8S" | cut -c1-64)"
-    echo "warmstart sha256 $(sha256sum "$WARM" | cut -c1-64)"
-    echo "session image mrtd $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tdx"]["mrtd"])' "$manifest") machine $machine"
-    echo "key service image mrtd $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tdx"]["mrtd"])' "$KSIMG/manifest.json") machine $ks_machine"
-    echo "firmware sha256 $(sha256sum "$IMG/OVMF.tdx.fd" | cut -c1-64)"
+    for side in "${sides[@]}"; do
+        m=${img[$side]}/manifest.json km=${ksimg[$side]}/manifest.json
+        echo "${label[$side]} side: c8s $("${bin[$side]}" --version 2>/dev/null | head -1) sha256 $(sha256sum "${bin[$side]}" | cut -c1-64); warmstart sha256 $(sha256sum "${warm[$side]}" | cut -c1-64)"
+        echo "${label[$side]} side: session image $(basename "${img[$side]}") disk sha256 $(field "$m" outputs.disk_image.sha256) kernel image sha256 $(field "$m" outputs.uki.sha256) firmware sha256 $(field "$m" tdx.firmware.sha256) mrtd $(field "$m" tdx.mrtd) rtmr1 $(field "$m" tdx.rtmr1) rtmr2 $(field "$m" tdx.rtmr2) machine ${machine[$side]}"
+        echo "${label[$side]} side: key service image $(basename "${ksimg[$side]}") disk sha256 $(field "$km" outputs.disk_image.sha256) kernel image sha256 $(field "$km" outputs.uki.sha256) mrtd $(field "$km" tdx.mrtd) rtmr2 $(field "$km" tdx.rtmr2) machine ${ks_machine[$side]}"
+        echo "${label[$side]} side: guest kernel $(field "$m" inputs.kernel.linux_version), guests on taps ${prefix[$side]:-c8st}<n> in ${block[$side]}"
+    done
+    if [ -n "$SIM" ]; then
+        echo "simulated TEE side: a development build (Go build tag c8s_simtee) under the simulated authority in $tee (root sha256 $(openssl x509 -in "$tee/root.pem" -outform DER 2>/dev/null | sha256sum | cut -c1-64)), its documents served at $(cat "$tee/vendor")"
+        echo "simulated TEE side: the registers above are declared by each guest's launcher from the image's manifest, after it held the firmware and the disk to the digests there; no hardware measures them. Its quotes are signed in the guest, and its platform is always UpToDate"
+        echo "simulated TEE side: the guest's kernel clears all of its memory when it boots, where a TD's accepts and clears memory as it uses it: its time from launch to ready is that work, named with it in the summary"
+    fi
     echo "session class 4 vCPUs, 16 GiB; key service 2 vCPUs, 4 GiB; Firecracker guest 4 vCPUs, 16 GiB"
     echo "sandbox image $ref"
     echo "work directory on $(df --output=fstype,source "$out" | tail -1)"
     echo "load $(cat /proc/loadavg)"
     free -g | sed -n 2p
+    echo "the host's busiest programs, by share of one CPU since each started:"
+    ps -eo pcpu=,comm= --sort=-pcpu | head -12 | sed 's/^/  /'
 } > "$out/env.txt" 2>&1
 
+records=$out/timing.jsonl
 if [ -n "$fc" ]; then
-    sudo -n python3 "$fc_sample" "$fc" snapshot >> "$records" || die "the Firecracker snapshot"
+    (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" snapshot) >> "$records" || die "the Firecracker snapshot"
 fi
-args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
-    --pool agents --image-manifest "$manifest" --launch-key "$out/bundle/opkeydata/pubkey" --authority-key "$out/authority.key"
-    --tenant acme --session-prefix "t" --sandbox-image "$ref" --collateral-cache "$out/collateral"
-    --rounds "$rounds" --commands 3 --attest --before-round "$out/before-round")
-[ "$stored" = 1 ] && args+=(--key-service "$pin" --stored-credential api-token)
-[ "$sealed" = 1 ] && args+=(--sealed-credential api-token)
-[ "$watch" = 1 ] || args+=(--watch-ready=false)
-[ "$claim_with_bind" = 1 ] && args+=(--claim-with-bind)
-[ "$lose_first" = 1 ] && args+=(--lose-first)
-if [ "$as_binder" = 1 ]; then
-    # The last of a flag given twice is the one that counts.
-    args+=(--daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --orchestrator-cert "$pki/orchestrator.pem" --orchestrator-key "$pki/orchestrator.key")
-fi
-[ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
-[ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
-[ -n "${C8S_ACCEPT_TCB:-}" ] && args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
-"$WARM" "${args[@]}" >> "$records" 2> "$out/warmstart.err" || die "the rounds: $(tail -c 400 "$out/warmstart.err")"
+for side in "${sides[@]}"; do
+    d=${dir[$side]}
+    args=(--daemon "127.0.0.1:${dport[$side]}" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
+        --pool agents --image-manifest "${img[$side]}/manifest.json" --launch-key "$d/bundle/opkeydata/pubkey" --authority-key "$out/authority.key"
+        --tenant acme --session-prefix "t" --sandbox-image "$ref" --collateral-cache "$d/collateral"
+        --rounds "$rounds" --commands 3 --attest --before-round "$d/before-round")
+    [ "$stored" = 1 ] && args+=(--key-service "$d/ks-pin.json" --stored-credential api-token)
+    [ "$sealed" = 1 ] && args+=(--sealed-credential api-token)
+    [ "$watch" = 1 ] || args+=(--watch-ready=false)
+    [ "$claim_with_bind" = 1 ] && args+=(--claim-with-bind)
+    [ "$lose_first" = 1 ] && args+=(--lose-first)
+    if [ "$as_binder" = 1 ]; then
+        # The last of a flag given twice is the one that counts.
+        args+=(--daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --orchestrator-cert "$pki/orchestrator.pem" --orchestrator-key "$pki/orchestrator.key")
+    fi
+    [ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
+    [ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
+    if [ "$side" = sim ]; then
+        args+=(--simulated-tee "$tee")
+    elif [ -n "${C8S_ACCEPT_TCB:-}" ]; then
+        args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
+    fi
+    on "$cpus_drive" "${warm[$side]}" "${args[@]}" >> "$d/timing.jsonl" 2> "$d/warmstart.err" &
+    warm_pid[$side]=$!
+done
+
+# The rounds. Each side's turn begins with every pool full and idle and the
+# host rested, and the side that goes first alternates. The baseline's
+# samples come once a round, before the first turn.
+for (( n = 0; n < rounds; n++ )); do
+    order=("${sides[@]}")
+    [ ${#sides[@]} = 2 ] && (( n % 2 == 1 )) && order=("${sides[1]}" "${sides[0]}")
+    first=1
+    for side in "${order[@]}"; do
+        pools_full
+        sleep "$rest"
+        if [ "$first" = 1 ] && [ -n "$fc" ]; then
+            (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" cold) >> "$records" || die "a Firecracker cold boot"
+            (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" load) >> "$records" || die "a Firecracker snapshot load"
+            if [ -n "$fc_agent" ]; then
+                (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" load-vsock) >> "$records" || die "a Firecracker snapshot load over vsock"
+            fi
+            sleep 1
+        fi
+        first=0
+        d=${dir[$side]}
+        : > "$d/go.$n"
+        deadline=$(( $(date +%s) + 400 ))
+        until [ "$(grep -c '"kind":"session"' "$d/timing.jsonl" 2>/dev/null)" -gt "$n" ]; do
+            kill -0 "${warm_pid[$side]}" 2>/dev/null || die "the ${label[$side]} side's rounds ended at round $n: $(tail -c 400 "$d/warmstart.err")"
+            [ "$(date +%s)" -lt "$deadline" ] || die "the ${label[$side]} side's round $n never ended"
+            sleep 0.05
+        done
+        taken[$side]=$(( ${taken[$side]} + per_round ))
+    done
+done
+for side in "${sides[@]}"; do
+    wait "${warm_pid[$side]}" || die "the ${label[$side]} side's rounds: $(tail -c 400 "${dir[$side]}/warmstart.err")"
+    warm_pid[$side]=""
+done
 restore_power
 
-# How long each TD took from its launch to ready.
-grep -o '"boot_ms":[0-9]*' "$out/daemon.log" | sed 's/"boot_ms":\([0-9]*\)/{"kind":"session-cold","boot_ms":\1}/' >> "$records"
+# How long each guest took from its launch to ready.
+for side in "${sides[@]}"; do
+    grep -o '"boot_ms":[0-9]*' "${dir[$side]}/daemon.log" | sed 's/"boot_ms":\([0-9]*\)/{"kind":"session-cold","boot_ms":\1}/' >> "${dir[$side]}/timing.jsonl"
+done
 echo "load at the end $(cat /proc/loadavg)" >> "$out/env.txt"
-python3 - "$records" <<'EOF' | tee "$out/summary.txt"
+# The TDX module, as the TD side's quotes name it: this host's kernel states
+# no version of it.
+echo "TDX module MRSEAM $(grep -o '"tdx_module_mrseam":"[0-9a-f]*"' "$records" | sort -u | cut -d'"' -f4 | tr '\n' ' ')" >> "$out/env.txt"
+summary=("$records")
+[ -n "$SIM" ] && summary+=("$out/sim/timing.jsonl")
+python3 - "${summary[@]}" <<'EOF' | tee "$out/summary.txt"
 import json, statistics, sys
-rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+read = lambda path: [json.loads(line) for line in open(path) if line.strip()]
+sides = [("TD", read(sys.argv[1]))] + ([("simulated TEE", read(sys.argv[2]))] if len(sys.argv) > 2 else [])
 def show(label, values, unit):
     values = sorted(values)
     if not values:
         return
     p = lambda q: values[min(len(values) - 1, int(q * len(values)))]
     print(f"{label:34} n={len(values):3}  median {statistics.median(values):9.1f}  p90 {p(0.9):9.1f}  min {values[0]:9.1f}  max {values[-1]:9.1f}  {unit}")
-# A round that a refresh of the vendor's documents ran beside is named and
-# left out: the refresh is no part of a start.
-refreshes = [r for r in rows if r.get("kind") == "refresh"]
+# A round that a refresh of the vendor's documents ran beside, on either
+# side, is named and left out: the refresh is no part of a start.
+refreshes = [r for _, rows in sides for r in rows if r.get("kind") == "refresh"]
 def beside(r):
     end = r["at_unix_us"] + max(r.get("first_cmd_us", 0), r.get("confirmed_us", 0))
     return any(f["at_unix_us"] < end and f["at_unix_us"] + f["took_us"] > r["at_unix_us"] for f in refreshes)
-sessions = [r for r in rows if r.get("kind") == "session" and r["round"] > 0]
-steady = [r for r in sessions if not beside(r)]
-for key in ("claim_us", "ready_check_us", "members_us", "sign_us", "seal_us", "bind_us", "judge_us", "start_us", "first_exec_us", "first_cmd_us", "quote_us", "confirmed_us", "attest_us", "destroy_us"):
-    show("session " + key[:-3], [r[key] / 1000 for r in steady if r.get(key)], "ms")
-show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
-if steady:
-    count = lambda key: sum(1 for r in steady if r.get(key))
-    if count("claimed_by_bind"):
-        print(f"of {len(steady)} rounds, the bind claimed its TD with no claim before it in {count('claimed_by_bind')}, and found that TD taken first in {count('not_ready')}")
-    print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
-    print(f"of {len(steady)} rounds, the guest was judged before its claim in {count('ready_ahead')}, and had a credential sealed with its bind in place in {count('credential_with_bind')}")
-show("ready TD judged ahead", [r["ready_judged_us"] / 1000 for r in steady if r.get("ready_judged_us")], "ms (before the round: no part of its times)")
-show("vendor documents fetched", [r["took_us"] / 1000 for r in rows if r.get("kind") == "documents"], "ms (before the rounds: no part of their times)")
-members = [r for r in rows if r.get("kind") == "members"]
-show("key service replica judged", [r["took_us"] / 1000 for r in members if not r.get("error")], "ms (before the rounds, and beside them when it failed: no part of their times)")
-if any(r.get("error") for r in members):
-    print(f"{sum(1 for r in members if r.get('error'))} judgments of the key service's replica failed: {next(r['error'] for r in members if r.get('error'))}")
-show("vendor documents refreshed", [r["took_us"] / 1000 for r in refreshes], "ms (beside the rounds)")
-if len(sessions) != len(steady):
-    print(f"{len(sessions) - len(steady)} rounds ran beside a refresh of the vendor's documents and are left out: rounds {', '.join(str(r['round']) for r in sessions if beside(r))}")
-show("session later command", [v / 1000 for r in steady for v in r.get("exec_us", [])], "ms")
-first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
-if first:
-    print(f"the first round, caches cold: start {first[0]['start_us'] / 1000:.1f} ms, first command {first[0]['first_cmd_us'] / 1000:.1f} ms")
-show("session TD launch to ready", [r["boot_ms"] for r in rows if r.get("kind") == "session-cold"], "ms")
+keys = ("claim_us", "ready_check_us", "members_us", "sign_us", "seal_us", "bind_us", "judge_us", "start_us", "first_exec_us", "first_cmd_us", "quote_us", "confirmed_us", "attest_us", "destroy_us")
+medians = {}
+for name, rows in sides:
+    if len(sides) > 1:
+        print(f"--- the {name} side")
+    sessions = [r for r in rows if r.get("kind") == "session" and r["round"] > 0]
+    steady = [r for r in sessions if not beside(r)]
+    for key in keys:
+        values = [r[key] / 1000 for r in steady if r.get(key)]
+        show("session " + key[:-3], values, "ms")
+        if values:
+            medians.setdefault(key, {})[name] = statistics.median(values)
+    show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
+    if steady:
+        count = lambda key: sum(1 for r in steady if r.get(key))
+        if count("claimed_by_bind"):
+            print(f"of {len(steady)} rounds, the bind claimed its TD with no claim before it in {count('claimed_by_bind')}, and found that TD taken first in {count('not_ready')}")
+        print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
+        print(f"of {len(steady)} rounds, the guest was judged before its claim in {count('ready_ahead')}, and had a credential sealed with its bind in place in {count('credential_with_bind')}")
+    show("ready TD judged ahead", [r["ready_judged_us"] / 1000 for r in steady if r.get("ready_judged_us")], "ms (before the round: no part of its times)")
+    show("vendor documents fetched", [r["took_us"] / 1000 for r in rows if r.get("kind") == "documents"], "ms (before the rounds: no part of their times)")
+    members = [r for r in rows if r.get("kind") == "members"]
+    show("key service replica judged", [r["took_us"] / 1000 for r in members if not r.get("error")], "ms (before the rounds, and beside them when it failed: no part of their times)")
+    if any(r.get("error") for r in members):
+        print(f"{sum(1 for r in members if r.get('error'))} judgments of the key service's replica failed: {next(r['error'] for r in members if r.get('error'))}")
+    show("vendor documents refreshed", [r["took_us"] / 1000 for r in rows if r.get("kind") == "refresh"], "ms (beside the rounds)")
+    if len(sessions) != len(steady):
+        print(f"{len(sessions) - len(steady)} rounds ran beside a refresh of the vendor's documents and are left out: rounds {', '.join(str(r['round']) for r in sessions if beside(r))}")
+    show("session later command", [v / 1000 for r in steady for v in r.get("exec_us", [])], "ms")
+    first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
+    if first:
+        print(f"the first round, caches cold: start {first[0]['start_us'] / 1000:.1f} ms, first command {first[0]['first_cmd_us'] / 1000:.1f} ms")
+    show("session guest launch to ready", [r["boot_ms"] for r in rows if r.get("kind") == "session-cold"], "ms" + (" (its kernel clears all of its memory first)" if name != "TD" else ""))
+    for r in rows:
+        if r.get("kind") == "tee" and r.get("simulated"):
+            print(f"this side's guests ran in no TEE: build tag {r['build_tag']}, authority {r['authority']} (root sha256 {r['root']})")
+if len(sides) > 1:
+    print("--- what the hardware and the vendor's quoting add: the TD side's median less the simulated side's")
+    for key in keys:
+        both = medians.get(key, {})
+        if len(both) == 2:
+            td, sim = both["TD"], both["simulated TEE"]
+            print(f"{'session ' + key[:-3]:34} {td - sim:+9.1f} ms  (TD {td:.1f}, simulated {sim:.1f})")
+rows = sides[0][1]
 for kind, label, how in (("fc-cold", "Firecracker cold", "serial console: a floor"), ("fc-load", "Firecracker snapshot load", "serial console: a floor"),
                          ("fc-load-vsock", "Firecracker snapshot load", "vsock to an agent in the guest")):
     show(label + " to first command", [r.get("first_cmd_us", r["first_cmd_ms"] * 1000) / 1000 for r in rows if r.get("kind") == kind], f"ms ({how})")
