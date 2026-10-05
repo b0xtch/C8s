@@ -15,7 +15,10 @@
 # With C8S_FIRECRACKER set, each round also takes one cold boot and one
 # snapshot load of stock Firecracker on the same host, between the rounds.
 # That baseline is driven over its serial console, with no channel of a
-# platform's on top: it is a floor, and a record says so.
+# platform's on top: it is a floor, and a record says so. With
+# C8S_FIRECRACKER_AGENT too, each round takes a second snapshot load whose
+# first command goes over vsock to an agent in the guest, which is how a
+# session's first command is reached: the baseline to hold a session to.
 #
 # Records go to <work>/timing.jsonl, one JSON object a line, and what the host
 # was to <work>/env.txt, whose first line says which rules of the document's
@@ -49,6 +52,9 @@
 #                            C1E; both are put back when the run ends
 #   C8S_FIRECRACKER          directory written by firecracker-setup.sh
 #   C8S_FIRECRACKER_SAMPLE   the sampling program (default: beside this script)
+#   C8S_FIRECRACKER_AGENT    the baseline's guest agent, built for the guest
+#                            (CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
+#                            ./test/session/fcagent)
 #   C8S_SESSION_DEV=1        the images are dev builds: attach their consoles.
 #                            Not a measured configuration.
 #   C8S_QUOTE_SOCKET, C8S_SESSION_CONFINE, C8S_ACCEPT_TCB, C8S_SESSION_PORT,
@@ -71,6 +77,7 @@ rest=${C8S_TIMING_REST:-3}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
 fc_sample=${C8S_FIRECRACKER_SAMPLE:-$(dirname "$(readlink -f "$0")")/firecracker_sample.py}
+fc_agent=${C8S_FIRECRACKER_AGENT:-}
 dev=${C8S_SESSION_DEV:-0}
 quote_socket=${C8S_QUOTE_SOCKET:-/var/run/tdx-qgs/qgs.socket}
 confine=${C8S_SESSION_CONFINE:-}
@@ -98,6 +105,15 @@ ref=$(cat "$store_dir/ref") store=$store_dir/images.store
 if [ -n "$fc" ]; then
     [ -x "$fc/firecracker" ] && [ -f "$fc_sample" ] || { echo "$fc holds no firecracker, or $fc_sample is missing" >&2; exit 2; }
     fc=$(readlink -f "$fc")
+    # The snapshot is taken with the agent this run names, or with none.
+    rm -f "$fc/fcagent"
+    if [ -n "$fc_agent" ]; then
+        [ -f "$fc_agent" ] || { echo "C8S_FIRECRACKER_AGENT=$fc_agent is not a file" >&2; exit 2; }
+        install -m 0755 "$fc_agent" "$fc/fcagent"
+    fi
+elif [ -n "$fc_agent" ]; then
+    echo "C8S_FIRECRACKER_AGENT needs C8S_FIRECRACKER" >&2
+    exit 2
 fi
 
 out=${C8S_SESSION_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/c8s-session-timing.XXXXXX")}
@@ -238,6 +254,9 @@ sleep $rest
 if [ -n "$fc" ]; then
     sudo -n python3 "$fc_sample" "$fc" cold >> "$records" || exit 1
     sudo -n python3 "$fc_sample" "$fc" load >> "$records" || exit 1
+    if [ -n "$fc_agent" ]; then
+        sudo -n python3 "$fc_sample" "$fc" load-vsock >> "$records" || exit 1
+    fi
     sleep 1
 fi
 HOOK
@@ -256,7 +275,10 @@ fi
 others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$run")
 {
     printf 'method: power %s; %s other VMs on the host; TDX on in the firmware; ' "$([ "$pin_power" = 1 ] && echo pinned || echo "as the host had it")" "$others"
-    printf 'baseline %s; no second baseline\n' "$([ -n "$fc" ] && echo "Firecracker over its serial console (a floor), interleaved" || echo "not sampled")"
+    baseline="not sampled"
+    [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
+    [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
+    printf 'baseline %s; no second baseline\n' "$baseline"
     echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
@@ -316,7 +338,9 @@ first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
 if first:
     print(f"the first round, caches cold: start {first[0]['start_us'] / 1000:.1f} ms, first command {first[0]['first_cmd_us'] / 1000:.1f} ms")
 show("session TD launch to ready", [r["boot_ms"] for r in rows if r.get("kind") == "session-cold"], "ms")
-for kind, label in (("fc-cold", "Firecracker cold"), ("fc-load", "Firecracker snapshot load")):
-    show(label + " to first command", [r["first_cmd_ms"] for r in rows if r.get("kind") == kind], "ms (serial console: a floor)")
+for kind, label, how in (("fc-cold", "Firecracker cold", "serial console: a floor"), ("fc-load", "Firecracker snapshot load", "serial console: a floor"),
+                         ("fc-load-vsock", "Firecracker snapshot load", "vsock to an agent in the guest")):
+    show(label + " to first command", [r.get("first_cmd_us", r["first_cmd_ms"] * 1000) / 1000 for r in rows if r.get("kind") == kind], f"ms ({how})")
+show("Firecracker later command", [r["next_cmd_us"] / 1000 for r in rows if r.get("next_cmd_us")], "ms (vsock to an agent in the guest)")
 EOF
 head -1 "$out/env.txt" | tee -a "$out/summary.txt"
