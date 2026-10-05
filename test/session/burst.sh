@@ -82,6 +82,12 @@
 #                            performance, turn off idle states deeper than
 #                            C1E and turn turbo on; all three are put back
 #                            when the run ends
+#   C8S_TIMING_HALT_POLL_NS  for the run, how long KVM lets a halted vCPU
+#                            spin for a wakeup before it gives up its CPU
+#                            (the host's halt_poll_ns, for every VM on it);
+#                            put back when the run ends. Unset, the run
+#                            takes the host's as it is. Either way the
+#                            record names it
 #   C8S_BURST_CPUS           four CPU lists, as taskset takes them, separated
 #                            by spaces: the TDs' with their daemon,
 #                            Firecracker's VMMs, the key service's, and the
@@ -140,6 +146,9 @@ credential_bytes=48
 td_mib=${C8S_BURST_TD_MIB:-1024}
 reserve_mib=${C8S_BURST_RESERVE_MIB:-8192}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
+halt_poll=${C8S_TIMING_HALT_POLL_NS:-}
+halt_poll_file=/sys/module/kvm/parameters/halt_poll_ns
+case "$halt_poll" in *[!0-9]*) echo "C8S_TIMING_HALT_POLL_NS is a number of nanoseconds" >&2; exit 2 ;; esac
 dev=${C8S_SESSION_DEV:-0}
 quote_socket=${C8S_QUOTE_SOCKET:-/var/run/tdx-qgs/qgs.socket}
 confine=${C8S_SESSION_CONFINE:-}
@@ -213,9 +222,9 @@ tdx_count() { # tdx_count <file of the root cgroup's misc controller>
 tdx_keys() { tdx_count misc.current; }
 tdx_capacity() { tdx_count misc.capacity; }
 available_mib() { awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo; }
-# pinned_mib: the memory the host can neither move out nor drop, which is
-# where it counts the private memory of TDs: what else runs on a host moves
-# its available memory by more than a TD's worth.
+# pinned_mib: the host's unevictable memory, the gauge of its TDs' private
+# pages, which it can neither move out nor drop. What else runs on a host
+# moves its available memory by more than a TD's worth.
 pinned_mib() { awk '/^Unevictable:/ { print int($2 / 1024) }' /proc/meminfo; }
 
 # What else the host runs, before anything of this run does: the CPU time its
@@ -287,13 +296,17 @@ for who in server orchestrator; do
 done
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 
-ks_pid="" daemon_pid="" probe_pid="" warm_pid="" governor="" turbo="" idle_off=()
+ks_pid="" daemon_pid="" probe_pid="" warm_pid="" governor="" turbo="" idle_off=() halt_poll_was=""
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
     wait "$1" 2>/dev/null
 }
 restore_power() {
+    if [ -n "$halt_poll_was" ]; then
+        echo "$halt_poll_was" | sudo -n tee "$halt_poll_file" > /dev/null
+        halt_poll_was=""
+    fi
     [ -n "$governor" ] || return 0
     echo "$governor" | sudo -n tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /dev/null
     for state in "${idle_off[@]}"; do echo 0 | sudo -n tee "$state" > /dev/null; done
@@ -463,10 +476,10 @@ stop_daemon() {
     # Their memory is back when the host holds pinned what it did before
     # the pool, within a sixteenth of one TD's share.
     while [ "$(pinned_mib)" -gt $(( pinned_before + td_mib / 16 )) ]; do
-        [ "$(date +%s)" -lt "$deadline" ] || die "the host holds $(pinned_mib) MiB pinned after the pool's end, and held $pinned_before before it"
+        [ "$(date +%s)" -lt "$deadline" ] || die "the host holds $(pinned_mib) MiB unevictable after the pool's end, and held $pinned_before before it"
         sleep 0.1
     done
-    echo "burst $1: after the last of its TDs' VMMs was gone, the host had their key IDs free again in $(since "$gone" "$keys_back") s and their memory back in $(since "$gone" "$(date +%s.%N)") s ($(pinned_mib) MiB pinned and $(available_mib) available, $pinned_before and $free_before before the pool)" >> "$out/env.txt"
+    echo "burst $1: after the last of its TDs' VMMs was gone, the host had their key IDs free again in $(since "$gone" "$keys_back") s and their memory back in $(since "$gone" "$(date +%s.%N)") s ($(pinned_mib) MiB unevictable and $(available_mib) available, $pinned_before and $free_before before the pool)" >> "$out/env.txt"
 }
 since() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", b - a }'; }
 # cold <n>: how long each TD of burst n took from its launch to ready, in
@@ -479,6 +492,9 @@ def at(entry):
     # A log's stamp has more digits than a datetime reads.
     stamp = re.sub(r"(\.\d{6})\d+", r"\1", entry["time"]).replace("Z", "+00:00")
     return datetime.datetime.fromisoformat(stamp).timestamp()
+# What a guest with a console says of its own bind, of the quote it took
+# beside it, and of the bind's whole call with what followed its answer.
+guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call"}
 def entries(path):
     try:
         with open(path, errors="replace") as f:
@@ -503,9 +519,9 @@ for ready in came:
             asked = at(entry)
         # What a guest with a console says of its own bind and of the quote
         # it took beside it, each in parts.
-        elif entry["msg"] in ("a bind was served", "took the quote over the bind's nonce"):
-            kind = "guest-bind" if entry["msg"] == "a bind was served" else "guest-quote"
-            said.append({"kind": kind, "round": burst, "td": ready.get("td"), **{k: v for k, v in entry.items() if k.endswith("_us")}})
+        elif entry["msg"] in guest_said:
+            said.append({"kind": guest_said[entry["msg"]], "round": burst, "td": ready.get("td"),
+                         **{k: v for k, v in entry.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}})
     if started is not None:
         record["before_vmm_ms"] = round(ready["boot_ms"] - (at(ready) - started) * 1000)
         if asked is not None:
@@ -535,14 +551,12 @@ BOUND
 # sample <side> <when> <n>: what that side's VMMs have cost their host so
 # far, as a record. Each side's drivers run it before burst n is let go and
 # when the burst's last first command has answered, while every guest runs.
-# The one before is taken twice, a second apart: what idle guests cost.
+# The one before first waits for the side's guests to be idle by their own
+# counters, whatever rest they had, and records how long that took.
 cat > "$out/sample" <<HOOK
 #!/usr/bin/env bash
 case "\$1" in td) text='guest=td-' ;; *) text='$fc/firecracker ' ;; esac
-if [ "\$2" = before ]; then
-    sudo -n python3 "$vmm_stat" "\$1" idle "\$3" "\$text" >> "$records"
-    sleep 1
-fi
+[ "\$2" = before ] && set -- "\$1" quiet "\$3"
 exec sudo -n python3 "$vmm_stat" "\$1" "\$2" "\$3" "\$text" >> "$records"
 HOOK
 for side in td load pool; do
@@ -562,6 +576,12 @@ exec "$out/sample" td before "\$1"
 HOOK
 chmod 0755 "$out/sample" "$out"/before-* "$out"/after-*
 
+if [ -n "$halt_poll" ]; then
+    halt_poll_was=$(cat "$halt_poll_file") || die "this host's KVM names no halt_poll_ns: the run cannot set it"
+    echo "$halt_poll" | sudo -n tee "$halt_poll_file" > /dev/null || die "KVM's halt_poll_ns"
+fi
+# What it is for this run, set by it or found.
+halt_polled=$(cat "$halt_poll_file" 2>/dev/null)
 if [ "$pin_power" = 1 ]; then
     governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
     echo performance | sudo -n tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /dev/null
@@ -587,12 +607,13 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
 {
     printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU over the five seconds before the run (listed below); TDX on in the firmware, for every side; ' \
         "$([ "$pin_power" = 1 ] && echo "pinned (governor performance, idle states past C1E off, turbo on)" || echo "as the host had it")" "$others" "$busy"
+    printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     printf 'baselines: Firecracker loading one snapshot of its leanest guest %s times at once, and Firecracker starting as many sessions at once in such guests booted ahead and idle, each to the first command over vsock to an agent that is its guest'"'"'s init on the same image'"'"'s tree, taking turns with the TDs burst by burst in an order that rotates, each side'"'"'s guests there for its own turn alone, which begins with them idle and the host rested; ' "$sessions"
     [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each TD burst (%s); ' "$C8S_BURST_WATCH"
     printf 'no second baseline: its guests hold all of their memory from boot; '
     printf 'CPUs: TDs and their daemon %s, Firecracker %s, key service %s, the programs that start the bursts %s; ' "$cpus_td" "$cpus_fc" "$cpus_ks" "$cpus_drive"
-    printf 'no claim: each bind claims its TD; before the measured path, on each side: its pool filled and then rested %s s, the TDs'"'"' with the vendor'"'"'s documents fetched by the binder, each ready TD judged when it became ready and the image unpacked in each, and as that unpacking'"'"'s counterpart each of Firecracker'"'"'s guests having read its file system whole, the one its snapshot was made of (which had also run one command) and each one booted for its pool, which was left the same way with a connection to its agent made; a start that failed or lost its guest counts against its side'"'"'s success rate, and none is left out\n' "$rest"
-    echo "run $run, $rounds bursts a side of $sessions sessions on a pool of $depth ready TDs (the host has $keys_all TDX key IDs, $keys_before in use before the pool), $(date -u +%FT%TZ), first command: $first_command, each sandbox's own process: ${sandbox_command:-as its image names it}, a credential of $credential_bytes bytes sealed with each bind and brought by each of Firecracker's starts, rest $rest s"
+    printf 'no claim: each bind claims its TD; before the measured path, on each side: its pool filled, rested %s s and then waited until every guest was idle by KVM'"'"'s own counters for it, the TDs'"'"' with the vendor'"'"'s documents fetched by the binder, each ready TD judged when it became ready and the image unpacked in each, and as that unpacking'"'"'s counterpart each of Firecracker'"'"'s guests having read its file system whole, the one its snapshot was made of (which had also run one command) and each one booted for its pool, which was left the same way with a connection to its agent made; a start that failed or lost its guest counts against its side'"'"'s success rate, and none is left out\n' "$rest"
+    echo "run $run, $rounds bursts a side of $sessions sessions on a pool of $depth ready TDs (the host has $keys_all TDX key IDs, $keys_before in use before the pool), $(date -u +%FT%TZ), first command: $first_command, a credential of $credential_bytes bytes sealed with each bind and brought by each of Firecracker's starts, rest $rest s"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
@@ -600,7 +621,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     echo "idle states of CPU 0: $(for s in /sys/devices/system/cpu/cpu0/cpuidle/state[0-9]*; do printf '%s%s ' "$(cat "$s/name")" "$([ "$(cat "$s/disable")" = 1 ] && echo '(off)')"; done)"
     echo "kvm_intel.tdx $(cat /sys/module/kvm_intel/parameters/tdx); the TDX module is named at the end, by its measurement in a TD's quote"
     echo "transparent huge pages $(cat /sys/kernel/mm/transparent_hugepage/enabled), defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
-    echo "KVM halt_poll_ns $(cat /sys/module/kvm/parameters/halt_poll_ns 2>/dev/null)"
+    echo "KVM halt_poll_ns $halt_polled"
     qemu-system-x86_64 --version | head -1
     cat "$fc/versions.txt"
     m=$IMG/manifest.json km=$KSIMG/manifest.json
@@ -658,7 +679,7 @@ for (( n = 0; n < rounds; n++ )); do
         pool_full
         sleep "$rest"
         free_after=$(available_mib) pinned_after=$(pinned_mib)
-        echo "burst $n: the pool of $depth ready TDs filled in $filled s, two booting at a time, and held $(( $(tdx_keys) - keys_before )) key IDs; the host's pinned memory went from $pinned_before MiB to $pinned_after MiB, $(( (pinned_after - pinned_before) / depth )) MiB a ready TD, and its available memory from $free_before MiB to $free_after MiB, $(( (free_before - free_after) / depth )) MiB a ready TD" >> "$out/env.txt"
+        echo "burst $n: the pool of $depth ready TDs filled in $filled s, two booting at a time, and held $(( $(tdx_keys) - keys_before )) key IDs; the host's unevictable memory, which holds the TDs' private pages, went from $pinned_before MiB to $pinned_after MiB, $(( (pinned_after - pinned_before) / depth )) MiB a ready TD, and its available memory from $free_before MiB to $free_after MiB, $(( (free_before - free_after) / depth )) MiB a ready TD" >> "$out/env.txt"
         watch_pid=""
         if [ -n "${C8S_BURST_WATCH:-}" ]; then
             # shellcheck disable=SC2086
@@ -670,7 +691,7 @@ for (( n = 0; n < rounds; n++ )); do
         wait "$warm_pid" || die "burst $n: $(tail -c 400 "$out/warmstart.err")"
         [ -n "$watch_pid" ] && wait "$watch_pid"
         warm_pid=""
-        echo "burst $n: after it the host held $(pinned_mib) MiB pinned and had $(available_mib) MiB available" >> "$out/env.txt"
+        echo "burst $n: after it the host held $(pinned_mib) MiB unevictable and had $(available_mib) MiB available" >> "$out/env.txt"
         if [ "${C8S_BURST_KEEP:-0}" -gt 0 ]; then
             sleep "$C8S_BURST_KEEP"
             echo "burst $n: $C8S_BURST_KEEP s after it, $(pgrep -cf '[q]emu-system.*guest=td-') VMMs ran, and the daemon had logged these ends: $(grep '"msg":"a TD ended"' "$out/daemon.log" | sed 's/.*"reason":"\([^"]*\)".*/\1/' | sort | uniq -c | tr '\n' ';')" >> "$out/env.txt"
@@ -715,7 +736,7 @@ echo "load at the end $(cat /proc/loadavg)" >> "$out/env.txt"
 # version of it.
 echo "TDX module MRSEAM $(grep -o '"tdx_module_mrseam":"[0-9a-f]*"' "$records" | sort -u | cut -d'"' -f4 | tr '\n' ' ')" >> "$out/env.txt"
 
-python3 - "$records" "$(cat /sys/module/kvm/parameters/halt_poll_ns 2>/dev/null)" <<'EOF' | tee "$out/summary.txt"
+python3 - "$records" "$halt_polled" <<'EOF' | tee "$out/summary.txt"
 import json, statistics, sys
 rows = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 halt_poll = sys.argv[2] or "not said"
@@ -778,10 +799,18 @@ show("the daemon's time over a bind", [r["took_us"] / 1000 for r in steady("daem
 show("  of which the guest's answer", [r["guest_us"] / 1000 for r in steady("daemon-bind") if r.get("guest_us")])
 # A guest with a console says how long its bind took in parts, each from the
 # bind's arrival, and the quote it took beside it.
-for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: ")):
+def told_by(kind, label):
+    """A guest's own numbers of one kind: times in ms, the rest as it gave them."""
     told = steady(kind)
-    for key in dict.fromkeys(k for r in told for k in r if k.endswith("_us")):
-        show(label + key[:-3], [r[key] / 1000 for r in told if key in r], "ms (the guest's own clock)")
+    for key in dict.fromkeys(k for r in told for k in r if k not in ("kind", "round", "td")):
+        values = [r[key] for r in told if key in r]
+        if key.endswith("_us"):
+            show(label + key[:-3], [v / 1000 for v in values], "ms (the guest's own clock)")
+        else:
+            show(label + key, values, "(the guest's own count)")
+told_by("guest-bind", "guest's bind, to ")
+told_by("guest-quote", "guest's quote: ")
+told_by("guest-call", "guest's bind and what followed: ")
 cold = [r for r in rows if r.get("kind") == "session-cold"]
 show("TD launch to ready", [r["boot_ms"] for r in cold], "ms (two boot at a time, beside whatever else ran)")
 show("  VMM start to documents asked", [r["vmm_to_documents_ms"] for r in cold if "vmm_to_documents_ms" in r])
@@ -824,6 +853,10 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
           f"{per('kvm', 'pf_fixed'):.0f} page faults resolved, pages mapped anew: {per('kvm', 'pages_4k'):.0f} of 4 KiB and {per('kvm', 'pages_2m'):.0f} of 2 MiB")
     polled = (per("kvm", "halt_poll_success_ns") + per("kvm", "halt_poll_fail_ns")) / 1e6
     print(f"KVM: halted vCPUs spun {polled:.2f} ms a start for a wakeup ({per('kvm', 'halt_successful_poll'):.0f} of {per('kvm', 'halt_attempted_poll'):.0f} spins met one) and then slept {per('kvm', 'halt_wait_ns') / 1e6:.2f} ms; the host's halt_poll_ns is {halt_poll}")
+for name, key in (("TDs", "td"), ("Firecracker's booted guests", "pool")):
+    waits = [r for r in rows if r.get("kind") == "vmm-quiet" and r["side"] == key and r["vmms"]]
+    if waits:
+        print(f"{name} were idle by their own counters {statistics.median(r['waited_s'] for r in waits):.0f} s after their rest, at the median of {len(waits)} bursts (at most {max(r['waited_s'] for r in waits):.0f} s): no guest's VMM ran over 10 ms or resolved over 16 page faults in each of two seconds")
 outputs = sorted({s.get("first_output", "") for s in rows if s.get("kind") in ("session", "fc-load-session", "fc-pool-session")})
 print("the first command wrote: " + ", ".join(repr(o) for o in outputs))
 # A start whose command wrote something else did other work than the rest.

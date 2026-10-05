@@ -96,6 +96,12 @@
 #                            performance, turn off idle states deeper than
 #                            C1E and turn turbo on, as a host in production
 #                            has it; all three are put back when the run ends
+#   C8S_TIMING_HALT_POLL_NS  for the run, how long KVM lets a halted vCPU
+#                            spin for a wakeup before it gives up its CPU
+#                            (the host's halt_poll_ns, for every VM on it);
+#                            put back when the run ends. Unset, the run
+#                            takes the host's as it is. Either way the
+#                            record names it
 #   C8S_SIM_BIN              a c8s binary built with -tags c8s_simtee: with
 #                            it the run takes the second baseline, and needs
 #                            the next three
@@ -176,6 +182,9 @@ depth=2
 rest=${C8S_TIMING_REST:-3}
 idle=${C8S_TIMING_IDLE:-0}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
+halt_poll=${C8S_TIMING_HALT_POLL_NS:-}
+halt_poll_file=/sys/module/kvm/parameters/halt_poll_ns
+case "$halt_poll" in *[!0-9]*) echo "C8S_TIMING_HALT_POLL_NS is a number of nanoseconds" >&2; exit 2 ;; esac
 fc=${C8S_FIRECRACKER:-}
 fc_sample=${C8S_FIRECRACKER_SAMPLE:-$(dirname "$(readlink -f "$0")")/firecracker_sample.py}
 fc_agent=${C8S_FIRECRACKER_AGENT:-}
@@ -373,13 +382,17 @@ quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key"
 quiet openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem"
 
-vendor_pid="" governor="" turbo="" idle_off=()
+vendor_pid="" governor="" turbo="" idle_off=() halt_poll_was=""
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
     wait "$1" 2>/dev/null
 }
 restore_power() {
+    if [ -n "$halt_poll_was" ]; then
+        echo "$halt_poll_was" | sudo -n tee "$halt_poll_file" > /dev/null
+        halt_poll_was=""
+    fi
     [ -n "$governor" ] || return 0
     echo "$governor" | sudo -n tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /dev/null
     for state in "${idle_off[@]}"; do echo 0 | sudo -n tee "$state" > /dev/null; done
@@ -602,6 +615,12 @@ HOOK
     chmod 0755 "${dir[$side]}/before-round"
 done
 
+if [ -n "$halt_poll" ]; then
+    halt_poll_was=$(cat "$halt_poll_file") || die "this host's KVM names no halt_poll_ns: the run cannot set it"
+    echo "$halt_poll" | sudo -n tee "$halt_poll_file" > /dev/null || die "KVM's halt_poll_ns"
+fi
+# What it is for this run, set by it or found.
+halt_polled=$(cat "$halt_poll_file" 2>/dev/null)
 if [ "$pin_power" = 1 ]; then
     governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
     echo performance | sudo -n tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /dev/null
@@ -626,6 +645,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
 {
     printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU over the five seconds before the run (listed below); TDX on in the firmware, for every side; ' \
         "$([ "$pin_power" = 1 ] && echo "pinned (governor performance, idle states past C1E off, turbo on)" || echo "as the host had it")" "$others" "$busy"
+    printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     baseline="not sampled"
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
     [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, its first command $(first_command) as a session's is, from a snapshot's load, from its leanest guest booted cold and from one booted ahead and idle, and over its serial console (a floor), interleaved"
@@ -802,6 +822,9 @@ def at(entry):
     # A log's stamp has more digits than a datetime reads.
     stamp = re.sub(r"(\.\d{6})\d+", r"\1", entry["time"]).replace("Z", "+00:00")
     return datetime.datetime.fromisoformat(stamp).timestamp()
+# What a guest with a console says of its own bind, of the quote it took
+# beside it, and of the bind's whole call with what followed its answer.
+guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call"}
 def entries(path):
     try:
         with open(path, errors="replace") as f:
@@ -829,9 +852,9 @@ for ready in entries(os.path.join(d, "daemon.log")):
             asked = at(entry)
         # What a guest with a console says of its own bind and of the quote
         # it took beside it, each in parts.
-        elif entry["msg"] in ("a bind was served", "took the quote over the bind's nonce"):
-            kind = "guest-bind" if entry["msg"] == "a bind was served" else "guest-quote"
-            said.append({"kind": kind, "td": ready.get("td"), **{k: v for k, v in entry.items() if k.endswith("_us")}})
+        elif entry["msg"] in guest_said:
+            said.append({"kind": guest_said[entry["msg"]], "td": ready.get("td"),
+                         **{k: v for k, v in entry.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}})
     if started is not None:
         record["before_vmm_ms"] = round(ready["boot_ms"] - (at(ready) - started) * 1000)
         if asked is not None:
@@ -884,10 +907,14 @@ for name, rows in sides:
     # A guest with a console says how long its bind took in parts, each from
     # the bind's arrival, and the quote it took beside it. The first round's
     # guest is among them.
-    for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: ")):
+    for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: "), ("guest-call", "guest's bind and what followed: ")):
         told = [r for r in rows if r.get("kind") == kind]
-        for key in dict.fromkeys(k for r in told for k in r if k.endswith("_us")):
-            show(label + key[:-3], [r[key] / 1000 for r in told if key in r], "ms (the guest's own clock)")
+        for key in dict.fromkeys(k for r in told for k in r if k not in ("kind", "td")):
+            values = [r[key] for r in told if key in r]
+            if key.endswith("_us"):
+                show(label + key[:-3], [v / 1000 for v in values], "ms (the guest's own clock)")
+            else:
+                show(label + key, values, "(the guest's own count)")
     show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
     if steady:
         count = lambda key: sum(1 for r in steady if r.get(key))
