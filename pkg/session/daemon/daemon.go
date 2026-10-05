@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -71,6 +72,19 @@ func Dial(opts Options) (*Client, error) {
 
 // Close ends every stream of the client.
 func (c *Client) Close() error { return c.conn.Close() }
+
+// Connect opens the client's connection now and returns once it is up. A
+// caller whose first call should not wait for the handshake, such as an
+// orchestrator that starts sessions against a deadline, connects ahead.
+func (c *Client) Connect(ctx context.Context) error {
+	c.conn.Connect()
+	for state := c.conn.GetState(); state != connectivity.Ready; state = c.conn.GetState() {
+		if !c.conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("daemon %s: %w", c.conn.Target(), ctx.Err())
+		}
+	}
+	return nil
+}
 
 // NewRequestID is an id for one change. A call repeated under the same id
 // gets the first answer and changes nothing.
