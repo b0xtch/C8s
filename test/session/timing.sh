@@ -95,13 +95,14 @@
 #   C8S_TIMING_PIN_POWER=1   for the run, set every CPU's governor to
 #                            performance, turn off idle states deeper than
 #                            C1E and turn turbo on, as a host in production
-#                            has it; all three are put back when the run ends
+#                            has it, and set KVM's halt polling to none (see
+#                            the next); all are put back when the run ends
 #   C8S_TIMING_HALT_POLL_NS  for the run, how long KVM lets a halted vCPU
 #                            spin for a wakeup before it gives up its CPU
 #                            (the host's halt_poll_ns, for every VM on it);
-#                            put back when the run ends. Unset, the run
-#                            takes the host's as it is. Either way the
-#                            record names it
+#                            put back when the run ends. Unset, a run that
+#                            pins the power sets 0 and any other takes the
+#                            host's as it is. Either way the record names it
 #   C8S_SIM_BIN              a c8s binary built with -tags c8s_simtee: with
 #                            it the run takes the second baseline, and needs
 #                            the next three
@@ -183,6 +184,8 @@ rest=${C8S_TIMING_REST:-3}
 idle=${C8S_TIMING_IDLE:-0}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 halt_poll=${C8S_TIMING_HALT_POLL_NS:-}
+# A run that pins the power settings pins halt polling with them, at none.
+[ "$pin_power" = 1 ] && halt_poll=${halt_poll:-0}
 halt_poll_file=/sys/module/kvm/parameters/halt_poll_ns
 case "$halt_poll" in *[!0-9]*) echo "C8S_TIMING_HALT_POLL_NS is a number of nanoseconds" >&2; exit 2 ;; esac
 fc=${C8S_FIRECRACKER:-}
