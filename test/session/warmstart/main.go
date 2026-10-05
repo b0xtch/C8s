@@ -79,6 +79,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -725,62 +726,95 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	var ahead *session.Client
 	var reached chan bool
 	var took steps
-	bindAnswered := make(chan struct{})
-	// prepare makes that client once the TD's name is known: before the
-	// bind for a claimed TD, and from the bind's answer for one the bind
-	// claims.
+	var bindAnswered chan struct{}
+	var dropAhead context.CancelFunc
+	// through reaches the session's TD by its name, which a bind that claims
+	// learns from the bind's answer: nothing dials before that.
+	through := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return host.Dialer(td)(ctx, network, addr)
+	}
+	// prepare makes that client as the bind is sent: the certificate it
+	// judges came with the ready evidence, so the judgment runs beside the
+	// bind, and the connection is made when the client's first use of it
+	// allows. A bind that found its TD taken prepares again, for the next.
 	prepare := func() error {
 		if !o.prejudge {
 			return nil
 		}
-		if ahead, err = session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer,
-			session.Through(host.Dialer(td)), session.Receipted(ready.InstanceKey), session.Timed(took.report)); err != nil {
+		if dropAhead != nil {
+			dropAhead()
+			ahead.Close()
+		}
+		attempt, cancel := context.WithCancel(ctx)
+		dropAhead = cancel
+		answered, said := make(chan struct{}), make(chan bool, 1)
+		bindAnswered, reached = answered, said
+		client, err := session.NewClient(fmt.Sprintf("https://%s:%d", rec.Session, session.AgentPort), bound, engine, signer,
+			session.Through(through), session.Receipted(ready.InstanceKey), session.Timed(took.report))
+		if err != nil {
 			return err
 		}
-		if leaf, err := x509.ParseCertificate(certificate); err == nil {
-			reached = make(chan bool, 1)
-			go func() {
-				if err := ahead.Prejudge(ctx, leaf); err != nil {
-					fmt.Fprintf(os.Stderr, "warmstart: round %d: the certificate was not judged ahead: %v\n", round, err)
-					reached <- false
-					return
-				}
-				if first != nil {
-					<-bindAnswered
-					reached <- o.preconnect && ahead.Reach(ctx) == nil
-					return
-				}
-				for o.preconnect {
-					if ahead.Reach(ctx) == nil {
-						reached <- true
-						return
-					}
-					select {
-					case <-bindAnswered:
-						// The first command makes its own connection.
-						reached <- false
-						return
-					case <-time.After(200 * time.Microsecond):
-					}
-				}
-				reached <- false
-			}()
+		ahead = client
+		leaf, err := x509.ParseCertificate(certificate)
+		if err != nil {
+			said <- false
+			return nil
 		}
+		go func() {
+			if err := client.Prejudge(attempt, leaf); err != nil {
+				if attempt.Err() == nil {
+					fmt.Fprintf(os.Stderr, "warmstart: round %d: the certificate was not judged ahead: %v\n", round, err)
+				}
+				said <- false
+				return
+			}
+			if first != nil || o.quoteFirst || o.claimWithBind {
+				// Once the guest has answered: a bind ends the connections
+				// that reached its guest before it, and a TD the bind
+				// claims has no name before. A binder that waits for the
+				// quote makes the connection meanwhile: a handshake carries
+				// nothing of the tenant's.
+				select {
+				case <-answered:
+				case <-attempt.Done():
+					said <- false
+					return
+				}
+				said <- o.preconnect && client.Reach(attempt) == nil
+				return
+			}
+			for o.preconnect {
+				if client.Reach(attempt) == nil {
+					said <- true
+					return
+				}
+				select {
+				case <-answered:
+					// The first command makes its own connection.
+					said <- false
+					return
+				case <-attempt.Done():
+					said <- false
+					return
+				case <-time.After(200 * time.Microsecond):
+				}
+			}
+			said <- false
+		}()
 		return nil
 	}
 	defer func() {
-		if ahead != nil {
+		if dropAhead != nil {
+			dropAhead()
 			ahead.Close()
 		}
 	}()
-	if !o.claimWithBind {
-		if err := prepare(); err != nil {
-			return nil, err
-		}
-	}
 
 	var call *daemon.BindCall
 	for {
+		if err := prepare(); err != nil {
+			return nil, err
+		}
 		step = time.Now()
 		var sealed []byte
 		if first != nil {
@@ -809,7 +843,6 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		}
 		break
 	}
-	close(bindAnswered)
 	if err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
 	}
@@ -821,9 +854,10 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 			return nil, errors.New("the daemon did not say which TD the bind claimed")
 		}
 		rec.TD = td
-		if err := prepare(); err != nil {
-			return nil, err
-		}
+	}
+	// The TD's name is known, and its guest has answered.
+	if bindAnswered != nil {
+		close(bindAnswered)
 	}
 
 	answered := time.Now()
@@ -894,7 +928,9 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		if ahead != nil {
 			// The connection made while the quote was awaited carried
 			// nothing of this side's, and is held to the quote before the
-			// command goes over it.
+			// command goes over it. One still in the making is waited for:
+			// it is there sooner than another would be.
+			rec.ReachedAhead = <-reached
 			if err := ahead.Confirmed(first.att, first.leaf); err != nil {
 				return nil, err
 			}
