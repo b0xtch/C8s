@@ -95,6 +95,9 @@ func (d *Daemon) ask(t *td, request *asked, address string) {
 		ctx, cancel := context.WithTimeout(t.ctx, evidenceTimeout)
 		request.evidence, request.err = t.guests.evidence(ctx, address)
 		cancel()
+		if request.err != nil && t.ctx.Err() == nil {
+			d.log.Warn("a guest gave no evidence", "td", t.rec.ID, "error", request.err)
+		}
 		d.mu.Lock()
 		t.asking, t.asksNext = t.asksNext, nil
 		next := t.asking

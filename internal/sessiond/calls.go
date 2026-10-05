@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"sync"
 	"time"
@@ -422,6 +423,15 @@ func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 				return status.Error(codes.Unavailable, "the guest's answer to the sealed message was lost: send the same request again")
 			}
 			// A guest that sends no quote here serves it with its state.
+			// A caller that left is no news either.
+			if !errors.Is(err, io.EOF) && ctx.Err() == nil {
+				// A bind that claimed its TD names it in its answer.
+				td := req.GetTd()
+				if td == "" {
+					td = answer.GetTd()
+				}
+				d.log.Warn("what followed a bind's answer was cut short", "td", td, "error", err)
+			}
 			break
 		}
 		following := &sessionv1alpha1.Bound{Evidence: next.evidence}
