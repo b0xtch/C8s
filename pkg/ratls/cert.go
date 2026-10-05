@@ -24,6 +24,11 @@ type CertOptions struct {
 	TTL time.Duration
 	// DNSNames for the certificate's SAN extension.
 	DNSNames []string
+	// Extensions are further extensions the certificate carries beside the
+	// attestation. The attestation covers one only if its issuer put it into
+	// the report data: a reader holds it to that, never to the certificate's
+	// own signature.
+	Extensions []pkix.Extension
 }
 
 func (o *CertOptions) ttl() time.Duration {
@@ -77,7 +82,7 @@ func CreateAttestedCert(key *ecdsa.PrivateKey, att *Attestation, opts *CertOptio
 	if err != nil {
 		return nil, err
 	}
-	extensions := []pkix.Extension{ext}
+	extensions := append([]pkix.Extension{ext}, opts.Extensions...)
 
 	serialNumber, err := certutil.GenerateSerial()
 	if err != nil {

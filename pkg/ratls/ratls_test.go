@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -128,6 +130,23 @@ func TestCreateAttestedCert(t *testing.T) {
 	if len(cert.DNSNames) != 1 || cert.DNSNames[0] != "test.local" {
 		t.Errorf("DNSNames = %v, want [test.local]", cert.DNSNames)
 	}
+}
+
+// A certificate carries the further extensions its issuer asks for, beside
+// the attestation.
+func TestCreateAttestedCertExtensions(t *testing.T) {
+	id := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 66378, 1, 99}
+	_, _, cert := testAttestedCert(t, &CertOptions{Extensions: []pkix.Extension{{Id: id, Value: []byte("beside")}}})
+	requireRATLSExtension(t, cert)
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(id) {
+			if string(ext.Value) != "beside" || ext.Critical {
+				t.Fatalf("the extension came back as %q, critical %v", ext.Value, ext.Critical)
+			}
+			return
+		}
+	}
+	t.Fatal("the certificate carries no such extension")
 }
 
 func TestCreateAttestedCertDefaultOpts(t *testing.T) {
