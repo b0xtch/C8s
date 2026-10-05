@@ -106,7 +106,7 @@ func newSimulatedAuthorityCmd() *cobra.Command {
 	var out string
 	cmd := &cobra.Command{
 		Use:   "new",
-		Short: "Make a simulated authority and one platform under it",
+		Short: "Make a simulated authority, one platform under it and that platform's quoting enclave",
 		Args:  cobra.NoArgs, SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			dir, err := simtee.NewDirectory(out, time.Now())

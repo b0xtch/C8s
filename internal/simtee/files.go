@@ -2,8 +2,10 @@ package simtee
 
 import (
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha512"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -15,14 +17,17 @@ import (
 )
 
 // The files of a simulated authority's directory. Each certificate is PEM,
-// and each key the PEM of its SEC 1 encoding beside it.
+// and each key the PEM of its SEC 1 encoding beside it. The platform's
+// quoting enclave is its key, and the platform's signature over its report
+// in base64 beside it.
 const (
 	rootFile       = "root"
 	platformCAFile = "platform-ca"
 	signerFile     = "signer"
 	platformFile   = "platform"
+	enclaveFile    = "quoting-enclave"
 
-	certSuffix, keySuffix = ".pem", ".key"
+	certSuffix, keySuffix, signatureSuffix = ".pem", ".key", ".sig"
 
 	// VendorFile holds the address, host:port, at which the directory's
 	// documents are served: see Handler. Whoever serves them writes it.
@@ -33,12 +38,14 @@ const (
 )
 
 // Directory is a simulated authority as its directory holds it: the
-// authority, and the one platform it certified, which every guest launched
-// from the directory quotes under, as the guests of a host quote under their
-// host's.
+// authority, the one platform it certified, and that platform's quoting
+// enclave. Every guest launched from the directory signs its quotes with
+// that enclave's key, as every TD of a host is quoted by its host's one
+// enclave, so a verifier finds one platform in all of them.
 type Directory struct {
 	Authority *Authority
 	Platform  *Platform
+	Quoter    *Quoter
 }
 
 // NewDirectory makes a development authority and one platform under it, and
@@ -53,6 +60,10 @@ func NewDirectory(dir string, now time.Time) (*Directory, error) {
 		return nil, err
 	}
 	platform, err := authority.NewPlatform(now)
+	if err != nil {
+		return nil, err
+	}
+	quoter, err := platform.NewQuoter()
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +86,19 @@ func NewDirectory(dir string, now time.Time) (*Directory, error) {
 			}
 		}
 	}
-	return &Directory{Authority: authority, Platform: platform}, nil
+	attestation, err := x509.MarshalECPrivateKey(quoter.key)
+	if err != nil {
+		return nil, err
+	}
+	for path, data := range map[string][]byte{
+		filepath.Join(dir, enclaveFile+keySuffix):       pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: attestation}),
+		filepath.Join(dir, enclaveFile+signatureSuffix): []byte(base64.StdEncoding.EncodeToString(quoter.signature) + "\n"),
+	} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return nil, err
+		}
+	}
+	return &Directory{Authority: authority, Platform: platform, Quoter: quoter}, nil
 }
 
 func readBounded(path string) ([]byte, error) {
@@ -133,7 +156,45 @@ func loadIssuer(dir, name string) (issuer, error) {
 	return issuer{Cert: cert, Key: key}, nil
 }
 
-// LoadDirectory reads the authority and the platform NewDirectory wrote.
+// attestationKey reads a quoting enclave's key: PEM, on the curve the
+// vendor's enclave signs on.
+func attestationKey(data []byte) (*ecdsa.PrivateKey, error) {
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "EC PRIVATE KEY" {
+		return nil, errors.New("no attestation key")
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("the attestation key: %w", err)
+	}
+	if key.Curve != elliptic.P256() {
+		return nil, errors.New("the attestation key is on another curve than the vendor's")
+	}
+	return key, nil
+}
+
+// loadQuoter reads the quoting enclave NewDirectory made for platform.
+func loadQuoter(dir string, platform *Platform) (*Quoter, error) {
+	data, err := readBounded(filepath.Join(dir, enclaveFile+keySuffix))
+	if err != nil {
+		return nil, err
+	}
+	key, err := attestationKey(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s%s: %w", enclaveFile, keySuffix, err)
+	}
+	if data, err = readBounded(filepath.Join(dir, enclaveFile+signatureSuffix)); err != nil {
+		return nil, err
+	}
+	signature, err := base64.StdEncoding.DecodeString(string(trimSpace(data)))
+	if err != nil {
+		return nil, fmt.Errorf("%s%s is no base64", enclaveFile, signatureSuffix)
+	}
+	return platform.quoter(key, signature)
+}
+
+// LoadDirectory reads the authority, the platform and the platform's
+// quoting enclave NewDirectory wrote.
 func LoadDirectory(dir string) (*Directory, error) {
 	authority, platform := &Authority{}, &Platform{}
 	var err error
@@ -145,7 +206,11 @@ func LoadDirectory(dir string) (*Directory, error) {
 		}
 	}
 	platform.Chain = chainPEM(platform.Cert, authority.PlatformCA.Cert, authority.Root.Cert)
-	return &Directory{Authority: authority, Platform: platform}, nil
+	quoter, err := loadQuoter(dir, platform)
+	if err != nil {
+		return nil, fmt.Errorf("simulated authority %s: %w", dir, err)
+	}
+	return &Directory{Authority: authority, Platform: platform, Quoter: quoter}, nil
 }
 
 // LoadRoot reads the root of the authority in dir, and nothing else of it:
@@ -196,7 +261,7 @@ const (
 // launcher hands the guest in place of a TDX module. Nothing measures a
 // simulated guest, and nothing inside a guest can measure its own first
 // memory, so the launcher says what the registers of the guest's image hold,
-// and hands over the key the platform's quotes are certified under.
+// and hands over the platform's quoting enclave, which on TDX the host keeps.
 type Hardware struct {
 	// MRTD and RTMR are the registers a TDX module and the guest's firmware
 	// would have filled by the time the guest's first program runs: the
@@ -204,10 +269,13 @@ type Hardware struct {
 	// kernel and what it booted. Hex, 48 bytes each.
 	MRTD string    `json:"mrtd"`
 	RTMR [3]string `json:"rtmr"`
-	// PlatformKey is the platform's key, PEM, and Chain its certificate, the
-	// platform CA's and the root's, PEM.
-	PlatformKey string `json:"platformKey"`
-	Chain       string `json:"chain"`
+	// AttestationKey is the key of the platform's quoting enclave, PEM: the
+	// same for every guest of the platform. Certification is the platform's
+	// signature over that enclave's report, base64, and Chain the platform's
+	// certificate, the platform CA's and the root's, PEM.
+	AttestationKey string `json:"attestationKey"`
+	Certification  string `json:"certification"`
+	Chain          string `json:"chain"`
 }
 
 // NewHardware is what a launcher hands a guest of the image whose registers
@@ -215,16 +283,17 @@ type Hardware struct {
 // class's shape, in any words. RTMR[0] is the digest of those words, so that
 // two shapes are two machines, as on TDX.
 func (d *Directory) NewHardware(mrtd, rtmr1, rtmr2 [48]byte, machine string) (*Hardware, error) {
-	key, err := x509.MarshalECPrivateKey(d.Platform.Key)
+	key, err := x509.MarshalECPrivateKey(d.Quoter.key)
 	if err != nil {
 		return nil, err
 	}
 	rtmr0 := sha512.Sum384([]byte("c8s simulated TEE: machine\x00" + machine))
 	return &Hardware{
-		MRTD:        hex.EncodeToString(mrtd[:]),
-		RTMR:        [3]string{hex.EncodeToString(rtmr0[:]), hex.EncodeToString(rtmr1[:]), hex.EncodeToString(rtmr2[:])},
-		PlatformKey: string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: key})),
-		Chain:       string(d.Platform.Chain),
+		MRTD:           hex.EncodeToString(mrtd[:]),
+		RTMR:           [3]string{hex.EncodeToString(rtmr0[:]), hex.EncodeToString(rtmr1[:]), hex.EncodeToString(rtmr2[:])},
+		AttestationKey: string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: key})),
+		Certification:  base64.StdEncoding.EncodeToString(d.Quoter.signature),
+		Chain:          string(d.Platform.Chain),
 	}, nil
 }
 
@@ -266,8 +335,8 @@ func (h *Hardware) registers() (mrtd [48]byte, rtmr [3][48]byte, err error) {
 }
 
 // Machine is a simulated guest's hardware as the guest runs on it: the
-// registers its host said its image fills, a quoting enclave of its own, and
-// the authority its platform's quotes chain to.
+// registers its host said its image fills, its platform's quoting enclave,
+// and the authority its platform's quotes chain to.
 type Machine struct {
 	MRTD [48]byte
 	RTMR [3][48]byte
@@ -278,8 +347,8 @@ type Machine struct {
 }
 
 // Boot is what a guest does with the hardware its launcher handed it: it
-// reads the registers, and makes the attestation key of this boot, which the
-// platform's key certifies.
+// reads the registers, and takes up its platform's quoting enclave, which
+// the platform's key certified once, for every guest.
 func (h *Hardware) Boot() (*Machine, error) {
 	mrtd, rtmr, err := h.registers()
 	if err != nil {
@@ -303,21 +372,19 @@ func (h *Hardware) Boot() (*Machine, error) {
 	if err := Marked(chain...); err != nil {
 		return nil, fmt.Errorf("simulated hardware: %w", err)
 	}
-	block, _ := pem.Decode([]byte(h.PlatformKey))
-	if block == nil {
-		return nil, errors.New("simulated hardware: it holds no platform key")
-	}
-	key, err := x509.ParseECPrivateKey(block.Bytes)
+	key, err := attestationKey([]byte(h.AttestationKey))
 	if err != nil {
 		return nil, fmt.Errorf("simulated hardware: %w", err)
 	}
-	if public, ok := chain[0].PublicKey.(*ecdsa.PublicKey); !ok || !public.Equal(&key.PublicKey) {
-		return nil, errors.New("simulated hardware: its key is not its platform certificate's")
-	}
-	platform := &Platform{issuer: issuer{Cert: chain[0], Key: key}, Chain: []byte(h.Chain)}
-	quoter, err := platform.NewQuoter()
+	signature, err := base64.StdEncoding.DecodeString(h.Certification)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("simulated hardware: its quoting enclave's certification is no base64")
+	}
+	// The platform as a guest holds it: its certificates, and no key of it.
+	platform := &Platform{issuer: issuer{Cert: chain[0]}, Chain: []byte(h.Chain)}
+	quoter, err := platform.quoter(key, signature)
+	if err != nil {
+		return nil, fmt.Errorf("simulated hardware: %w", err)
 	}
 	return &Machine{MRTD: mrtd, RTMR: rtmr, Root: chain[2], quoter: quoter}, nil
 }

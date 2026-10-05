@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -289,5 +290,80 @@ func TestSimulatedPlatformThatFallsBehind(t *testing.T) {
 	s.vendor.SetEvaluation(minTCBEvaluation - 1)
 	if res, err := s.engine().VerifyEvidence(context.Background(), s.evidence(t, simulatedReportData), simulatedReportData); !isOutage(err) || res != nil {
 		t.Fatalf("documents of an evaluation the vendor no longer gives out: %+v, %v", res, err)
+	}
+}
+
+// The guests of one simulated platform are one platform to a verifier, as
+// the TDs of one host are: the checks that depend on the platform and the
+// vendor's documents run for the first guest and stand for the next, however
+// each guest came by its hardware. What the second baseline of
+// docs/session-performance.md measures rests on this: a simulated guest
+// that was a platform of its own would have every verifier do for each
+// guest what a TD's verifier does once a minute for a whole host.
+func TestGuestsOfOneSimulatedPlatformShareItsChecks(t *testing.T) {
+	s := newSimulated(t)
+	path := filepath.Join(t.TempDir(), "authority")
+	made, err := simtee.NewDirectory(path, s.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.authority, s.vendor = made.Authority, simtee.NewVendor(made.Authority, func() time.Time { return s.now })
+	s.roots = x509.NewCertPool()
+	s.roots.AddCert(made.Authority.Root.Cert)
+	guest := func(d *simtee.Directory, shape string) teetypes.AttestationEvidence {
+		t.Helper()
+		var register [48]byte
+		hardware, err := d.NewHardware(register, register, register, shape)
+		if err != nil {
+			t.Fatal(err)
+		}
+		machine, err := hardware.Boot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var bound [64]byte
+		copy(bound[:], simulatedReportData)
+		quote, err := machine.Quote(register, bound)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := json.Marshal(map[string]string{"quote": base64.StdEncoding.EncodeToString(quote)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return teetypes.AttestationEvidence{Platform: teetypes.PlatformTDX, Evidence: body}
+	}
+	bound := make([]byte, 64)
+	copy(bound, simulatedReportData)
+	engine := s.engine()
+	ctx := context.Background()
+	if _, err := engine.VerifyEvidence(ctx, guest(made, "4 vCPUs, 16 GiB"), bound); err != nil {
+		t.Fatal(err)
+	}
+	if hits := engine.chains.hits.Load(); hits != 0 {
+		t.Fatalf("a platform's first guest rested on a memo (%d)", hits)
+	}
+	// A second guest, of another shape, whose launcher read the directory
+	// for itself.
+	loaded, err := simtee.LoadDirectory(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.VerifyEvidence(ctx, guest(loaded, "2 vCPUs, 4 GiB"), bound); err != nil {
+		t.Fatal(err)
+	}
+	if hits := engine.chains.hits.Load(); hits != 1 {
+		t.Fatalf("the platform's second guest had its platform checked anew: %d memo hits, want 1", hits)
+	}
+	// An enclave that started anew on the platform has a key of its own, and
+	// is checked for itself.
+	if s.quoter, err = made.Platform.NewQuoter(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.VerifyEvidence(ctx, s.evidence(t, simulatedReportData), simulatedReportData); err != nil {
+		t.Fatal(err)
+	}
+	if hits := engine.chains.hits.Load(); hits != 1 {
+		t.Fatalf("another quoting enclave rested on the first one's checks: %d memo hits", hits)
 	}
 }

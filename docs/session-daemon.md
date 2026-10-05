@@ -535,7 +535,8 @@ the hardware and the vendor's quoting add.
   +------ TD ------------------+        +------ plain VM ----------------+
   | init: extend RTMR[3]       |        | init: /run/c8s-simtee/rtmr3    |
   | agent: TDREPORT, quote     |        | agent: quote signed in guest   |
-  |        from host's QE      |        |        under the handed key    |
+  |        from host's QE      |        |        with the platform's QE  |
+  |                            |        |        key, which it is handed |
   +----------------------------+        +--------------------------------+
       verifier: Intel's root                verifier: simulated root,
       and Intel's documents                 in place of Intel's, and
@@ -547,15 +548,21 @@ the hardware and the vendor's quoting add.
 | MRTD, RTMR[1], RTMR[2] | measured by the TDX module and the firmware | declared by the guest's launcher from the image's `manifest.json`, after it held the firmware and the disk it hands the VMM to the digests the manifest names |
 | RTMR[0] | the firmware's measurement of the machine | the digest of the launcher's description of the machine: vCPUs, memory and its split, and which devices |
 | RTMR[3] | extended through the guest's kernel | a file in the guest's memory, made by the init with the launch key's digest and extended by the agent |
-| A quote | signed by the host's quoting enclave | the same format, signed in the guest under a platform key its launcher handed it |
+| A quote | signed by the host's quoting enclave | the same format, signed in the guest with the key of the simulated platform's one quoting enclave, which each guest's launcher hands it with the platform's certification of that key |
 | The vendor's documents | Intel's service | `c8s session simtee vendor`: the same four documents, signed under the simulated authority; the platform is always UpToDate and nothing is revoked |
 | The root evidence is held to | Intel's | the simulated authority's, in its place and never beside it |
 
 The authority is a directory. Whoever reads it makes any quote and any
-document.
+document. It holds one platform, and that platform's quoting enclave: one
+attestation key for every guest launched from the directory, as every TD of
+a host is quoted by its host's one enclave. A verifier knows a platform by
+that key and its certification, and keeps the outcome of the checks that
+depend only on the platform and the vendor's documents. So it does for the
+guests of one simulated authority what it does for the TDs of one host: the
+checks once, and then each guest's own quote.
 
 ```sh
-c8s session simtee new --out /var/lib/c8s/simtee        # the authority, and one platform under it
+c8s session simtee new --out /var/lib/c8s/simtee        # the authority, one platform under it, and its quoting enclave
 c8s session simtee vendor --dir /var/lib/c8s/simtee &   # serves its documents, and writes its address there
 C8S_SIMTEE=1 C8S_PLATFORM=tdx session-guest-image/build # -> c8s-session-simtee, with its own reference values
 ```

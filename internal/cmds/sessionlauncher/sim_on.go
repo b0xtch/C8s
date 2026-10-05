@@ -23,9 +23,9 @@ import (
 // second baseline of docs/session-performance.md. With --simulated-tee the
 // guest boots the image's firmware and disk with no TEE at all, and its
 // launcher stands where a TDX module would: it declares the registers the
-// image's manifest names, and hands the guest the key its quotes are
-// certified under. Such a guest is protected from nobody. Only a build made
-// with the c8s_simtee tag has this.
+// image's manifest names, and hands the guest its platform's quoting
+// enclave. Such a guest is protected from nobody. Only a build made with the
+// c8s_simtee tag has this.
 type simulation struct {
 	// Dir is the simulated authority's directory ('c8s session simtee new').
 	Dir string

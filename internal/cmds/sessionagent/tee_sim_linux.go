@@ -22,8 +22,8 @@ import (
 // This file is the guest's side of a TEE simulated in software, the second
 // baseline of docs/session-performance.md. Only a build made with the
 // c8s_simtee tag holds it, and it protects nothing: the registers are what
-// the guest's launcher declared, the platform's key came on the launch
-// volume, and RTMR[3] is a file in the guest's memory.
+// the guest's launcher declared, the key of the platform's quoting enclave
+// came on the launch volume, and RTMR[3] is a file in the guest's memory.
 
 // The image's own paths. A simulation build takes its hardware from where
 // its load step stages it, and its register from where its init made it.

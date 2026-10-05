@@ -1,12 +1,14 @@
 package simtee
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -45,7 +47,8 @@ func TestGuestOfADirectoryQuotesUnderItsRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !loaded.Authority.Root.Cert.Equal(made.Authority.Root.Cert) || !loaded.Platform.Key.Equal(made.Platform.Key) ||
-		string(loaded.Platform.Chain) != string(made.Platform.Chain) {
+		string(loaded.Platform.Chain) != string(made.Platform.Chain) ||
+		!loaded.Quoter.key.Equal(made.Quoter.key) || !bytes.Equal(loaded.Quoter.signature, made.Quoter.signature) {
 		t.Fatal("the directory does not read back as it was written")
 	}
 	root, err := LoadRoot(dir)
@@ -54,7 +57,7 @@ func TestGuestOfADirectoryQuotesUnderItsRoot(t *testing.T) {
 	}
 	// Every key file is its owner's alone.
 	entries, err := os.ReadDir(dir)
-	if err != nil || len(entries) != 8 {
+	if err != nil || len(entries) != 10 {
 		t.Fatalf("the directory holds %d files, %v", len(entries), err)
 	}
 	for _, entry := range entries {
@@ -162,6 +165,105 @@ func TestGuestOfADirectoryQuotesUnderItsRoot(t *testing.T) {
 	}
 }
 
+// certificationOf is what a quote carries after the signature over its
+// header and body: its attestation key and how that key is certified. A
+// verifier knows a platform by it.
+func certificationOf(t *testing.T, quote []byte) []byte {
+	t.Helper()
+	const header, body, length, signature = 48, 584, 4, 64
+	if len(quote) <= header+body+length+signature {
+		t.Fatalf("a quote of %d bytes", len(quote))
+	}
+	return quote[header+body+length+signature:]
+}
+
+// Every guest launched from one directory is a guest of one platform: its
+// quotes end in the certification every other guest's end in, whichever
+// launcher read the directory and whatever the guest's shape. So a verifier
+// that knows a platform by that certification finds one platform, as it
+// does in the TDs of one host. Another directory is another platform.
+func TestGuestsOfADirectoryAreOnePlatform(t *testing.T) {
+	now := time.Now()
+	dir := filepath.Join(t.TempDir(), "authority")
+	made, err := NewDirectory(dir, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elsewhere, err := NewDirectory(filepath.Join(t.TempDir(), "authority"), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var register, bound [48]byte
+	quoteOf := func(d *Directory, shape string, binds byte) []byte {
+		t.Helper()
+		hardware, err := d.NewHardware(register, register, register, shape)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := hardware.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		handed, err := ParseHardware(encoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		machine, err := handed.Boot()
+		if err != nil {
+			t.Fatal(err)
+		}
+		quote, err := machine.Quote(bound, [64]byte{binds})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return quote
+	}
+	first := quoteOf(made, "4 vCPUs, 16 GiB", 1)
+	var launchers []*Directory
+	for range 2 {
+		loaded, err := LoadDirectory(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		launchers = append(launchers, loaded)
+	}
+	for i, quote := range [][]byte{
+		quoteOf(made, "4 vCPUs, 16 GiB", 2), quoteOf(launchers[0], "4 vCPUs, 16 GiB", 3), quoteOf(launchers[1], "2 vCPUs, 4 GiB", 4),
+	} {
+		if bytes.Equal(quote, first) {
+			t.Fatalf("guest %d made the first guest's quote", i+2)
+		}
+		if !bytes.Equal(certificationOf(t, quote), certificationOf(t, first)) {
+			t.Errorf("guest %d of the directory is another platform to a verifier than the first", i+2)
+		}
+	}
+	if bytes.Equal(certificationOf(t, quoteOf(elsewhere, "4 vCPUs, 16 GiB", 1)), certificationOf(t, first)) {
+		t.Error("a guest of another directory is the same platform to a verifier")
+	}
+	// The key that certifies a platform's enclave stays with the directory:
+	// a guest is handed no part of it.
+	hardware, err := made.NewHardware(register, register, register, "a machine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := hardware.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, _ := pem.Decode([]byte(hardware.AttestationKey))
+	if block == nil {
+		t.Fatal("the hardware holds no attestation key")
+	}
+	handed, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One key, which has a line to begin it and a line to end it.
+	if handed.Equal(made.Platform.Key) || !handed.Equal(made.Quoter.key) || strings.Count(string(encoded), "PRIVATE KEY-----") != 2 {
+		t.Error("a guest's hardware holds another key than its quoting enclave's")
+	}
+}
+
 // The directory's server answers one question in one way.
 func TestSimulatedVendorIsAskedByADocumentsAddress(t *testing.T) {
 	authority, err := NewAuthority(time.Now())
@@ -253,6 +355,35 @@ func TestDirectoryOfAnotherAuthorityIsNotRead(t *testing.T) {
 		t.Fatal("a platform whose key is another's was read")
 	}
 
+	// The quoting enclave is the platform's own: a key the platform did not
+	// certify, a certification of another platform's, or none.
+	for _, file := range []string{enclaveFile + keySuffix, enclaveFile + signatureSuffix} {
+		dir = fresh()
+		other, err := os.ReadFile(filepath.Join(fresh(), file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, file), other, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDirectory(dir); err == nil {
+			t.Fatalf("a directory whose %s is another platform's was read", file)
+		}
+		if err := os.Remove(filepath.Join(dir, file)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadDirectory(dir); err == nil {
+			t.Fatalf("a directory with no %s was read", file)
+		}
+	}
+	dir = fresh()
+	if err := os.WriteFile(filepath.Join(dir, enclaveFile+signatureSuffix), []byte("no base64!\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadDirectory(dir); err == nil || !strings.Contains(err.Error(), "base64") {
+		t.Fatalf("a directory whose enclave's certification is no base64: %v", err)
+	}
+
 	dir = fresh()
 	if err := os.WriteFile(filepath.Join(dir, signerFile+certSuffix), []byte("no certificate"), 0o600); err != nil {
 		t.Fatal(err)
@@ -304,13 +435,29 @@ func TestGuestBootsOnWholeHardwareAlone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wide, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec1, err := x509.MarshalECPrivateKey(wide)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, bend := range map[string]func(*Hardware){
-		"a register that is too short":    func(h *Hardware) { h.MRTD = h.MRTD[:94] },
-		"a register that is no hex":       func(h *Hardware) { h.RTMR[1] = strings.Repeat("z", 96) },
-		"no platform key":                 func(h *Hardware) { h.PlatformKey = "" },
-		"another platform's key":          func(h *Hardware) { h.PlatformKey = foreign.PlatformKey },
-		"a chain of two":                  func(h *Hardware) { h.Chain = h.Chain[:strings.LastIndex(h.Chain, "-----BEGIN")] },
-		"a chain that is no certificates": func(h *Hardware) { h.Chain = "no chain" },
+		"a register that is too short":              func(h *Hardware) { h.MRTD = h.MRTD[:94] },
+		"a register that is no hex":                 func(h *Hardware) { h.RTMR[1] = strings.Repeat("z", 96) },
+		"no attestation key":                        func(h *Hardware) { h.AttestationKey = "" },
+		"an attestation key its platform never saw": func(h *Hardware) { h.AttestationKey = foreign.AttestationKey },
+		"an attestation key on another curve": func(h *Hardware) {
+			h.AttestationKey = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: sec1}))
+		},
+		"another platform's certification of its key": func(h *Hardware) { h.Certification = foreign.Certification },
+		"a certification that is no base64":           func(h *Hardware) { h.Certification = "no base64!" },
+		"a certification cut short":                   func(h *Hardware) { h.Certification = h.Certification[:len(h.Certification)-4] },
+		"no certification":                            func(h *Hardware) { h.Certification = "" },
+		"another platform's chain":                    func(h *Hardware) { h.Chain = foreign.Chain },
+		"a chain of two":                              func(h *Hardware) { h.Chain = h.Chain[:strings.LastIndex(h.Chain, "-----BEGIN")] },
+		"a chain that is no certificates":             func(h *Hardware) { h.Chain = "no chain" },
 	} {
 		h := whole()
 		bend(h)
@@ -349,10 +496,6 @@ func TestGuestBootsUnderNoUnmarkedCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	unmarked := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
-	sec1, err := x509.MarshalECPrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir, err := NewDirectory(filepath.Join(t.TempDir(), "authority"), now)
 	if err != nil {
 		t.Fatal(err)
@@ -362,10 +505,24 @@ func TestGuestBootsUnderNoUnmarkedCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The whole chain is the unmarked certificate, three times over, with
-	// its own key: everything else about it holds.
+	// The whole chain is the unmarked certificate, three times over, with a
+	// quoting enclave its key certified: everything else about it holds.
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
 	h.Chain = unmarked + unmarked + unmarked
-	h.PlatformKey = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: sec1}))
+	real := &Platform{issuer: issuer{Cert: certificate, Key: key}, Chain: []byte(h.Chain)}
+	enclave, err := real.NewQuoter()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sec1, err := x509.MarshalECPrivateKey(enclave.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.AttestationKey = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: sec1}))
+	h.Certification = base64.StdEncoding.EncodeToString(enclave.signature)
 	if _, err := h.Boot(); err == nil || !strings.Contains(err.Error(), "simulated") {
 		t.Fatalf("a guest booted under certificates that do not say they are simulated: %v", err)
 	}

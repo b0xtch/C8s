@@ -111,9 +111,9 @@ func TestSimulatedGuestIsTheSameMachineWithNoTEE(t *testing.T) {
 
 // The launcher of a simulated guest stands where the TDX module would: it
 // holds the two files it hands the VMM to the digests the manifest names,
-// declares that manifest's registers, and hands the guest a platform key
-// certified under the authority. The guest's quotes then verify under that
-// authority's root and carry those registers.
+// declares that manifest's registers, and hands the guest the quoting
+// enclave of the authority's platform. The guest's quotes then verify under
+// that authority's root and carry those registers.
 func TestRunDeclaresTheRegistersOfTheImageItBoots(t *testing.T) {
 	bsdtar, err := exec.LookPath("bsdtar")
 	if err != nil {

@@ -291,12 +291,16 @@ type Report struct {
 	ReportData [64]byte
 }
 
-// Quoter makes the quotes of one boot: an attestation key, and the quoting
+// Quoter is a platform's quoting enclave: an attestation key, and the
 // enclave's report that binds it, signed once under the platform's key.
+// Every quote it makes ends in the same certification, which is how a
+// verifier knows the quotes of one platform from another's.
 type Quoter struct {
 	key *ecdsa.PrivateKey
+	// signature is the platform's over the enclave's report.
+	signature []byte
 	// certification is everything of a quote that follows the signature
-	// over its header and body: the same for every quote of the boot.
+	// over its header and body: the same for every quote of the platform.
 	certification *pb.CertificationData
 	public        []byte
 }
@@ -317,21 +321,29 @@ func signRaw(key *ecdsa.PrivateKey, message []byte) ([]byte, error) {
 	return raw64(r, s), nil
 }
 
-// NewQuoter makes an attestation key and has the platform certify it, as a
-// quoting enclave does when it starts.
-func (p *Platform) NewQuoter() (*Quoter, error) {
-	key, err := newKey()
-	if err != nil {
-		return nil, err
+func verifyRaw(key *ecdsa.PublicKey, message, signature []byte) bool {
+	if len(signature) != 64 {
+		return false
 	}
-	public := raw64(key.X, key.Y)
-	// The enclave's report binds the attestation key and its own
-	// authenticated data, which the vendor's enclave fills with 32 bytes.
+	digest := sha256.Sum256(message)
+	return ecdsa.Verify(key, digest[:], new(big.Int).SetBytes(signature[:32]), new(big.Int).SetBytes(signature[32:]))
+}
+
+// enclaveAuth is a quoting enclave's authenticated data, which the vendor's
+// enclave fills with 32 bytes.
+func enclaveAuth() []byte {
 	auth := make([]byte, 32)
 	for i := range auth {
 		auth[i] = byte(i)
 	}
-	bound := sha256.Sum256(append(append([]byte{}, public...), auth...))
+	return auth
+}
+
+// enclaveReport is the report of a quoting enclave whose attestation key is
+// public: it binds the key and the enclave's authenticated data, and nothing
+// else in it varies.
+func enclaveReport(public []byte) (*pb.EnclaveReport, []byte, error) {
+	bound := sha256.Sum256(append(append([]byte{}, public...), enclaveAuth()...))
 	// What the enclave is, for whoever reads the quote: no enclave.
 	enclave := sha256.Sum256([]byte("c8s simulated TEE: no quoting enclave"))
 	report := &pb.EnclaveReport{
@@ -339,14 +351,45 @@ func (p *Platform) NewQuoter() (*Quoter, error) {
 		MrEnclave: enclave[:], Reserved2: make([]byte, 32), MrSigner: qeMrSigner[:], Reserved3: make([]byte, 96),
 		IsvProdId: qeProdID, IsvSvn: QESVN, Reserved4: make([]byte, 60), ReportData: append(bound[:], make([]byte, 32)...),
 	}
-	rawReport, err := abi.EnclaveReportToAbiBytes(report)
+	raw, err := abi.EnclaveReportToAbiBytes(report)
 	if err != nil {
-		return nil, fmt.Errorf("the quoting enclave's report: %w", err)
+		return nil, nil, fmt.Errorf("the quoting enclave's report: %w", err)
 	}
-	signature, err := signRaw(p.Key, rawReport)
+	return report, raw, nil
+}
+
+// NewQuoter makes an attestation key and has the platform certify it, as a
+// quoting enclave does when it starts.
+func (p *Platform) NewQuoter() (*Quoter, error) {
+	key, err := newKey()
 	if err != nil {
 		return nil, err
 	}
+	_, raw, err := enclaveReport(raw64(key.X, key.Y))
+	if err != nil {
+		return nil, err
+	}
+	signature, err := signRaw(p.Key, raw)
+	if err != nil {
+		return nil, err
+	}
+	return p.quoter(key, signature)
+}
+
+// quoter is the platform's quoting enclave as its key and the platform's
+// signature over its report make it: the enclave NewQuoter made, wherever
+// the two were kept since. A signature that is not this platform's over the
+// report of an enclave with this key makes none.
+func (p *Platform) quoter(key *ecdsa.PrivateKey, signature []byte) (*Quoter, error) {
+	public := raw64(key.X, key.Y)
+	report, raw, err := enclaveReport(public)
+	if err != nil {
+		return nil, err
+	}
+	if certified, ok := p.Cert.PublicKey.(*ecdsa.PublicKey); !ok || !verifyRaw(certified, raw, signature) {
+		return nil, errors.New("the quoting enclave's key is not certified by this platform")
+	}
+	auth := enclaveAuth()
 	chain := &pb.PCKCertificateChainData{CertificateDataType: 5, Size: uint32(len(p.Chain)), PckCertChain: p.Chain}
 	inner := &pb.QEReportCertificationData{
 		QeReport: report, QeReportSignature: signature,
@@ -356,9 +399,9 @@ func (p *Platform) NewQuoter() (*Quoter, error) {
 	// The enclave's report, its signature, the authenticated data behind a
 	// length of two bytes, and the chain behind a type of two and a length
 	// of four.
-	size := len(rawReport) + len(signature) + 2 + len(auth) + 2 + 4 + len(p.Chain)
+	size := len(raw) + len(signature) + 2 + len(auth) + 2 + 4 + len(p.Chain)
 	return &Quoter{
-		key: key, public: public,
+		key: key, public: public, signature: signature,
 		certification: &pb.CertificationData{CertificateDataType: 6, Size: uint32(size), QeReportCertificationData: inner},
 	}, nil
 }
