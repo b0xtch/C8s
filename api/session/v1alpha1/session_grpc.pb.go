@@ -32,6 +32,7 @@ const (
 	Sessions_Destroy_FullMethodName     = "/c8s.session.v1alpha1.Sessions/Destroy"
 	Sessions_GetEvidence_FullMethodName = "/c8s.session.v1alpha1.Sessions/GetEvidence"
 	Sessions_WatchReady_FullMethodName  = "/c8s.session.v1alpha1.Sessions/WatchReady"
+	Sessions_Watch_FullMethodName       = "/c8s.session.v1alpha1.Sessions/Watch"
 )
 
 // SessionsClient is the client API for Sessions service.
@@ -42,6 +43,14 @@ type SessionsClient interface {
 	// record. The guest is asked nothing: it learns of the claim from the bind.
 	Claim(ctx context.Context, in *ClaimRequest, opts ...grpc.CallOption) (*Claimed, error)
 	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
+	// A bind that names no TD claims one: the ready TD of the instance key the
+	// bind names, which no claim holds, for the bind's session and with no
+	// grace. An orchestrator may send such a bind, and a binder its pool names,
+	// under an authority the pool names for that binder. A TD that is claimed
+	// or gone by then is answered as not ready, before anything reaches a
+	// guest: FAILED_PRECONDITION with an ErrorInfo of reason TD_NOT_READY in
+	// the domain sessions.c8s. Its sender signs a bind for another TD.
+	//
 	// The guest raises its fence as the bind arrives: no connection opened to
 	// it before survives. The first message carries the bind, and may carry a
 	// message sealed for the guest: the session's first command, credentials
@@ -63,10 +72,16 @@ type SessionsClient interface {
 	GetEvidence(ctx context.Context, in *EvidenceRequest, opts ...grpc.CallOption) (*Evidence, error)
 	// WatchReady streams what each ready TD of a pool says of itself, as a
 	// claim of it would be answered: the TDs ready now, then each as it becomes
-	// ready or comes to serve another certificate. A binder judges them ahead
-	// of its claims. A stream shows how fast a pool refills, so it is open only
-	// to the binders the pool's configuration names.
-	WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Evidence], error)
+	// ready or comes to serve another certificate, and each that leaves ready.
+	// A binder judges them ahead of its claims, or signs a bind for one, which
+	// claims it. A stream shows how fast a pool refills, so it is open only to
+	// the binders the pool's configuration names.
+	WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReadyChange], error)
+	// Watch streams what becomes of the host's TDs to an orchestrator: each TD
+	// as it is now, then each as it changes. A TD that changed more than once
+	// between two messages is shown as it is, so every session a host serves
+	// is shown, also one that a binder's bind started with no claim.
+	Watch(ctx context.Context, in *WatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error)
 }
 
 type sessionsClient struct {
@@ -133,13 +148,13 @@ func (c *sessionsClient) GetEvidence(ctx context.Context, in *EvidenceRequest, o
 	return out, nil
 }
 
-func (c *sessionsClient) WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Evidence], error) {
+func (c *sessionsClient) WatchReady(ctx context.Context, in *WatchReadyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ReadyChange], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[2], Sessions_WatchReady_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[WatchReadyRequest, Evidence]{ClientStream: stream}
+	x := &grpc.GenericClientStream[WatchReadyRequest, ReadyChange]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -150,7 +165,26 @@ func (c *sessionsClient) WatchReady(ctx context.Context, in *WatchReadyRequest, 
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sessions_WatchReadyClient = grpc.ServerStreamingClient[Evidence]
+type Sessions_WatchReadyClient = grpc.ServerStreamingClient[ReadyChange]
+
+func (c *sessionsClient) Watch(ctx context.Context, in *WatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Event], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Sessions_ServiceDesc.Streams[3], Sessions_Watch_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchRequest, Event]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_WatchClient = grpc.ServerStreamingClient[Event]
 
 // SessionsServer is the server API for Sessions service.
 // All implementations must embed UnimplementedSessionsServer
@@ -160,6 +194,14 @@ type SessionsServer interface {
 	// record. The guest is asked nothing: it learns of the claim from the bind.
 	Claim(context.Context, *ClaimRequest) (*Claimed, error)
 	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
+	// A bind that names no TD claims one: the ready TD of the instance key the
+	// bind names, which no claim holds, for the bind's session and with no
+	// grace. An orchestrator may send such a bind, and a binder its pool names,
+	// under an authority the pool names for that binder. A TD that is claimed
+	// or gone by then is answered as not ready, before anything reaches a
+	// guest: FAILED_PRECONDITION with an ErrorInfo of reason TD_NOT_READY in
+	// the domain sessions.c8s. Its sender signs a bind for another TD.
+	//
 	// The guest raises its fence as the bind arrives: no connection opened to
 	// it before survives. The first message carries the bind, and may carry a
 	// message sealed for the guest: the session's first command, credentials
@@ -181,10 +223,16 @@ type SessionsServer interface {
 	GetEvidence(context.Context, *EvidenceRequest) (*Evidence, error)
 	// WatchReady streams what each ready TD of a pool says of itself, as a
 	// claim of it would be answered: the TDs ready now, then each as it becomes
-	// ready or comes to serve another certificate. A binder judges them ahead
-	// of its claims. A stream shows how fast a pool refills, so it is open only
-	// to the binders the pool's configuration names.
-	WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[Evidence]) error
+	// ready or comes to serve another certificate, and each that leaves ready.
+	// A binder judges them ahead of its claims, or signs a bind for one, which
+	// claims it. A stream shows how fast a pool refills, so it is open only to
+	// the binders the pool's configuration names.
+	WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[ReadyChange]) error
+	// Watch streams what becomes of the host's TDs to an orchestrator: each TD
+	// as it is now, then each as it changes. A TD that changed more than once
+	// between two messages is shown as it is, so every session a host serves
+	// is shown, also one that a binder's bind started with no claim.
+	Watch(*WatchRequest, grpc.ServerStreamingServer[Event]) error
 	mustEmbedUnimplementedSessionsServer()
 }
 
@@ -210,8 +258,11 @@ func (UnimplementedSessionsServer) Destroy(context.Context, *DestroyRequest) (*S
 func (UnimplementedSessionsServer) GetEvidence(context.Context, *EvidenceRequest) (*Evidence, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetEvidence not implemented")
 }
-func (UnimplementedSessionsServer) WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[Evidence]) error {
+func (UnimplementedSessionsServer) WatchReady(*WatchReadyRequest, grpc.ServerStreamingServer[ReadyChange]) error {
 	return status.Error(codes.Unimplemented, "method WatchReady not implemented")
+}
+func (UnimplementedSessionsServer) Watch(*WatchRequest, grpc.ServerStreamingServer[Event]) error {
+	return status.Error(codes.Unimplemented, "method Watch not implemented")
 }
 func (UnimplementedSessionsServer) mustEmbedUnimplementedSessionsServer() {}
 func (UnimplementedSessionsServer) testEmbeddedByValue()                  {}
@@ -307,11 +358,22 @@ func _Sessions_WatchReady_Handler(srv interface{}, stream grpc.ServerStream) err
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(SessionsServer).WatchReady(m, &grpc.GenericServerStream[WatchReadyRequest, Evidence]{ServerStream: stream})
+	return srv.(SessionsServer).WatchReady(m, &grpc.GenericServerStream[WatchReadyRequest, ReadyChange]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Sessions_WatchReadyServer = grpc.ServerStreamingServer[Evidence]
+type Sessions_WatchReadyServer = grpc.ServerStreamingServer[ReadyChange]
+
+func _Sessions_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(SessionsServer).Watch(m, &grpc.GenericServerStream[WatchRequest, Event]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Sessions_WatchServer = grpc.ServerStreamingServer[Event]
 
 // Sessions_ServiceDesc is the grpc.ServiceDesc for Sessions service.
 // It's only intended for direct use with grpc.RegisterService,
@@ -349,6 +411,11 @@ var Sessions_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "WatchReady",
 			Handler:       _Sessions_WatchReady_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "Watch",
+			Handler:       _Sessions_Watch_Handler,
 			ServerStreams: true,
 		},
 	},

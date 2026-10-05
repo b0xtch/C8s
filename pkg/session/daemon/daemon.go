@@ -11,6 +11,7 @@ package daemon
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -20,10 +21,12 @@ import (
 	"io"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
@@ -149,6 +152,11 @@ type BindCall struct {
 	// SealedTooLate. Empty for a bind that came with none. Only a sealed
 	// answer that opens says the guest acted on a message.
 	SealedStatus string
+	// TD and Host are the TD a bind that named none claimed, and its host,
+	// as the daemon says: the name connections to the session's guest are
+	// made by. Whether the guest at that name is the bind's is for the
+	// answer's evidence to show.
+	TD, Host string
 
 	stream sessionv1alpha1.Sessions_BindClient
 	cancel context.CancelFunc
@@ -191,6 +199,14 @@ func (c *Client) BindWith(ctx context.Context, requestID, td string, bind *sessi
 // StartBind sends the bind, with sealed if it is not nil, and returns
 // without waiting for the guest's answer: Await does that. In between, a
 // binder that now has its message sealed sends it with SendSealed.
+//
+// With no TD named the bind claims its own: the ready TD of the instance key
+// it names, which a binder that watches the pool has judged (WatchReady,
+// session.ReadyVerdicts). The daemon lets an orchestrator do that, and a
+// binder its pool names, under an authority the pool names for it. The call
+// then says which TD it claimed, and a TD that another claim or bind took
+// first, or that is gone, is answered with an error NotReady knows: the
+// binder signs for another TD it has judged.
 func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *session.SignedBind, sealed []byte) (*BindCall, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	stream, err := c.api.Bind(ctx)
@@ -244,6 +260,7 @@ func (b *BindCall) Await() error {
 		}
 	}
 	b.Answer, b.SealedStatus = out, answer.GetSealedStatus()
+	b.TD, b.Host = answer.GetTd(), answer.GetHost()
 	return nil
 }
 
@@ -302,24 +319,64 @@ func (c *Client) Evidence(ctx context.Context, td string) (*session.Relayed, err
 	return relayed(answer), nil
 }
 
-// WatchReady calls each with what each ready TD of pool says of itself, as a
-// claim of it would be answered: the TDs ready now, oldest first, then each
-// as it becomes ready or comes to serve another certificate. A binder judges
-// them ahead of its claims (session.ReadyVerdicts). It returns when ctx ends
-// or the stream breaks, with the reason: a caller that keeps watching calls
-// it again. The daemon answers it only for a caller the pool's configuration
-// names as a binder (BinderName).
-func (c *Client) WatchReady(ctx context.Context, pool string, each func(*session.Relayed)) error {
+// NotReady reports whether err is the daemon's answer to a bind that named
+// no TD and found no ready TD of the instance key it names: the TD was
+// claimed or bound by somebody else, or is gone. Nothing reached a guest.
+func NotReady(err error) bool {
+	for _, detail := range status.Convert(err).Details() {
+		if info, ok := detail.(*errdetails.ErrorInfo); ok && info.GetReason() == "TD_NOT_READY" && info.GetDomain() == "sessions.c8s" {
+			return true
+		}
+	}
+	return false
+}
+
+// WatchReady calls ready with what each ready TD of pool says of itself, as
+// a claim of it would be answered: the TDs ready now, oldest first, then
+// each as it becomes ready or comes to serve another certificate. It calls
+// left, when that is not nil, with the SHA-256 of the certificate a TD was
+// last shown under once the TD is ready no more. A binder judges the ready
+// TDs ahead of its claims, and forgets those that left
+// (session.ReadyVerdicts). It returns when ctx ends or the stream breaks,
+// with the reason: a caller that keeps watching calls it again, and is shown
+// the ready TDs anew. The daemon answers it only for a caller the pool's
+// configuration names as a binder (BinderName).
+func (c *Client) WatchReady(ctx context.Context, pool string, ready func(*session.Relayed), left func(certificate [sha256.Size]byte)) error {
 	stream, err := c.api.WatchReady(ctx, &sessionv1alpha1.WatchReadyRequest{Pool: pool})
 	if err != nil {
 		return err
 	}
 	for {
-		evidence, err := stream.Recv()
+		change, err := stream.Recv()
 		if err != nil {
 			return err
 		}
-		each(relayed(evidence))
+		if evidence := change.GetReady(); evidence != nil {
+			ready(relayed(evidence))
+		}
+		if gone := change.GetLeft(); len(gone) == sha256.Size && left != nil {
+			left([sha256.Size]byte(gone))
+		}
+	}
+}
+
+// Watch calls each with every TD of the daemon's host as it is now, oldest
+// first, and then with each as it changes: its pool, its state, the session
+// it serves and, for one a binder's bind claimed, that binder's key. It is
+// an orchestrator's call, and how it learns of a session that a binder
+// started with no claim. It returns when ctx ends or the stream breaks, with
+// the reason.
+func (c *Client) Watch(ctx context.Context, each func(*sessionv1alpha1.Event)) error {
+	stream, err := c.api.Watch(ctx, &sessionv1alpha1.WatchRequest{})
+	if err != nil {
+		return err
+	}
+	for {
+		event, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		each(event)
 	}
 }
 

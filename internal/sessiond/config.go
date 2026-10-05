@@ -31,13 +31,73 @@ const (
 	DefaultBootTimeout = 5 * time.Minute
 	// maxConfigBytes bounds the daemon's configuration file.
 	maxConfigBytes = 1 << 20
-	// maxBinders bounds the callers a pool's configuration lets watch it.
-	maxBinders = 64
+	// maxBinders bounds the callers a pool's configuration lets watch it,
+	// and maxAuthorities the authorities it names for one of them.
+	maxBinders     = 64
+	maxAuthorities = 64
 )
 
-// binderRE is a binder as a pool's configuration names it: the digest of
-// the public key in its certificate.
+// binderRE is a binder as a pool's configuration names it, and an authority
+// it names for one: the digest of a public key.
 var binderRE = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+
+// Binder is a caller a pool names by the key of its certificate. It may
+// watch the pool's ready TDs, and claim one with a bind under an authority
+// the pool names for it.
+type Binder struct {
+	// Key is the SHA-256 of the public key in the binder's certificate, as
+	// sha256:<64 hex>.
+	Key string `yaml:"key"`
+	// Authorities are the owners' authorities whose binds the binder may
+	// send to a ready TD of the pool that no claim holds, each as the
+	// SHA-256 of its public key. With none the binder watches the pool and
+	// claims nothing: an outsider, or one tenant's binder signing under
+	// another authority, starts no session on the pool's TDs.
+	Authorities []string `yaml:"authorities,omitempty"`
+}
+
+// UnmarshalYAML takes a binder as its key alone, which names one that only
+// watches, or as a mapping with the authorities it may bind under.
+func (b *Binder) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind == yaml.ScalarNode {
+		return node.Decode(&b.Key)
+	}
+	if node.Kind != yaml.MappingNode {
+		return errors.New("a binder is the digest of its key, or a mapping with key and authorities")
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		switch name := node.Content[i].Value; name {
+		case "key":
+			if err := node.Content[i+1].Decode(&b.Key); err != nil {
+				return err
+			}
+		case "authorities":
+			if err := node.Content[i+1].Decode(&b.Authorities); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("a binder has no field %q", name)
+		}
+	}
+	return nil
+}
+
+// binder returns the pool's entry for the caller of this key, or nil.
+func (p *Pool) binder(key string) *Binder {
+	for i := range p.Binders {
+		if p.Binders[i].Key == key {
+			return &p.Binders[i]
+		}
+	}
+	return nil
+}
+
+// binds reports whether the pool lets the caller of this key claim a TD
+// with a bind under this authority.
+func (p *Pool) binds(key, authority string) bool {
+	b := p.binder(key)
+	return b != nil && slices.Contains(b.Authorities, authority)
+}
 
 // Networks a TD's guest can be given.
 const (
@@ -142,10 +202,11 @@ type Pool struct {
 	ImageStore string `yaml:"imageStore,omitempty"`
 	// Binders are the callers that may watch the pool's ready TDs
 	// (WatchReady), each named by the SHA-256 of the public key in its
-	// certificate, as sha256:<64 hex>. A stream shows how fast the pool
-	// refills, which is every tenant's starts together, so it is open to
-	// nobody else: with none named, to nobody.
-	Binders []string `yaml:"binders,omitempty"`
+	// certificate. A stream shows how fast the pool refills, which is every
+	// tenant's starts together, so it is open to nobody else: with none
+	// named, to nobody. A binder may also claim a ready TD with a bind, under
+	// the authorities the pool names for it.
+	Binders []Binder `yaml:"binders,omitempty"`
 
 	// From the launch document.
 	name     string
@@ -358,11 +419,22 @@ func (p *Pool) load() error {
 		return fmt.Errorf("binders: at most %d may watch a pool", maxBinders)
 	}
 	for i, binder := range p.Binders {
-		if !binderRE.MatchString(binder) {
-			return fmt.Errorf("binders: %q is not the digest of a certificate's public key, sha256:<64 lowercase hex>", binder)
+		if !binderRE.MatchString(binder.Key) {
+			return fmt.Errorf("binders: %q is not the digest of a certificate's public key, sha256:<64 lowercase hex>", binder.Key)
 		}
-		if slices.Contains(p.Binders[:i], binder) {
-			return fmt.Errorf("binders: %s is named twice", binder)
+		if p.binder(binder.Key) != &p.Binders[i] {
+			return fmt.Errorf("binders: %s is named twice", binder.Key)
+		}
+		if len(binder.Authorities) > maxAuthorities {
+			return fmt.Errorf("binders: at most %d authorities are named for one binder", maxAuthorities)
+		}
+		for j, authority := range binder.Authorities {
+			if !binderRE.MatchString(authority) {
+				return fmt.Errorf("binders: authority %q of %s is not the digest of a public key, sha256:<64 lowercase hex>", authority, binder.Key)
+			}
+			if slices.Contains(binder.Authorities[:j], authority) {
+				return fmt.Errorf("binders: authority %s is named twice for %s", authority, binder.Key)
+			}
 		}
 	}
 	pub, err := session.ReadBounded(filepath.Join(p.LaunchDir, session.PubkeyFile), 8192)

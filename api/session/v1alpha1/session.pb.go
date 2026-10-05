@@ -83,6 +83,68 @@ func (SessionState) EnumDescriptor() ([]byte, []int) {
 	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{0}
 }
 
+type TDState int32
+
+const (
+	TDState_TD_STATE_UNSPECIFIED TDState = 0
+	TDState_TD_STATE_BOOTING     TDState = 1
+	TDState_TD_STATE_READY       TDState = 2
+	TDState_TD_STATE_CLAIMED     TDState = 3
+	// Sent a bind whose answer is not known yet.
+	TDState_TD_STATE_BOUND   TDState = 4
+	TDState_TD_STATE_RUNNING TDState = 5
+	TDState_TD_STATE_ENDED   TDState = 6
+)
+
+// Enum value maps for TDState.
+var (
+	TDState_name = map[int32]string{
+		0: "TD_STATE_UNSPECIFIED",
+		1: "TD_STATE_BOOTING",
+		2: "TD_STATE_READY",
+		3: "TD_STATE_CLAIMED",
+		4: "TD_STATE_BOUND",
+		5: "TD_STATE_RUNNING",
+		6: "TD_STATE_ENDED",
+	}
+	TDState_value = map[string]int32{
+		"TD_STATE_UNSPECIFIED": 0,
+		"TD_STATE_BOOTING":     1,
+		"TD_STATE_READY":       2,
+		"TD_STATE_CLAIMED":     3,
+		"TD_STATE_BOUND":       4,
+		"TD_STATE_RUNNING":     5,
+		"TD_STATE_ENDED":       6,
+	}
+)
+
+func (x TDState) Enum() *TDState {
+	p := new(TDState)
+	*p = x
+	return p
+}
+
+func (x TDState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (TDState) Descriptor() protoreflect.EnumDescriptor {
+	return file_session_v1alpha1_session_proto_enumTypes[1].Descriptor()
+}
+
+func (TDState) Type() protoreflect.EnumType {
+	return &file_session_v1alpha1_session_proto_enumTypes[1]
+}
+
+func (x TDState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use TDState.Descriptor instead.
+func (TDState) EnumDescriptor() ([]byte, []int) {
+	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{1}
+}
+
 type ClaimRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// A repeat with the same id returns the first answer and changes nothing.
@@ -226,7 +288,8 @@ func (x *Claimed) GetBindBy() *timestamppb.Timestamp {
 type BindRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	RequestId string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Td        string                 `protobuf:"bytes,2,opt,name=td,proto3" json:"td,omitempty"`
+	// The claimed TD the bind is for. Empty in a bind that claims its TD.
+	Td string `protobuf:"bytes,2,opt,name=td,proto3" json:"td,omitempty"`
 	// c8s-bind/v1, canonical JSON, and its signature.
 	Bind      []byte `protobuf:"bytes,3,opt,name=bind,proto3" json:"bind,omitempty"`
 	Signature []byte `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
@@ -320,7 +383,10 @@ type Bound struct {
 	// guest says. With the receipt for a message that came with the bind, and
 	// in a message of its own for one that came after. An answer follows only
 	// what was taken, and a binder relies on that answer alone.
-	SealedStatus  string `protobuf:"bytes,4,opt,name=sealed_status,json=sealedStatus,proto3" json:"sealed_status,omitempty"`
+	SealedStatus string `protobuf:"bytes,4,opt,name=sealed_status,json=sealedStatus,proto3" json:"sealed_status,omitempty"`
+	// With the receipt of a bind that claimed its TD: the TD, and its host.
+	Td            string `protobuf:"bytes,5,opt,name=td,proto3" json:"td,omitempty"`
+	Host          string `protobuf:"bytes,6,opt,name=host,proto3" json:"host,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -379,6 +445,20 @@ func (x *Bound) GetSealedAnswer() []byte {
 func (x *Bound) GetSealedStatus() string {
 	if x != nil {
 		return x.SealedStatus
+	}
+	return ""
+}
+
+func (x *Bound) GetTd() string {
+	if x != nil {
+		return x.Td
+	}
+	return ""
+}
+
+func (x *Bound) GetHost() string {
+	if x != nil {
+		return x.Host
 	}
 	return ""
 }
@@ -800,6 +880,235 @@ func (x *WatchReadyRequest) GetPool() string {
 	return ""
 }
 
+// ReadyChange is one change to a pool's ready TDs.
+type ReadyChange struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Change:
+	//
+	//	*ReadyChange_Ready
+	//	*ReadyChange_Left
+	Change        isReadyChange_Change `protobuf_oneof:"change"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReadyChange) Reset() {
+	*x = ReadyChange{}
+	mi := &file_session_v1alpha1_session_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReadyChange) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReadyChange) ProtoMessage() {}
+
+func (x *ReadyChange) ProtoReflect() protoreflect.Message {
+	mi := &file_session_v1alpha1_session_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReadyChange.ProtoReflect.Descriptor instead.
+func (*ReadyChange) Descriptor() ([]byte, []int) {
+	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ReadyChange) GetChange() isReadyChange_Change {
+	if x != nil {
+		return x.Change
+	}
+	return nil
+}
+
+func (x *ReadyChange) GetReady() *Evidence {
+	if x != nil {
+		if x, ok := x.Change.(*ReadyChange_Ready); ok {
+			return x.Ready
+		}
+	}
+	return nil
+}
+
+func (x *ReadyChange) GetLeft() []byte {
+	if x != nil {
+		if x, ok := x.Change.(*ReadyChange_Left); ok {
+			return x.Left
+		}
+	}
+	return nil
+}
+
+type isReadyChange_Change interface {
+	isReadyChange_Change()
+}
+
+type ReadyChange_Ready struct {
+	// A TD that is ready, as a claim of it would be answered.
+	Ready *Evidence `protobuf:"bytes,1,opt,name=ready,proto3,oneof"`
+}
+
+type ReadyChange_Left struct {
+	// A TD that left ready, claimed, bound or ended, or that came to serve
+	// another certificate. It is named by the SHA-256 of the certificate it
+	// was last shown under, which is how a binder keeps its verdict on it.
+	Left []byte `protobuf:"bytes,2,opt,name=left,proto3,oneof"`
+}
+
+func (*ReadyChange_Ready) isReadyChange_Change() {}
+
+func (*ReadyChange_Left) isReadyChange_Change() {}
+
+type WatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchRequest) Reset() {
+	*x = WatchRequest{}
+	mi := &file_session_v1alpha1_session_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchRequest) ProtoMessage() {}
+
+func (x *WatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_session_v1alpha1_session_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchRequest.ProtoReflect.Descriptor instead.
+func (*WatchRequest) Descriptor() ([]byte, []int) {
+	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{11}
+}
+
+// Event is a TD as it is: when a watch begins, and after each change.
+type Event struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Td    string                 `protobuf:"bytes,1,opt,name=td,proto3" json:"td,omitempty"`
+	Pool  string                 `protobuf:"bytes,2,opt,name=pool,proto3" json:"pool,omitempty"`
+	Host  string                 `protobuf:"bytes,3,opt,name=host,proto3" json:"host,omitempty"`
+	State TDState                `protobuf:"varint,4,opt,name=state,proto3,enum=c8s.session.v1alpha1.TDState" json:"state,omitempty"`
+	// The session the TD serves or served, once it is claimed.
+	Session string `protobuf:"bytes,5,opt,name=session,proto3" json:"session,omitempty"`
+	// Why an ended TD ended.
+	Reason string `protobuf:"bytes,6,opt,name=reason,proto3" json:"reason,omitempty"`
+	// For a TD that a bind claimed: the key of the binder that sent it, as the
+	// pool's configuration names it. Empty when an orchestrator sent it, and
+	// for a TD claimed by Claim.
+	ClaimedBy     string                 `protobuf:"bytes,7,opt,name=claimed_by,json=claimedBy,proto3" json:"claimed_by,omitempty"`
+	At            *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=at,proto3" json:"at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Event) Reset() {
+	*x = Event{}
+	mi := &file_session_v1alpha1_session_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Event) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Event) ProtoMessage() {}
+
+func (x *Event) ProtoReflect() protoreflect.Message {
+	mi := &file_session_v1alpha1_session_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Event.ProtoReflect.Descriptor instead.
+func (*Event) Descriptor() ([]byte, []int) {
+	return file_session_v1alpha1_session_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *Event) GetTd() string {
+	if x != nil {
+		return x.Td
+	}
+	return ""
+}
+
+func (x *Event) GetPool() string {
+	if x != nil {
+		return x.Pool
+	}
+	return ""
+}
+
+func (x *Event) GetHost() string {
+	if x != nil {
+		return x.Host
+	}
+	return ""
+}
+
+func (x *Event) GetState() TDState {
+	if x != nil {
+		return x.State
+	}
+	return TDState_TD_STATE_UNSPECIFIED
+}
+
+func (x *Event) GetSession() string {
+	if x != nil {
+		return x.Session
+	}
+	return ""
+}
+
+func (x *Event) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *Event) GetClaimedBy() string {
+	if x != nil {
+		return x.ClaimedBy
+	}
+	return ""
+}
+
+func (x *Event) GetAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.At
+	}
+	return nil
+}
+
 var File_session_v1alpha1_session_proto protoreflect.FileDescriptor
 
 const file_session_v1alpha1_session_proto_rawDesc = "" +
@@ -822,12 +1131,14 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x02td\x18\x02 \x01(\tR\x02td\x12\x12\n" +
 	"\x04bind\x18\x03 \x01(\fR\x04bind\x12\x1c\n" +
 	"\tsignature\x18\x04 \x01(\fR\tsignature\x12\x16\n" +
-	"\x06sealed\x18\a \x01(\fR\x06sealedJ\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\xa7\x01\n" +
+	"\x06sealed\x18\a \x01(\fR\x06sealedJ\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\xcb\x01\n" +
 	"\x05Bound\x12:\n" +
 	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
 	"\areceipt\x18\x02 \x01(\fR\areceipt\x12#\n" +
 	"\rsealed_answer\x18\x03 \x01(\fR\fsealedAnswer\x12#\n" +
-	"\rsealed_status\x18\x04 \x01(\tR\fsealedStatus\"\xf1\x02\n" +
+	"\rsealed_status\x18\x04 \x01(\tR\fsealedStatus\x12\x0e\n" +
+	"\x02td\x18\x05 \x01(\tR\x02td\x12\x12\n" +
+	"\x04host\x18\x06 \x01(\tR\x04host\"\xf1\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +
@@ -861,20 +1172,44 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x0fEvidenceRequest\x12\x0e\n" +
 	"\x02td\x18\x01 \x01(\tR\x02td\"'\n" +
 	"\x11WatchReadyRequest\x12\x12\n" +
-	"\x04pool\x18\x01 \x01(\tR\x04pool*y\n" +
+	"\x04pool\x18\x01 \x01(\tR\x04pool\"e\n" +
+	"\vReadyChange\x126\n" +
+	"\x05ready\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceH\x00R\x05ready\x12\x14\n" +
+	"\x04left\x18\x02 \x01(\fH\x00R\x04leftB\b\n" +
+	"\x06change\"\x0e\n" +
+	"\fWatchRequest\"\xf1\x01\n" +
+	"\x05Event\x12\x0e\n" +
+	"\x02td\x18\x01 \x01(\tR\x02td\x12\x12\n" +
+	"\x04pool\x18\x02 \x01(\tR\x04pool\x12\x12\n" +
+	"\x04host\x18\x03 \x01(\tR\x04host\x123\n" +
+	"\x05state\x18\x04 \x01(\x0e2\x1d.c8s.session.v1alpha1.TDStateR\x05state\x12\x18\n" +
+	"\asession\x18\x05 \x01(\tR\asession\x12\x16\n" +
+	"\x06reason\x18\x06 \x01(\tR\x06reason\x12\x1d\n" +
+	"\n" +
+	"claimed_by\x18\a \x01(\tR\tclaimedBy\x12*\n" +
+	"\x02at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\x02at*y\n" +
 	"\fSessionState\x12\x1d\n" +
 	"\x19SESSION_STATE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11SESSION_STATE_NEW\x10\x01\x12\x16\n" +
 	"\x12SESSION_STATE_LIVE\x10\x02\x12\x1b\n" +
-	"\x17SESSION_STATE_DESTROYED\x10\x032\xea\x03\n" +
+	"\x17SESSION_STATE_DESTROYED\x10\x03*\xa1\x01\n" +
+	"\aTDState\x12\x18\n" +
+	"\x14TD_STATE_UNSPECIFIED\x10\x00\x12\x14\n" +
+	"\x10TD_STATE_BOOTING\x10\x01\x12\x12\n" +
+	"\x0eTD_STATE_READY\x10\x02\x12\x14\n" +
+	"\x10TD_STATE_CLAIMED\x10\x03\x12\x12\n" +
+	"\x0eTD_STATE_BOUND\x10\x04\x12\x14\n" +
+	"\x10TD_STATE_RUNNING\x10\x05\x12\x12\n" +
+	"\x0eTD_STATE_ENDED\x10\x062\xb9\x04\n" +
 	"\bSessions\x12J\n" +
 	"\x05Claim\x12\".c8s.session.v1alpha1.ClaimRequest\x1a\x1d.c8s.session.v1alpha1.Claimed\x12J\n" +
 	"\x04Bind\x12!.c8s.session.v1alpha1.BindRequest\x1a\x1b.c8s.session.v1alpha1.Bound(\x010\x01\x12G\n" +
 	"\aConnect\x12\x1b.c8s.session.v1alpha1.Bytes\x1a\x1b.c8s.session.v1alpha1.Bytes(\x010\x01\x12N\n" +
 	"\aDestroy\x12$.c8s.session.v1alpha1.DestroyRequest\x1a\x1d.c8s.session.v1alpha1.Session\x12T\n" +
-	"\vGetEvidence\x12%.c8s.session.v1alpha1.EvidenceRequest\x1a\x1e.c8s.session.v1alpha1.Evidence\x12W\n" +
+	"\vGetEvidence\x12%.c8s.session.v1alpha1.EvidenceRequest\x1a\x1e.c8s.session.v1alpha1.Evidence\x12Z\n" +
 	"\n" +
-	"WatchReady\x12'.c8s.session.v1alpha1.WatchReadyRequest\x1a\x1e.c8s.session.v1alpha1.Evidence0\x01BIZGgithub.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1b\x06proto3"
+	"WatchReady\x12'.c8s.session.v1alpha1.WatchReadyRequest\x1a!.c8s.session.v1alpha1.ReadyChange0\x01\x12J\n" +
+	"\x05Watch\x12\".c8s.session.v1alpha1.WatchRequest\x1a\x1b.c8s.session.v1alpha1.Event0\x01BIZGgithub.com/confidential-dot-ai/c8s/api/session/v1alpha1;sessionv1alpha1b\x06proto3"
 
 var (
 	file_session_v1alpha1_session_proto_rawDescOnce sync.Once
@@ -888,46 +1223,55 @@ func file_session_v1alpha1_session_proto_rawDescGZIP() []byte {
 	return file_session_v1alpha1_session_proto_rawDescData
 }
 
-var file_session_v1alpha1_session_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_session_v1alpha1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_session_v1alpha1_session_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_session_v1alpha1_session_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_session_v1alpha1_session_proto_goTypes = []any{
 	(SessionState)(0),             // 0: c8s.session.v1alpha1.SessionState
-	(*ClaimRequest)(nil),          // 1: c8s.session.v1alpha1.ClaimRequest
-	(*Claimed)(nil),               // 2: c8s.session.v1alpha1.Claimed
-	(*BindRequest)(nil),           // 3: c8s.session.v1alpha1.BindRequest
-	(*Bound)(nil),                 // 4: c8s.session.v1alpha1.Bound
-	(*Evidence)(nil),              // 5: c8s.session.v1alpha1.Evidence
-	(*Bytes)(nil),                 // 6: c8s.session.v1alpha1.Bytes
-	(*DestroyRequest)(nil),        // 7: c8s.session.v1alpha1.DestroyRequest
-	(*Session)(nil),               // 8: c8s.session.v1alpha1.Session
-	(*EvidenceRequest)(nil),       // 9: c8s.session.v1alpha1.EvidenceRequest
-	(*WatchReadyRequest)(nil),     // 10: c8s.session.v1alpha1.WatchReadyRequest
-	(*durationpb.Duration)(nil),   // 11: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil), // 12: google.protobuf.Timestamp
+	(TDState)(0),                  // 1: c8s.session.v1alpha1.TDState
+	(*ClaimRequest)(nil),          // 2: c8s.session.v1alpha1.ClaimRequest
+	(*Claimed)(nil),               // 3: c8s.session.v1alpha1.Claimed
+	(*BindRequest)(nil),           // 4: c8s.session.v1alpha1.BindRequest
+	(*Bound)(nil),                 // 5: c8s.session.v1alpha1.Bound
+	(*Evidence)(nil),              // 6: c8s.session.v1alpha1.Evidence
+	(*Bytes)(nil),                 // 7: c8s.session.v1alpha1.Bytes
+	(*DestroyRequest)(nil),        // 8: c8s.session.v1alpha1.DestroyRequest
+	(*Session)(nil),               // 9: c8s.session.v1alpha1.Session
+	(*EvidenceRequest)(nil),       // 10: c8s.session.v1alpha1.EvidenceRequest
+	(*WatchReadyRequest)(nil),     // 11: c8s.session.v1alpha1.WatchReadyRequest
+	(*ReadyChange)(nil),           // 12: c8s.session.v1alpha1.ReadyChange
+	(*WatchRequest)(nil),          // 13: c8s.session.v1alpha1.WatchRequest
+	(*Event)(nil),                 // 14: c8s.session.v1alpha1.Event
+	(*durationpb.Duration)(nil),   // 15: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil), // 16: google.protobuf.Timestamp
 }
 var file_session_v1alpha1_session_proto_depIdxs = []int32{
-	11, // 0: c8s.session.v1alpha1.ClaimRequest.wait:type_name -> google.protobuf.Duration
-	5,  // 1: c8s.session.v1alpha1.Claimed.evidence:type_name -> c8s.session.v1alpha1.Evidence
-	12, // 2: c8s.session.v1alpha1.Claimed.bind_by:type_name -> google.protobuf.Timestamp
-	5,  // 3: c8s.session.v1alpha1.Bound.evidence:type_name -> c8s.session.v1alpha1.Evidence
+	15, // 0: c8s.session.v1alpha1.ClaimRequest.wait:type_name -> google.protobuf.Duration
+	6,  // 1: c8s.session.v1alpha1.Claimed.evidence:type_name -> c8s.session.v1alpha1.Evidence
+	16, // 2: c8s.session.v1alpha1.Claimed.bind_by:type_name -> google.protobuf.Timestamp
+	6,  // 3: c8s.session.v1alpha1.Bound.evidence:type_name -> c8s.session.v1alpha1.Evidence
 	0,  // 4: c8s.session.v1alpha1.Session.state:type_name -> c8s.session.v1alpha1.SessionState
-	1,  // 5: c8s.session.v1alpha1.Sessions.Claim:input_type -> c8s.session.v1alpha1.ClaimRequest
-	3,  // 6: c8s.session.v1alpha1.Sessions.Bind:input_type -> c8s.session.v1alpha1.BindRequest
-	6,  // 7: c8s.session.v1alpha1.Sessions.Connect:input_type -> c8s.session.v1alpha1.Bytes
-	7,  // 8: c8s.session.v1alpha1.Sessions.Destroy:input_type -> c8s.session.v1alpha1.DestroyRequest
-	9,  // 9: c8s.session.v1alpha1.Sessions.GetEvidence:input_type -> c8s.session.v1alpha1.EvidenceRequest
-	10, // 10: c8s.session.v1alpha1.Sessions.WatchReady:input_type -> c8s.session.v1alpha1.WatchReadyRequest
-	2,  // 11: c8s.session.v1alpha1.Sessions.Claim:output_type -> c8s.session.v1alpha1.Claimed
-	4,  // 12: c8s.session.v1alpha1.Sessions.Bind:output_type -> c8s.session.v1alpha1.Bound
-	6,  // 13: c8s.session.v1alpha1.Sessions.Connect:output_type -> c8s.session.v1alpha1.Bytes
-	8,  // 14: c8s.session.v1alpha1.Sessions.Destroy:output_type -> c8s.session.v1alpha1.Session
-	5,  // 15: c8s.session.v1alpha1.Sessions.GetEvidence:output_type -> c8s.session.v1alpha1.Evidence
-	5,  // 16: c8s.session.v1alpha1.Sessions.WatchReady:output_type -> c8s.session.v1alpha1.Evidence
-	11, // [11:17] is the sub-list for method output_type
-	5,  // [5:11] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	6,  // 5: c8s.session.v1alpha1.ReadyChange.ready:type_name -> c8s.session.v1alpha1.Evidence
+	1,  // 6: c8s.session.v1alpha1.Event.state:type_name -> c8s.session.v1alpha1.TDState
+	16, // 7: c8s.session.v1alpha1.Event.at:type_name -> google.protobuf.Timestamp
+	2,  // 8: c8s.session.v1alpha1.Sessions.Claim:input_type -> c8s.session.v1alpha1.ClaimRequest
+	4,  // 9: c8s.session.v1alpha1.Sessions.Bind:input_type -> c8s.session.v1alpha1.BindRequest
+	7,  // 10: c8s.session.v1alpha1.Sessions.Connect:input_type -> c8s.session.v1alpha1.Bytes
+	8,  // 11: c8s.session.v1alpha1.Sessions.Destroy:input_type -> c8s.session.v1alpha1.DestroyRequest
+	10, // 12: c8s.session.v1alpha1.Sessions.GetEvidence:input_type -> c8s.session.v1alpha1.EvidenceRequest
+	11, // 13: c8s.session.v1alpha1.Sessions.WatchReady:input_type -> c8s.session.v1alpha1.WatchReadyRequest
+	13, // 14: c8s.session.v1alpha1.Sessions.Watch:input_type -> c8s.session.v1alpha1.WatchRequest
+	3,  // 15: c8s.session.v1alpha1.Sessions.Claim:output_type -> c8s.session.v1alpha1.Claimed
+	5,  // 16: c8s.session.v1alpha1.Sessions.Bind:output_type -> c8s.session.v1alpha1.Bound
+	7,  // 17: c8s.session.v1alpha1.Sessions.Connect:output_type -> c8s.session.v1alpha1.Bytes
+	9,  // 18: c8s.session.v1alpha1.Sessions.Destroy:output_type -> c8s.session.v1alpha1.Session
+	6,  // 19: c8s.session.v1alpha1.Sessions.GetEvidence:output_type -> c8s.session.v1alpha1.Evidence
+	12, // 20: c8s.session.v1alpha1.Sessions.WatchReady:output_type -> c8s.session.v1alpha1.ReadyChange
+	14, // 21: c8s.session.v1alpha1.Sessions.Watch:output_type -> c8s.session.v1alpha1.Event
+	15, // [15:22] is the sub-list for method output_type
+	8,  // [8:15] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_session_v1alpha1_session_proto_init() }
@@ -935,13 +1279,17 @@ func file_session_v1alpha1_session_proto_init() {
 	if File_session_v1alpha1_session_proto != nil {
 		return
 	}
+	file_session_v1alpha1_session_proto_msgTypes[10].OneofWrappers = []any{
+		(*ReadyChange_Ready)(nil),
+		(*ReadyChange_Left)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_session_v1alpha1_session_proto_rawDesc), len(file_session_v1alpha1_session_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   10,
+			NumEnums:      2,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

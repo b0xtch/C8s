@@ -41,6 +41,9 @@ var open = map[string]bool{
 // call in neither list is an orchestrator's.
 var byKey = map[string]bool{
 	sessionv1alpha1.Sessions_WatchReady_FullMethodName: true,
+	// A bind for a claimed TD is an orchestrator's. One that claims its TD
+	// is also a binder's, under an authority its pool names for it.
+	sessionv1alpha1.Sessions_Bind_FullMethodName: true,
 }
 
 // maxChains bounds the certificates whose chain the daemon remembers.

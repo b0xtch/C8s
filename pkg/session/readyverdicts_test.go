@@ -6,14 +6,18 @@ import (
 	"crypto"
 	"crypto/sha256"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
+	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/sessionsim"
 )
 
 // counted is an engine that counts what it is asked to verify and says how
@@ -545,5 +549,253 @@ func TestVerdictsAreKeptOnlyOnWhatPassedAndWithinABound(t *testing.T) {
 	}
 	if verdicts.Kept() != 1 {
 		t.Fatalf("%d verdicts are kept once none of the old ones stands", verdicts.Kept())
+	}
+}
+
+// poolOf is n ready guests of one pool, as their host relays each, and the
+// policy of a binder that pins the pool.
+func poolOf(t *testing.T, n int) (session.Policy, []*session.Relayed) {
+	t.Helper()
+	pool := sessionsim.NewPool(t)
+	identity, err := runtimemeasure.LoadImageManifest(pool.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchKey, err := os.ReadFile(pool.LaunchKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: []byte(keyPEM(t, newKey(t))), AllowReady: true}
+	shown := make([]*session.Relayed, n)
+	for i := range shown {
+		guest := pool.Boot(t, nil, nil)
+		shown[i] = relayedState(t, &served{addr: strings.TrimPrefix(guest.URL, "https://")})
+	}
+	return policy, shown
+}
+
+// A binder that watches a pool needs no claim to learn which guest its next
+// bind is for: it takes one from the verdicts it keeps, the guest it was
+// shown first among those whose verdict stands, and each once. A verdict
+// that does not stand is not signed on, and a guest its watch said left is
+// taken no more.
+func TestBinderTakesTheGuestItWasShownFirst(t *testing.T) {
+	policy, shown := poolOf(t, 5)
+	engine := &renewing{counted: newCounted()}
+	verdicts, err := session.NewReadyVerdicts(policy, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	clock := now
+	verdicts.SetClock(func() time.Time { return clock })
+	taken := func(what string, want *session.Relayed) *session.JudgedReady {
+		t.Helper()
+		judged, err := verdicts.Take()
+		switch {
+		case want == nil && errors.Is(err, session.ErrNoneJudged):
+			return nil
+		case want == nil:
+			t.Fatalf("%s: the binder was handed a guest, or another error: %+v, %v", what, judged, err)
+		case err != nil:
+			t.Fatalf("%s: %v", what, err)
+		case !bytes.Equal(judged.Certificate, want.Certificate):
+			t.Fatalf("%s: the binder was handed another guest", what)
+		case !judged.Ahead:
+			t.Fatalf("%s: the verdict is not said to be made ahead", what)
+		}
+		return judged
+	}
+
+	taken("a binder that was shown nothing", nil)
+	for i, r := range shown {
+		if err := verdicts.Judge(within(t), r); err != nil {
+			t.Fatalf("guest %d: %v", i, err)
+		}
+	}
+	// A guest shown again keeps its place.
+	if err := verdicts.Judge(within(t), shown[0]); err != nil {
+		t.Fatal(err)
+	}
+	// The engine came to hold another document: no verdict stands, none is
+	// signed on, and none is dropped, since a refresh makes each anew.
+	engine.documents.Add(1)
+	taken("verdicts made under documents since replaced", nil)
+	if verdicts.Kept() != len(shown) {
+		t.Fatalf("%d verdicts are kept of %d that wait to be made anew", verdicts.Kept(), len(shown))
+	}
+	if judged, err := verdicts.Refresh(within(t)); err != nil || judged != len(shown) {
+		t.Fatalf("Refresh judged %d anew: %v", judged, err)
+	}
+	// Made anew, each is still taken in the order its guest was shown.
+	first := taken("the guest shown first", shown[0])
+	want, err := session.VerifyReadyToRelease(within(t), policy, sessiontest.Engine{}, shown[0], now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyDigest(t, first.InstanceKey) != keyDigest(t, want.InstanceKey) || !bytes.Equal(first.OneTime.KEM, want.OneTime.KEM) || !first.Until.After(now) {
+		t.Fatal("the verdict the binder was handed is not the one made on that guest's evidence")
+	}
+	if verdicts.Kept() != len(shown)-1 {
+		t.Fatalf("%d verdicts are kept after one was taken", verdicts.Kept())
+	}
+	// The watch says the next guest left: the binder signs for the one after.
+	verdicts.Forget(sha256.Sum256(shown[1].Certificate))
+	taken("the guest shown after one that left", shown[2])
+	// A guest shown anew after it left comes after those that waited.
+	if err := verdicts.Judge(within(t), shown[1]); err != nil {
+		t.Fatal(err)
+	}
+	// Past its time no verdict stands.
+	clock = now.Add(session.ServingVerdictTTL)
+	taken("verdicts past their time", nil)
+	clock = now
+	taken("the next that waited", shown[3])
+	taken("the last that waited", shown[4])
+	taken("the guest that came back", shown[1])
+	taken("a binder with no verdict left", nil)
+	if verdicts.Kept() != 0 {
+		t.Fatalf("%d verdicts are kept once each was taken", verdicts.Kept())
+	}
+	// Forgetting a guest the binder keeps nothing of changes nothing.
+	verdicts.Forget(sha256.Sum256(shown[0].Certificate))
+}
+
+// A verdict on its way is none to sign on yet: the binder is handed its guest
+// once the verdict is made.
+func TestBinderTakesNoGuestWhoseVerdictIsOnItsWay(t *testing.T) {
+	policy, shown := poolOf(t, 1)
+	engine := newCounted()
+	engine.hold, engine.inside = make(chan struct{}), make(chan struct{}, 4)
+	verdicts, err := session.NewReadyVerdicts(policy, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	judging := make(chan error, 1)
+	go func() { judging <- verdicts.Judge(within(t), shown[0]) }()
+	<-engine.inside
+	if judged, err := verdicts.Take(); !errors.Is(err, session.ErrNoneJudged) {
+		t.Fatalf("a guest whose verdict is on its way was handed over: %+v, %v", judged, err)
+	}
+	// The watch says the guest left while it is judged: its verdict, once
+	// made, is none to sign on.
+	verdicts.Forget(sha256.Sum256(shown[0].Certificate))
+	close(engine.hold)
+	if err := <-judging; err != nil {
+		t.Fatal(err)
+	}
+	if judged, err := verdicts.Take(); !errors.Is(err, session.ErrNoneJudged) {
+		t.Fatalf("a guest that left while it was judged was handed over: %+v, %v", judged, err)
+	}
+	// Shown again, it is handed over, on the verdict that was made.
+	if err := verdicts.Judge(within(t), shown[0]); err != nil {
+		t.Fatal(err)
+	}
+	if judged, err := verdicts.Take(); err != nil || !bytes.Equal(judged.Certificate, shown[0].Certificate) || engine.asked.Load() != 1 {
+		t.Fatalf("the guest shown again: %v, the engine asked %d times", err, engine.asked.Load())
+	}
+}
+
+// The watch says a TD left ready about when the claim that took it is
+// answered. Whichever the binder reads first, the claim finds its guest
+// judged, while no bind is signed for a guest that left. A refresh judges
+// such a guest no more, and drops its verdict once a claim has had its time.
+func TestClaimFindsAGuestItsWatchSaidLeft(t *testing.T) {
+	policy, shown := poolOf(t, 3)
+	engine := &renewing{counted: newCounted()}
+	verdicts, err := session.NewReadyVerdicts(policy, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	clock := now
+	verdicts.SetClock(func() time.Time { return clock })
+	for _, r := range shown {
+		if err := verdicts.Judge(within(t), r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	asked := engine.asked.Load()
+	verdicts.Forget(sha256.Sum256(shown[0].Certificate))
+	verdicts.Forget(sha256.Sum256(shown[1].Certificate))
+	judged, err := verdicts.Claimed(within(t), shown[0])
+	if err != nil || !judged.Ahead || engine.asked.Load() != asked {
+		t.Fatalf("the claim of a guest the watch said left: %v, the engine asked %d times more", err, engine.asked.Load()-asked)
+	}
+	// The vendor's documents are replaced: the guest that waits is judged
+	// again, and the one that left is not.
+	engine.documents.Add(1)
+	if n, err := verdicts.Refresh(within(t)); err != nil || n != 1 || verdicts.Kept() != 2 {
+		t.Fatalf("Refresh judged %d anew and %d verdicts are kept: %v", n, verdicts.Kept(), err)
+	}
+	// Told again that the guest left, the binder keeps it no longer for it.
+	clock = now.Add(session.LeftGrace - time.Second)
+	verdicts.Forget(sha256.Sum256(shown[1].Certificate))
+	if _, err := verdicts.Refresh(within(t)); err != nil || verdicts.Kept() != 2 {
+		t.Fatalf("a guest that left was dropped before a claim had its time: %d kept, %v", verdicts.Kept(), err)
+	}
+	clock = now.Add(session.LeftGrace)
+	if n, err := verdicts.Refresh(within(t)); err != nil || n != 0 || verdicts.Kept() != 1 {
+		t.Fatalf("a guest that left long ago is kept: %d kept, %d judged anew, %v", verdicts.Kept(), n, err)
+	}
+	if got, err := verdicts.Take(); err != nil || !bytes.Equal(got.Certificate, shown[2].Certificate) {
+		t.Fatalf("the guest that waited: %v", err)
+	}
+	// A claim that comes later still is judged on what it says.
+	asked = engine.asked.Load()
+	if late, err := verdicts.Claimed(within(t), shown[1]); err != nil || late.Ahead || engine.asked.Load() != asked+1 {
+		t.Fatalf("a claim long after its guest left: %v", err)
+	}
+}
+
+// A watch that says a guest left while a refresh judges it again is heard:
+// the verdict made anew is none to sign on either.
+func TestRefreshKeepsWhatTheWatchSaidMeanwhile(t *testing.T) {
+	policy, shown := poolOf(t, 1)
+	engine := newCounted()
+	verdicts, err := session.NewReadyVerdicts(policy, engine)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verdicts.Judge(within(t), shown[0]); err != nil {
+		t.Fatal(err)
+	}
+	engine.documents.Add(1)
+	engine.hold, engine.inside = make(chan struct{}), make(chan struct{}, 4)
+	refreshed := make(chan int, 1)
+	go func() {
+		n, _ := verdicts.Refresh(within(t))
+		refreshed <- n
+	}()
+	<-engine.inside
+	verdicts.Forget(sha256.Sum256(shown[0].Certificate))
+	close(engine.hold)
+	if n := <-refreshed; n != 1 {
+		t.Fatalf("Refresh judged %d anew", n)
+	}
+	if judged, err := verdicts.Take(); !errors.Is(err, session.ErrNoneJudged) {
+		t.Fatalf("a guest that left while it was judged again was handed over: %+v, %v", judged, err)
+	}
+	if judged, err := verdicts.Claimed(within(t), shown[0]); err != nil || !judged.Ahead {
+		t.Fatalf("the claim of that guest: %v", err)
+	}
+}
+
+// Room for a new verdict is made first of the guests whose TD left ready:
+// none of those that wait is dropped for it.
+func TestVerdictsOfGuestsThatLeftGoFirst(t *testing.T) {
+	policy, shown := poolOf(t, 1)
+	verdicts, err := session.NewReadyVerdicts(policy, newCounted())
+	if err != nil {
+		t.Fatal(err)
+	}
+	digests := session.FillReadyVerdicts(verdicts, session.MaxReadyVerdicts)
+	verdicts.Forget(digests[5])
+	if err := verdicts.Judge(within(t), shown[0]); err != nil {
+		t.Fatal(err)
+	}
+	if verdicts.Kept() != session.MaxReadyVerdicts || verdicts.KeepsReadyVerdict(digests[5]) || !verdicts.KeepsReadyVerdict(digests[0]) ||
+		!verdicts.KeepsReadyVerdict(sha256.Sum256(shown[0].Certificate)) {
+		t.Fatalf("room was not made by dropping the guest that left: %d kept", verdicts.Kept())
 	}
 }

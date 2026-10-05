@@ -1,6 +1,7 @@
 package sessiond
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/sha256"
@@ -15,8 +16,10 @@ import (
 
 // WatchReady streams what each ready TD of a pool says of itself, as a claim
 // of it would be answered: the TDs ready now, oldest first, then each as it
-// becomes ready or comes to serve another certificate. A binder judges them
-// ahead of its claims, so that its check is off the path of a start.
+// becomes ready or comes to serve another certificate, and each that leaves
+// ready. A binder judges them ahead of its claims, so that its check is off
+// the path of a start, and signs a bind for one it has judged, which claims
+// it: a TD that left is one it signs for no more.
 //
 // A stream shows how fast the pool refills, which is every tenant's starts
 // together, so it is open only to the binders the pool's configuration
@@ -51,8 +54,8 @@ func (d *Daemon) WatchReady(req *sessionv1alpha1.WatchReadyRequest, stream sessi
 	shown := map[string][sha256.Size]byte{}
 	for {
 		due, changed := d.readyUnshown(pool, shown)
-		for _, evidence := range due {
-			if err := stream.Send(evidence); err != nil {
+		for _, change := range due {
+			if err := stream.Send(change); err != nil {
 				return err
 			}
 		}
@@ -66,11 +69,13 @@ func (d *Daemon) WatchReady(req *sessionv1alpha1.WatchReadyRequest, stream sessi
 	}
 }
 
-// readyUnshown returns the evidence of the pool's ready TDs that shown does
-// not hold under the certificate they serve now, oldest TD first, notes them
-// in shown, and forgets there the TDs that are ready no more. changed is
-// closed when a TD next changes.
-func (d *Daemon) readyUnshown(pool *poolState, shown map[string][sha256.Size]byte) (due []*sessionv1alpha1.Evidence, changed <-chan struct{}) {
+// readyUnshown returns what changed among the pool's ready TDs since shown
+// was last brought up to them: the TDs in shown that are ready no more, each
+// by the certificate it was shown under, and then the evidence of the ready
+// TDs that shown does not hold under the certificate they serve now, oldest
+// TD first. It brings shown up to both. changed is closed when a TD next
+// changes.
+func (d *Daemon) readyUnshown(pool *poolState, shown map[string][sha256.Size]byte) (due []*sessionv1alpha1.ReadyChange, changed <-chan struct{}) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := d.now()
@@ -92,19 +97,40 @@ func (d *Daemon) readyUnshown(pool *poolState, shown map[string][sha256.Size]byt
 	still := make(map[string]bool, len(ready))
 	for _, t := range ready {
 		still[t.rec.ID] = true
+	}
+	// Those that left come first: a binder that reads on signs for none of
+	// them.
+	var left [][sha256.Size]byte
+	for id, digest := range shown {
+		if !still[id] {
+			left = append(left, digest)
+			delete(shown, id)
+		}
+	}
+	slices.SortFunc(left, func(a, b [sha256.Size]byte) int { return bytes.Compare(a[:], b[:]) })
+	for _, digest := range left {
+		due = append(due, leftChange(digest))
+	}
+	for _, t := range ready {
 		digest := sha256.Sum256(t.leaf)
 		if shown[t.rec.ID] == digest {
 			continue
 		}
-		shown[t.rec.ID] = digest
-		due = append(due, readyEvidence(t))
-	}
-	for id := range shown {
-		if !still[id] {
-			delete(shown, id)
+		// A TD that serves another certificate is known by that one from
+		// here on.
+		if before, ok := shown[t.rec.ID]; ok {
+			due = append(due, leftChange(before))
 		}
+		shown[t.rec.ID] = digest
+		due = append(due, &sessionv1alpha1.ReadyChange{Change: &sessionv1alpha1.ReadyChange_Ready{Ready: readyEvidence(t)}})
 	}
 	return due, d.changed
+}
+
+// leftChange says that the TD shown under the certificate of this digest is
+// ready no more, or serves another.
+func leftChange(certificate [sha256.Size]byte) *sessionv1alpha1.ReadyChange {
+	return &sessionv1alpha1.ReadyChange{Change: &sessionv1alpha1.ReadyChange_Left{Left: certificate[:]}}
 }
 
 // readyEvidence is what a ready TD last said of itself, as a claim of it is
@@ -126,5 +152,5 @@ func watches(ctx context.Context, pool *Pool) bool {
 		return false
 	}
 	digest, err := session.InstanceKeyDigest(certs[0].PublicKey)
-	return err == nil && slices.Contains(pool.Binders, digest)
+	return err == nil && pool.binder(digest) != nil
 }

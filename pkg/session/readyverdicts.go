@@ -17,6 +17,11 @@ const maxReadyVerdicts = 1024
 // ReadyVerdicts.KeepCurrent.
 const RefreshEvery = time.Minute
 
+// leftGrace is how long a verdict is kept once its guest's TD left ready: a
+// claim that took the TD is answered about when the watch says it left, and
+// finds its guest judged whichever of the two the binder reads first.
+const leftGrace = 10 * time.Second
+
 // ReadyVerdicts keeps a binder's verdicts on ready guests it was shown ahead
 // of a claim, as a daemon's WatchReady shows a pool's, so that a claim finds
 // its guest judged and the binder's check is off the path of a start.
@@ -46,6 +51,9 @@ type ReadyVerdicts struct {
 	// an earlier one is none.
 	epoch  uint64
 	judged map[[sha256.Size]byte]*readyVerdict
+	// shown counts the guests the binder was shown: each is taken in the
+	// order it came.
+	shown uint64
 }
 
 // readyVerdict is one verdict, or one on its way.
@@ -65,17 +73,31 @@ type readyVerdict struct {
 	settled   bool
 	began     time.Time
 	took      time.Duration
+	// order is when the binder was last shown the guest as ready, among all
+	// it was shown.
+	order uint64
+	// left is when the binder's watch said the guest's TD is ready no more,
+	// or zero.
+	left time.Time
 }
 
-// JudgedReady is a ready guest as ReadyVerdicts.Claimed found it.
+// JudgedReady is a ready guest as ReadyVerdicts.Claimed or Take found it.
 type JudgedReady struct {
 	*ReadyTD
+	// Certificate is the guest's serving certificate, DER, from the evidence
+	// the verdict was made on.
+	Certificate []byte
 	// Ahead says the verdict was made before the claim, on evidence the
 	// guest gave while it was ready. Took is how long making it took, then
 	// or now.
 	Ahead bool
 	Took  time.Duration
 }
+
+// ErrNoneJudged is Take's answer when the binder holds no verdict that
+// stands: it claims a TD and judges it at the claim, or waits for its watch
+// to show it one.
+var ErrNoneJudged = errors.New("the binder holds no verdict that stands on a ready guest")
 
 // NewReadyVerdicts returns an empty set of verdicts under policy, which is a
 // policy for guests nobody has bound.
@@ -121,12 +143,19 @@ func (v *ReadyVerdicts) Judge(ctx context.Context, r *Relayed) error {
 	digest := sha256.Sum256(r.Certificate)
 	v.mu.Lock()
 	if kept := v.judged[digest]; kept != nil && (!kept.made() || v.usableLocked(kept)) {
+		// A guest whose TD left ready and is ready again takes its place
+		// after those that waited.
+		if !kept.left.IsZero() {
+			v.shown++
+			kept.left, kept.order = time.Time{}, v.shown
+		}
 		v.mu.Unlock()
 		return nil
 	}
 	v.evictLocked()
+	v.shown++
 	verdict := &readyVerdict{
-		done: make(chan struct{}), epoch: v.epoch, began: v.now(),
+		done: make(chan struct{}), epoch: v.epoch, began: v.now(), order: v.shown,
 		evidence: &Relayed{Certificate: r.Certificate, Phase: r.Phase, Launch: r.Launch, Signature: r.Signature, Events: r.Events},
 	}
 	v.judged[digest] = verdict
@@ -180,13 +209,14 @@ func (v *ReadyVerdicts) usableLocked(kept *readyVerdict) bool {
 }
 
 // evictLocked makes room for one more verdict: it drops those that no longer
-// stand, and then the oldest. The caller holds the lock.
+// stand and those whose TD left ready, and then the oldest. The caller holds
+// the lock.
 func (v *ReadyVerdicts) evictLocked() {
 	if len(v.judged) < maxReadyVerdicts {
 		return
 	}
 	for digest, kept := range v.judged {
-		if kept.made() && !v.usableLocked(kept) {
+		if kept.made() && (!v.usableLocked(kept) || !kept.left.IsZero()) {
 			delete(v.judged, digest)
 		}
 	}
@@ -233,14 +263,54 @@ func (v *ReadyVerdicts) Claimed(ctx context.Context, r *Relayed) (*JudgedReady, 
 	}
 	v.mu.Unlock()
 	if usable {
-		return &JudgedReady{ReadyTD: kept.ready, Ahead: true, Took: kept.took}, nil
+		return &JudgedReady{ReadyTD: kept.ready, Certificate: kept.evidence.Certificate, Ahead: true, Took: kept.took}, nil
 	}
 	began := v.now()
 	ready, err := VerifyReadyToRelease(ctx, policy, v.engine, r, began)
 	if err != nil {
 		return nil, err
 	}
-	return &JudgedReady{ReadyTD: ready, Took: v.now().Sub(began)}, nil
+	return &JudgedReady{ReadyTD: ready, Certificate: r.Certificate, Took: v.now().Sub(began)}, nil
+}
+
+// Take hands the binder a ready guest it has judged, to sign a bind for:
+// the one it was shown first among those whose verdict stands. A bind that
+// names its guest's instance key claims the guest's TD at a daemon that lets
+// this binder (daemon.Client.StartBind with no TD named), so a binder that
+// watches a pool needs no claim. The verdict leaves the set, as at a claim.
+// A TD that another claim or bind took first is answered as not ready before
+// anything reaches a guest, and the binder takes the next. With no verdict
+// that stands, Take returns ErrNoneJudged.
+func (v *ReadyVerdicts) Take() (*JudgedReady, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	var first *readyVerdict
+	var at [sha256.Size]byte
+	for digest, kept := range v.judged {
+		if kept.made() && kept.left.IsZero() && v.usableLocked(kept) && (first == nil || kept.order < first.order) {
+			first, at = kept, digest
+		}
+	}
+	if first == nil {
+		return nil, ErrNoneJudged
+	}
+	delete(v.judged, at)
+	return &JudgedReady{ReadyTD: first.ready, Certificate: first.evidence.Certificate, Ahead: true, Took: first.took}, nil
+}
+
+// Forget notes that the TD of the guest that served the certificate of this
+// SHA-256 is ready no more, as a watch says (daemon.Client.WatchReady). The
+// binder signs no bind for that guest from here on: Take passes it over, and
+// it is judged no more. If the binder's own claim took the TD, the claim's
+// answer comes about when the watch says so, and Claimed still finds the
+// guest judged for a few seconds. After that the verdict is dropped by the
+// next Refresh.
+func (v *ReadyVerdicts) Forget(certificate [sha256.Size]byte) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if kept := v.judged[certificate]; kept != nil && kept.left.IsZero() {
+		kept.left = v.now()
+	}
 }
 
 // Refresh keeps the verdicts current, off the path of any claim. It has the
@@ -263,6 +333,14 @@ func (v *ReadyVerdicts) Refresh(ctx context.Context) (judged int, err error) {
 	policy, epoch, now := v.policy, v.epoch, v.now()
 	var due []stale
 	for digest, kept := range v.judged {
+		// A guest whose TD left ready is judged no more, and dropped once a
+		// claim that took it has had its time to find it.
+		if !kept.left.IsZero() {
+			if now.Sub(kept.left) >= leftGrace {
+				delete(v.judged, digest)
+			}
+			continue
+		}
 		// One on its way is made on what the engine holds now.
 		if kept.made() && (!v.usableLocked(kept) || kept.ready.Until.Sub(now) <= RenewAhead) {
 			due = append(due, stale{digest, kept})
@@ -279,6 +357,9 @@ func (v *ReadyVerdicts) Refresh(ctx context.Context) (judged int, err error) {
 		v.mu.Lock()
 		// A claim may have taken the verdict meanwhile, or the policy changed.
 		if v.judged[d.digest] == d.kept && v.epoch == epoch {
+			// The guest keeps its place, and its TD may have left ready
+			// meanwhile, or left and come back.
+			again.left, again.order = d.kept.left, d.kept.order
 			switch {
 			case again.err == nil:
 				v.judged[d.digest] = again

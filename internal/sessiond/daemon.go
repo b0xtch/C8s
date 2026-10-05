@@ -72,8 +72,9 @@ type Daemon struct {
 	streams int
 	// relays bounds the evidence requests in flight.
 	relays chan struct{}
-	// watchers counts the WatchReady streams in flight.
-	watchers int
+	// watchers counts the WatchReady streams in flight, and eventWatchers
+	// the Watch streams.
+	watchers, eventWatchers int
 	// orchestrators is the authority an orchestrator's certificate chains
 	// to, and chains the outcome of that check for the certificates seen.
 	orchestrators *x509.CertPool
@@ -300,6 +301,8 @@ func (d *Daemon) newTD(pool *poolState) (*td, error) {
 		return nil, err
 	}
 	d.tds[id] = t
+	// Whoever watches the host's TDs sees it boot.
+	d.notify()
 	return t, nil
 }
 
@@ -363,7 +366,8 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 		return
 	}
 	t.rec.State = StateReady
-	t.offered, t.leaf, t.collateral = offered, leaf, collateral
+	t.serves(offered, leaf)
+	t.collateral = collateral
 	pool.failures, pool.bootTime = 0, d.now().Sub(started)
 	if err := d.save(t); err != nil {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
@@ -511,7 +515,7 @@ func (d *Daemon) keepWarm(ctx context.Context) {
 				// Whoever watches the pool is shown a certificate the guest
 				// came to serve since: a claim is answered with it.
 				renewed := !bytes.Equal(t.leaf, leaf)
-				t.offered, t.leaf = offered, leaf
+				t.serves(offered, leaf)
 				if collateral != nil {
 					t.collateral = collateral
 				}

@@ -1,6 +1,7 @@
 package sessiond
 
 import (
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -72,8 +73,23 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatalf("a pool that names no binder has %v", pool.Binders)
 	}
 	watched := strings.Replace(strings.ReplaceAll(validConfig, "LAUNCH", launch), "depth: 2", "depth: 2\n    binders: [\""+binder('a')+"\", \""+binder('b')+"\"]", 1)
-	if cfg, err = LoadConfig(writeConfig(t, watched)); err != nil || len(cfg.Pools[0].Binders) != 2 || cfg.Pools[0].Binders[1] != binder('b') {
+	if cfg, err = LoadConfig(writeConfig(t, watched)); err != nil || len(cfg.Pools[0].Binders) != 2 || cfg.Pools[0].Binders[1].Key != binder('b') {
 		t.Fatalf("a pool with two binders: %v, %v", cfg, err)
+	}
+	// A binder named by its key alone watches, and binds nothing unclaimed.
+	// One named with authorities may claim a TD with a bind under one of
+	// them, and under no other.
+	if first := &cfg.Pools[0]; first.binder(binder('a')) == nil || first.binder(binder('c')) != nil || first.binds(binder('a'), binder('d')) {
+		t.Fatalf("a pool with two binders that only watch: %+v", first.Binders)
+	}
+	claiming := strings.Replace(strings.ReplaceAll(validConfig, "LAUNCH", launch), "depth: 2",
+		"depth: 2\n    binders:\n      - "+binder('a')+"\n      - key: "+binder('b')+"\n        authorities: [\""+binder('d')+"\", \""+binder('e')+"\"]", 1)
+	if cfg, err = LoadConfig(writeConfig(t, claiming)); err != nil {
+		t.Fatalf("a pool whose second binder may claim: %v", err)
+	}
+	if p := &cfg.Pools[0]; len(p.Binders) != 2 || p.binds(binder('a'), binder('d')) || !p.binds(binder('b'), binder('d')) || !p.binds(binder('b'), binder('e')) ||
+		p.binds(binder('b'), binder('f')) || p.binds(binder('c'), binder('d')) || p.binds(binder('d'), binder('d')) {
+		t.Fatalf("a pool whose second binder may claim under two authorities: %+v", p.Binders)
 	}
 
 	// A pool with no grace of its own gets the default.
@@ -128,6 +144,13 @@ func TestLoadConfigRefuses(t *testing.T) {
 		"a binder by a digest in capitals":  {"depth: 2", "depth: 2\n    binders: [\"sha256:" + strings.Repeat("A", 64) + "\"]"},
 		"one binder twice":                  {"depth: 2", "depth: 2\n    binders: [\"" + binder('a') + "\", \"" + binder('a') + "\"]"},
 		"more binders than a pool takes":    {"depth: 2", "depth: 2\n    binders: [" + strings.Repeat("\""+binder('a')+"\", ", maxBinders+1) + "]"},
+		"a binder with no key":              {"depth: 2", "depth: 2\n    binders: [{authorities: [\"" + binder('d') + "\"]}]"},
+		"a binder with a field of no kind":  {"depth: 2", "depth: 2\n    binders: [{key: \"" + binder('a') + "\", authority: \"" + binder('d') + "\"}]"},
+		"a binder that is a list":           {"depth: 2", "depth: 2\n    binders: [[\"" + binder('a') + "\"]]"},
+		"an authority by its name":          {"depth: 2", "depth: 2\n    binders: [{key: \"" + binder('a') + "\", authorities: [acme]}]"},
+		"one authority twice":               {"depth: 2", "depth: 2\n    binders: [{key: \"" + binder('a') + "\", authorities: [\"" + binder('d') + "\", \"" + binder('d') + "\"]}]"},
+		"one binder twice, as a mapping":    {"depth: 2", "depth: 2\n    binders: [\"" + binder('a') + "\", {key: \"" + binder('a') + "\"}]"},
+		"more authorities than one takes":   {"depth: 2", "depth: 2\n    binders: [{key: \"" + binder('a') + "\", authorities: [" + manyAuthorities(maxAuthorities+1) + "]}]"},
 	} {
 		body := strings.Replace(validConfig, change[0], change[1], 1)
 		if body == validConfig {
@@ -194,4 +217,13 @@ func TestFilterRuleset(t *testing.T) {
 	if strings.Index(open, `oifname "eth0" accept`) > strings.LastIndex(open, `iifname "c8st*" counter drop`) {
 		t.Errorf("the egress rule sits behind the drop:\n%s", open)
 	}
+}
+
+// manyAuthorities is n authorities, each another.
+func manyAuthorities(n int) string {
+	var out []string
+	for i := range n {
+		out = append(out, fmt.Sprintf("\"sha256:%064x\"", i))
+	}
+	return strings.Join(out, ", ")
 }

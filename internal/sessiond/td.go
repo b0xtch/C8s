@@ -3,6 +3,7 @@ package sessiond
 import (
 	"context"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -76,6 +77,11 @@ type claim struct {
 	BindBy    time.Time `json:"bindBy"`
 	// Answer is the first answer, which a repeat of the request gets.
 	Answer []byte `json:"answer,omitempty"`
+	// ByBind says a bind made the claim, with no Claim before it and no
+	// grace: RequestID is then that bind's. Binder is the key of the binder
+	// that sent it, as its pool names it, or empty for an orchestrator.
+	ByBind bool   `json:"byBind,omitempty"`
+	Binder string `json:"binder,omitempty"`
 }
 
 type bound struct {
@@ -118,6 +124,18 @@ type td struct {
 	offered    *session.StateResponse
 	leaf       []byte
 	collateral []byte
+	// instanceKey is the digest of the key leaf carries: what a bind names
+	// its TD by.
+	instanceKey string
+}
+
+// serves notes what a ready guest said of itself, and the certificate it
+// said it under. The caller holds the daemon's lock.
+func (t *td) serves(offered *session.StateResponse, leaf []byte) {
+	t.offered, t.leaf, t.instanceKey = offered, leaf, ""
+	if cert, err := x509.ParseCertificate(leaf); err == nil {
+		t.instanceKey, _ = session.InstanceKeyDigest(cert.PublicKey)
+	}
 }
 
 // session is the session the TD serves or served, or "".

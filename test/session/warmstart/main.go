@@ -352,7 +352,8 @@ func run(o *options) error {
 
 func micros(since time.Time) int64 { return time.Since(since).Microseconds() }
 
-// watch judges each ready TD of pool as the daemon shows it, until ctx ends.
+// watch judges each ready TD of pool as the daemon shows it, and forgets
+// each that leaves ready, until ctx ends.
 // A daemon that does not let this side watch leaves every guest to be judged
 // at its claim.
 func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *session.ReadyVerdicts) {
@@ -361,7 +362,7 @@ func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *sess
 			if err := verdicts.Judge(ctx, shown); err != nil && ctx.Err() == nil {
 				fmt.Fprintf(os.Stderr, "warmstart: a ready TD the daemon showed was not judged ahead: %v\n", err)
 			}
-		})
+		}, verdicts.Forget)
 		switch status.Code(err) {
 		case codes.PermissionDenied, codes.Unimplemented, codes.NotFound, codes.Unauthenticated:
 			fmt.Fprintf(os.Stderr, "warmstart: the pool's ready TDs are not watched, and each is judged at its claim: %v\n", err)

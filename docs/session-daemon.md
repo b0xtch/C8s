@@ -1,9 +1,9 @@
 # The session daemon
 
-Status: built for one host. It serves six calls of the
+Status: built for one host. It serves seven calls of the
 [session API](session-api.md): `Claim`, `Bind`, `Connect`, `GetEvidence`,
-`WatchReady` and `Destroy`. [What is missing](#what-is-missing) lists the rest
-of the design.
+`WatchReady`, `Watch` and `Destroy`. [What is missing](#what-is-missing) lists
+the rest of the design.
 
 `c8s session-daemon` keeps pools of ready TDs on a host and hands them to
 sessions. It runs on the host, outside the trust boundary
@@ -82,9 +82,11 @@ command once.
 A binder that the pool names may watch it ([Who may call
 what](#who-may-call-what)): the daemon shows it each ready TD's evidence as
 the TD becomes ready, and again when its guest comes to serve another
-certificate. The binder judges each then, and at a claim finds its guest by
-the certificate in the claim's answer, never by the TD's name. A TD it was
-not shown, or whose verdict no longer stands, it judges at the claim.
+certificate, and tells it when a TD is ready no more, by the SHA-256 of the
+certificate that TD was last shown under. The binder judges each then, and at
+a claim finds its guest by the certificate in the claim's answer, never by
+the TD's name. A TD it was not shown, or whose verdict no longer stands, it
+judges at the claim.
 
 What a binder seals with a bind, or sends over `Connect`, goes on a verdict
 that rests on the vendor's documents as the binder fetched them from the
@@ -105,11 +107,64 @@ first, and `--sealed-credential NAME=FILE` seals a credential with it.
 `verify`, `credential put`, `exec` and `destroy` then take `--binding` and
 reach the guest through the daemon.
 
+### A bind that claims
+
+A binder that watches a pool has judged its ready TDs, so it needs no claim
+to learn which guest its bind is for:
+
+```text
+ binder                      daemon                      guest (TD)
+   |                           |                            |
+   | WatchReady(pool) -------> |                            |
+   | <== each ready TD's evidence, and each that left ready |
+   | judge each as it comes, forget each that left          |
+   |                           |                            |
+   | take the TD shown first, sign a bind for its instance key,
+   | seal the first command and credentials to its one-time key
+   |                           |                            |
+   | Bind(bind, sealed) -----> | the ready TD of that key:  |
+   |                           | claimed for the bind's session
+   |                           | bind, sealed ------------> |
+   | <-- receipt, td, host --- | <-- receipt -------------- |
+   |                           |                            |
+   |   or, when a claim or another bind took that TD first: |
+   | <-- not ready ----------- | nothing reached a guest    |
+   | sign for the next TD it has judged                     |
+```
+
+A `Bind` that names no TD claims the ready TD whose instance key the bind
+names, for the bind's session, and hands it the bind in the same call. There
+is no grace, since the bind is there, and the answer names the TD, which is
+the name the session's connections are made by. The daemon reads the bind to
+learn the key and the authority it is signed under, as the guest will read
+it, and lets only an orchestrator send one, or a binder the pool names, under
+an authority the pool names for that binder
+([Configuration](#configuration)). Anybody else is refused whatever TDs the
+host has, so a bind is no probe for them.
+
+A TD that a claim or another bind took first, or that is gone, is answered
+with `FAILED_PRECONDITION` and an `ErrorInfo` of reason `TD_NOT_READY`
+(`daemon.NotReady` in the client library), before anything reaches a guest.
+The binder then signs for the next TD it has judged: `session.ReadyVerdicts`
+hands them out in the order they were shown (`Take`) and passes over those
+the stream says left (`Forget`), which it keeps a few seconds longer for a
+claim of the binder's own that took one. What that retry costs is a
+signature, a seal and a round trip to the daemon. Two binders that watch one
+pool and start a session at the same moment sign for the same TD, and one of
+them pays it.
+
+An orchestrator learns of a session that started so from `Watch`, which shows
+it every TD of the host as it is and then each as it changes: its pool, its
+state, the session it serves and, for a TD that a binder's bind claimed, that
+binder's key. It ends such a session as it ends any other, with `Destroy` by
+the session's name.
+
 ## Who may call what
 
 | Call | Caller | Needs |
 |---|---|---|
-| `Claim`, `Bind`, `Destroy` | an orchestrator | a client certificate that chains to the authority in `tls.clientCA` |
+| `Claim`, `Bind` of a claimed TD, `Destroy`, `Watch` | an orchestrator | a client certificate that chains to the authority in `tls.clientCA` |
+| `Bind` that names no TD | an orchestrator, or a binder the pool names | as above, or a client certificate whose public key the pool's `binders` lists with the authority the bind is signed under |
 | `WatchReady` | a binder the pool names | a client certificate whose public key the pool's `binders` lists, whoever issued it: a stream shows how fast the pool refills, which is every tenant's starts together |
 | `GetEvidence` | anyone | nothing: what a guest serves to anyone is public |
 | `Connect` | anyone | nothing at the daemon: the guest authenticates every request under the keys its bind names |
@@ -119,13 +174,16 @@ key of the one it presents, and nothing more. Each call then decides whose
 certificate it takes. An orchestrator's must chain to the authority, which
 the daemon checks once per certificate and remembers until the chain's first
 certificate ends. A binder's need not: the pool names its key, so a binder
-may present a certificate of its own making, and that key opens the pool's
-stream and no orchestrator call.
+may present a certificate of its own making. That key opens the pool's
+stream and, with an authority the pool names for it, a bind that claims one
+of the pool's ready TDs. It opens no other orchestrator call: a binder ends
+no session and claims none without a bind.
 
 A TD carries connections only once it is bound. Before that, the only bytes
-that reach its guest are the daemon's own requests and the bind of its claim,
-so a caller that learns a ready TD's name cannot bind it for itself. TD names
-are 128 random bits.
+that reach its guest are the daemon's own requests, the bind of its claim,
+and a bind that claims it from a caller the pool lets, so a caller that
+learns a ready TD's name or its key cannot bind it for itself. TD names are
+128 random bits.
 
 Every change takes the caller's `request_id`. A repeat under the same id gets
 the first answer and changes nothing, across a restart of the daemon too.
@@ -158,7 +216,10 @@ pools:
     depth: 4
     bindGrace: 30s
     imageStore: /var/lib/c8s/images/images.store
-    binders: ["sha256:9f2c..."] # optional: who may watch the pool's ready TDs
+    binders:                    # optional: who may watch the pool's ready TDs
+      - "sha256:9f2c..."        # this key watches
+      - key: "sha256:41d0..."   # this one also claims a TD with a bind
+        authorities: ["sha256:c7a9..."] # that one of these signed
 ```
 
 | Key | Meaning |
@@ -169,7 +230,7 @@ pools:
 | `pools[].depth` | How many TDs the pool keeps ready. Two boot at a time. |
 | `pools[].bindGrace` | How long a claim waits for its bind. After it the TD returns to the pool: the daemon sent it nothing, so nothing of a tenant entered it. |
 | `pools[].imageStore` | A store of public images (`c8s session image-store write`) handed read-only to every guest, so that a bind which names one starts it without a pull. |
-| `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). The certificate may be self-signed. With none, nobody watches the pool. |
+| `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). The certificate may be self-signed. With none, nobody watches the pool. An entry is that digest alone, or a `key` with `authorities`: the tenants' authority keys, named the same way (`openssl pkey -in authority.key -pubout -outform DER \| sha256sum`), whose binds that binder may claim a TD of the pool with. A binder with no authority watches and claims nothing, and an orchestrator needs no entry to claim with a bind. |
 | `vmm.console` | Attach each guest's console to its launcher's log. For dev images only: a locked image prints nothing there. |
 
 Relative paths are taken from the configuration file's directory. An unknown
@@ -399,10 +460,12 @@ changes on the host while it runs.
 ## What is missing
 
 - The other calls of the design: pools made and changed through the API,
-  `Hold`, `Release`, `Seal`, `Deliver`, `Collect`, `GetStats`, `Watch`, and
-  the flows that call a registered binder (`Start`, `Restore`, `Fork`). Pools
-  come from the configuration file, with the binders that may watch them,
-  and the binder of a session is the caller's own.
+  `Hold`, `Release`, `Seal`, `Deliver`, `Collect`, `GetStats`, and the flows
+  that call a registered binder (`Start`, `Restore`, `Fork`). Pools come from
+  the configuration file, with the binders that may watch them and claim
+  their TDs, and the binder of a session is the caller's own.
+- Of `Watch`: it shows TDs. The design's events for a commit, a seal, a
+  restore and a pool's depth come with those calls.
 - The JSON form of the API.
 - A second host, and with it placement.
 - Quotas per orchestrator. The bounds on open calls are fixed: 64 evidence
@@ -420,6 +483,6 @@ changes on the host while it runs.
   there is nothing yet to refuse a running session whose platform the vendor
   revokes: the key service keeps the evidence each bound guest acquired with
   for that judgment, and a repeat of an acquire is held to it.
-- A stream that says when a TD leaves ready. A binder keeps its verdict on a
-  TD that another binder took until that TD's certificate ends, and judges
-  it again each hour meanwhile.
+- Offering each ready TD to one watcher at a time. Binders that watch one
+  pool are all shown the same TDs and sign for the one shown first, so two
+  that start a session at the same moment collide, and one signs again.

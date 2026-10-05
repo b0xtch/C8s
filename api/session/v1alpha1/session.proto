@@ -18,6 +18,14 @@ service Sessions {
   // record. The guest is asked nothing: it learns of the claim from the bind.
   rpc Claim(ClaimRequest) returns (Claimed);
   // Bind hands a claimed TD its bind and returns the guest's receipt for it.
+  // A bind that names no TD claims one: the ready TD of the instance key the
+  // bind names, which no claim holds, for the bind's session and with no
+  // grace. An orchestrator may send such a bind, and a binder its pool names,
+  // under an authority the pool names for that binder. A TD that is claimed
+  // or gone by then is answered as not ready, before anything reaches a
+  // guest: FAILED_PRECONDITION with an ErrorInfo of reason TD_NOT_READY in
+  // the domain sessions.c8s. Its sender signs a bind for another TD.
+  //
   // The guest raises its fence as the bind arrives: no connection opened to
   // it before survives. The first message carries the bind, and may carry a
   // message sealed for the guest: the session's first command, credentials
@@ -39,10 +47,16 @@ service Sessions {
   rpc GetEvidence(EvidenceRequest) returns (Evidence);
   // WatchReady streams what each ready TD of a pool says of itself, as a
   // claim of it would be answered: the TDs ready now, then each as it becomes
-  // ready or comes to serve another certificate. A binder judges them ahead
-  // of its claims. A stream shows how fast a pool refills, so it is open only
-  // to the binders the pool's configuration names.
-  rpc WatchReady(WatchReadyRequest) returns (stream Evidence);
+  // ready or comes to serve another certificate, and each that leaves ready.
+  // A binder judges them ahead of its claims, or signs a bind for one, which
+  // claims it. A stream shows how fast a pool refills, so it is open only to
+  // the binders the pool's configuration names.
+  rpc WatchReady(WatchReadyRequest) returns (stream ReadyChange);
+  // Watch streams what becomes of the host's TDs to an orchestrator: each TD
+  // as it is now, then each as it changes. A TD that changed more than once
+  // between two messages is shown as it is, so every session a host serves
+  // is shown, also one that a binder's bind started with no claim.
+  rpc Watch(WatchRequest) returns (stream Event);
 }
 
 message ClaimRequest {
@@ -67,6 +81,7 @@ message Claimed {
 
 message BindRequest {
   string request_id = 1;
+  // The claimed TD the bind is for. Empty in a bind that claims its TD.
   string td = 2;
   // c8s-bind/v1, canonical JSON, and its signature.
   bytes bind = 3;
@@ -96,6 +111,9 @@ message Bound {
   // in a message of its own for one that came after. An answer follows only
   // what was taken, and a binder relies on that answer alone.
   string sealed_status = 4;
+  // With the receipt of a bind that claimed its TD: the TD, and its host.
+  string td = 5;
+  string host = 6;
 }
 
 // Evidence is what a guest says of itself, relayed unread. Each part is
@@ -164,4 +182,46 @@ message EvidenceRequest {
 
 message WatchReadyRequest {
   string pool = 1;
+}
+
+// ReadyChange is one change to a pool's ready TDs.
+message ReadyChange {
+  oneof change {
+    // A TD that is ready, as a claim of it would be answered.
+    Evidence ready = 1;
+    // A TD that left ready, claimed, bound or ended, or that came to serve
+    // another certificate. It is named by the SHA-256 of the certificate it
+    // was last shown under, which is how a binder keeps its verdict on it.
+    bytes left = 2;
+  }
+}
+
+message WatchRequest {}
+
+enum TDState {
+  TD_STATE_UNSPECIFIED = 0;
+  TD_STATE_BOOTING = 1;
+  TD_STATE_READY = 2;
+  TD_STATE_CLAIMED = 3;
+  // Sent a bind whose answer is not known yet.
+  TD_STATE_BOUND = 4;
+  TD_STATE_RUNNING = 5;
+  TD_STATE_ENDED = 6;
+}
+
+// Event is a TD as it is: when a watch begins, and after each change.
+message Event {
+  string td = 1;
+  string pool = 2;
+  string host = 3;
+  TDState state = 4;
+  // The session the TD serves or served, once it is claimed.
+  string session = 5;
+  // Why an ended TD ended.
+  string reason = 6;
+  // For a TD that a bind claimed: the key of the binder that sent it, as the
+  // pool's configuration names it. Empty when an orchestrator sent it, and
+  // for a TD claimed by Claim.
+  string claimed_by = 7;
+  google.protobuf.Timestamp at = 8;
 }

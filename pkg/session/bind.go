@@ -278,6 +278,16 @@ func (s *SignedBind) SignedBy(authorityPEM []byte) bool {
 	return err == nil && got.Equal(want)
 }
 
+// AuthorityDigest names the bind's authority as a pool's configuration names
+// one: sha256:<hex> of the key's PKIX encoding.
+func (s *SignedBind) AuthorityDigest() (string, error) {
+	key, err := parsePublicKey(s.Doc.Authority)
+	if err != nil {
+		return "", err
+	}
+	return InstanceKeyDigest(key)
+}
+
 // Targets checks that the bind was written for the guest that holds this
 // instance key.
 func (b *Bind) Targets(instanceKey crypto.PublicKey) error {

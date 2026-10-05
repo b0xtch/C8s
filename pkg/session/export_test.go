@@ -93,3 +93,6 @@ func (v *ReadyVerdicts) KeepsReadyVerdict(digest [sha256.Size]byte) bool {
 	defer v.mu.Unlock()
 	return v.judged[digest] != nil
 }
+
+// LeftGrace is how long a verdict outlives its TD's leaving ready.
+const LeftGrace = leftGrace

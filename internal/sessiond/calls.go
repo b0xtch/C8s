@@ -136,7 +136,8 @@ func (d *Daemon) repeatedClaim(req *sessionv1alpha1.ClaimRequest) (*sessionv1alp
 			continue
 		}
 		if c.RequestID == req.GetRequestId() {
-			if c.Session != req.GetSession() || t.rec.Pool != req.GetPool() {
+			// A bind that claimed its TD under this id is another claim too.
+			if c.ByBind || c.Session != req.GetSession() || t.rec.Pool != req.GetPool() {
 				return nil, status.Error(codes.InvalidArgument, "request_id was used for another claim")
 			}
 			if c.Answer == nil {
@@ -251,8 +252,116 @@ func lasts(leaf []byte, now time.Time) bool {
 	return err == nil && now.Add(certMargin).Before(cert.NotAfter)
 }
 
-// Bind hands a claimed TD its bind and answers with the guest's receipt for
-// it. The call is a stream both ways. Its first message is the bind, with a
+// claimant is who sends a bind that claims its TD, and what the bind says of
+// the TD and the session it is for.
+type claimant struct {
+	// instanceKey names the TD, and session the session, as the bind does.
+	instanceKey, session string
+	// authority is the digest of the key the bind is signed under.
+	authority string
+	// orchestrator: the caller presented an orchestrator's certificate.
+	// Otherwise binder is the digest of the key it presented.
+	orchestrator bool
+	binder       string
+}
+
+// notReadyReason is what an answer carries, beside its words, when a bind
+// that claims found no ready TD of the key it names.
+const notReadyReason = "TD_NOT_READY"
+
+func notReady() error {
+	st := status.New(codes.FailedPrecondition, "no ready TD holds the instance key the bind names: it was claimed or bound, or it is gone")
+	if detailed, err := st.WithDetails(&errdetails.ErrorInfo{Reason: notReadyReason, Domain: "sessions.c8s"}); err == nil {
+		st = detailed
+	}
+	return st.Err()
+}
+
+// claimant reads a bind that names no TD, as its guest will read it, to
+// learn which TD it is for, and holds its sender to what may claim one: an
+// orchestrator, or a binder some pool names with the bind's authority. An
+// outsider is told so whatever TDs there are.
+func (d *Daemon) claimant(ctx context.Context, req *sessionv1alpha1.BindRequest) (*claimant, error) {
+	certs := presented(ctx)
+	if len(certs) == 0 {
+		return nil, status.Error(codes.Unauthenticated, "this call needs a certificate")
+	}
+	denied := status.Error(codes.PermissionDenied, "no pool lets this caller claim a TD with a bind under that authority")
+	c := &claimant{orchestrator: d.chained(certs)}
+	if !c.orchestrator {
+		var err error
+		if c.binder, err = session.InstanceKeyDigest(certs[0].PublicKey); err != nil {
+			return nil, status.Error(codes.Unauthenticated, "the certificate carries no usable key")
+		}
+		// A key no pool names is told so before its bind is read.
+		if !d.anyPool(func(p *Pool) bool { return p.binder(c.binder) != nil }) {
+			return nil, denied
+		}
+	}
+	signed, err := session.VerifyBind(req.GetBind(), string(req.GetSignature()))
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "a bind that names no TD must verify, to say which TD it claims")
+	}
+	// A bind that parses names its session by an RFC 1123 label.
+	c.instanceKey, c.session = signed.Doc.InstanceKey, signed.Doc.Session
+	if c.authority, err = signed.AuthorityDigest(); err != nil {
+		return nil, status.Error(codes.InvalidArgument, "the bind names no usable authority")
+	}
+	if !c.orchestrator && !d.anyPool(func(p *Pool) bool { return p.binds(c.binder, c.authority) }) {
+		return nil, denied
+	}
+	return c, nil
+}
+
+// anyPool reports whether ok holds for the configuration of one of the
+// host's pools.
+func (d *Daemon) anyPool(ok func(*Pool) bool) bool {
+	for i := range d.cfg.Pools {
+		if ok(&d.cfg.Pools[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// claimable finds the TD a bind that names none is for: the one an earlier
+// request under the same id claimed, or the ready TD of the instance key the
+// bind names, in a pool that lets its sender claim. The caller holds the
+// lock.
+func (d *Daemon) claimable(c *claimant, requestID string) (*td, error) {
+	for _, t := range d.tds {
+		cl := t.rec.Claim
+		if cl == nil {
+			continue
+		}
+		if cl.ByBind && cl.RequestID == requestID {
+			if cl.Binder != c.binder {
+				return nil, status.Error(codes.InvalidArgument, "request_id was used by another caller")
+			}
+			return t, nil
+		}
+		if cl.Session == c.session && t.rec.State != StateEnded {
+			return nil, status.Errorf(codes.AlreadyExists, "session %s has a TD", c.session)
+		}
+	}
+	for _, t := range d.tds {
+		if t.rec.State != StateReady || t.busy || t.instanceKey == "" || t.instanceKey != c.instanceKey {
+			continue
+		}
+		// A TD of a pool that does not let this caller claim is none to it.
+		if pool, ok := d.pools[t.rec.Pool]; ok && (c.orchestrator || pool.cfg.binds(c.binder, c.authority)) {
+			return t, nil
+		}
+	}
+	return nil, notReady()
+}
+
+// Bind hands a TD its bind and answers with the guest's receipt for it. The
+// TD is one a claim reserved or, for a bind that names none, the ready TD of
+// the instance key the bind names, which the bind then claims for its
+// session, with no grace: see claimant.
+//
+// The call is a stream both ways. Its first message is the bind, with a
 // message sealed for the guest if its sender had one by then: the session's
 // first command, credentials its binder holds, or both. A sealed message may
 // also come alone in the next message, and is carried to the guest, which
@@ -383,11 +492,32 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	sum.Write(req.GetSignature())
 	digest := hex.EncodeToString(sum.Sum(nil))
 
+	// A bind for a claimed TD is its orchestrator's. One that names no TD
+	// claims the one it is for.
+	var claiming *claimant
+	if req.GetTd() == "" {
+		var err error
+		if claiming, err = d.claimant(ctx, req); err != nil {
+			return nil, nil, err
+		}
+	} else if certs := presented(ctx); len(certs) == 0 || !d.chained(certs) {
+		return nil, nil, status.Error(codes.Unauthenticated, "a bind for a claimed TD needs an orchestrator's certificate")
+	}
+
 	d.mu.Lock()
-	t, ok := d.tds[req.GetTd()]
-	if !ok {
-		d.mu.Unlock()
-		return nil, nil, status.Error(codes.NotFound, "no such TD")
+	var t *td
+	if claiming == nil {
+		var ok bool
+		if t, ok = d.tds[req.GetTd()]; !ok {
+			d.mu.Unlock()
+			return nil, nil, status.Error(codes.NotFound, "no such TD")
+		}
+	} else {
+		var err error
+		if t, err = d.claimable(claiming, req.GetRequestId()); err != nil {
+			d.mu.Unlock()
+			return nil, nil, err
+		}
 	}
 	replay := false
 	switch b := t.rec.Bind; {
@@ -421,6 +551,12 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		// as it answered the first, and says what became of this message.
 		// Only the guest keeps a sealed answer.
 		replay = true
+	case b == nil && t.rec.State == StateReady && claiming != nil:
+		// The bind claims the TD, for its session: nothing of a tenant has
+		// reached the guest, and nothing does before this bind.
+		t.rec.Claim = &claim{RequestID: req.GetRequestId(), Session: claiming.session, ByBind: true, Binder: claiming.binder}
+		// Those who watch the pool learn now that the TD is ready no more.
+		d.notify()
 	case b == nil && t.rec.State != StateClaimed:
 		state := t.rec.State
 		d.mu.Unlock()
@@ -478,6 +614,10 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		evidence.Collateral = t.collateral
 	}
 	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, SealedStatus: relayed.sealed}
+	if t.rec.Claim != nil && t.rec.Claim.ByBind {
+		// Whoever sent the bind learns which TD it claimed.
+		answer.Td, answer.Host = t.rec.ID, d.cfg.Host
+	}
 	if replay {
 		return answer, relayed.wait, nil
 	}
@@ -492,7 +632,7 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	}
 	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
 		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
-		"sealed", relayed.sealed)
+		"sealed", relayed.sealed, "claimed_by_bind", t.rec.Claim != nil && t.rec.Claim.ByBind)
 	d.notify()
 	return answer, relayed.wait, nil
 }

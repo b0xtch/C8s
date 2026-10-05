@@ -3,7 +3,9 @@ package sessiond_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -17,10 +19,12 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
 )
 
-// watched is what a stream that watches a pool has shown so far.
+// watched is what a stream that watches a pool has shown so far, and the
+// certificates of the TDs it said left.
 type watched struct {
 	mu    sync.Mutex
 	shown []*session.Relayed
+	left  [][sha256.Size]byte
 	ended chan error
 	stop  context.CancelFunc
 }
@@ -35,10 +39,22 @@ func watch(t *testing.T, c *daemon.Client, pool string) *watched {
 			w.mu.Lock()
 			defer w.mu.Unlock()
 			w.shown = append(w.shown, r)
+		}, func(certificate [sha256.Size]byte) {
+			w.mu.Lock()
+			defer w.mu.Unlock()
+			w.left = append(w.left, certificate)
 		})
 	}()
 	t.Cleanup(cancel)
 	return w
+}
+
+// gone reports whether the stream said the TD shown under this certificate
+// left ready.
+func (w *watched) gone(certificate []byte) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Contains(w.left, sha256.Sum256(certificate))
 }
 
 func (w *watched) seen() []*session.Relayed {
@@ -94,6 +110,14 @@ func TestWatchReadyShowsABinderThePoolsReadyTDs(t *testing.T) {
 	judged, err := verdicts.Claimed(ctx(t), claimed.Evidence)
 	if err != nil || !judged.Ahead {
 		t.Fatalf("the claimed TD was not found judged: %v", err)
+	}
+	// The stream says the claimed TD left, by the certificate it was shown
+	// under, and of the other it says nothing.
+	eventually(t, "the stream says the claimed TD left ready", func() bool { return w.gone(claimed.Evidence.Certificate) })
+	for _, shown := range w.seen()[:2] {
+		if !bytes.Equal(shown.Certificate, claimed.Evidence.Certificate) && w.gone(shown.Certificate) {
+			t.Fatal("the stream says a TD left that nobody claimed")
+		}
 	}
 	// The pool refills, and the new TD is shown: no other is shown again.
 	eventually(t, "the TD that refilled the pool is shown", func() bool { return len(w.seen()) == 3 })

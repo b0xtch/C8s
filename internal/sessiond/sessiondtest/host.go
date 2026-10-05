@@ -223,13 +223,13 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 		t.Fatal(err)
 	}
 	dir := h.pki()
-	var binders []string
+	var binders []sessiond.Binder
 	for _, cert := range []*tls.Certificate{&h.Orchestrator, &h.Binder} {
 		binder, err := daemon.BinderName(cert.Leaf)
 		if err != nil {
 			t.Fatal(err)
 		}
-		binders = append(binders, binder)
+		binders = append(binders, sessiond.Binder{Key: binder})
 	}
 	h.Config = &sessiond.Config{
 		Listen: "127.0.0.1:0", Host: "host-a", StateDir: t.TempDir(), Capacity: 4,
