@@ -473,9 +473,13 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	}
 	traced(ctx, "signed")
 	// What signing left on the heap, and opening a sealed message before it,
-	// is erased by a collection. Begun this early, it runs beside every step
-	// that follows, and the sandbox's start waits for it below.
-	go a.oneTime.collect()
+	// is erased by one collection, which the sandbox's start waits for below.
+	// With the message opened it begins now and runs beside every step that
+	// follows. While one may still come it waits for that, so that no bind
+	// pays for two.
+	if a.oneTime.kemGone() {
+		go a.oneTime.collect()
+	}
 	if sandbox != nil {
 		if err := a.cfg.Runner.Prepare(ctx, sandbox, egress); err != nil {
 			return nil, nil, fmt.Errorf("prepare sandbox: %w", err)

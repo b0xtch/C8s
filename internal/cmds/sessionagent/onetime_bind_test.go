@@ -167,43 +167,86 @@ func TestReceiptOfAGuestThatAdmitsNoSandboxIsNeverReleased(t *testing.T) {
 
 // The sandbox is not started while the collection that erases what the
 // one-time keys left is still on its way: the agent waits for it, however
-// long it takes, and starts the sandbox once it is done.
-func TestSandboxStartWaitsForTheCollection(t *testing.T) {
-	p := newPool(t)
-	p.runner.gate = make(chan struct{})
-	p.runner.starting, p.runner.started = make(chan struct{}), make(chan struct{})
-	p.start(t)
-	c := found(t, p)
-	release := sessionagent.HoldCollections(c.agent)
-	bound := make(chan bindAnswer, 1)
-	go func() { bound <- c.post(t, c.bind, nil) }()
-	// The receipt is signed and the key gone, and the collection that began
-	// then is on its way, beside the sandbox's preparation.
-	until(t, "the collection began", func() bool { return sessionagent.OneTimeCollecting(c.agent) == 1 })
-	if !sessionagent.OneTimeSigningGone(c.agent) {
-		t.Fatal("a collection began before the receipt was signed")
-	}
-	// The guest gets everything else done, and waits for it.
-	close(p.runner.gate)
-	select {
-	case <-p.runner.starting:
-		t.Fatal("the sandbox was started before what the one-time keys left was collected")
-	case <-time.After(150 * time.Millisecond):
-	}
-	if sessionagent.OneTimeKeysErased(c.agent) {
-		t.Fatal("a collection that is held reads as done")
-	}
-	release()
-	select {
-	case <-p.runner.starting:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the sandbox was never started")
-	}
-	if !sessionagent.OneTimeKeysErased(c.agent) {
-		t.Fatal("the sandbox is started, and the collection is not done")
-	}
-	close(p.runner.started)
-	if answer := <-bound; answer.status != http.StatusOK {
-		t.Fatalf("the bind's answer: %d", answer.status)
+// long it takes, and starts the sandbox once it is done. A bind pays for one
+// collection and no more. With its sealed message opened before the receipt
+// is signed, the collection begins at the signing, beside the sandbox's
+// preparation. While a message may still come it waits for that: for the
+// message that comes after the bind, or for the time of one to be over.
+func TestSandboxStartWaitsForTheOneCollection(t *testing.T) {
+	for name, tc := range map[string]struct {
+		with, late bool
+	}{
+		"a sealed message with the bind":  {true, false},
+		"no sealed message":               {false, false},
+		"a sealed message after the bind": {false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := newPool(t)
+			p.runner.gate = make(chan struct{})
+			p.runner.starting, p.runner.started = make(chan struct{}), make(chan struct{})
+			p.start(t)
+			c := found(t, p)
+			before := sessionagent.OneTimeCollections(c.agent)
+			release := sessionagent.HoldCollections(c.agent)
+			message := c.seal(t, p.access, c.bind, true)
+			var sealed []byte
+			if tc.with {
+				sealed = message.Sealed
+			}
+			bound := make(chan bindAnswer, 1)
+			go func() { bound <- c.post(t, c.bind, sealed) }()
+			until(t, "the guest took its bind", func() bool { return c.phase(t) == session.PhaseBound })
+			if !sessionagent.OneTimeSigningGone(c.agent) {
+				t.Fatal("the guest still holds its signing key while it prepares its sandbox")
+			}
+			if tc.with {
+				// The collection that began at the signing is on its way,
+				// beside the sandbox's preparation.
+				until(t, "the collection began", func() bool { return sessionagent.OneTimeCollecting(c.agent) == 1 })
+			} else {
+				// None begins while a message may still come.
+				time.Sleep(150 * time.Millisecond)
+				if n := sessionagent.OneTimeCollecting(c.agent); n != 0 {
+					t.Fatalf("%d collections began while a sealed message could still come", n)
+				}
+			}
+			after := make(chan bindAnswer, 1)
+			if tc.late {
+				go func() { after <- c.late(t, message.Sealed) }()
+				until(t, "the guest opened the message", func() bool { return sessionagent.SealedState(c.agent) == session.SealedTaken })
+			}
+			// The guest gets everything else done, and waits for the collection.
+			close(p.runner.gate)
+			until(t, "the collection began", func() bool { return sessionagent.OneTimeCollecting(c.agent) == 1 })
+			select {
+			case <-p.runner.starting:
+				t.Fatal("the sandbox was started before what the one-time keys left was collected")
+			case <-time.After(150 * time.Millisecond):
+			}
+			if sessionagent.OneTimeKeysErased(c.agent) {
+				t.Fatal("a collection that is held reads as done")
+			}
+			release()
+			select {
+			case <-p.runner.starting:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the sandbox was never started")
+			}
+			if !sessionagent.OneTimeKeysErased(c.agent) {
+				t.Fatal("the sandbox is started, and the collection is not done")
+			}
+			if ran := sessionagent.OneTimeCollections(c.agent) - before; ran != 1 {
+				t.Fatalf("the bind ran %d collections, and pays for one", ran)
+			}
+			close(p.runner.started)
+			if answer := <-bound; answer.status != http.StatusOK {
+				t.Fatalf("the bind's answer: %d", answer.status)
+			}
+			if tc.late {
+				if answer := <-after; answer.status != http.StatusOK {
+					t.Fatalf("the answer to the message sent after the bind: %d", answer.status)
+				}
+			}
+		})
 	}
 }

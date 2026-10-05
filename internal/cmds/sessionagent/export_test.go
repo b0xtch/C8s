@@ -88,6 +88,14 @@ func OneTimeCollecting(a *Agent) int {
 	return a.oneTime.collecting
 }
 
+// OneTimeCollections is how many collections of what the guest's one-time
+// keys left have run since the guest made the keys.
+func OneTimeCollections(a *Agent) int {
+	a.oneTime.mu.Lock()
+	defer a.oneTime.mu.Unlock()
+	return a.oneTime.collected
+}
+
 // OneTimeSigningGone reports whether the guest has erased its one-time
 // signing key.
 func OneTimeSigningGone(a *Agent) bool {

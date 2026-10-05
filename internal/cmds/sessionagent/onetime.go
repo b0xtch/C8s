@@ -34,9 +34,11 @@ type oneTime struct {
 	kem []byte
 	// used says work on a key has left something on the heap since the last
 	// collection began, and collecting counts the collections on their way.
-	// Nothing of the keys is left once neither holds.
+	// Nothing of the keys is left once neither holds. collected counts the
+	// collections that ran.
 	used       bool
 	collecting int
+	collected  int
 	// inflight is done when no collection is on its way.
 	inflight sync.WaitGroup
 	// hold, when set, is where a collection waits before it runs: a test's
@@ -117,6 +119,7 @@ func (o *oneTime) collect() {
 		runtime.GC()
 		o.mu.Lock()
 		o.collecting--
+		o.collected++
 		o.mu.Unlock()
 		o.inflight.Done()
 	}
@@ -169,6 +172,14 @@ func (o *oneTime) eraseKEM() {
 	defer o.mu.Unlock()
 	clear(o.kem)
 	o.kem = nil
+}
+
+// kemGone reports whether the KEM key is erased: a sealed message was
+// opened with it, or the time for one is over.
+func (o *oneTime) kemGone() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.kem == nil
 }
 
 // gone reports whether both keys are erased.
