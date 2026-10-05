@@ -207,6 +207,7 @@ const (
 	StepUnpack       Code = "unpack"
 	StepOwn          Code = "own"
 	StepClear        Code = "clear"
+	StepChecks       Code = "checks"
 	StepMeasure      Code = "measure"
 	StepCredentials  Code = "credentials"
 	StepStart        Code = "start"
@@ -215,7 +216,7 @@ const (
 // Steps lists every admission step, in the order they happen.
 var Steps = []Code{
 	StepRegistryWait, StepResolve, StepFetch, StepStore, StepPrestaged, StepUnpack, StepOwn, StepClear,
-	StepMeasure, StepCredentials, StepStart,
+	StepChecks, StepMeasure, StepCredentials, StepStart,
 }
 
 var (

@@ -33,6 +33,10 @@ const (
 	stepOwn = string(disclosure.StepOwn)
 	// stepClear: the fetched blobs removed.
 	stepClear = string(disclosure.StepClear)
+	// stepChecks: what the guest checks of itself before it admits a
+	// sandbox: its schemas, its console, its devices, its packet filter and
+	// its listeners.
+	stepChecks = string(disclosure.StepChecks)
 	// stepMeasure: the sandbox extended into the register.
 	stepMeasure = string(disclosure.StepMeasure)
 	// stepCredentials: the stored credentials taken from the key service.

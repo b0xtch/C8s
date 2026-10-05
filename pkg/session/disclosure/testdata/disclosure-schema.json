@@ -213,6 +213,7 @@
             "unpack",
             "own",
             "clear",
+            "checks",
             "measure",
             "credentials",
             "start"

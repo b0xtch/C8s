@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sync"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
@@ -94,4 +95,53 @@ func withoutHandles(v any) any {
 	default:
 		return v
 	}
+}
+
+// RulesetWatch is the check of the packet filter that a guest repeats. The
+// first check lists the filter and compares it, as RulesetGuard does. The
+// kernel counts the changes made to a network namespace's filter, and the
+// count moves with every change that takes effect: while it stands where it
+// stood around a listing that passed, the filter is the one that was listed,
+// and a check is one question to the kernel. A count that moved has the
+// filter listed again.
+type RulesetWatch struct {
+	Guard RulesetGuard
+	// Generation reads the kernel's count for the namespace the filter is
+	// in. Nil lists the filter at every check.
+	Generation func() (uint32, error)
+
+	mu sync.Mutex
+	// held says a listing passed with the count at generation before and
+	// after it.
+	held       bool
+	generation uint32
+}
+
+// Check fails unless the ruleset in force is the expected one.
+func (w *RulesetWatch) Check(ctx context.Context) error {
+	if w.Generation == nil {
+		return w.Guard.Check(ctx)
+	}
+	before, err := w.Generation()
+	if err == nil {
+		w.mu.Lock()
+		same := w.held && before == w.generation
+		w.mu.Unlock()
+		if same {
+			return nil
+		}
+	}
+	w.mu.Lock()
+	w.held = false
+	w.mu.Unlock()
+	if err := w.Guard.Check(ctx); err != nil {
+		return err
+	}
+	// A listing stands for a count only if nothing changed while it was
+	// taken. Otherwise the next check lists again.
+	after, afterErr := w.Generation()
+	w.mu.Lock()
+	w.held, w.generation = err == nil && afterErr == nil && after == before, before
+	w.mu.Unlock()
+	return nil
 }

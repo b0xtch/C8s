@@ -166,3 +166,121 @@ func TestExpectedRulesetNamesTheLoadedTable(t *testing.T) {
 		}
 	}
 }
+
+// countingNft is an nft that lists listing and counts how often it is asked.
+func countingNft(t *testing.T, listing func() string) (path string, asked func() int) {
+	t.Helper()
+	dir := t.TempDir()
+	count := filepath.Join(dir, "asked")
+	out := filepath.Join(dir, "listing")
+	path = filepath.Join(dir, "nft")
+	script := "#!/bin/sh\necho x >> " + count + "\ncat " + out + "\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func() {
+		if err := os.WriteFile(out, []byte(listing()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write()
+	return path, func() int {
+		write()
+		data, err := os.ReadFile(count)
+		if err != nil {
+			return 0
+		}
+		return len(data) / 2
+	}
+}
+
+// A guest lists its packet filter once and from then on asks the kernel only
+// whether anything changed it. While the kernel's count of changes stands
+// where it stood around a listing that passed, a check lists nothing. A count
+// that moved has the filter listed again, and so does one that moved while
+// the filter was being listed, a count that cannot be read, and a listing
+// that did not pass.
+func TestRulesetWatchListsAgainOnlyWhenTheFilterChanged(t *testing.T) {
+	if _, err := os.Stat(expectedRuleset); errors.Is(err, fs.ErrNotExist) {
+		t.Skip("needs the guest image profile: run from a checkout")
+	}
+	ctx := context.Background()
+	listing := asKernelLists(t, nil)
+	nft, asked := countingNft(t, func() string { return listing })
+	generation, failing := uint32(7), false
+	var moving func()
+	watch := &RulesetWatch{
+		Guard: RulesetGuard{Nft: nft, Expected: expectedRuleset},
+		Generation: func() (uint32, error) {
+			if failing {
+				return 0, errors.New("no netlink")
+			}
+			now := generation
+			if moving != nil {
+				moving()
+			}
+			return now, nil
+		},
+	}
+	check := func(what string, want int) {
+		t.Helper()
+		if err := watch.Check(ctx); err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if got := asked(); got != want {
+			t.Fatalf("%s: the filter was listed %d times, want %d", what, got, want)
+		}
+	}
+	check("the first check", 1)
+	check("a check with nothing changed", 1)
+	check("another", 1)
+
+	// A change that takes effect, whatever it leaves behind.
+	generation++
+	check("a check after a change that was undone", 2)
+	check("a check with nothing changed since", 2)
+
+	// A change while the filter is listed: that listing stands for nothing.
+	generation++
+	moving = func() { generation++; moving = nil }
+	check("a check while the filter changes", 3)
+	check("the check after it", 4)
+	check("a check with nothing changed since", 4)
+
+	// A kernel that does not say: the filter is listed every time.
+	failing = true
+	check("a check with no count", 5)
+	check("another", 6)
+	failing = false
+	check("a check once the count is back", 7)
+	check("a check with nothing changed since", 7)
+
+	// A filter that is not the image's is refused, and nothing is held for
+	// the count it was listed under.
+	generation++
+	listing = asKernelLists(t, func(items []nftItem) []nftItem { return items[:len(items)-1] })
+	asked()
+	if err := watch.Check(ctx); err == nil {
+		t.Fatal("a filter with a rule gone passed")
+	}
+	if err := watch.Check(ctx); err == nil {
+		t.Fatal("the same filter passed the second time, under the count it was refused under")
+	}
+	listing = asKernelLists(t, nil)
+	if got := asked(); got != 9 {
+		t.Fatalf("a refused filter was listed %d times in two checks, want 2", got-7)
+	}
+	check("the image's filter again, under the same count", 10)
+	check("a check with nothing changed since", 10)
+
+	// With no count to ask for, every check lists.
+	plain := &RulesetWatch{Guard: RulesetGuard{Nft: nft, Expected: expectedRuleset}}
+	for range 2 {
+		if err := plain.Check(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := asked(); got != 12 {
+		t.Fatalf("a watch with no count listed %d times in two checks", got-10)
+	}
+}

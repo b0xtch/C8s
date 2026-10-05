@@ -436,9 +436,11 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		// Asked before the image is measured: a guest that will not start
 		// its sandbox does not say it admitted one.
 		if a.cfg.Guard != nil {
+			began := time.Now()
 			if err := a.cfg.Guard(ctx); err != nil {
 				return nil, nil, fmt.Errorf("before starting the sandbox: %w", err)
 			}
+			recordStep(ctx, stepChecks, time.Since(began))
 		}
 	}
 	events, err := a.settle(ctx, sandbox != nil)

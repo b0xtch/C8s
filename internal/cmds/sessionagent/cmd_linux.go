@@ -156,7 +156,10 @@ func newRunCmd() *cobra.Command {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.
 				listeners := ListenerGuard{Proc: "/proc"}
-				checks = append(checks, guard.Check, listeners.Check)
+				// Listed before the guest serves, and from then on held to
+				// the kernel's count of its changes.
+				filter := &RulesetWatch{Guard: guard, Generation: rulesetGeneration}
+				checks = append(checks, filter.Check, listeners.Check)
 			}
 			cfg.Guard = func(ctx context.Context) error {
 				for _, check := range checks {
