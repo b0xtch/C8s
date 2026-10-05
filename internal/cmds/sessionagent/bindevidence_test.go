@@ -77,10 +77,13 @@ func (q *quotingTEE) quotes() [][]byte {
 }
 
 // failNext has the next quote fail.
-func (q *quotingTEE) failNext() {
+func (q *quotingTEE) failNext() { q.fail(1) }
+
+// fail has the next n quotes fail.
+func (q *quotingTEE) fail(n int) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	q.failing = 1
+	q.failing = n
 }
 
 // failFor has every quote over reportData fail.

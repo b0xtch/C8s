@@ -19,6 +19,21 @@ import (
 // they last; the rest are the other routes'.
 const maxConnections = 128
 
+// sandboxEndMargin is what a guest whose sandbox has ended allows, beyond
+// the pauses between its attempts at its bind's quote, for those attempts
+// and for its answers to leave.
+var sandboxEndMargin = 1250 * time.Millisecond
+
+// sandboxEndGrace is how long such a guest gives the answers it still owes
+// before it stops: its bind's quote is settled within it.
+func sandboxEndGrace() time.Duration {
+	grace := sandboxEndMargin
+	for _, pause := range bindQuotePauses {
+		grace += pause
+	}
+	return grace
+}
+
 // Run stages the launch document, serves the agent API, and admits the
 // sandbox. It returns when ctx ends, when the sandbox ends, or when anything
 // on that path fails; the unit that runs it then powers the guest off, because
@@ -98,9 +113,13 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 		cancel()
 		return err
 	case err := <-sandbox:
-		// A session's guest is its sandbox. When that ends the agent stops
-		// and the unit powers the guest off.
+		// A session's guest is its sandbox. When that ends the agent takes
+		// no more connections, gives the answers it still owes, its bind's
+		// quote among them, and stops; the unit then powers the guest off.
 		if ctx.Err() == nil {
+			owed, cancel := context.WithTimeout(context.Background(), sandboxEndGrace())
+			_ = srv.Shutdown(owed)
+			cancel()
 			_ = srv.Close()
 			if err != nil {
 				return fmt.Errorf("sandbox ended: %w", err)

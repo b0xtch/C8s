@@ -2,13 +2,17 @@ package sessionagent_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,4 +273,125 @@ func TestBindsAnswerCarriesNoStateForACallerThatDoesNotReadOn(t *testing.T) {
 			}
 		}
 	})
+}
+
+// served runs a pool's guest as its unit does, with a sandbox the test ends
+// and a quoting service the test holds, and returns what Run returns.
+func served(t *testing.T) (*pool, *quotingTEE, <-chan error, string) {
+	t.Helper()
+	p := newPool(t)
+	tee := &quotingTEE{TEE: sessiontest.TEE{TD: p.td}}
+	p.cfg.TEE, p.cfg.Logger = tee, slog.New(slog.DiscardHandler)
+	p.runner.ended = make(chan error, 1)
+	addr := freeAddr(t)
+	done := make(chan error, 1)
+	go func() { done <- sessionagent.Run(context.Background(), p.cfg, addr) }()
+	p.url = "https://" + addr
+	until(t, "the guest serves", func() bool {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			_ = conn.Close()
+		}
+		return err == nil
+	})
+	return p, tee, done, addr
+}
+
+// A sandbox may end before its guest has the quote over its bind's nonce:
+// an image's process that ends at once outruns the quoting service. The
+// guest then takes no more connections, and finishes the answer to its bind
+// before it stops, so that its binder still gets the quote the receipt is
+// held to.
+func TestRunFinishesItsBindsAnswerWhenTheSandboxEnds(t *testing.T) {
+	p, tee, done, addr := served(t)
+	c := found(t, p)
+	release := tee.hold()
+	defer release()
+	answer, first := c.reads(t, c.bind, nil, true)
+	if first.Receipt == nil || first.Attestation != nil {
+		t.Fatalf("the bind's answer while the quoting service is slow: %+v", first)
+	}
+	p.runner.ended <- nil
+	until(t, "the guest takes no more connections", func() bool {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err == nil {
+			_ = conn.Close()
+		}
+		return err != nil
+	})
+	select {
+	case err := <-done:
+		t.Fatalf("the guest stopped while it owed its bind's answer: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if reply, state := answer.next(); reply != nil || state == nil || state.BindQuote != session.BindQuoteTaken || state.Attestation == nil {
+		t.Fatalf("what followed the receipt of a guest whose sandbox had ended: %+v", state)
+	}
+	answer.ended("after the quote")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the guest of a sandbox that ended in order stopped with %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the guest did not stop after it had finished its bind's answer")
+	}
+}
+
+// The time a guest whose sandbox has ended gives what it owes covers every
+// further attempt at its bind's quote, however long the pauses between them
+// are set: a quoting service that fails until the last attempt still has its
+// quote sent.
+func TestRunWaitsOutEveryAttemptAtItsBindsQuoteWhenTheSandboxEnds(t *testing.T) {
+	sessionagent.SetBindQuotePauses(t, 150*time.Millisecond, 150*time.Millisecond)
+	sessionagent.SetSandboxEndMargin(t, 100*time.Millisecond)
+	p, tee, done, _ := served(t)
+	c := found(t, p)
+	// The attempt beside the bind fails, and the first of the two after it.
+	tee.fail(2)
+	answer, first := c.reads(t, c.bind, nil, true)
+	if first.Receipt == nil || first.Attestation != nil {
+		t.Fatalf("the bind's answer of a guest whose quoting service fails: %+v", first)
+	}
+	p.runner.ended <- nil
+	if reply, state := answer.next(); reply != nil || state == nil || state.BindQuote != session.BindQuoteTaken || state.Attestation == nil {
+		t.Fatalf("what followed the receipt of a guest whose sandbox had ended: %+v", state)
+	}
+	answer.ended("after the quote")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the guest of a sandbox that ended in order stopped with %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the guest did not stop after it had finished its bind's answer")
+	}
+}
+
+// A guest whose sandbox has ended waits for what it owes so long and no
+// longer: a quoting service that never answers does not keep it.
+func TestRunStopsWithoutAQuoteThatNeverComes(t *testing.T) {
+	sessionagent.SetBindQuotePauses(t, time.Millisecond)
+	sessionagent.SetSandboxEndMargin(t, 200*time.Millisecond)
+	p, tee, done, _ := served(t)
+	c := found(t, p)
+	release := tee.hold()
+	defer release()
+	if _, first := c.reads(t, c.bind, nil, true); first.Receipt == nil || first.Attestation != nil {
+		t.Fatalf("the bind's answer while the quoting service is slow: %+v", first)
+	}
+	began := time.Now()
+	p.runner.ended <- errors.New("sandbox exited with status 3")
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "sandbox exited with status 3") {
+			t.Fatalf("the guest of a sandbox that failed stopped with %v", err)
+		}
+		if waited := time.Since(began); waited < 150*time.Millisecond {
+			t.Fatalf("the guest stopped %s after its sandbox ended, with its bind's answer still owed", waited)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the guest waited for a quote that never came")
+	}
 }

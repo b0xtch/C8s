@@ -20,6 +20,14 @@ func SetBindQuotePauses(t interface{ Cleanup(func()) }, pauses ...time.Duration)
 	t.Cleanup(func() { bindQuotePauses = before })
 }
 
+// SetSandboxEndMargin has a guest whose sandbox has ended give what it owes
+// this long beyond the pauses of its bind's quote, until the test ends.
+func SetSandboxEndMargin(t interface{ Cleanup(func()) }, margin time.Duration) {
+	before := sandboxEndMargin
+	sandboxEndMargin = margin
+	t.Cleanup(func() { sandboxEndMargin = before })
+}
+
 // AdmissionOf is how long the agent's sandbox took to admit, step by step.
 func AdmissionOf(a *Agent) []session.AdmissionStep {
 	a.measured.RLock()
