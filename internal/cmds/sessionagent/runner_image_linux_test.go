@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -352,9 +353,24 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 		if !strings.Contains(options, "nodev") || !strings.Contains(options, "nosuid") {
 			t.Errorf("root filesystem mount options %q", options)
 		}
+		// The sandbox has a process namespace of its own, and nothing of the
+		// guest's is in it: not this process, which is the guest's agent
+		// here, and no more than the few the sandbox runs. The runtime is in
+		// it for the moment it takes to become the next process that waits
+		// for a command, as it is when it starts a command itself.
+		outside, err := os.Readlink("/proc/self/ns/pid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inside := c.out(t, client, "readlink /proc/self/ns/pid"); !strings.HasPrefix(inside, "pid:[") || inside == outside {
+			t.Errorf("the sandbox's process namespace is %q, and the guest's is %q", inside, outside)
+		}
 		// The bracket keeps the pattern from matching the shell that carries it.
-		if got := c.out(t, client, "ps | grep -c '[c]run' || true"); got != "0" {
+		if got := c.out(t, client, "ps -o pid,comm,args | grep -c -e '[s]essionagent' -e '[.]test' || true"); got != "0" {
 			t.Errorf("the sandbox sees %s of the guest's processes", got)
+		}
+		if got, err := strconv.Atoi(c.out(t, client, "ls -d /proc/[0-9]* | wc -l")); err != nil || got < 2 || got > 12 {
+			t.Errorf("the sandbox sees %d processes (%v): its own are a handful", got, err)
 		}
 		limit, err := os.ReadFile(filepath.Join(c.cgroup, "sandbox", "pids.max"))
 		if err != nil || strings.TrimSpace(string(limit)) != fmt.Sprint(testPidsLimit) {
