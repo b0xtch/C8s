@@ -18,8 +18,8 @@ import (
 	tdxverify "github.com/google/go-tdx-guest/verify"
 	"github.com/google/go-tdx-guest/verify/trust"
 
+	attestationtdx "github.com/confidential-dot-ai/attestation-go/attestation/tdx"
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
-	"github.com/confidential-dot-ai/attestation-go/attestation/teeverify"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/localverify"
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
@@ -319,11 +319,20 @@ func CollateralOf(res *teetypes.VerificationResult) *CollateralFinding {
 // quoting enclave, lists what Intel has revoked, and states where the
 // platform, its TDX module and its quoting enclave stand.
 func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvidence, params teetypes.VerifyParams) (*teetypes.VerificationResult, error) {
-	res, err := teeverify.VerifyEnvelope(ctx, env, params, teeverify.Options{})
+	// The envelope is decoded once, here. The engine verifies those bytes,
+	// and everything below reads the quote parsed from the same ones.
+	raw, err := tdQuoteBytes(env.Evidence)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}
-	quote, raw, err := parseTDQuote(env.Evidence)
+	if len(params.ExpectedReportData) > 64 {
+		return nil, &VerificationError{Err: fmt.Errorf("expected report data is %d bytes, and a TD's is 64", len(params.ExpectedReportData))}
+	}
+	res, err := attestationtdx.VerifyQuoteBytes(raw, params, teetypes.PlatformTDX, attestationtdx.Options{})
+	if err != nil {
+		return nil, &VerificationError{Err: err}
+	}
+	quote, err := parseVerifiedTDQuote(raw)
 	if err != nil {
 		return nil, &VerificationError{Err: err}
 	}

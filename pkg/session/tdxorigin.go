@@ -10,6 +10,8 @@ import (
 
 	"github.com/google/go-tdx-guest/abi"
 	pb "github.com/google/go-tdx-guest/proto/tdx"
+
+	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 )
 
 // Intel's TD quoting enclave identity, as Intel PCS publishes it (enclave
@@ -26,26 +28,51 @@ var (
 
 const tdQEProdID = 2
 
-// parseTDQuote decodes the version 4 quote in bare-metal TDX evidence, and
-// returns its bytes with it.
-func parseTDQuote(evidence json.RawMessage) (*pb.QuoteV4, []byte, error) {
+// tdQuoteBytes decodes bare-metal TDX evidence to the bytes of its quote.
+// It is the one decoding of the envelope: the engine verifies these bytes,
+// and what this package reads of the quote it parses from the same ones, so
+// the two cannot be shown different quotes.
+func tdQuoteBytes(evidence json.RawMessage) ([]byte, error) {
 	var envelope struct {
 		Quote string `json:"quote"`
 	}
 	if err := json.Unmarshal(evidence, &envelope); err != nil {
-		return nil, nil, fmt.Errorf("TDX evidence: %w", err)
+		return nil, fmt.Errorf("TDX evidence: %w", err)
+	}
+	if err := teetypes.CheckFieldSize("quote", len(envelope.Quote)); err != nil {
+		return nil, fmt.Errorf("TDX evidence: %w", err)
 	}
 	raw, err := base64.StdEncoding.DecodeString(envelope.Quote)
 	if err != nil {
-		return nil, nil, fmt.Errorf("TDX quote encoding: %w", err)
+		return nil, fmt.Errorf("TDX quote encoding: %w", err)
 	}
+	return raw, nil
+}
+
+// parseVerifiedTDQuote parses the bytes of a version 4 quote. Its callers
+// hand it bytes whose signature the engine has verified.
+func parseVerifiedTDQuote(raw []byte) (*pb.QuoteV4, error) {
 	parsed, err := abi.QuoteToProto(raw)
 	if err != nil {
-		return nil, nil, fmt.Errorf("TDX quote: %w", err)
+		return nil, fmt.Errorf("TDX quote: %w", err)
 	}
 	quote, ok := parsed.(*pb.QuoteV4)
 	if !ok {
-		return nil, nil, fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
+		return nil, fmt.Errorf("TDX quote is a %T, want a version 4 quote", parsed)
+	}
+	return quote, nil
+}
+
+// parseTDQuote decodes the version 4 quote in bare-metal TDX evidence, and
+// returns its bytes with it.
+func parseTDQuote(evidence json.RawMessage) (*pb.QuoteV4, []byte, error) {
+	raw, err := tdQuoteBytes(evidence)
+	if err != nil {
+		return nil, nil, err
+	}
+	quote, err := parseVerifiedTDQuote(raw)
+	if err != nil {
+		return nil, nil, err
 	}
 	return quote, raw, nil
 }
