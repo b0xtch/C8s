@@ -182,7 +182,8 @@ stored credential, only when all of these hold:
 1. The TD's evidence verifies against an image and a class from the release
    log, with their proofs, and against accepted attributes and platform, with
    each TCB level UpToDate or accepted by name for the TD's pool ([An old
-   TCB](session-threat-model.md#launch-and-measurement)).
+   TCB](session-threat-model.md#launch-and-measurement)), on the vendor's
+   documents as the key service fetched them itself within the last hour.
 2. The request arrives over a live channel to the instance key in that
    evidence.
 3. The TD presents a bind naming that instance key, signed by the authority
@@ -197,13 +198,18 @@ stored credential, only when all of these hold:
 
 - **Off the hot path.** A pooled TD opens its attested session to the key
   service at boot, before it has a tenant. The key service verifies its
-  evidence then and keeps the verdict by instance key in its replicated state,
-  so acquiring a session at bind time costs one round trip and one quorum
-  write, and the key service needs no new quote. It answers with the vendor's
-  documents it checked the quote against, which it fetches once per platform
-  and judges by its own clock, and newer ones in a later answer when the
-  vendor publishes them. The TD staples them to its evidence, so no TD fetches
-  them itself and no boot waits on the vendor's service.
+  evidence then and keeps the verdict and the evidence by instance key in its
+  replicated state, so acquiring a session at bind time costs one round trip
+  and one quorum write, and the key service needs no new quote. It answers
+  with the vendor's documents it checked the quote against, which it fetches
+  from the vendor itself once per platform, asks for again each hour and
+  judges by its own clock, and newer ones in a later answer when the vendor
+  publishes them. When a newer document arrives it judges the evidence it
+  keeps again, still with no new quote, so no release rests on a document it
+  has since replaced ([Old vendor
+  documents](session-threat-model.md#launch-and-measurement)). The TD staples
+  them to its evidence, so no TD fetches them itself and no boot waits on the
+  vendor's service.
 - **Sealed to the instance key.** What is released is also encrypted with
   HPKE, under the hybrid KEM, to the encryption key that the TD's instance key
   signed, inside the attested channel. A log or a proxy that ever saw the

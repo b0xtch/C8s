@@ -106,6 +106,19 @@ but not confidentiality.
   reached under an allowance is never taken for one under a stricter policy.
   The guest holds its key service to the same rule, and the key service its
   pools' guests.
+- **Old vendor documents.** The vendor signs and dates its collateral and its
+  revocation lists, but a document stays within its dates after the vendor
+  replaces it, and the vendor reissues its root revocation list rarely. The
+  host relays the documents stapled to a ready TD's evidence, so it can relay
+  old ones, among them a revocation list from before a CA or a platform's key
+  was revoked. So a verifier that sends a guest a secret on its verdict, as
+  the key service does with keys and a binder with what it seals with its bind
+  or puts over `Connect`, judges on the vendor's documents as it fetched them
+  from the vendor itself within the last hour, and keeps a verdict only while
+  those are the newest it has. A verifier that cannot reach the vendor for
+  longer than that sends no secret, which costs availability only, as the host
+  can always cost it. Stapled documents serve verdicts that send no secret,
+  such as a binder's before it signs a bind, which holds none.
 
 ### Binding and identity
 
@@ -238,8 +251,10 @@ but not confidentiality.
   daemon's requests and talks only to the key service. Even the vendor's
   documents for its own quotes come from the key service, which checked the
   quote against them and judged their dates by its own clock. So a pooled TD
-  fetches nothing from outside the platform, and every verifier still judges
-  the documents' dates by its own clock.
+  fetches nothing from outside the platform. Every verifier still judges the
+  documents' dates by its own clock, and one that will send the guest a secret
+  judges on documents it fetched itself ([Old vendor
+  documents](#launch-and-measurement)).
 - **Inference** leaves only through the guest's gateway, which verifies the
   inference service's attestation before it sends anything.
 - **Recorded traffic.** Attested channels use hybrid key exchange, and

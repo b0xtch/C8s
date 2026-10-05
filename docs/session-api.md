@@ -15,7 +15,7 @@ every call that changes what a TD is returns evidence that the caller checks.
 | Caller | Trusted for | Calls | Authenticates with |
 |---|---|---|---|
 | orchestrator: the platform's control plane | availability, never data | pools, `Claim`, `Bind` (relaying), `Hold`, `Release`, `Commit`, `Seal`, `Destroy`, the flows, `GetStats`, `Watch` | mutual TLS with a service identity; quotas per orchestrator |
-| binder: holds or reaches the owner's authority | deciding what a TD becomes | `GetEvidence`, `WatchReady`; `Bind` directly, or `SignBind` when the daemon calls it during a flow | TLS to an endpoint registered per tenant; the daemon believes nothing it says, and the guest checks the bind's signature |
+| binder: holds or reaches the owner's authority | deciding what a TD becomes | `GetEvidence`, `WatchReady`; `Bind` directly, or `SignBind` when the daemon calls it during a flow | TLS to an endpoint registered per tenant, and for `WatchReady` a key the pool names, which opens no orchestrator call; the daemon believes nothing it says, and the guest checks the bind's signature |
 | verifiers: SDKs, browsers, the key service, the binder | their own checks | `GetEvidence`, `Connect` | none for evidence, which is public; `Connect` carries the verifier's own channel |
 | senders and readers of envelopes | their own messages | `Deliver`, `Collect` | the orchestrator's identity or a per-session token; envelopes are sealed and signed inside |
 | the platform's review service | the signals its review policy allows | `Collect`, for review batches | the orchestrator's identity; batches are encrypted to its review key |
@@ -52,7 +52,7 @@ guest's own API on its TLS port.
 | host | the daemon | its TDX module and TCB level, the classes it runs, free capacity | the daemon for capacity; each quote for the TCB |
 | class | a name such as `s-4x16` | vCPUs, memory, the disk slots and the launch shape | the published reference values, one set per class and image |
 | image | its launch bundle | the measured guest and its manifest | the signed reference values |
-| pool | the orchestrator | image, class, hosts, depth per host, age limit, bind grace | the daemon |
+| pool | the orchestrator | image, class, hosts, depth per host, age limit, bind grace, the binders that may watch it | the daemon |
 | TD | the daemon | host, pool, the instance key's digest, state, the session it serves | its own evidence |
 | session | the orchestrator | tenant, binder, state, the live TD, envelope counters | the key service for its generation and lease; the daemon for where it runs |
 | seal | session and generation | its layers' ciphertext and sizes, by layer id | the key service, which alone holds the layers' keys and root hashes and knows whether it is the latest |
@@ -413,17 +413,21 @@ reach, no new HTTP method and no cloud metadata endpoint.
    and the instance key and one-time keys the quote binds. That quote is as
    old as the certificate, since a guest quotes fresh only for a bind or over
    `Connect`. A binder that watches the pool (`WatchReady`) makes this check
-   as each TD becomes ready, and at the claim finds the claimed TD's
-   certificate, by its digest and never by the TD's name, among those it has
-   judged, and takes everything else from the evidence it judged, not from the
-   claim's. It reuses a verdict only while nothing it rests on has changed:
-   its policy, and the vendor's documents it judged under, which must still be
-   current and the newest it holds; otherwise it checks again. Then the binder
-   signs a bind naming the TD's instance key, the session, the disks (a fresh
-   root, and the read-only images by root hash), the policy, a nonce and a
-   `notAfter` a minute away. A binder may sign and send the bind before that
-   check ends, since a bind holds no secret, but it takes no receipt, and
-   seals nothing to the guest, until the check has passed.
+   as each TD becomes ready and again when anything the verdict rests on
+   changes, and at the claim finds the claimed TD's certificate, by its digest
+   and never by the TD's name, among those it has judged, and takes everything
+   else from the evidence it judged, not from the claim's. It reuses a verdict
+   only while nothing it rests on has changed: its policy, and the vendor's
+   documents it judged under, which must still be current and the newest it
+   holds; otherwise it checks again. Then the binder signs a bind naming the
+   TD's instance key, the session, the disks (a fresh root, and the read-only
+   images by root hash), the policy, a nonce and a `notAfter` a minute away. A
+   binder may sign and send the bind before that check ends, since a bind
+   holds no secret, but it takes no receipt until the check has passed. It
+   seals nothing to the guest until the check has passed as one for a release:
+   on the vendor's documents as the binder fetched them from the vendor itself
+   within the last hour, not as the host relayed them with the evidence ([Old
+   vendor documents](session-threat-model.md#launch-and-measurement)).
 4. The daemon calls `Bind`. The guest raises its fence, checks the bind and
    extends RTMR[3] with its digest. Then it signs a receipt over the binder's
    nonce with its one-time key, naming the bind's digest, the events the bind
