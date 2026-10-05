@@ -123,10 +123,16 @@ but not confidentiality.
   among them, and the evidence the TD gave when it became ready still
   verifies. So nothing another binder relies on rests on them: a bind's
   receipt is signed by a one-time key that the guest erases before anything of
-  the tenant runs, a command sent with a bind is sealed to a second one-time
-  key, erased by then too, the key service releases only against such a
-  receipt and for one bind per instance key, and the bind's quote shows the
-  bind in RTMR[3].
+  the tenant runs, a command or credentials a binder sends with its bind are
+  sealed to a second one-time key, erased by then too, the key service
+  releases only against such a receipt and for one bind per instance key, and
+  the bind's quote shows the bind in RTMR[3].
+- **A message the host seals.** A ready TD's evidence is public, so anyone can
+  seal to its one-time KEM key, and HPKE's base mode does not say who did. So
+  each part of a message sealed with a bind carries the authorization it would
+  need over `Connect`, from a key the bind grants, and the guest tries only
+  the first such message after its bind, so one the host sends first costs the
+  binder a trip over `Connect` and no more.
 - **A revision the owner did not make, or one beyond the bind.** A revision of
   a session's egress or credential rules is signed by the bind's authority,
   must lie inside the bind's boundary, and is measured before it takes effect,
@@ -156,7 +162,11 @@ but not confidentiality.
   quote confirms it, so the verdict that is kept rests on the quote, and a
   session whose quote disagrees with its receipt, or never comes, ends. Each
   quote carries the events and phase it covers, so a verifier replays exactly
-  those, whatever the guest extends later.
+  those, whatever the guest extends later. A binder that judges ready evidence
+  before a claim finds the claimed TD by its certificate's digest, and reuses
+  a verdict only while its policy and the vendor's documents the verdict rests
+  on are unchanged and current, so a verdict reached ahead is the one it would
+  reach at the claim.
 - **A pooled TD carrying something from an earlier session.** A bound TD never
   returns to a pool, and a pooled TD holds no tenant data, code or keys before
   its bind.

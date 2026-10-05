@@ -15,7 +15,7 @@ every call that changes what a TD is returns evidence that the caller checks.
 | Caller | Trusted for | Calls | Authenticates with |
 |---|---|---|---|
 | orchestrator: the platform's control plane | availability, never data | pools, `Claim`, `Bind` (relaying), `Hold`, `Release`, `Commit`, `Seal`, `Destroy`, the flows, `GetStats`, `Watch` | mutual TLS with a service identity; quotas per orchestrator |
-| binder: holds or reaches the owner's authority | deciding what a TD becomes | `GetEvidence`; `Bind` directly, or `SignBind` when the daemon calls it during a flow | TLS to an endpoint registered per tenant; the daemon believes nothing it says, and the guest checks the bind's signature |
+| binder: holds or reaches the owner's authority | deciding what a TD becomes | `GetEvidence`, `WatchReady`; `Bind` directly, or `SignBind` when the daemon calls it during a flow | TLS to an endpoint registered per tenant; the daemon believes nothing it says, and the guest checks the bind's signature |
 | verifiers: SDKs, browsers, the key service, the binder | their own checks | `GetEvidence`, `Connect` | none for evidence, which is public; `Connect` carries the verifier's own channel |
 | senders and readers of envelopes | their own messages | `Deliver`, `Collect` | the orchestrator's identity or a per-session token; envelopes are sealed and signed inside |
 | the platform's review service | the signals its review policy allows | `Collect`, for review batches | the orchestrator's identity; batches are encrypted to its review key |
@@ -138,6 +138,7 @@ service Sessions {
   rpc Seal(SealRequest) returns (Operation);
   rpc Destroy(DestroyRequest) returns (Session);
   rpc GetEvidence(EvidenceRequest) returns (Evidence);
+  rpc WatchReady(WatchReadyRequest) returns (stream Evidence);   // a pool's ready TDs, each as it becomes ready
   rpc GetStats(SessionRef) returns (Stats);
   rpc Watch(WatchRequest) returns (stream Event);
   // Flows: each calls the session's registered binder
@@ -172,12 +173,13 @@ message BindRequest {
   bytes signature = 4;
   repeated DiskRef disks = 5;          // what the bind names, in its slots
   repeated LayerPlacement layers = 6;  // where each layer sits in the in slot
-  bytes command = 7;                   // the first command, sealed to the guest's one-time KEM key; with the bind or in the next message
+  bytes sealed = 7;                    // the first command and credentials the binder holds, sealed to the guest's one-time KEM key; with the bind or in the next message
 }
 message Bound {
   Evidence evidence = 1;               // includes the bind
   bytes receipt = 2;                   // c8s-bind-receipt/v1, signed by the guest's one-time key over the bind's nonce
-  bytes command_result = 3;            // in a later message: the command's output and status, sealed back to the binder
+  bytes sealed_answer = 3;             // in a later message: what became of each part, and the command's output and status, sealed back to the binder
+  string sealed_status = 4;            // taken, unopened or too_late: with the receipt for a message sent with the bind, or on its own
 }
 message Evidence {
   bytes certificate = 1;               // RA-TLS; report data binds the instance key and, until a bind, the one-time keys
@@ -191,6 +193,7 @@ message Evidence {
   bytes bind_signature = 9;            // when bound; a verifier holds the bind to it
   string phase = 10;                   // as the guest reports it
   string bind_quote = 11;              // once bound: trying, taken or given_up, as the guest's state says
+  bytes ready_certificate = 12;        // once bound: the last certificate from before the bind, whose quote binds the one-time keys
 }
 message DiskRef {
   string slot = 1;                     // root, ro, in or out
@@ -263,7 +266,7 @@ What each call does, and what a daemon that cheats could do with it:
 |---|---|---|---|---|
 | `CreatePool` | orchestrator | boots TDs from the bundle on the hosts named, up to the depth, and keeps them there | checks its launch document, makes its instance key, opens its session with the key service | it boots something else, and every verifier refuses the evidence |
 | `Claim` | orchestrator | reserves a ready TD in its own record and returns the evidence the guest gave when it became ready; waits up to `wait`, then says when the next will be ready | nothing: it learns of the claim from the bind | it hands one TD to two sessions, and the guest takes only one bind: denial of service |
-| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, with a command sealed for it if one comes, and returns the guest's receipt, signed over the bind's nonce, with its evidence, then the command's sealed result | raises its fence; checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation, and answers with a receipt while it takes the quote over the bind's nonce; runs a command that came with the bind once the sandbox runs | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service; it holds a bind back, which the guest takes only until its `notAfter` |
+| `Bind` | orchestrator or binder | places what the bind names on the TD's slots, and for a restore or a fork the stack's layers on `in`; posts the bind to the guest, with a message sealed for it if one comes, and returns the guest's receipt, signed over the bind's nonce, with its evidence, then the guest's sealed answer to that message | raises its fence; checks and takes the bind, measures it, opens only the disks it names and the layers the key service releases, restores if it names a generation, and answers with a receipt while it takes the quote over the bind's nonce; puts in place the credentials sealed with the bind before the sandbox runs anything of the tenant, and runs the command sealed with it once the sandbox runs | it binds a TD to another authority, and every verifier sees the wrong authority in the evidence: denial of service; it holds a bind back, which the guest takes only until its `notAfter` |
 | `Connect` | anyone, once the TD is bound | splices bytes to the guest's TLS port without terminating TLS, and holds the stream while a held or sealed session is released or restored; refuses a TD that is not bound yet | serves RA-TLS with its instance key, and c8s-verify's channel | it sees ciphertext, sizes and timing |
 | `Deliver`, `Collect` | the platform's application tier; the owner's clients | stores and numbers envelopes | pulls, opens and authenticates them in the sender's order | it drops, delays or replays them, and the guest sees the gap or the repeat: denial of service |
 | `Hold`, `Release` | orchestrator | stops and restarts the TD's vCPUs | after a release, renews its lease before any effect leaves | it holds forever: denial of service, with no second copy |
@@ -271,6 +274,7 @@ What each call does, and what a daemon that cheats could do with it:
 | `Seal` | orchestrator | makes room on the TD's `out` slot, stores the layers the guest writes there, then asks the guest to commit them | drains its gateways, checkpoints the sandbox if the level keeps processes (in continuous mode, only its last epoch), and writes new layers, each under a new key; then records the generation at the key service and ends | it loses the seal before the commit, and the session runs on at its last generation; after the commit, the key service refuses any older seal in its place |
 | `Destroy` | orchestrator | ends the TD and deletes the session's ciphertext; returns a claimed TD that was never sent a bind to its pool, as a lapsed claim does | nothing: ending a TD needs no cooperation | the same as any host stopping a guest |
 | `GetEvidence` | anyone | returns what the guest serves, and never asks it to quote | serves its certificate, documents, events, bind, phase and the quote over the bind's nonce once it has it; it quotes fresh only for a bind or over `Connect` | it serves stale evidence, and the RA-TLS handshake on `Connect` proves whether the key is live |
+| `WatchReady` | binder | streams the evidence each ready TD of a pool gave when it became ready, as each becomes ready, so that the binder can judge it before a claim | nothing: the daemon relays what the guest gave | it shows a TD it will not hand out, or hides one, which costs only time: the binder judges on the path a claimed TD it has not judged |
 | `GetStats` | orchestrator | reports what a host sees | nothing | nothing new: the host saw it anyway |
 | `Start`, `Restore`, `Fork` | orchestrator | `Claim`, then `SignBind` on the binder, then `Bind` | as for `Bind` | as for each step |
 
@@ -334,18 +338,18 @@ Every effect leaves through the guest's gateways
 says what each may pass.
 
 - **Credentials are placeholders by default.** A credential reaches the guest
-  from the key service, or from a holder of a credential key over `Connect`,
-  and stays in the egress gateway: the sandbox sees only a placeholder for it.
-  The gateway ends TLS for the endpoints the credential names, under a
-  certificate authority of the session's own that the sandbox trusts, and puts
-  the real value in place of the placeholder only in requests to those
-  endpoints; where a protocol signs requests with the credential, as AWS's
-  SigV4 does, the gateway signs them. Only a credential the policy marks for
-  the sandbox is handed into it, for a tool that must hold one itself. So a
-  hijacked agent can use a credential only where its owner allowed it and
-  cannot copy it out, and a template carries none. Milestone 1 hands every
-  credential into the sandbox; placeholders come with templates in milestone
-  3.
+  from the key service, sealed with the bind by a binder that holds it
+  ([Start](#start)), or from a holder of a credential key over `Connect`, and
+  stays in the egress gateway: the sandbox sees only a placeholder for it. The
+  gateway ends TLS for the endpoints the credential names, under a certificate
+  authority of the session's own that the sandbox trusts, and puts the real
+  value in place of the placeholder only in requests to those endpoints; where
+  a protocol signs requests with the credential, as AWS's SigV4 does, the
+  gateway signs them. Only a credential the policy marks for the sandbox is
+  handed into it, for a tool that must hold one itself. So a hijacked agent
+  can use a credential only where its owner allowed it and cannot copy it out,
+  and a template carries none. Milestone 1 hands every credential into the
+  sandbox; placeholders come with templates in milestone 3.
 - **Egress rules deny what they do not allow.** A rule allows a host and port,
   and where the gateway reads the request, a method and a path. In a container
   sandbox a rule may also name the program that connects: the agent catches
@@ -408,25 +412,31 @@ reach, no new HTTP method and no cloud metadata endpoint.
    each level ([An old TCB](session-threat-model.md#launch-and-measurement))
    and the instance key and one-time keys the quote binds. That quote is as
    old as the certificate, since a guest quotes fresh only for a bind or over
-   `Connect`. Then the binder signs a bind naming the TD's instance key, the
-   session, the disks (a fresh root, and the read-only images by root hash),
-   the policy, a nonce and a `notAfter` a minute away. A binder may sign and
-   send the bind before that check ends, since a bind holds no secret, but it
-   takes no receipt, and seals nothing to the guest, until the check has
-   passed.
+   `Connect`. A binder that watches the pool (`WatchReady`) makes this check
+   as each TD becomes ready, and at the claim finds the claimed TD's
+   certificate, by its digest and never by the TD's name, among those it has
+   judged. It reuses a verdict only while nothing it rests on has changed: its
+   policy, and the vendor's documents it judged under, which must still be
+   current and the newest it holds; otherwise it checks again. Then the binder
+   signs a bind naming the TD's instance key, the session, the disks (a fresh
+   root, and the read-only images by root hash), the policy, a nonce and a
+   `notAfter` a minute away. A binder may sign and send the bind before that
+   check ends, since a bind holds no secret, but it takes no receipt, and
+   seals nothing to the guest, until the check has passed.
 4. The daemon calls `Bind`. The guest raises its fence, checks the bind and
    extends RTMR[3] with its digest and then the sandbox's image. It signs a
    receipt over the binder's nonce with its one-time key, naming the bind's
    digest, the events it extended and the phase it reached, and erases that
-   key. Then it takes the credentials the bind names, showing the key service
-   the receipt, and starts the sandbox on the root file system it made before
-   any bind, under a key it generated, while it takes the quote over the
-   binder's nonce. It erases its one-time KEM key before the sandbox runs
-   anything of the tenant, having opened the command sealed to it if one came
-   by then. It answers with the receipt. The quote follows in the evidence it
-   serves, and the binder holds it to the receipt. A guest whose admission
-   fails after it extended RTMR[3] ends and gives no quote, and a bind sent
-   again is answered with the same receipt and quote.
+   key. Then it takes from the key service the credentials the bind says come
+   from there, showing it the receipt, and starts the sandbox on the root file
+   system it made before any bind, under a key it generated, while it takes
+   the quote over the binder's nonce. Before the sandbox runs anything of the
+   tenant, it tries the message sealed to its one-time KEM key if one came by
+   then, puts in place the credentials it carries, and erases that key. It
+   answers with the receipt. The quote follows in the evidence it serves, and
+   the binder holds it to the receipt. A guest whose admission fails after it
+   extended RTMR[3] ends and gives no quote, and a bind sent again is answered
+   with the same receipt and quote.
 
 A receipt is fresh because the nonce is the binder's, and only the guest's
 agent, as it takes its one bind, can sign one: the binder checks the quote
@@ -453,34 +463,57 @@ the session if none comes, since a check that cannot be made counts as failed
 and a binder whose policy asks for the quote first waits for it before it
 sends anything.
 
-A binder that calls `Bind` itself may send the session's first command with
-it: one exec request, authorized by one of the bind's `access` keys and sealed
-with HPKE to the guest's one-time KEM key, with the bind's digest as HPKE's
-info so that it opens under that bind alone. It seals the command only once
-its check of the evidence has passed, and may send it on the same call after
-the bind, since the guest keeps the key until the sandbox is about to run; a
-command that comes later is refused unopened, and goes over `Connect` instead.
-The guest runs it once the sandbox runs and answers after the receipt with its
-output and status, sealed under a key exported from the same HPKE context, as
-Oblivious HTTP answers a request (RFC 9458). The daemon carries ciphertext
-both ways, and a bind sent again gets the same answers, so the command runs
-once. It rests on what a command sent on the receipt rests on: the quote that
-binds the key, and the measured agent. A binder whose policy asks for the
-quote first sends no command with its bind. The host can hold a bind back
-until its `notAfter`, so a binder that gives up sooner takes its command as
-perhaps run until then, and one that sends a command sets `notAfter` to what
-it will wait.
+A bound guest goes on serving the last certificate it issued before its bind
+(`ready_certificate`), whose quote binds the one-time keys, so that a verifier
+that comes later can hold a kept receipt to the key that signed it: that
+certificate must name the instance key the guest serves now and show RTMR[3]
+at its value before the bind, and is judged as of its issue.
 
-A bind holds no secret, and a command sent with it opens only in the TD whose
+A binder that calls `Bind` itself may send with it, sealed, the session's
+first command and the credentials it holds that the bind says come from it.
+They travel as one message, sealed with HPKE to the guest's one-time KEM key,
+with a label and the bind's digest as HPKE's info, so that it opens under that
+bind alone. HPKE's base mode does not say who sealed a message, and anyone who
+has the TD's evidence can seal to its key, so each part carries the
+authorization it would need over `Connect`: the command, one from a key the
+bind's `access` lets run commands, and each credential, one from a key it lets
+release that credential, each for this guest and over those bytes. The command
+also carries an id. The binder seals only once its check of the evidence has
+passed, and may send the message on the same call after the bind, since the
+guest keeps the key until the sandbox is about to run. The guest tries the
+first sealed message it gets after the bind and erases the key whatever came
+of it, and refuses one that comes later unopened.
+
+The guest puts the credentials in place before the sandbox runs anything of
+the tenant, runs the command once the sandbox runs, and answers after the
+receipt with what became of each part and the command's output and status,
+sealed under a key exported from the same HPKE context, as Oblivious HTTP
+answers a request (RFC 9458). The daemon carries ciphertext both ways, and a
+message sent again gets the same answer. The daemon also relays the guest's
+word on whether the message was taken, which a binder does not rely on: one
+that has no sealed answer when it needs it sends the command again over
+`Connect` under the same id, and the credentials again, and the guest runs a
+command once per id, answering a repeat with the first run's result. All of
+this rests on what a command sent on the receipt rests on: the quote that
+binds the key, and the measured agent. A binder whose policy asks for the
+quote first seals nothing with its bind. The host can hold a bind back until
+its `notAfter`, so a binder that gives up sooner takes its command as perhaps
+run until then, and one that sends a command sets `notAfter` to what it will
+wait.
+
+A bind holds no secret, and what is sealed with it opens only in the TD whose
 one-time KEM key it was sealed to, and only while that TD takes its bind, so
-stale evidence costs at most a wasted bind and an unopened command: keys and
-credentials reach a session only after the key service, or the owner's client
-over `Connect`, has checked the instance key's evidence and that the key is
-live.
+stale evidence costs at most a wasted bind and an unopened message: keys and
+credentials reach a session either sealed to a key its TD's measured agent
+holds only while it takes its one bind, or after the key service, or the
+owner's client over `Connect`, has checked the instance key's evidence and
+that the key is live.
 
 No boot is on this path: a start is one round trip to the guest, the bind,
 over a connection the daemon keeps to each ready guest so that it pays no
-handshake, plus the binder's check, and the first command can travel with it.
+handshake, and the binder's check, which a binder that watches the pool makes
+before the claim. The first command and the credentials the binder holds can
+travel with the bind.
 
 ### Hold and release
 

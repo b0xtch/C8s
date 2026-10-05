@@ -33,8 +33,10 @@ name each baseline.
 
 - **Warm pools.** A TD boots before anyone asks for it, so a start is a claim,
   which the daemon answers from its own record, and a bind, one round trip to
-  the guest that can carry the first command, plus the binder's check. Boot
-  time still matters for how fast a pool refills after a burst.
+  the guest that can carry the first command and the credentials the binder
+  holds, plus the binder's check, which it can make before the claim, as each
+  TD becomes ready. Boot time still matters for how fast a pool refills after
+  a burst.
 - **Hold keeps memory.** A release restarts the vCPUs and renews the lease;
   nothing is read back.
 - **Lazy restore.** A restored session runs before its seal has been read
@@ -90,7 +92,7 @@ Each lever must keep the rules in
 | cold boot | Firecracker boot to a ready guest | TD launch to a ready, unbound guest |
 | a boot, in parts | Firecracker's boot, in parts | the firmware's memory acceptance and its waits, loading and measuring the kernel image, the kernel's memory acceptance, bounce buffer and devices, the initrd, user space and the agent, the session with the key service that brings the vendor's documents, and the CPU time the boot burns on every vCPU |
 | warm activation | snapshot load to the first command | claim and bind to the first command |
-| a start, in parts | none | claim, ready check, bind (with the key service's answer and the sandbox's start inside it), the binder's check, and the first command, on its own or sent with the bind |
+| a start, in parts | none | claim; the binder's check of the ready evidence, or finding the verdict it reached before the claim; signing and sealing; the bind, with the sandbox's start and any answer from the key service inside it; the receipt's check; and the first command, on its own or sent with the bind |
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
 | a burst of 100 starts at once | median and tail latency, and success rate | the same |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |
@@ -132,8 +134,10 @@ memory-acceptance floor; work inside within the published floors.
   and recorded, versions are named, and runs of the two sides interleave.
   Nothing else runs on the host during a run: no other TD or VM.
 - **Like for like.** Both sides reach their first command the same way. A
-  baseline driven over a serial console, with no platform channel, is a
-  floor, and is labeled as one.
+  baseline driven over a serial console, with no platform channel, is a floor,
+  and is labeled as one. Work either side does before the measured path, such
+  as a snapshot made, or ready evidence judged, before the claim, is named and
+  timed beside the number.
 - **Published records.** Every number comes with its raw records, the commands
   that made them, the versions of the host kernel, VMM, firmware, TDX module
   and guest, and the host's store: its file system and how layers were placed.

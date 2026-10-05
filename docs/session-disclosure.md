@@ -15,13 +15,14 @@ enforces its rules without reading a session.
 ## Rules
 
 1. **Plaintext leaves by schema only.** Every message the guest itself sends
-   in plaintext beyond the boundary, to the daemon, the platform or a
-   console, has a type in its image's disclosure schema, and every field of a
-   type is bounded: a code from a list, a flag, a counter, a size, a time or
-   a digest, or evidence and documents that are public by design. Everything
-   else leaves encrypted, to the owner or to a peer whose evidence the guest
-   has verified. What the session sends where its egress policy allows is
-   its own, and the policy can require TLS everywhere.
+   in plaintext beyond the boundary, to the daemon, the platform or a console,
+   has a type in its image's disclosure schema, and every field of a type is
+   bounded: a code from a list, a flag, a counter, a size, a time or a digest,
+   ciphertext of a bounded size sealed to the owner, or evidence and documents
+   that are public by design. Everything else leaves encrypted, to the owner
+   or to a peer whose evidence the guest has verified. What the session sends
+   where its egress policy allows is its own, and the policy can require TLS
+   everywhere.
 2. **No free text.** No field holds a string the session can choose, so no
    error message, path, host name or stack trace leaves in plaintext. A
    refusal or a crash is a code.
@@ -51,8 +52,8 @@ choosing where the host can read it.
 | From | What leaves in plaintext | Bounded by |
 |---|---|---|
 | the TD as a VM | that it runs, its class, its memory high-water mark, and when it ends | the hardware; this is metadata |
-| the network | sizes, times and endpoints of ciphertext, a command sealed into a bind and its sealed answer among them | metadata ([non-goals](session-threat-model.md#goals)) |
-| answers to the daemon | phases; a bind taken, or a refusal code; whether the bind's quote is taken, still being tried or given up; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
+| the network | sizes, times and endpoints of ciphertext, a message sealed into a bind and its sealed answer among them | metadata ([non-goals](session-threat-model.md#goals)) |
+| answers to the daemon | phases; a bind taken, or a refusal code; whether the bind's quote is taken, still being tried or given up; whether a message sealed with the bind was taken, and its answer, sealed; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
 | events and statistics | VM-level counters, sizes and times | the schema |
 | evidence | certificates, documents, events, receipts and quotes | public by design |
 | a console | nothing once the kernel runs; before that, what a release build of the firmware and the boot stub print, before any session exists | the image ([Logs](#logs-consoles-and-crashes)) |
