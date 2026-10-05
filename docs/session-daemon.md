@@ -157,7 +157,8 @@ An orchestrator learns of a session that started so from `Watch`, which shows
 it every TD of the host as it is and then each as it changes: its pool, its
 state, the session it serves and, for a TD that a binder's bind claimed, that
 binder's key. It ends such a session as it ends any other, with `Destroy` by
-the session's name.
+the session's name. `c8s session watch` prints that stream, one JSON object a
+line.
 
 ## Who may call what
 

@@ -10,9 +10,11 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -902,4 +904,95 @@ func runDestroy(ctx context.Context, d *daemonFlags, binding, name string, timeo
 	}
 	fmt.Fprintf(stdout, "DESTROYED session %s\n  TD            %s on %s\n", gone.GetName(), gone.GetTd(), gone.GetHost())
 	return ExitOK
+}
+
+// tdEvent is one line of `c8s session watch`: a guest of the host as it is.
+type tdEvent struct {
+	TD   string `json:"td"`
+	Pool string `json:"pool"`
+	Host string `json:"host"`
+	// State is booting, ready, claimed, bound, running or ended.
+	State   string `json:"state"`
+	Session string `json:"session,omitempty"`
+	// ClaimedBy is the key of the binder whose bind claimed the guest's TD,
+	// when no claim came before that bind.
+	ClaimedBy string `json:"claimed_by,omitempty"`
+	// Reason is why an ended guest ended.
+	Reason string `json:"reason,omitempty"`
+	At     string `json:"at"`
+}
+
+func newWatchCmd() *cobra.Command {
+	var d daemonFlags
+	cmd := &cobra.Command{
+		Use:   "watch",
+		Short: "Show a host's guests as they change",
+		Long: `Print each guest of a c8s daemon's host as it is now, oldest first, and
+then each as it changes, one JSON object a line: its TD and pool, its state,
+the session it serves and, for a guest that a binder's bind claimed with no
+claim before it, that binder's key. It is an orchestrator's view of its
+host, and how it learns of every session the host serves. A guest that
+changed more than once between two lines is shown as it is. It runs until
+it is interrupted or the daemon goes away.
+
+Exit codes: 0 interrupted, 1 usage error, 3 the daemon could not be reached,
+went away, or does not let this caller watch.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			code := runWatch(ctx, &d, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			stop()
+			os.Exit(code)
+			return nil
+		},
+	}
+	d.register(cmd.Flags(), true)
+	for _, flag := range []string{"daemon", "daemon-cert", "daemon-key"} {
+		_ = cmd.MarkFlagRequired(flag)
+	}
+	return cmd
+}
+
+func runWatch(ctx context.Context, d *daemonFlags, stdout, stderr io.Writer) int {
+	route, err := d.route(nil, "")
+	switch {
+	case err != nil:
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	case route == nil:
+		fmt.Fprintln(stderr, "--daemon is required")
+		return ExitUsage
+	}
+	host, err := d.dial(route)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return ExitUsage
+	}
+	defer host.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := json.NewEncoder(stdout)
+	var unwritten error
+	err = host.Watch(ctx, func(event *sessionv1alpha1.Event) {
+		line := tdEvent{
+			TD: event.GetTd(), Pool: event.GetPool(), Host: event.GetHost(),
+			State:   strings.ToLower(strings.TrimPrefix(event.GetState().String(), "TD_STATE_")),
+			Session: event.GetSession(), ClaimedBy: event.GetClaimedBy(), Reason: event.GetReason(),
+			At: event.GetAt().AsTime().UTC().Format(time.RFC3339Nano),
+		}
+		if unwritten = out.Encode(line); unwritten != nil {
+			// Nobody reads on: the stream ends with its reader.
+			cancel()
+		}
+	})
+	switch {
+	case unwritten != nil:
+		fmt.Fprintf(stderr, "NOT WATCHED: %v\n", unwritten)
+		return ExitUnavailable
+	case ctx.Err() != nil:
+		return ExitOK
+	}
+	fmt.Fprintf(stderr, "NOT WATCHED: %v\n", err)
+	return ExitUnavailable
 }

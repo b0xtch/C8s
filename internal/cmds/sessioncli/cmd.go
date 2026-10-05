@@ -66,14 +66,15 @@ does the same to a guest reached by its address. 'verify', 'credential put'
 and 'exec' talk to the bound guest, and each one first proves from hardware
 evidence that the guest is the pinned image, launched for the pool's key,
 bound by exactly that bind, and that it holds the key the connection ends
-at. 'destroy' ends a session.
+at. 'destroy' ends a session, and 'watch' shows an orchestrator the guests
+of a host as they change.
 See docs/sessions.md.`,
 	}
 	launch := &cobra.Command{Use: "launch-config", Short: "Create a pool's signed launch bundle"}
 	launch.AddCommand(newBundleCmd(), newLaunchKeyCmd(), newMachineCmd())
 	credential := &cobra.Command{Use: "credential", Short: "Release credentials into a verified guest"}
 	credential.AddCommand(newCredentialPutCmd())
-	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), keyServiceCmd(), sessionschema.NewCmd())
+	cmd.AddCommand(launch, newStartCmd(), newBindCmd(), newVerifyCmd(), credential, newExecCmd(), newDestroyCmd(), newWatchCmd(), keyServiceCmd(), sessionschema.NewCmd())
 	cmd.AddCommand(imageStoreCmds()...)
 	return cmd
 }

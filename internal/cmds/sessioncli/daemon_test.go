@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -577,5 +579,192 @@ func TestStartRefusesACredentialItCannotSeal(t *testing.T) {
 	s.sealed = []string{"api-token=" + token}
 	if res := start(t, s); !res.Started {
 		t.Fatalf("start result = %+v", res)
+	}
+}
+
+// printed is what a command that runs on has printed so far.
+type printed struct {
+	mu  sync.Mutex
+	out bytes.Buffer
+}
+
+func (p *printed) Write(data []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.out.Write(data)
+}
+
+// events are the whole lines printed so far, read as `watch` writes them.
+func (p *printed) events(t *testing.T) []tdEvent {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var all []tdEvent
+	for line := range strings.Lines(p.out.String()) {
+		if !strings.HasSuffix(line, "\n") {
+			break
+		}
+		var event tdEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("watch printed %q: %v", line, err)
+		}
+		all = append(all, event)
+	}
+	return all
+}
+
+// An orchestrator watches its host: each guest as it is, and then as it
+// changes, so that it sees the session a start made and the guest's end.
+func TestWatchShowsAnOrchestratorItsHostsGuests(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	orchestrator := &daemonFlags{address: host.Addr, ca: host.CAFile, cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := &printed{}
+	ended := make(chan int, 1)
+	go func() { ended <- runWatch(ctx, orchestrator, out, io.Discard) }()
+	shows := func(what string, ok func(tdEvent) bool) tdEvent {
+		t.Helper()
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			events := out.events(t)
+			for i := len(events) - 1; i >= 0; i-- {
+				if ok(events[i]) {
+					return events[i]
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("watch never showed %s: %+v", what, events)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	ready := shows("the pool's ready guest", func(e tdEvent) bool { return e.State == "ready" })
+	if ready.TD == "" || ready.Pool != sessiondtest.Pool || ready.Host != "host-a" || ready.Session != "" || ready.At == "" {
+		t.Fatalf("a ready guest was shown as %+v", ready)
+	}
+	res := start(t, starting(t, host, "sbx-1"))
+	if res.TD != ready.TD {
+		t.Fatalf("the session started on %s, and the guest shown ready was %s", res.TD, ready.TD)
+	}
+	running := shows("the session's guest running", func(e tdEvent) bool { return e.TD == res.TD && e.State == "running" })
+	if running.Session != "sbx-1" || running.ClaimedBy != "" {
+		t.Fatalf("the session's guest was shown as %+v", running)
+	}
+	var stdout, stderr bytes.Buffer
+	if code := runDestroy(context.Background(), orchestrator, "", "sbx-1", 30*time.Second, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("destroy exit %d: %s", code, stderr.String())
+	}
+	if gone := shows("the session's guest ended", func(e tdEvent) bool { return e.TD == res.TD && e.State == "ended" }); gone.Reason != "destroyed" {
+		t.Fatalf("the destroyed guest was shown as %+v", gone)
+	}
+	// Interrupted, the command ends well.
+	cancel()
+	select {
+	case code := <-ended:
+		if code != ExitOK {
+			t.Fatalf("watch exit %d after it was interrupted", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watch ran on after it was interrupted")
+	}
+
+	// Nobody but an orchestrator is shown a host's guests.
+	anyone := &daemonFlags{address: host.Addr, ca: host.CAFile}
+	stderr.Reset()
+	if code := runWatch(context.Background(), anyone, &stdout, &stderr); code != ExitUnavailable || !strings.Contains(stderr.String(), "NOT WATCHED") {
+		t.Fatalf("watch with no certificate: exit %d: %s", code, stderr.String())
+	}
+	if code := runWatch(context.Background(), &daemonFlags{}, &stdout, &stderr); code != ExitUsage {
+		t.Fatalf("watch with no daemon: exit %d", code)
+	}
+	// A daemon that goes away ends the command, which says so.
+	again, stop := context.WithCancel(context.Background())
+	defer stop()
+	go func() { ended <- runWatch(again, orchestrator, &printed{}, io.Discard) }()
+	time.Sleep(200 * time.Millisecond)
+	host.Stop()
+	select {
+	case code := <-ended:
+		if code != ExitUnavailable {
+			t.Fatalf("watch exit %d after its daemon went away", code)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("watch ran on after its daemon went away")
+	}
+}
+
+// A session that a binder's bind started with no claim is shown to the
+// orchestrator with the key of that binder.
+func TestWatchNamesTheBinderWhoseBindClaimed(t *testing.T) {
+	authority := newKey(t)
+	authorityPub, err := session.PublicKeyPEM(&authority.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	named, err := session.InstanceKeyDigest(&authority.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := sessiondtest.NewHost(t, 1, func(c *sessiond.Config) {
+		for i := range c.Pools[0].Binders {
+			c.Pools[0].Binders[i].Authorities = []string{named}
+		}
+	})
+	binderKey, err := daemon.BinderName(host.Binder.Leaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out := &printed{}
+	orchestrator := &daemonFlags{address: host.Addr, ca: host.CAFile, cert: host.OrchestratorCertFile, key: host.OrchestratorKeyFile}
+	go runWatch(ctx, orchestrator, out, io.Discard)
+
+	binder := host.Client(&host.Binder)
+	shown := make(chan *session.Relayed, 1)
+	go func() {
+		_ = binder.WatchReady(ctx, sessiondtest.Pool, func(r *session.Relayed) {
+			select {
+			case shown <- r:
+			default:
+			}
+		}, nil)
+	}()
+	var evidence *session.Relayed
+	select {
+	case evidence = <-shown:
+	case <-ctx.Done():
+		t.Fatal("the binder was shown no ready guest")
+	}
+	policy := session.Policy{Image: host.Identity, LaunchKey: host.LaunchKey, Authority: authorityPub, AllowReady: true}
+	ready, err := session.VerifyReady(ctx, policy, host.Engine, evidence, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind, err := session.NewBind(session.BindOptions{Authority: authority, InstanceKey: ready.InstanceKey, Tenant: "acme", Session: "sbx-b", NotAfter: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := daemon.NewRequestID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, err := binder.BindWith(ctx, id, "", bind, nil)
+	if err != nil {
+		t.Fatalf("the binder's bind that claims: %v", err)
+	}
+	defer call.Close()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		for _, e := range out.events(t) {
+			if e.TD == call.TD && e.Session == "sbx-b" && e.ClaimedBy == binderKey {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watch never showed the binder that claimed %s: %+v", call.TD, out.events(t))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
