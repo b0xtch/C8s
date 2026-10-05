@@ -47,6 +47,38 @@ func TestRawReportFieldReadsFires(t *testing.T) {
 	}
 }
 
+// A file that may parse a verified quote may do that and nothing else the
+// guard bans: an init-data read there is caught like anywhere, and so is a
+// quote parsed in any other file.
+func TestVerifiedQuoteParsersMayOnlyParse(t *testing.T) {
+	for file, why := range verifiedQuoteParsers {
+		if why == "" {
+			t.Errorf("%s may parse a quote for no stated reason", file)
+		}
+		dir := t.TempDir()
+		write := func(rel, src string) {
+			path := filepath.Join(dir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write(file, "package x\n\nfunc f(quote []byte, body any) {\n\t_, _ = abi.QuoteToProto(quote)\n\t_ = body.GetMrConfigId()\n\t_, _ = abi.ReportToProto(quote)\n}\n")
+		write(filepath.ToSlash(filepath.Join(filepath.Dir(file), "other.go")), "package x\n\nfunc g(quote []byte) {\n\t_, _ = abi.QuoteToProto(quote)\n}\n")
+		hits := rawReportFieldReads(t, dir)
+		if len(hits) != 3 {
+			t.Fatalf("hits = %v, want the init-data read and the report parse in %s and the quote parse beside it", hits, file)
+		}
+		for _, hit := range hits {
+			if strings.HasPrefix(hit, file+":4 ") {
+				t.Errorf("the quote parse in %s is a hit: %s", file, hit)
+			}
+		}
+	}
+}
+
 // Test files are exempt — fixtures parse reports legitimately and a production
 // build omits them — so a banned call in a _test.go is not a hit.
 func TestRawReportFieldReadsExemptsTestFiles(t *testing.T) {
@@ -58,6 +90,16 @@ func TestRawReportFieldReadsExemptsTestFiles(t *testing.T) {
 	if hits := rawReportFieldReads(t, dir); len(hits) != 0 {
 		t.Fatalf("test files must be exempt, got hits: %v", hits)
 	}
+}
+
+// verifiedQuoteParsers are the files that may parse a TDX quote, each with
+// why. The claims a verifier returns carry nothing of the quoting enclave's
+// report or of the PCK certificate, so a verifier that holds those to the
+// vendor's identity and TCB documents has to read them off the quote. It
+// does so only after the quote's signature has verified, and it reads no
+// init data: the field getters stay banned in these files too.
+var verifiedQuoteParsers = map[string]string{
+	"pkg/session/tdxorigin.go": "holds an already verified quote's quoting enclave, TDX module and TCB levels to Intel's documents",
 }
 
 // rawReportFieldReads scans every non-test Go file under root for calls to
@@ -106,6 +148,9 @@ func rawReportFieldReads(t *testing.T, root string) []string {
 				r, rerr := filepath.Rel(root, path)
 				if rerr != nil {
 					r = path
+				}
+				if _, verified := verifiedQuoteParsers[filepath.ToSlash(r)]; verified && sel.Sel.Name == "QuoteToProto" {
+					return true
 				}
 				hits = append(hits, r+":"+strconv.Itoa(fset.Position(sel.Pos()).Line)+" "+sel.Sel.Name+" ("+what+")")
 			}
