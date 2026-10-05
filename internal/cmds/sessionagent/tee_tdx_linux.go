@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -26,8 +25,6 @@ import (
 
 const (
 	tdxGuestDevice = "/dev/tdx_guest"
-	ccelPath       = "/sys/firmware/acpi/tables/data/CCEL"
-	maxCCELBytes   = 1 << 20
 
 	// TDX_CMD_GET_REPORT0 = _IOWR('T', 1, struct tdx_report_req): 64 bytes of
 	// REPORTDATA in, a 1024-byte TDREPORT out.
@@ -55,8 +52,6 @@ type tdxTEE struct {
 	// failure, so a guest with no route to QGS does not pay a failed connect on
 	// every quote, and one transient failure does not cost the fast path for good.
 	vsockRetryAt atomic.Int64
-	ccelOnce     sync.Once
-	ccel         string
 }
 
 // OpenTEE returns the native TEE interface for platform ("tdx" or "snp").
@@ -97,15 +92,16 @@ func (t *tdxTEE) Evidence(_ context.Context, reportData []byte) (teetypes.Attest
 	if err != nil {
 		return teetypes.AttestationEvidence{}, err
 	}
-	t.ccelOnce.Do(func() {
-		if data, err := readLimited(ccelPath, maxCCELBytes); err == nil && len(data) > 0 {
-			t.ccel = base64.StdEncoding.EncodeToString(data)
-		}
-	})
+	return tdxEnvelope(quote)
+}
+
+// tdxEnvelope is a quote as a session's verifier takes it. The firmware's
+// event log stays out: a verifier holds the quote's registers to published
+// values and replays no log, and the log is many times the quote's size.
+func tdxEnvelope(quote []byte) (teetypes.AttestationEvidence, error) {
 	evidence, err := json.Marshal(struct {
-		Quote      string `json:"quote"`
-		CCEventlog string `json:"cc_eventlog,omitempty"`
-	}{base64.StdEncoding.EncodeToString(quote), t.ccel})
+		Quote string `json:"quote"`
+	}{base64.StdEncoding.EncodeToString(quote)})
 	if err != nil {
 		return teetypes.AttestationEvidence{}, err
 	}
@@ -189,13 +185,4 @@ func quoteVsock(rd [64]byte) ([]byte, error) {
 		return nil, fmt.Errorf("vsock read response: %w", err)
 	}
 	return qgsQuote(body)
-}
-
-func readLimited(path string, limit int64) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, limit))
 }
