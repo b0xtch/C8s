@@ -820,13 +820,14 @@ func (a *Agent) acceptable(raw []byte, signature string) (*session.SignedBind, [
 	if a.doc.AgeLimitSeconds > 0 && a.cfg.clockSource() != ownClockSource {
 		return nil, nil, refused(disclosure.BindClock, errClockLeft)
 	}
-	// Parsed first, so that the two ways a bind fails to verify are told
-	// apart: it is no bind, or its signature is not its authority's.
-	if _, err := session.ParseBind(raw); err != nil {
-		return nil, nil, refused(disclosure.BindInvalid, err)
-	}
+	// The two ways a bind fails to verify are told apart: it is no bind, or
+	// its signature is not its authority's.
 	bind, err := session.VerifyBind(raw, signature)
-	if err != nil {
+	var malformed *session.MalformedBindError
+	switch {
+	case errors.As(err, &malformed):
+		return nil, nil, refused(disclosure.BindInvalid, err)
+	case err != nil:
 		return nil, nil, refused(disclosure.BindSignature, err)
 	}
 	if err := bind.Doc.Targets(&a.key.PublicKey); err != nil {

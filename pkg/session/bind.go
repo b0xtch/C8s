@@ -237,6 +237,13 @@ type SignedBind struct {
 	Doc       *Bind
 }
 
+// MalformedBindError is VerifyBind's error for bytes that are no bind, where
+// any other is a bind whose signature is not its authority's.
+type MalformedBindError struct{ Err error }
+
+func (e *MalformedBindError) Error() string { return e.Err.Error() }
+func (e *MalformedBindError) Unwrap() error { return e.Err }
+
 // VerifyBind parses a bind and checks its signature under the authority it
 // names. That alone says nothing about whose authority it is: see SignedBy.
 //
@@ -244,12 +251,12 @@ type SignedBind struct {
 // is inside them. Nothing is lost by that: a signature under a key of the
 // sender's own choosing would authenticate nothing either.
 func VerifyBind(data []byte, signature string) (*SignedBind, error) {
-	if len(signature) > maxSignatureSize {
-		return nil, errors.New("bind signature is too large")
-	}
 	doc, err := ParseBind(data)
 	if err != nil {
-		return nil, err
+		return nil, &MalformedBindError{Err: err}
+	}
+	if len(signature) > maxSignatureSize {
+		return nil, errors.New("bind signature is too large")
 	}
 	key, err := parsePublicKey(doc.Authority)
 	if err != nil {
