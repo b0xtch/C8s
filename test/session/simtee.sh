@@ -246,7 +246,7 @@ ends_unserved() {
     local step=$1 log=$2 at=$3 program=$4 began served=0 code
     shift 4
     began=$(date +%s%N)
-    sudo -n timeout 120 "$program" "${launcher[@]}" "$@" --network user --port "127.0.0.1:$at:8443" > "$out/$log.log" 2>&1 &
+    sudo -n timeout 240 "$program" "${launcher[@]}" "$@" --network user --port "127.0.0.1:$at:8443" > "$out/$log.log" 2>&1 &
     probe_pid=$!
     while kill -0 "$probe_pid" 2>/dev/null; do
         [ "$(curl -sk --max-time 1 "https://127.0.0.1:$at/healthz" 2>/dev/null)" = ok ] && { served=1; break; }
@@ -345,6 +345,48 @@ unknown "a launcher declares no registers for a disk its manifest does not name"
     --name "c8s-session-other-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443"
 check "and started no VMM for it" sh -c "! pgrep -f '[q]emu-system.*guest=c8s-session-other-$run' > /dev/null"
 
+# Before anything else of this test runs beside them: a plain guest's kernel
+# clears all of its memory as it boots, through its host's page faults, and
+# takes many times as long on a host whose memory other guests hold.
+if [ -n "$TDIMG" ]; then
+    # Neither kind of guest runs as the other. A simulating image is launched
+    # as a TD by a release launcher, and ends before it serves: its init
+    # keeps no register beside the hardware's.
+    td_launcher=()
+    [ -S "$quote_socket" ] && td_launcher=(--quote-socket "$quote_socket")
+    ends_unserved "a simulating image ends in a TD" sim-in-td "$probe_port" "$C8S" "${td_launcher[@]}" \
+        --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/sim-in-td-vm" --name "c8s-session-simtd-$run" "${shape[@]}"
+    if [ "$dev" = 1 ]; then
+        check "it said that a simulation build runs in no TEE" grep -a -q "a simulation build runs in none" "$out/sim-in-td.log"
+    fi
+    # An image built for a TD is launched with no TEE, and ends before it
+    # serves: it has no register to bind its launch key in, and never falls
+    # back to a simulation.
+    expect 0 "a bundle for the TD's image" bundle-td "$SIM" session launch-config new --out "$out/bundle-td" --image-manifest "$TDIMG/manifest.json" \
+        --pool agents --class s-4x16
+    ends_unserved "a TD's image ends without a TEE" td-in-sim "$probe_port" "$SIM" "${simulated[@]}" \
+        --image-dir "$TDIMG" --launch-dir "$out/bundle-td/opkeydata" --work-dir "$out/td-in-sim-vm" --name "c8s-session-tdsim-$run" "${shape[@]}"
+    if [ "$dev" = 1 ]; then
+        check "it said that it has no way to bind its launch key" grep -a -q "neither a writable RTMR\[3\] nor an SEV-SNP guest device" "$out/td-in-sim.log"
+    fi
+    # A TD of that image, and its evidence under both roots.
+    sudo -n "$C8S" "${launcher[@]}" "${td_launcher[@]}" --image-dir "$TDIMG" --launch-dir "$out/bundle-td/opkeydata" --work-dir "$out/td-vm" \
+        --name "c8s-session-td-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/td.log" 2>&1 &
+    probe_pid=$!
+    if serving "$probe_pid" "$probe_port"; then
+        record PASS "a TD of the TD's image serves"
+        td=(--url "https://127.0.0.1:$probe_port" --image-manifest "$TDIMG/manifest.json" --launch-key "$out/bundle-td/opkeydata/pubkey")
+        expect 0 "a release build takes the TD's evidence" td-release "$C8S" session launch-config machine "${td[@]}" "${accept[@]}"
+        expect 2 "a verifier under the simulated authority refuses it" td-simulated "$SIM" session launch-config machine "${td[@]}" "${simulated[@]}"
+        expect 0 "the development build that is given no directory takes it as a release build does" td-vendor-root \
+            "$SIM" session launch-config machine "${td[@]}" "${accept[@]}"
+    else
+        record FAIL "a TD of the TD's image serves" "$(tail -c 400 "$out/td.log" | tr '\n' ' ')"
+    fi
+    stop_pid "$probe_pid"; probe_pid=""
+fi
+
+
 # The key service, the tenant, and the daemon with its pool.
 launch_ks "$out/ks" "$out/ks-vm" "$out/ks.log"
 if ! serving "$ks_pid" "$ks_port"; then
@@ -407,6 +449,9 @@ expect 0 "its command reads the credential the key service released" exec "$SIM"
     sh -c 'cat "$C8S_CREDENTIALS_DIR/api-token"'
 check "and it is the one the tenant stored" [ "$(cat "$out/exec.out")" = "simulated-secret-$run" ]
 expect 0 "the session is verified from a fresh quote" verify "$SIM" session verify "${s1[@]}" --fresh -o json
+check "and the verdict says first that it proves nothing about the guest's hardware" python3 -c 'import json, sys
+gaps = json.load(open(sys.argv[1])).get("not_proven") or [""]
+sys.exit(0 if "TEE is simulated" in gaps[0] else 1)' "$out/verify.out"
 expect 0 "and with documents from the authority's service alone" verify-own "$SIM" session verify "${s1[@]}" --fresh --own-collateral-only --collateral-cache "$out/cache-own"
 check "which are kept apart from the vendor's" sh -c "ls '$out/cache-own' | grep -q '^simulated-' && [ \"\$(ls '$out/cache-own' | wc -l)\" = 1 ]"
 
@@ -422,44 +467,6 @@ check "whose documents are served too" test -n "$other_vendor_pid"
 expect 2 "a verifier under another simulated authority refuses the session" verify-other \
     "$SIM" session verify --binding "$out/s1" --image-manifest "$manifest" --fresh --simulated-tee "$other" --collateral-cache "$out/cache-other"
 expect 0 "the session's own verifier still takes it" verify-again "$SIM" session verify "${s1[@]}" --fresh
-
-if [ -n "$TDIMG" ]; then
-    # Neither kind of guest runs as the other. A simulating image is launched
-    # as a TD by a release launcher, and ends before it serves: its init
-    # keeps no register beside the hardware's.
-    td_launcher=()
-    [ -S "$quote_socket" ] && td_launcher=(--quote-socket "$quote_socket")
-    ends_unserved "a simulating image ends in a TD" sim-in-td "$probe_port" "$C8S" "${td_launcher[@]}" \
-        --image-dir "$IMG" --launch-dir "$out/bundle/opkeydata" --work-dir "$out/sim-in-td-vm" --name "c8s-session-simtd-$run" "${shape[@]}"
-    if [ "$dev" = 1 ]; then
-        check "it said that a simulation build runs in no TEE" grep -a -q "a simulation build runs in none" "$out/sim-in-td.log"
-    fi
-    # An image built for a TD is launched with no TEE, and ends before it
-    # serves: it has no register to bind its launch key in, and never falls
-    # back to a simulation.
-    expect 0 "a bundle for the TD's image" bundle-td "$SIM" session launch-config new --out "$out/bundle-td" --image-manifest "$TDIMG/manifest.json" \
-        --pool agents --class s-4x16
-    ends_unserved "a TD's image ends without a TEE" td-in-sim "$probe_port" "$SIM" "${simulated[@]}" \
-        --image-dir "$TDIMG" --launch-dir "$out/bundle-td/opkeydata" --work-dir "$out/td-in-sim-vm" --name "c8s-session-tdsim-$run" "${shape[@]}"
-    if [ "$dev" = 1 ]; then
-        check "it said that it has no way to bind its launch key" grep -a -q "neither a writable RTMR\[3\] nor an SEV-SNP guest device" "$out/td-in-sim.log"
-    fi
-    # A TD of that image, and its evidence under both roots.
-    sudo -n "$C8S" "${launcher[@]}" "${td_launcher[@]}" --image-dir "$TDIMG" --launch-dir "$out/bundle-td/opkeydata" --work-dir "$out/td-vm" \
-        --name "c8s-session-td-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/td.log" 2>&1 &
-    probe_pid=$!
-    if serving "$probe_pid" "$probe_port"; then
-        record PASS "a TD of the TD's image serves"
-        td=(--url "https://127.0.0.1:$probe_port" --image-manifest "$TDIMG/manifest.json" --launch-key "$out/bundle-td/opkeydata/pubkey")
-        expect 0 "a release build takes the TD's evidence" td-release "$C8S" session launch-config machine "${td[@]}" "${accept[@]}"
-        expect 2 "a verifier under the simulated authority refuses it" td-simulated "$SIM" session launch-config machine "${td[@]}" "${simulated[@]}"
-        expect 0 "the development build that is given no directory takes it as a release build does" td-vendor-root \
-            "$SIM" session launch-config machine "${td[@]}" "${accept[@]}"
-    else
-        record FAIL "a TD of the TD's image serves" "$(tail -c 400 "$out/td.log" | tr '\n' ' ')"
-    fi
-    stop_pid "$probe_pid"; probe_pid=""
-fi
 
 expect 0 "the session ends" destroy "$SIM" session destroy --binding "$out/s1" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
 # Whoever served the documents takes its address with it.

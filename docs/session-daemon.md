@@ -593,7 +593,7 @@ so:
 
 | Work | In a TD | Simulated |
 |---|---|---|
-| Memory at boot | accepted and cleared as the guest uses it | all of it cleared by the kernel before the init runs, through the host's page faults |
+| Memory at boot | accepted and cleared as the guest uses it | all of it cleared by the kernel before the init runs, through the host's page faults: seconds for 16 GiB, and many times that on a host whose memory other guests hold |
 | The guest's clock | the TSC, at the rate the TDX module states | the TSC, at the rate the kernel measured at boot: a plain guest's kernel may never finish refining it, and the agent takes the counter under either name |
 | A quote | a report from the TDX module, signed by the host's quoting service | one signature in the guest |
 | An extend of RTMR[3] | a call into the TDX module | a write to a file in memory |

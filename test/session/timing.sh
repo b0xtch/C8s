@@ -76,6 +76,10 @@
 #   C8S_TIMING_REST          seconds of rest before each round (default 3): a
 #                            long one shows what a start costs once the
 #                            guests' connections have sat idle
+#   C8S_TIMING_IDLE          seconds to watch the pools once the rounds are
+#                            over, full and with nothing asked of them
+#                            (default 0: not at all): the CPU time each ready
+#                            guest's VMM takes while it waits
 #   C8S_TIMING_PIN_POWER=1   for the run, set every CPU's governor to
 #                            performance and turn off idle states deeper than
 #                            C1E; both are put back when the run ends
@@ -147,6 +151,7 @@ per_round=1
 [ "$lose_first" = 1 ] && per_round=2
 depth=2
 rest=${C8S_TIMING_REST:-3}
+idle=${C8S_TIMING_IDLE:-0}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
 fc_sample=${C8S_FIRECRACKER_SAMPLE:-$(dirname "$(readlink -f "$0")")/firecracker_sample.py}
@@ -227,6 +232,11 @@ on() {
     shift
     if [ -n "$cpus" ]; then exec taskset -c "$cpus" "$@"; else exec "$@"; fi
 }
+
+# What else the host runs, before anything of this run does: the share of
+# one CPU each process has had since it started, in all and for the busiest.
+busy=$(ps -eo pcpu= | awk '{ s += $1 } END { printf "%.0f", s }')
+busiest=$(ps -eo pcpu=,comm= --sort=-pcpu | head -12 | sed 's/^/  /')
 
 out=${C8S_SESSION_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/c8s-session-timing.XXXXXX")}
 mkdir -p "$out/pki" || exit 2
@@ -488,9 +498,6 @@ for k in sys.argv[2].split("."): v = v[k]
 print(v)' "$1" "$2"
 }
 others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-z]*-$run")
-# What else the host runs, as the share of one CPU each process has had since
-# it started: the run's own programs are young and count for little here.
-busy=$(ps -eo pcpu= | awk '{ s += $1 } END { printf "%.0f", s }')
 {
     printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU in all (listed below); TDX on in the firmware, for every side; ' "$([ "$pin_power" = 1 ] && echo pinned || echo "as the host had it")" "$others" "$busy"
     baseline="not sampled"
@@ -534,8 +541,8 @@ busy=$(ps -eo pcpu= | awk '{ s += $1 } END { printf "%.0f", s }')
     echo "work directory on $(df --output=fstype,source "$out" | tail -1)"
     echo "load $(cat /proc/loadavg)"
     free -g | sed -n 2p
-    echo "the host's busiest programs, by share of one CPU since each started:"
-    ps -eo pcpu=,comm= --sort=-pcpu | head -12 | sed 's/^/  /'
+    echo "the host's busiest programs before the run, by share of one CPU since each started:"
+    echo "$busiest"
 } > "$out/env.txt" 2>&1
 
 records=$out/timing.jsonl
@@ -602,6 +609,49 @@ for side in "${sides[@]}"; do
     wait "${warm_pid[$side]}" || die "the ${label[$side]} side's rounds: $(tail -c 400 "${dir[$side]}/warmstart.err")"
     warm_pid[$side]=""
 done
+# What a ready guest costs its host while nobody asks anything of it: the
+# CPU time of each pooled guest's VMM, its vCPUs and its device threads
+# among it, over a stretch with every pool full.
+if [ "$idle" -gt 0 ]; then
+    pools_full
+    sleep "$rest"
+    watchers=()
+    for side in "${sides[@]}"; do
+        python3 - "$idle" "${dir[$side]}/state" <<'IDLE' >> "${dir[$side]}/timing.jsonl" &
+import json, os, sys, time
+seconds, state = float(sys.argv[1]), sys.argv[2]
+def processes():
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+            with open(f"/proc/{pid}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        # After the name: state, parent, ..., and user and system time as
+        # the 12th and 13th.
+        yield int(pid), [a.decode(errors="replace") for a in args], int(fields[1]), int(fields[11]) + int(fields[12])
+def guests():
+    """The VMMs whose launchers work under this daemon's state directory."""
+    everything = list(processes())
+    launchers = {pid for pid, args, _, _ in everything
+                 if "session-launcher" in args and any(a.startswith(state + "/") for a in args) and not os.path.basename(args[0]).startswith("sudo")}
+    return {pid: ticks for pid, args, parent, ticks in everything if parent in launchers and "qemu" in os.path.basename(args[0])}
+before, began = guests(), time.monotonic()
+time.sleep(seconds)
+after, took = guests(), time.monotonic() - began
+tick = os.sysconf("SC_CLK_TCK")
+for pid in sorted(before):
+    if pid in after:
+        print(json.dumps({"kind": "idle", "vmm": pid, "seconds": round(took, 1),
+                          "cpu_ms_per_s": round((after[pid] - before[pid]) * 1000 / tick / took, 2)}))
+IDLE
+        watchers+=($!)
+    done
+    # These alone: the daemons and the key services are this shell's too.
+    wait "${watchers[@]}"
+fi
 restore_power
 
 # How long each guest took from its launch to ready.
@@ -663,6 +713,7 @@ for name, rows in sides:
     if first:
         print(f"the first round, caches cold: start {first[0]['start_us'] / 1000:.1f} ms, first command {first[0]['first_cmd_us'] / 1000:.1f} ms")
     show("session guest launch to ready", [r["boot_ms"] for r in rows if r.get("kind") == "session-cold"], "ms" + (" (its kernel clears all of its memory first)" if name != "TD" else ""))
+    show("ready guest, idle", [r["cpu_ms_per_s"] for r in rows if r.get("kind") == "idle"], "ms of CPU a second, its VMM's with its vCPUs and device threads")
     for r in rows:
         if r.get("kind") == "tee" and r.get("simulated"):
             print(f"this side's guests ran in no TEE: build tag {r['build_tag']}, authority {r['authority']} (root sha256 {r['root']})")
