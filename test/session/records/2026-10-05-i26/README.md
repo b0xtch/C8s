@@ -3,10 +3,15 @@
 Two runs of [`test/session/timing.sh`](../../timing.sh) on one development
 host, each of three configurations, under the method of
 [docs/session-performance.md](../../../../docs/session-performance.md#method).
-The programs and images are this branch's at `c2011f16`: c8s
-`v0.34.2-132-gc2011f16`, with `+c8s_simtee` for the simulating build, and
-images built from that tree by `session-guest-image/build`, the simulating
-pair with `C8S_SIMTEE=1`.
+The programs and images are this branch's at the commit *feat(session): name
+a simulating build in its version*: c8s states `v0.34.2-132-gc2011f16`, with
+`+c8s_simtee` for the simulating build, and the images were built from that
+tree by `session-guest-image/build`, the simulating pair with `C8S_SIMTEE=1`.
+
+Commits are named here by their titles. The branch was replayed onto later
+documents after these runs, which gave its commits other ids and changed no
+file but the documents, so a version string names the id its commit had when
+the program was built.
 
 | Directories | Configuration | Settings |
 |---|---|---|
@@ -62,10 +67,11 @@ Before a run's first configuration the one other VM on the host was stopped,
 and the host was left alone for 30 s.
 
 The second run's scripts are `test/session/timing.sh` and
-`test/session/firecracker_sample.py` as commit `5672fbea` holds them. The
-first run's timing script was the file as `e2de784c` left it, with a first
-draft of the idle watch that `5672fbea` adds. The summary program is the timing
-script's own.
+`test/session/firecracker_sample.py` as the commit *test(session): watch idle
+pools, and check a lone simulated guest first* holds them. The first run's
+timing script was the file as *test(session): check and time guests whose
+TEE is simulated* left it, with a first draft of the idle watch that the
+later commit adds. The summary program is the timing script's own.
 
 ## Where the runs depart from the method
 
