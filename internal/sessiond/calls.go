@@ -89,6 +89,7 @@ func (d *Daemon) Claim(ctx context.Context, req *sessionv1alpha1.ClaimRequest) (
 				return nil, exhausted(pool.cfg.name, hint)
 			}
 		}
+		picked := time.Now()
 		t.rec.State = StateClaimed
 		t.rec.Claim = &claim{RequestID: req.GetRequestId(), Session: req.GetSession()}
 		t.busy = true
@@ -99,7 +100,7 @@ func (d *Daemon) Claim(ctx context.Context, req *sessionv1alpha1.ClaimRequest) (
 			d.end(t, "its record could not be kept", "")
 			return nil, status.Error(codes.Internal, "the claim could not be recorded")
 		}
-		answer, err := d.fence(ctx, t, pool)
+		answer, err := d.fence(ctx, t, pool, picked)
 		if err == nil {
 			return answer, nil
 		}
@@ -181,14 +182,17 @@ func exhausted(pool string, hint time.Duration) error {
 }
 
 // fence has the claimed guest cut the connections it has, collects what it
-// serves to anyone, and starts the claim's grace.
-func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState) (*sessionv1alpha1.Claimed, error) {
+// serves to anyone, and starts the claim's grace. picked is when the claim
+// took the TD.
+func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState, picked time.Time) (*sessionv1alpha1.Claimed, error) {
 	ctx, cancel := context.WithTimeout(ctx, fenceTimeout)
 	defer cancel()
+	asked := time.Now()
 	leaf, err := d.guests.fence(ctx, t.rec.Address)
 	if err != nil {
 		return nil, err
 	}
+	guest := time.Since(asked)
 	d.mu.Lock()
 	offered, collateral := t.offered, t.collateral
 	d.mu.Unlock()
@@ -225,7 +229,8 @@ func (d *Daemon) fence(ctx context.Context, t *td, pool *poolState) (*sessionv1a
 		return nil, err
 	}
 	d.armLapse(t)
-	d.log.Info("claimed a TD", "td", t.rec.ID, "pool", t.rec.Pool, "session", t.rec.Claim.Session)
+	d.log.Info("claimed a TD", "td", t.rec.ID, "pool", t.rec.Pool, "session", t.rec.Claim.Session,
+		"took_us", time.Since(picked).Microseconds(), "guest_us", guest.Microseconds())
 	return answer, nil
 }
 
@@ -238,6 +243,7 @@ func lasts(leaf []byte, now time.Time) bool {
 
 // Bind hands a claimed TD its bind and returns the guest's evidence.
 func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*sessionv1alpha1.Bound, error) {
+	began := time.Now()
 	if err := checkRequestID(req.GetRequestId()); err != nil {
 		return nil, err
 	}
@@ -301,7 +307,9 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 		return nil, status.Error(codes.Internal, "the bind could not be recorded")
 	}
 
+	asked := time.Now()
 	evidence, receipt, err := d.relayBind(ctx, t, address, req)
+	guest := time.Since(asked)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	t.busy = false
@@ -338,7 +346,8 @@ func (d *Daemon) Bind(ctx context.Context, req *sessionv1alpha1.BindRequest) (*s
 	if err := d.save(t); err != nil {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
 	}
-	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase())
+	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
+		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer))
 	d.notify()
 	return answer, nil
 }
