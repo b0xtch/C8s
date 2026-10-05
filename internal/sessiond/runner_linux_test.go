@@ -83,7 +83,7 @@ func TestRunnerStartsAdoptsAndStops(t *testing.T) {
 	}
 	want := "session-launcher run --platform tdx --image-dir /images/session --launch-dir /bundle/opkeydata" +
 		" --work-dir " + filepath.Join(spec.Dir, workDir) + " --name td-test --vcpus 4 --memory 16G --vsock-cid auto" +
-		" --collateral-cache /state/collateral" +
+		" --collateral-cache /state/collateral --end-file " + filepath.Join(spec.Dir, endFile) +
 		" --quote-socket /run/qgs.socket --confine 64055 --scratch 8G --image-store /store/images.store" +
 		" --network user --port 127.0.0.1:39003:8443"
 	if args != want {

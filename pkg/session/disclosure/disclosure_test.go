@@ -263,3 +263,74 @@ func checkField(t *testing.T, message string, field *disclosure.Field, messages 
 		t.Errorf("%s: kind %q", at, field.Kind)
 	}
 }
+
+// A guest's last word is one of the schema's, whichever way it ends, and
+// what its launcher reads back is what was said.
+func TestEndIsSaidAndReadBack(t *testing.T) {
+	status, signal := 3, 9
+	for name, end := range map[string]disclosure.End{
+		"the session's process ended": {Phase: "running", Code: disclosure.EndProcess},
+		"the service exited":          {Phase: "ready", Code: disclosure.EndExited, Status: &status},
+		"the service was killed":      {Phase: "running", Code: disclosure.EndKilled, Signal: &signal, Memory: true},
+		"the boot failed":             {Phase: disclosure.EndedBooting, Code: disclosure.EndBoot},
+		"before the service is ready": {Phase: disclosure.EndedStarting, Code: disclosure.EndExited, Status: &status},
+	} {
+		said, err := disclosure.Encode(disclosure.MessageEnd, end)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(said) > disclosure.MaxEnd {
+			t.Errorf("%s: a word of %d bytes, and a launcher reads %d", name, len(said), disclosure.MaxEnd)
+		}
+		read, err := disclosure.ParseEnd(said)
+		if err != nil {
+			t.Fatalf("%s: read back: %v", name, err)
+		}
+		if read.Phase != end.Phase || read.Code != end.Code || read.Memory != end.Memory ||
+			(read.Status == nil) != (end.Status == nil) || (read.Signal == nil) != (end.Signal == nil) {
+			t.Errorf("%s: read back as %+v", name, read)
+		}
+	}
+	if got := (&disclosure.End{Phase: "running", Code: disclosure.EndKilled, Signal: &signal, Memory: true}).String(); got != "service_killed (signal 9, by the kernel for memory) in phase running" {
+		t.Errorf("a last word, as an operator reads it: %q", got)
+	}
+}
+
+// A launcher holds a guest's last word to the schema: a guest is not trusted
+// to keep to it, and a word that says more, or anything else, is no word.
+func TestParseEndHoldsAWordToTheSchema(t *testing.T) {
+	for name, word := range map[string]string{
+		"a code outside the list":       `{"phase":"running","code":"the tenant ran out of patience"}`,
+		"a phase outside the list":      `{"phase":"sealing a secret","code":"process_ended"}`,
+		"a member the schema lacks":     `{"phase":"running","code":"process_ended","note":"c2VjcmV0"}`,
+		"a status beyond a process's":   `{"phase":"running","code":"service_exited","status":70000}`,
+		"a status that is no number":    `{"phase":"running","code":"service_exited","status":"3"}`,
+		"no code":                       `{"phase":"running"}`,
+		"a second document":             `{"phase":"running","code":"process_ended"}{"phase":"running","code":"process_ended"}`,
+		"no document":                   `process_ended`,
+		"a word longer than any may be": `{"phase":"running","code":"process_ended"` + strings.Repeat(" ", disclosure.MaxEnd) + `}`,
+	} {
+		if end, err := disclosure.ParseEnd([]byte(word)); err == nil {
+			t.Errorf("%s was read as %+v", name, end)
+		}
+	}
+}
+
+// A service's exit status names a reason only inside its own range, and the
+// statuses a shell or a runtime exits with are outside it.
+func TestEndStatusesNameOnlyTheServicesOwnReasons(t *testing.T) {
+	status := disclosure.EndStatus(disclosure.EndProcess)
+	if code, ok := disclosure.EndOfStatus(status); !ok || code != disclosure.EndProcess || status < 64 || status > 125 {
+		t.Fatalf("the status of a process that ended is %d, read back as %q", status, code)
+	}
+	for _, code := range []disclosure.Code{disclosure.EndExited, disclosure.EndKilled, disclosure.EndBoot, "unknown"} {
+		if got := disclosure.EndStatus(code); got != 0 {
+			t.Errorf("%s has exit status %d, and the service never chooses it", code, got)
+		}
+	}
+	for _, status := range []int{0, 1, 2, 126, 127, 137, 255, status + 1} {
+		if code, ok := disclosure.EndOfStatus(status); ok {
+			t.Errorf("status %d names %q", status, code)
+		}
+	}
+}

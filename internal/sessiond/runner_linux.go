@@ -103,6 +103,7 @@ func (r *QEMURunner) Start(_ context.Context, spec Spec) (Instance, error) {
 		"--memory", spec.Class.Memory,
 		"--vsock-cid", "auto",
 		"--collateral-cache", filepath.Join(r.cfg.StateDir, collateralDir),
+		"--end-file", filepath.Join(spec.Dir, endFile),
 	}
 	for _, option := range [][2]string{
 		{"--qemu", vmm.QEMU}, {"--quote-socket", vmm.QuoteSocket}, {"--confine", vmm.Confine},

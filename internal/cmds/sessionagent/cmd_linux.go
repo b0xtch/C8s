@@ -20,6 +20,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 
+	"github.com/confidential-dot-ai/c8s/internal/guestend"
 	"github.com/confidential-dot-ai/c8s/internal/imagestore"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
@@ -28,7 +29,7 @@ import (
 // verity root, so they are part of what the image measurement covers.
 const (
 	defaultPubkeyPath    = "/etc/confai/operator-pubkey"
-	defaultLaunchDir     = "/run/c8s-session/launch"
+	defaultLaunchDir     = guestend.LaunchDir
 	defaultResolvConf    = "/run/c8s-session/resolv.conf"
 	defaultCredentialDir = "/run/c8s/credentials"
 	defaultSandboxUser   = "sandbox"
@@ -250,6 +251,7 @@ func newRunCmd() *cobra.Command {
 	f.StringVar(&listen, "listen", fmt.Sprintf(":%d", session.AgentPort), "RA-TLS bind address")
 	f.StringVar(&cfg.PubkeyPath, "pubkey", defaultPubkeyPath, "launch public key staged by the measured initrd")
 	f.StringVar(&cfg.LaunchDir, "launch-dir", defaultLaunchDir, "directory holding launch.yaml and launch.yaml.sig")
+	f.StringVar(&cfg.PhaseFile, "phase-file", guestend.PhaseFile, "file the agent writes its phase to as it changes, for the guest's init to read once the agent has ended; empty writes none")
 	f.StringVar(&cfg.CredentialDir, "credential-dir", defaultCredentialDir, "RAM-backed directory for released credentials")
 	f.StringVar(&sandboxUser, "sandbox-user", defaultSandboxUser, "unprivileged user commands run as when the bind names no sandbox image")
 	f.BoolVar(&cfg.Bare, "bare", false, "take a bind that names no sandbox image, and run its commands on the guest's own file system as --sandbox-user: a dev image's mode, for tests. Without it such a document is refused")

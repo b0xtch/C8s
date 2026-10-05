@@ -45,6 +45,11 @@ type HostConfig struct {
 	// TLS session on such a connection ends at the vendor, so the launcher
 	// can keep a document from the guest and can give it none.
 	VendorPorts map[string]uint32 `json:"vendor_ports,omitempty"`
+	// EndPort is the vsock port of the host on which the guest's launcher
+	// takes the guest's last word: how far it had come and why it ends, one
+	// message of the disclosure schema, which the guest's init sends as the
+	// guest ends itself. Zero is no port: the guest then ends without a word.
+	EndPort uint32 `json:"end_port,omitempty"`
 }
 
 // maxVendorPorts bounds the services a host names roads to.
@@ -108,6 +113,9 @@ func (c *HostConfig) Validate() error {
 	}
 	if c.CollateralPort == math.MaxUint32 {
 		return fmt.Errorf("collateral_port %d is no port", c.CollateralPort)
+	}
+	if c.EndPort == math.MaxUint32 {
+		return fmt.Errorf("end_port %d is no port", c.EndPort)
 	}
 	if len(c.VendorPorts) > maxVendorPorts {
 		return fmt.Errorf("vendor_ports names more than %d services", maxVendorPorts)

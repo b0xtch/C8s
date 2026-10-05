@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io/fs"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -80,6 +81,11 @@ type fakeGuest struct {
 	exits    [][2]int
 	nextPID  int
 	startErr map[string]error
+	// killed names the signal that ended a process, by its id, in place of
+	// a status. launcher answers a dial of the host, and dialed lists them.
+	killed   map[int]int
+	launcher func(port uint32) (net.Conn, error)
+	dialed   []uint32
 }
 
 func newFakeGuest() *fakeGuest {
@@ -248,13 +254,25 @@ func (f *fakeGuest) Start(argv, _ []string, cgroup string, oom int) (int, error)
 	return f.nextPID, nil
 }
 
-func (f *fakeGuest) Wait() (int, int, error) {
+func (f *fakeGuest) Wait() (int, ending, error) {
 	if len(f.exits) == 0 {
-		return 0, 0, errors.New("no child left")
+		return 0, ending{}, errors.New("no child left")
 	}
 	next := f.exits[0]
 	f.exits = f.exits[1:]
-	return next[0], next[1], nil
+	// A child the test had killed ends by that signal, with no status.
+	if signal := f.killed[next[0]]; signal != 0 {
+		return next[0], ending{signal: signal}, nil
+	}
+	return next[0], ending{status: next[1]}, nil
+}
+
+func (f *fakeGuest) DialHost(port uint32) (net.Conn, error) {
+	f.dialed = append(f.dialed, port)
+	if f.launcher == nil {
+		return nil, errors.New("no launcher listens")
+	}
+	return f.launcher(port)
 }
 
 func (f *fakeGuest) mounted(target string) *mountCall {

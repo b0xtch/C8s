@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/confidential-dot-ai/c8s/internal/devmapper"
+	"github.com/confidential-dot-ai/c8s/internal/vsock"
 )
 
 // kernel is the guest's own kernel, asked directly.
@@ -390,7 +392,7 @@ func (k *kernel) Start(argv, env []string, cgroup string, oomScore int) (int, er
 	return syscall.ForkExec(argv[0], argv, attr)
 }
 
-func (k *kernel) Wait() (int, int, error) {
+func (k *kernel) Wait() (int, ending, error) {
 	var status unix.WaitStatus
 	for {
 		pid, err := unix.Wait4(-1, &status, 0, nil)
@@ -398,12 +400,19 @@ func (k *kernel) Wait() (int, int, error) {
 			continue
 		}
 		if err != nil {
-			return 0, 0, err
+			return 0, ending{}, err
 		}
-		if status.Exited() || status.Signaled() {
-			return pid, exitCode(status), nil
+		switch {
+		case status.Signaled():
+			return pid, ending{signal: int(status.Signal())}, nil
+		case status.Exited():
+			return pid, ending{status: status.ExitStatus()}, nil
 		}
 	}
+}
+
+func (k *kernel) DialHost(port uint32) (net.Conn, error) {
+	return vsock.Dial(vsock.HostCID, port)
 }
 
 // powerOff ends the guest. A session guest never reboots: whatever comes up
@@ -426,6 +435,7 @@ func Main() int {
 	}
 	err := runGuest(k)
 	k.Log("the guest ends: %v", err)
+	sayLastWord(k, lastWord(err))
 	powerOff()
 	return 1
 }

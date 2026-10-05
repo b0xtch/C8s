@@ -474,6 +474,45 @@ the bind with `bind_no_member` and ends, as a guest does that refused any
 bind. A bind that names no key service closes the guest's session with its
 pool's, and the guest deals with no replica after it.
 
+## Why a TD ended
+
+A guest that ends itself says why as it goes
+([What leaves a session](session-disclosure.md#logs-consoles-and-crashes)).
+Its init sees the agent end, however it ends, and sends one message of the
+disclosure schema to the guest's launcher before it powers the guest off: the
+phase the guest had reached and a code.
+
+```
+ TD                                   its host
+ +-------+ exits, with  +------+ vsock +----------+ end.json +--------+
+ | agent |------------->| init |------>| launcher |--------->| daemon |
+ +-------+  a status    +------+ port E+----------+          +--------+
+     |                     ^            logs the word   the TD's reason,
+     +--- its phase, in ---+                            in its log and in
+          a file                                        Watch
+```
+
+The launcher listens on a vsock port of the host's and names it as `end_port`
+in `host.json`. It takes one word, from its own guest's context id, holds it
+to the schema, logs it, and writes it to the file the daemon named
+(`--end-file`). The daemon gives it as the reason of the TD's end: `the guest
+ended: process_ended in phase running`. A guest that says nothing, because its
+kernel faulted or its VMM was ended under it, leaves `the guest ended`.
+Neither side waits on the other for more than two seconds, and a guest that
+reaches no launcher ends all the same.
+
+| Code | The guest ended because |
+|---|---|
+| `process_ended` | the process the session's policy names as its own ended. What that process exited with is the session's, and stays in its logs |
+| `service_exited` | the agent exited for a reason that has no code of its own yet, such as a bind it took and could not act on. The word carries the status |
+| `service_killed` | the agent was killed. The word carries the signal, and whether the kernel sent it for memory, by the kill count of the agent's own cgroup |
+| `boot_failed` | a step of the guest's boot failed after its launch files were staged. A failure before that has no port to tell |
+
+The agent names a reason of its own by the status it exits with, from a range
+that neither a shell nor the Go runtime uses, and writes its phase to a file
+as it changes, which the init reads. The codes are for whoever operates the
+guests, and nothing that guards a session rests on one.
+
 ## Restarts and draining
 
 A TD's launcher runs in a session of its own and outlives the daemon. The
@@ -647,6 +686,9 @@ given the development build and its images.
   requests of one caller in flight, and 4096 connections for every caller
   together.
 - A cgroup per TD, which statistics and memory limits need.
+- Of a guest's last word: a code of its own for each reason the agent ends
+  a guest (its age limit, a refused bind, each guard), and the kernel's
+  fixed code for a fault, through the platform's call for a fatal error.
 - Disk slots. A TD has its image, its launch disk, a scratch disk and the
   image store.
 - A reload of the daemon's certificate without a restart.

@@ -11,6 +11,7 @@ import (
 	"golang.org/x/net/netutil"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // maxConnections caps accepted sockets: each costs a TLS handshake before any
@@ -121,17 +122,41 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 			_ = srv.Shutdown(owed)
 			cancel()
 			_ = srv.Close()
-			if err != nil {
-				return fmt.Errorf("sandbox ended: %w", err)
+			if err == nil {
+				cfg.Logger.Info("sandbox exited with status 0, stopping")
+			} else {
+				err = fmt.Errorf("sandbox ended: %w", err)
 			}
-			cfg.Logger.Info("sandbox exited with status 0, stopping")
-			return nil
+			// The end of the process a session named is the session's own
+			// end, whatever the process exited with.
+			if agent.namedProcess() {
+				return &Ended{Code: disclosure.EndProcess, Err: err}
+			}
+			return err
 		}
 	}
 	shut, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return srv.Shutdown(shut)
 }
+
+// Ended is an agent that ended its guest for a reason the disclosure schema
+// has a code for. The program exits with that code's status, for the guest's
+// init to say as the guest's last word. Err is what else there is to log,
+// and may be nil.
+type Ended struct {
+	Code disclosure.Code
+	Err  error
+}
+
+func (e *Ended) Error() string {
+	if e.Err == nil {
+		return "the guest ends: " + string(e.Code)
+	}
+	return fmt.Sprintf("the guest ends: %s: %v", e.Code, e.Err)
+}
+
+func (e *Ended) Unwrap() error { return e.Err }
 
 // Serve runs srv, which Server made, on ln. The agent keeps track of the
 // connections it accepts there, which is what lets an unbound guest end them

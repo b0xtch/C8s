@@ -173,6 +173,15 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		defer stop()
 		go keeper.run(keeping)
 	}
+	// A guest with a vsock device says why it ends, when it ends itself.
+	if cid := cfg.guestCID(); cid != 0 {
+		word, port, err := listenLastWord(cid, cfg.EndFile, log)
+		if err != nil {
+			return fmt.Errorf("the guest's last word: %w", err)
+		}
+		defer word.Close()
+		host.EndPort = port
+	}
 	// Every file of the guest reaches QEMU open, so it is given no path into
 	// the image directory or the work directory and needs no right to enter
 	// either.

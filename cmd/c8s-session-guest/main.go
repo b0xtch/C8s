@@ -7,6 +7,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionkeyservice"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionschema"
 	"github.com/confidential-dot-ai/c8s/internal/version"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 func main() {
@@ -29,6 +31,15 @@ func main() {
 	root.AddCommand(sessionagent.NewCmd(), sessionkeyservice.NewCmd(), sessionschema.NewCmd())
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		// An agent that ended its guest for a reason the disclosure schema
+		// has a code for exits with that code's status: the init that
+		// started it says the code as the guest's last word.
+		var ended *sessionagent.Ended
+		if errors.As(err, &ended) {
+			if status := disclosure.EndStatus(ended.Code); status != 0 {
+				os.Exit(status)
+			}
+		}
 		os.Exit(1)
 	}
 }

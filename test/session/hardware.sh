@@ -559,6 +559,17 @@ if [ -n "$ref_changed" ]; then
     expect 3 "a sandbox image whose content was changed is not run" start-changed \
         start_session s0 "$out/s0-changed" acme "$out/authority.key" "$manifest" "$launch_key" --sandbox-image "$ref_changed"
 fi
+# Each of those guests ended itself, and its init told its launcher why as
+# it went: the service exited while the guest was bound. The daemon gives
+# that word as the TD's reason for ending, on a locked image as on a dev one.
+said_why() { # said_why <count> <word>: so many TDs ended with that word
+    local deadline=$(( $(date +%s) + 60 ))
+    until [ "$(grep '"msg":"a TD ended"' "$out/daemon.log" 2>/dev/null | grep -c "\"reason\":\"the guest ended: $2\"")" -ge "$1" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        sleep 0.5
+    done
+}
+check "each guest that could not act on its bind said why it ended" said_why 3 "service_exited (status 1) in phase bound"
 
 # Two sessions of two tenants, each on a TD of its own. The first takes one
 # credential from the key service and is handed another by a key its bind

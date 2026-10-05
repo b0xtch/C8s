@@ -97,6 +97,7 @@ misbehaves produces a guest that will not boot or will not verify.`,
 	f.StringVar(&cfg.QuoteSocket, "quote-socket", "", "host quoting service (TDX): a unix socket path, or vsock:<cid>:<port>")
 	f.StringVar(&vsock, "vsock-cid", "0", "guest vsock context id, for the fast quote path: a number, auto for one no other guest on the host holds, or 0 for no vsock device")
 	f.BoolVar(&cfg.Collateral, "collateral", true, "answer the guest's asks for Intel's collateral for its platform; the guest passes it on to its verifiers so that they need not ask Intel (TDX with --vsock-cid). A verifier checks Intel's signatures and dates on it either way")
+	f.StringVar(&cfg.EndFile, "end-file", "", "file the launcher writes the guest's last word to, if the guest says one as it ends itself: how far it had come and why, as the disclosure schema's end message (needs --vsock-cid)")
 	f.StringVar(&cfg.CollateralCache, "collateral-cache", "", "directory the launchers of this host keep Intel's collateral in, so that a guest is answered with what another guest's launcher fetched; empty has this launcher fetch for itself")
 	f.BoolVar(&cfg.AvoidFirstCPU, "avoid-first-cpu", true, "keep the VMM off the first online CPU of each package (TDX): when a host frees any guest's key it writes the package's caches back on that CPU, in an interrupt handler, and whatever runs there waits")
 	f.BoolVar(&cfg.Console, "console", false, "attach a guest console to this process's output (dev images; a locked image prints nothing)")

@@ -5,9 +5,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"io/fs"
+	"net"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/confidential-dot-ai/c8s/internal/guestend"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 const testBootConfig = `{
@@ -194,5 +200,116 @@ func TestISOVolumeLabel(t *testing.T) {
 	}
 	if got := isoVolumeLabel(bytes.NewReader(make([]byte, 100))); got != "" {
 		t.Fatalf("label %q of a short disk", got)
+	}
+}
+
+// said runs a booted guest to its end as process 1 does, with a launcher
+// that takes its last word, and returns the word the launcher was sent.
+func said(t *testing.T, change func(*fakeGuest)) (*fakeGuest, *disclosure.End) {
+	t.Helper()
+	f := bootedGuest()
+	f.files[guestend.HostConfigFile] = []byte(`{"end_port": 20007, "collateral_port": 20003}`)
+	received := make(chan *disclosure.End, 1)
+	f.launcher = func(uint32) (net.Conn, error) {
+		guest, launcher := net.Pipe()
+		go func() {
+			end, _ := guestend.Receive(launcher, time.Second)
+			received <- end
+		}()
+		return guest, nil
+	}
+	change(f)
+	err := runGuest(f)
+	sayLastWord(f, lastWord(err))
+	select {
+	case end := <-received:
+		return f, end
+	case <-time.After(100 * time.Millisecond):
+		return f, nil
+	}
+}
+
+// A guest whose service has ended tells its launcher how far it had come
+// and why, on the port the host's file names: the reason the service exited
+// with, when it is one of the service's own, and otherwise the status as it
+// is, or the signal that killed it and whether the kernel sent it for memory.
+func TestGuestSaysWhyItEnds(t *testing.T) {
+	process := disclosure.EndStatus(disclosure.EndProcess)
+	for name, tc := range map[string]struct {
+		change func(*fakeGuest)
+		want   disclosure.End
+		status int
+		signal int
+	}{
+		"its session's process ended": {func(f *fakeGuest) {
+			f.exits[3][1] = process
+			f.files[guestend.PhaseFile] = []byte("running\n")
+		}, disclosure.End{Phase: "running", Code: disclosure.EndProcess}, -1, -1},
+		"its service exited before it was ready": {func(*fakeGuest) {},
+			disclosure.End{Phase: disclosure.EndedStarting, Code: disclosure.EndExited}, 3, -1},
+		"its service exited while it waited for a bind": {func(f *fakeGuest) { f.files[guestend.PhaseFile] = []byte("ready") },
+			disclosure.End{Phase: "ready", Code: disclosure.EndExited}, 3, -1},
+		"its service was killed": {func(f *fakeGuest) {
+			f.killed = map[int]int{103: 11}
+			f.files[guestend.PhaseFile] = []byte("bound")
+		}, disclosure.End{Phase: "bound", Code: disclosure.EndKilled}, -1, 11},
+		"the kernel killed its service for memory": {func(f *fakeGuest) {
+			f.killed = map[int]int{103: 9}
+			f.files[guestend.PhaseFile] = []byte("running")
+			f.files[serviceCgroup+"/memory.events.local"] = []byte("low 0\nhigh 0\nmax 0\noom 1\noom_kill 1\noom_group_kill 0\n")
+		}, disclosure.End{Phase: "running", Code: disclosure.EndKilled, Memory: true}, -1, 9},
+		"its service was killed, and not for memory": {func(f *fakeGuest) {
+			f.killed = map[int]int{103: 9}
+			f.files[serviceCgroup+"/memory.events.local"] = []byte("oom 0\noom_kill 0\n")
+		}, disclosure.End{Phase: disclosure.EndedStarting, Code: disclosure.EndKilled}, -1, 9},
+		"a step of its boot failed": {func(f *fakeGuest) { f.exits[1][1] = 4 },
+			disclosure.End{Phase: disclosure.EndedBooting, Code: disclosure.EndBoot}, -1, -1},
+	} {
+		f, end := said(t, tc.change)
+		if end == nil {
+			t.Errorf("%s: its launcher was told nothing (the init logged %q)", name, f.logs)
+			continue
+		}
+		if end.Phase != tc.want.Phase || end.Code != tc.want.Code || end.Memory != tc.want.Memory {
+			t.Errorf("%s: its launcher was told %s", name, end)
+		}
+		if (tc.status >= 0) != (end.Status != nil) || end.Status != nil && *end.Status != tc.status {
+			t.Errorf("%s: the word's status is %v, want %d", name, end.Status, tc.status)
+		}
+		if (tc.signal >= 0) != (end.Signal != nil) || end.Signal != nil && *end.Signal != tc.signal {
+			t.Errorf("%s: the word's signal is %v, want %d", name, end.Signal, tc.signal)
+		}
+		if len(f.dialed) != 1 || f.dialed[0] != 20007 {
+			t.Errorf("%s: the init dialed %v, and the host named port 20007", name, f.dialed)
+		}
+	}
+}
+
+// A guest that cannot say its word ends all the same: with no port named,
+// with a host's file that is not staged, and with no launcher that listens.
+func TestGuestEndsWithoutAWordItCannotSay(t *testing.T) {
+	for name, change := range map[string]func(*fakeGuest){
+		"the host named no port":  func(f *fakeGuest) { f.files[guestend.HostConfigFile] = []byte(`{"collateral_port": 20003}`) },
+		"the host's file is gone": func(f *fakeGuest) { delete(f.files, guestend.HostConfigFile) },
+		"no launcher listens":     func(f *fakeGuest) { f.launcher = nil },
+		"the launcher takes none": func(f *fakeGuest) {
+			f.launcher = func(uint32) (net.Conn, error) {
+				guest, launcher := net.Pipe()
+				t.Cleanup(func() { launcher.Close() })
+				return guest, nil
+			}
+		},
+	} {
+		began := time.Now()
+		f, end := said(t, change)
+		if end != nil {
+			t.Errorf("%s: a launcher was told %s", name, end)
+		}
+		if waited := time.Since(began); waited > 2*guestend.Wait {
+			t.Errorf("%s: the guest's end waited %s", name, waited)
+		}
+		if !slices.ContainsFunc(f.logs, func(line string) bool { return strings.Contains(line, "no last word") }) {
+			t.Errorf("%s: the init did not log that it said no word: %q", name, f.logs)
+		}
 	}
 }

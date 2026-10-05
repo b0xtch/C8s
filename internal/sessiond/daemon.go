@@ -14,6 +14,7 @@ import (
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 const (
@@ -38,6 +39,9 @@ const (
 	// workDir is where a TD's launch disk and scratch disk live, in its own
 	// directory.
 	workDir = "vm"
+	// endFile is where a TD's launcher keeps the guest's last word, in the
+	// TD's own directory.
+	endFile = "end.json"
 	// collateralDir is where the launchers keep the vendor's documents they
 	// answer their guests with, in the state directory: one set for every TD
 	// of the host.
@@ -391,13 +395,31 @@ func (d *Daemon) watch(t *td) {
 		if pool := d.pools[t.rec.Pool]; pool != nil && t.rec.State == StateBooting {
 			d.failed(pool)
 		}
-		// An age limit, a refused bind, a crash: the host cannot tell which.
-		d.endLocked(t, "the guest ended", "")
+		// An age limit, a refused bind, a crash: the guest's last word says
+		// which, where it gave one.
+		d.endLocked(t, d.guestEnded(t), "")
 	}
 	// The launch disk and the scratch disk held only what the guest wrote
 	// under keys that died with it.
 	_ = os.RemoveAll(filepath.Join(d.dir(t.rec.ID), workDir))
 	d.notify()
+}
+
+// guestEnded is the reason of a TD whose guest ended: with the guest's last
+// word, as its launcher kept it, or without one. A guest that says none
+// crashed, or its VMM was ended under it. The word is an operator's to read
+// and nothing here acts on it.
+func (d *Daemon) guestEnded(t *td) string {
+	const reason = "the guest ended"
+	data, err := session.ReadBounded(filepath.Join(d.dir(t.rec.ID), endFile), disclosure.MaxEnd)
+	if err != nil {
+		return reason
+	}
+	end, err := disclosure.ParseEnd(bytes.TrimSpace(data))
+	if err != nil {
+		return reason
+	}
+	return reason + ": " + end.String()
 }
 
 // end ends a TD: no state leads out of it.

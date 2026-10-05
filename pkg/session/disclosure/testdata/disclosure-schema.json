@@ -307,6 +307,50 @@
           ]
         }
       ]
+    },
+    {
+      "name": "end",
+      "says": "to its launcher, once, as it ends itself: how far it had come and why it ends",
+      "fields": [
+        {
+          "name": "phase",
+          "kind": "code",
+          "codes": [
+            "boot",
+            "starting",
+            "ready",
+            "bound",
+            "running"
+          ]
+        },
+        {
+          "name": "code",
+          "kind": "code",
+          "codes": [
+            "process_ended",
+            "service_exited",
+            "service_killed",
+            "boot_failed"
+          ]
+        },
+        {
+          "name": "status",
+          "kind": "counter",
+          "max": 255,
+          "optional": true
+        },
+        {
+          "name": "signal",
+          "kind": "counter",
+          "max": 64,
+          "optional": true
+        },
+        {
+          "name": "memory",
+          "kind": "flag",
+          "optional": true
+        }
+      ]
     }
   ]
 }

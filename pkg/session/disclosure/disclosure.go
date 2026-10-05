@@ -199,6 +199,7 @@ const (
 	MessageStep        = "step"
 	MessageRefusal     = "refusal"
 	MessagePlatform    = "platform"
+	MessageEnd         = "end"
 )
 
 // The steps of admitting a sandbox, which a guest's answer to a bind times.
@@ -239,10 +240,67 @@ const (
 	SealedTooLate  Code = "too_late"
 )
 
+// Why a guest ended itself, which its init tells its launcher as its last
+// word. A code is for whoever operates the guests: nothing that guards a
+// session rests on one.
+const (
+	// EndProcess: the process the session's policy names as its own ended.
+	// What that process exited with is the session's, and is not said.
+	EndProcess Code = "process_ended"
+	// EndExited: the guest's service exited, for a reason that has no code of
+	// its own, with the status the word gives.
+	EndExited Code = "service_exited"
+	// EndKilled: the guest's service was killed by the signal the word
+	// gives: by the kernel, for memory, where the word says so.
+	EndKilled Code = "service_killed"
+	// EndBoot: the guest's boot failed before its service started.
+	EndBoot Code = "boot_failed"
+)
+
+// Ends lists every code a guest ends with, in the order the schema prints
+// them.
+var Ends = []Code{EndProcess, EndExited, EndKilled, EndBoot}
+
+// How far a guest had come when it ended: still booting, its service started
+// and not yet ready, and from there the service's own phases.
+const (
+	EndedBooting  Code = "boot"
+	EndedStarting Code = "starting"
+)
+
+// endStatusBase is the first exit status that stands for a reason of the
+// service's own. A shell's and a runtime's own statuses lie below it and
+// above 125.
+const endStatusBase = 80
+
+// serviceEnds are the reasons a guest's service ends itself for that have a
+// code, in the order of their exit statuses. It only grows at its end.
+var serviceEnds = []Code{EndProcess}
+
+// EndStatus is the status a guest's service exits with for a reason of its
+// own, so that the init that started it can name the reason. Zero is a
+// reason that has none.
+func EndStatus(code Code) int {
+	if i := slices.Index(serviceEnds, code); i >= 0 {
+		return endStatusBase + i
+	}
+	return 0
+}
+
+// EndOfStatus is the reason a status of the service's stands for, if it
+// stands for one.
+func EndOfStatus(status int) (Code, bool) {
+	if i := status - endStatusBase; i >= 0 && i < len(serviceEnds) {
+		return serviceEnds[i], true
+	}
+	return "", false
+}
+
 var (
 	sealings   = []Code{SealedTaken, SealedUnopened, SealedTooLate}
 	bindQuotes = []Code{QuoteTrying, QuoteTaken, QuoteGivenUp}
 	phases     = []Code{"ready", "bound", "running"}
+	endPhases  = append([]Code{EndedBooting, EndedStarting}, phases...)
 	// platforms are the tags a guest's evidence comes under.
 	platforms = []Code{"tdx", "snp"}
 )
@@ -263,6 +321,11 @@ const (
 	maxEvents      = 8
 	// An admission step takes an hour at most, in microseconds.
 	maxMicros = 3600 * 1000 * 1000
+	// A process's exit status and the number of a signal.
+	maxStatus = 255
+	maxSignal = 64
+	// MaxEnd bounds a guest's last word as it is sent.
+	MaxEnd = 256
 )
 
 // measured are the documents a guest measured and its events, which a state
@@ -320,6 +383,13 @@ var Schema = []Message{
 	{Name: MessagePlatform, Says: "to its host, which fetches the vendor's documents for that platform", Fields: []Field{
 		{Name: "fmspc", Kind: KindPublic, Max: 12},
 		{Name: "ca", Kind: KindCode, Codes: []Code{"platform", "processor"}},
+	}},
+	{Name: MessageEnd, Says: "to its launcher, once, as it ends itself: how far it had come and why it ends", Fields: []Field{
+		{Name: "phase", Kind: KindCode, Codes: endPhases},
+		{Name: "code", Kind: KindCode, Codes: Ends},
+		{Name: "status", Kind: KindCounter, Max: maxStatus, Optional: true},
+		{Name: "signal", Kind: KindCounter, Max: maxSignal, Optional: true},
+		{Name: "memory", Kind: KindFlag, Optional: true},
 	}},
 }
 
@@ -489,4 +559,56 @@ func checkField(field *Field, value any) error {
 // without a key.
 type Refusal struct {
 	Error Code `json:"error"`
+}
+
+// End is a guest's last word: how far it had come and why it ends. Status
+// goes with EndExited, and Signal and Memory with EndKilled.
+type End struct {
+	Phase  Code `json:"phase"`
+	Code   Code `json:"code"`
+	Status *int `json:"status,omitempty"`
+	Signal *int `json:"signal,omitempty"`
+	Memory bool `json:"memory,omitempty"`
+}
+
+// ParseEnd reads a guest's last word as its launcher received it. The guest
+// is not trusted to keep to the schema, so the word is held to it here: a
+// word that says anything else is no word.
+func ParseEnd(data []byte) (*End, error) {
+	if len(data) > MaxEnd {
+		return nil, errors.New("a last word longer than any the schema allows")
+	}
+	msg, err := message(MessageEnd)
+	if err != nil {
+		return nil, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var tree any
+	if err := dec.Decode(&tree); err != nil {
+		return nil, errors.New("a last word that is no document")
+	}
+	if err := checkMessage(msg, tree); err != nil {
+		return nil, fmt.Errorf("%s: %w", MessageEnd, err)
+	}
+	// The whole of what came is read here: more after one document fails it.
+	var end End
+	if err := json.Unmarshal(data, &end); err != nil {
+		return nil, errors.New("a last word that is no document, or more than one")
+	}
+	return &end, nil
+}
+
+// String says a last word as an operator reads it in a log or an event.
+func (e *End) String() string {
+	said := string(e.Code)
+	switch {
+	case e.Code == EndExited && e.Status != nil:
+		said += fmt.Sprintf(" (status %d)", *e.Status)
+	case e.Code == EndKilled && e.Signal != nil && e.Memory:
+		said += fmt.Sprintf(" (signal %d, by the kernel for memory)", *e.Signal)
+	case e.Code == EndKilled && e.Signal != nil:
+		said += fmt.Sprintf(" (signal %d)", *e.Signal)
+	}
+	return said + " in phase " + string(e.Phase)
 }

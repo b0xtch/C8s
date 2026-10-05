@@ -118,6 +118,8 @@ type Config struct {
 	// documents in, so that each guest is answered with what another's
 	// launcher fetched. Empty has this launcher fetch for itself.
 	CollateralCache string
+	// EndFile is where the guest's last word is written, if it says one.
+	EndFile string
 	// AvoidFirstCPU keeps the VMM off the first online CPU of each package,
 	// on TDX: see packageFirstCPUs.
 	AvoidFirstCPU bool

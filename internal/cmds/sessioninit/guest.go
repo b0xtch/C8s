@@ -1,10 +1,16 @@
 package sessioninit
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
+	"strconv"
 	"strings"
+
+	"github.com/confidential-dot-ai/c8s/internal/guestend"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 // Mount flags, with the kernel's values: this file builds wherever its tests
@@ -50,10 +56,36 @@ type guestPlatform interface {
 	// Start starts a program as a child, in the cgroup at dir when dir is
 	// not empty, and returns its process id.
 	Start(argv, env []string, cgroup string, oomScore int) (int, error)
-	// Wait returns the next child that ended, whichever it is: as process 1
-	// the init is also the parent of every orphan in the guest.
-	Wait() (pid, status int, err error)
+	// Wait returns the next child that ended, whichever it is, and how: as
+	// process 1 the init is also the parent of every orphan in the guest.
+	Wait() (pid int, how ending, err error)
+	// DialHost connects to a vsock port of the guest's host.
+	DialHost(port uint32) (net.Conn, error)
 }
+
+// ending is how a process ended: the status it exited with, or the signal
+// that killed it.
+type ending struct {
+	status, signal int
+}
+
+// code is the ending as a shell states one: the status, or 128 and the
+// signal's number.
+func (e ending) code() int {
+	if e.signal != 0 {
+		return 128 + e.signal
+	}
+	return e.status
+}
+
+// guestEnd is why a guest ends once its service has: in full for the init's
+// own log, and as the word its launcher is told.
+type guestEnd struct {
+	word disclosure.End
+	text string
+}
+
+func (e *guestEnd) Error() string { return e.text }
 
 // mountsAfterMove are the kernel file systems a guest's programs expect,
 // beyond the three the init mounted for itself.
@@ -125,12 +157,12 @@ func runGuest(p guestPlatform) error {
 		if err != nil {
 			return fmt.Errorf("%s: %w", argv[0], err)
 		}
-		status, err := waitFor(p, pid)
+		how, err := waitFor(p, pid)
 		if err != nil {
 			return err
 		}
-		if status != 0 {
-			return fmt.Errorf("%s ended with status %d", strings.Join(argv, " "), status)
+		if how.code() != 0 {
+			return fmt.Errorf("%s ended with status %d", strings.Join(argv, " "), how.code())
 		}
 		p.Log("step: %s done", strings.Join(argv, " "))
 	}
@@ -139,23 +171,93 @@ func runGuest(p guestPlatform) error {
 		return fmt.Errorf("%s: %w", cfg.Service[0], err)
 	}
 	p.Log("service: %s", cfg.Service[0])
-	status, err := waitFor(p, pid)
+	how, err := waitFor(p, pid)
 	if err != nil {
 		return err
 	}
-	return fmt.Errorf("%s ended with status %d", cfg.Service[0], status)
+	return &guestEnd{word: serviceWord(p, how), text: fmt.Sprintf("%s ended with status %d", cfg.Service[0], how.code())}
 }
 
-// waitFor reaps children until pid has ended, and returns its status.
-func waitFor(p guestPlatform, pid int) (int, error) {
+// waitFor reaps children until pid has ended, and returns how it did.
+func waitFor(p guestPlatform, pid int) (ending, error) {
 	for {
-		ended, status, err := p.Wait()
+		ended, how, err := p.Wait()
 		if err != nil {
-			return 0, fmt.Errorf("wait for process %d: %w", pid, err)
+			return ending{}, fmt.Errorf("wait for process %d: %w", pid, err)
 		}
 		if ended == pid {
-			return status, nil
+			return how, nil
 		}
+	}
+}
+
+// serviceWord is the guest's last word once its service has ended: the phase
+// the service last wrote, and why it ended. A service that ended for a reason
+// of its own exited with that reason's status. Any other status is given as
+// it is, and a signal with whether the kernel sent it for memory.
+func serviceWord(p guestPlatform, how ending) disclosure.End {
+	written, _ := p.ReadFile(guestend.PhaseFile, 64)
+	word := disclosure.End{Phase: guestend.Phase(written)}
+	code, own := disclosure.EndOfStatus(how.status)
+	switch {
+	case how.signal != 0:
+		word.Code, word.Signal, word.Memory = disclosure.EndKilled, &how.signal, killedForMemory(p)
+	case own:
+		word.Code = code
+	default:
+		word.Code, word.Status = disclosure.EndExited, &how.status
+	}
+	return word
+}
+
+// killedForMemory reports whether the kernel killed a process of the
+// service's own cgroup for memory. The sandbox and the commands have cgroups
+// of their own below it, whose kills this count leaves out.
+func killedForMemory(p guestPlatform) bool {
+	events, err := p.ReadFile(serviceCgroup+"/memory.events.local", 4096)
+	if err != nil {
+		return false
+	}
+	for _, line := range bytes.Split(events, []byte("\n")) {
+		if count, ok := bytes.CutPrefix(line, []byte("oom_kill ")); ok {
+			n, err := strconv.Atoi(string(bytes.TrimSpace(count)))
+			return err == nil && n > 0
+		}
+	}
+	return false
+}
+
+// lastWord is the word for whatever ended the guest: the service's own, or
+// that the boot failed before there was a service.
+func lastWord(err error) disclosure.End {
+	var ended *guestEnd
+	if errors.As(err, &ended) {
+		return ended.word
+	}
+	return disclosure.End{Phase: disclosure.EndedBooting, Code: disclosure.EndBoot}
+}
+
+// sayLastWord tells the guest's launcher why the guest ends, on the port the
+// host's file names, and waits for nobody: a guest that reaches no launcher
+// ends all the same.
+func sayLastWord(p guestPlatform, word disclosure.End) {
+	config, err := p.ReadFile(guestend.HostConfigFile, 16<<10)
+	if err != nil {
+		p.Log("no last word: the host's file is not staged")
+		return
+	}
+	port := guestend.Port(config)
+	if port == 0 {
+		p.Log("no last word: the host named no port for it")
+		return
+	}
+	conn, err := p.DialHost(port)
+	if err != nil {
+		p.Log("no last word: %v", err)
+		return
+	}
+	if err := guestend.Send(conn, word, guestend.Wait); err != nil {
+		p.Log("no last word: %v", err)
 	}
 }
 

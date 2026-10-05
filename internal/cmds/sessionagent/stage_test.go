@@ -23,6 +23,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
 const sandboxImage = "ghcr.io/acme/agent@sha256:2222222222222222222222222222222222222222222222222222222222222222"
@@ -348,18 +349,25 @@ func TestCredentialsGoToTheImageUser(t *testing.T) {
 }
 
 // A session's guest is its sandbox: when the sandbox ends, Run returns and
-// the unit powers the guest off.
+// the unit powers the guest off. When the session named a process of its
+// own for the sandbox, that end is the session's, and Run says so with the
+// schema's code for it, whatever the process exited with. As it goes the
+// agent has written the phase it reached, for the guest's last word.
 func TestRunEndsWithTheSandbox(t *testing.T) {
 	for name, tc := range map[string]struct {
-		end  error
-		want string
+		end     error
+		process string
+		want    string
 	}{
-		"failed":  {errors.New("sandbox exited with status 3"), "sandbox ended: sandbox exited with status 3"},
-		"cleanly": {nil, ""},
+		"failed":                        {errors.New("sandbox exited with status 3"), "", "sandbox ended: sandbox exited with status 3"},
+		"cleanly":                       {nil, "", ""},
+		"the session's process failed":  {errors.New("sandbox exited with status 3"), session.ProcessImage, "the guest ends: process_ended: sandbox ended: sandbox exited with status 3"},
+		"the session's process is done": {nil, session.ProcessImage, "the guest ends: process_ended"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			p := newPool(t)
 			p.cfg.Logger = slog.New(slog.DiscardHandler)
+			p.cfg.PhaseFile = filepath.Join(t.TempDir(), "phase")
 			p.runner.ended = make(chan error, 1)
 			addr := freeAddr(t)
 			done := make(chan error, 1)
@@ -377,8 +385,15 @@ func TestRunEndsWithTheSandbox(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := client.Bind(ctxT(t), p.bindFor(t, ready, nil)); err != nil {
+			if phase, _ := os.ReadFile(p.cfg.PhaseFile); string(phase) != "ready\n" {
+				t.Fatalf("a guest that waits for its bind wrote the phase %q", phase)
+			}
+			bind := p.bindFor(t, ready, func(o *session.BindOptions) { o.Policy.Sandbox.Process = tc.process })
+			if _, err := client.Bind(ctxT(t), bind); err != nil {
 				t.Fatal(err)
+			}
+			if phase, _ := os.ReadFile(p.cfg.PhaseFile); string(phase) != "running\n" {
+				t.Fatalf("a guest whose sandbox runs wrote the phase %q", phase)
 			}
 			if got := p.runner.recorded(); got != "prepare "+sandboxImage+",start" {
 				t.Fatalf("the sandbox was not started: %s", got)
@@ -393,6 +408,10 @@ func TestRunEndsWithTheSandbox(t *testing.T) {
 			case err := <-done:
 				if (tc.want == "") != (err == nil) || (err != nil && err.Error() != tc.want) {
 					t.Fatalf("Run = %v, want %q", err, tc.want)
+				}
+				var ended *sessionagent.Ended
+				if named := errors.As(err, &ended); named != (tc.process != "") || named && ended.Code != disclosure.EndProcess {
+					t.Fatalf("Run = %v: the session named a process (%v), and the end is the session's (%v)", err, tc.process != "", named)
 				}
 			case <-time.After(30 * time.Second):
 				t.Fatal("Run did not return after the sandbox ended")

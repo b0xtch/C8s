@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -41,6 +42,10 @@ type Config struct {
 	CredentialDir string
 	TEE           TEE
 	Runner        Runner
+	// PhaseFile, when set, is where the agent writes its phase as it
+	// changes. The guest's init reads it once the agent has ended, for the
+	// guest's last word: how far the guest had come.
+	PhaseFile string
 	// Bare lets a bind name no sandbox image: commands then run on the
 	// guest's own file system, as its sandbox user, in the guest's own
 	// namespaces and beside its services. That is a mode for tests. A guest
@@ -432,6 +437,7 @@ func (a *Agent) Admit(ctx context.Context) error {
 	a.prestaged = ahead
 	a.measured.Unlock()
 	a.log.Info("waiting for a bind", "phase", session.PhaseReady, "prestage", len(a.doc.Prestage))
+	a.reached(session.PhaseReady)
 	return nil
 }
 
@@ -572,10 +578,33 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	a.admission = taken
 	a.measured.Unlock()
 	a.log.Info("sandbox admitted", "phase", session.PhaseRunning, "steps", taken)
+	a.reached(session.PhaseRunning)
 	// The guest has its sandbox. What it has not accepted of its memory is
 	// accepted behind it, for as long as the guest lives if it takes that.
 	go a.cfg.Memory.AcceptRest(context.WithoutCancel(ctx))
 	return receipt, resp, nil
+}
+
+// namedProcess reports whether the guest's bind names a process of the
+// session's own for its sandbox, whose end is the session's.
+func (a *Agent) namedProcess() bool {
+	a.measured.RLock()
+	defer a.measured.RUnlock()
+	return a.bind != nil && a.bind.Doc.Policy.Sandbox != nil && a.bind.Doc.Policy.Sandbox.Process != ""
+}
+
+// reached writes the phase the guest has come to where its init reads it
+// once the agent has ended. It is for the guest's last word: a phase that
+// could not be written leaves the word a phase behind. Nobody reads the file
+// while the agent lives, so it is written in place, at the cost of a write
+// to memory on a bind's path.
+func (a *Agent) reached(phase session.Phase) {
+	if a.cfg.PhaseFile == "" {
+		return
+	}
+	if err := os.WriteFile(a.cfg.PhaseFile, []byte(string(phase)+"\n"), 0o644); err != nil {
+		a.log.Warn("the guest's phase was not written for its init", "error", err)
+	}
 }
 
 // bindQuotePauses are how long a guest that could not take the quote over
@@ -827,6 +856,7 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, seal
 	}
 	a.binding.Unlock()
 	a.log.Info("bound", "bind_digest", session.DocumentDigest(raw), "sandbox", bind.Doc.Policy.Sandbox != nil)
+	a.reached(session.PhaseBound)
 
 	// The first bind is the only one, so a guest whose sandbox cannot be
 	// admitted is of no use to anyone and ends. The caller going away changes
