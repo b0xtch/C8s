@@ -823,8 +823,10 @@ def at(entry):
     stamp = re.sub(r"(\.\d{6})\d+", r"\1", entry["time"]).replace("Z", "+00:00")
     return datetime.datetime.fromisoformat(stamp).timestamp()
 # What a guest with a console says of its own bind, of the quote it took
-# beside it, and of the bind's whole call with what followed its answer.
-guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call"}
+# beside it, of the bind's whole call with what followed its answer, and of
+# its first second after it was prepared.
+guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call",
+              "a guest's first second prepared": "guest-prepared"}
 def entries(path):
     try:
         with open(path, errors="replace") as f:
@@ -907,7 +909,8 @@ for name, rows in sides:
     # A guest with a console says how long its bind took in parts, each from
     # the bind's arrival, and the quote it took beside it. The first round's
     # guest is among them.
-    for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: "), ("guest-call", "guest's bind and what followed: ")):
+    for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: "), ("guest-call", "guest's bind and what followed: "),
+                        ("guest-prepared", "guest's first second prepared: ")):
         told = [r for r in rows if r.get("kind") == kind]
         for key in dict.fromkeys(k for r in told for k in r if k not in ("kind", "td")):
             values = [r[key] for r in told if key in r]

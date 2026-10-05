@@ -40,19 +40,23 @@ type spent struct {
 
 // cost is what the guest's processors gave since the bind was read, as the
 // members of a log line.
-func (t *bindTrace) cost() []any {
+func (t *bindTrace) cost() []any { return costSince(t.spent) }
+
+// costSince is what the guest's processors gave since before was read, as
+// the members of a log line.
+func costSince(before spent) []any {
 	now := spentNow()
 	return []any{
-		"agent_cpu_us", (now.agent - t.spent.agent).Microseconds(),
-		"children_cpu_us", (now.children - t.spent.children).Microseconds(),
-		"collector_cpu_us", (now.collector - t.spent.collector).Microseconds(),
-		"collections", now.collections - t.spent.collections,
+		"agent_cpu_us", (now.agent - before.agent).Microseconds(),
+		"children_cpu_us", (now.children - before.children).Microseconds(),
+		"collector_cpu_us", (now.collector - before.collector).Microseconds(),
+		"collections", now.collections - before.collections,
 		"heap_kb", now.heap >> 10,
-		"guest_cpu_us", (now.guest - t.spent.guest).Microseconds(),
-		"guest_user_ms", (now.user - t.spent.user).Milliseconds(),
-		"guest_system_ms", (now.system - t.spent.system).Milliseconds(),
-		"guest_interrupts_ms", (now.interrupts - t.spent.interrupts).Milliseconds(),
-		"guest_idle_ms", (now.idle - t.spent.idle).Milliseconds(),
+		"guest_cpu_us", (now.guest - before.guest).Microseconds(),
+		"guest_user_ms", (now.user - before.user).Milliseconds(),
+		"guest_system_ms", (now.system - before.system).Milliseconds(),
+		"guest_interrupts_ms", (now.interrupts - before.interrupts).Milliseconds(),
+		"guest_idle_ms", (now.idle - before.idle).Milliseconds(),
 	}
 }
 

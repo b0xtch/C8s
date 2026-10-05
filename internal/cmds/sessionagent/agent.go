@@ -436,6 +436,19 @@ func (a *Agent) Admit(ctx context.Context) error {
 	a.measured.Lock()
 	a.prestaged = ahead
 	a.measured.Unlock()
+	// A guest that says it is prepared should be quiet. What its first
+	// second after that cost says whether it is, in its own log.
+	go func() {
+		if ahead != nil {
+			<-ahead
+		}
+		before := spentNow()
+		select {
+		case <-time.After(preparedLook):
+			a.log.Info("a guest's first second prepared", costSince(before)...)
+		case <-ctx.Done():
+		}
+	}()
 	a.log.Info("waiting for a bind", "phase", session.PhaseReady, "prestage", len(a.doc.Prestage))
 	a.reached(session.PhaseReady)
 	return nil
@@ -596,6 +609,10 @@ func (a *Agent) namedProcess() bool {
 	defer a.measured.RUnlock()
 	return a.bind != nil && a.bind.Doc.Policy.Sandbox != nil && a.bind.Doc.Policy.Sandbox.Process != ""
 }
+
+// preparedLook is how long after a guest is prepared it logs what that time
+// cost its processors.
+const preparedLook = time.Second
 
 // reached writes the phase the guest has come to where its init reads it
 // once the agent has ended. It is for the guest's last word: a phase that

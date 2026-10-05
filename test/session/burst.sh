@@ -484,8 +484,10 @@ def at(entry):
     stamp = re.sub(r"(\.\d{6})\d+", r"\1", entry["time"]).replace("Z", "+00:00")
     return datetime.datetime.fromisoformat(stamp).timestamp()
 # What a guest with a console says of its own bind, of the quote it took
-# beside it, and of the bind's whole call with what followed its answer.
-guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call"}
+# beside it, of the bind's whole call with what followed its answer, and of
+# its first second after it was prepared.
+guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call",
+              "a guest's first second prepared": "guest-prepared"}
 def entries(path):
     try:
         with open(path, errors="replace") as f:
@@ -802,6 +804,7 @@ def told_by(kind, label):
 told_by("guest-bind", "guest's bind, to ")
 told_by("guest-quote", "guest's quote: ")
 told_by("guest-call", "guest's bind and what followed: ")
+told_by("guest-prepared", "guest's first second prepared: ")
 cold = [r for r in rows if r.get("kind") == "session-cold"]
 show("TD launch to ready", [r["boot_ms"] for r in cold], "ms (two boot at a time, beside whatever else ran)")
 show("  VMM start to documents asked", [r["vmm_to_documents_ms"] for r in cold if "vmm_to_documents_ms" in r])
