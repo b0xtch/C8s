@@ -162,6 +162,19 @@ type dcapEngine struct {
 	// chains keeps the outcome of the checks that are the same for every
 	// quote of a platform: see chainmemo.go.
 	chains chainMemos
+	// roots, when set, is the one authority evidence and the vendor's
+	// documents chain to, in place of Intel's pinned root: that of a TEE
+	// simulated in software. Only a build made to judge such a TEE has a way
+	// to set it, and its verdicts are of another scope than any other's.
+	roots *x509.CertPool
+}
+
+// trusted is the authority this engine holds evidence to.
+func (e *dcapEngine) trusted() (*x509.CertPool, error) {
+	if e.roots != nil {
+		return e.roots, nil
+	}
+	return intelRoots()
 }
 
 type offlineKey struct{}
@@ -289,7 +302,12 @@ func (e *dcapEngine) Documents() uint64 { return e.cache.count() }
 // with collateral past its reuse period, and whether it takes Intel's
 // documents from Intel alone. Where the collateral is kept decides nothing.
 func (e *dcapEngine) Requirements() string {
-	return fmt.Sprintf("dcap fresh-only=%t own-only=%t", e.freshOnly, e.ownOnly)
+	requirements := fmt.Sprintf("dcap fresh-only=%t own-only=%t", e.freshOnly, e.ownOnly)
+	if e.roots != nil {
+		// No verdict on a simulated TEE is one on a real one.
+		requirements += " simulated-tee"
+	}
+	return requirements
 }
 
 func (e *dcapEngine) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, expectedReportData []byte) (*teetypes.VerificationResult, error) {
@@ -357,7 +375,7 @@ func (e *dcapEngine) verifyTDX(ctx context.Context, env teetypes.AttestationEvid
 	if len(params.ExpectedReportData) > 64 {
 		return nil, &VerificationError{Err: fmt.Errorf("expected report data is %d bytes, and a TD's is 64", len(params.ExpectedReportData))}
 	}
-	roots, err := intelRoots()
+	roots, err := e.trusted()
 	if err != nil {
 		return nil, err
 	}
