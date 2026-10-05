@@ -1,0 +1,66 @@
+--- the TD side
+session ready_check                n= 20  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session members                    n= 19  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session sign                       n= 20  median       0.3  p90       0.4  min       0.3  max       0.5  ms
+session seal                       n= 20  median       0.3  p90       0.5  min       0.2  max       0.5  ms
+session bind                       n= 20  median       7.2  p90       7.9  min       6.4  max       8.1  ms
+session judge                      n= 20  median       0.1  p90       0.4  min       0.1  max       0.6  ms
+session start                      n= 20  median       8.1  p90       8.9  min       7.1  max       9.0  ms
+session first_exec                 n= 20  median       1.2  p90       1.8  min       0.3  max       2.0  ms
+session first_cmd                  n= 20  median       9.3  p90       9.7  min       8.6  max      10.0  ms
+session quote                      n= 20  median       3.2  p90       5.4  min       1.6  max       6.4  ms
+session confirmed                  n= 20  median      11.5  p90      13.4  min       9.7  max      13.7  ms
+session attest                     n= 20  median       4.5  p90       5.1  min       3.1  max       5.4  ms
+session destroy                    n= 20  median       0.5  p90       0.6  min       0.4  max       0.8  ms
+of 20 rounds, the bind claimed its TD with no claim before it in 20, and found that TD taken first in 0
+of 20 rounds, the guest took the first command with its bind in 20, the command's answer was taken on the receipt in 20, and the connection for commands was made ahead in 20; the quote came with the bind's answer in 12
+of 20 rounds, the guest was judged before its claim in 20, and had a credential sealed with its bind in place in 0
+ready TD judged ahead              n= 20  median       2.1  p90       3.1  min       1.4  max       3.5  ms (before the round: no part of its times)
+vendor documents fetched           n=  1  median     696.2  p90     696.2  min     696.2  max     696.2  ms (before the rounds: no part of their times)
+key service replica judged         n=  1  median      87.3  p90      87.3  min      87.3  max      87.3  ms (before the rounds, and beside them when it failed: no part of their times)
+session later command              n= 60  median       1.9  p90       3.0  min       1.4  max       3.4  ms
+the first round, caches cold: start 8.5 ms, first command 9.9 ms
+session guest launch to ready      n= 23  median    2302.0  p90    2362.0  min    2281.0  max    4284.0  ms
+--- the simulated TEE side
+session ready_check                n= 20  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session members                    n= 20  median       0.0  p90       0.0  min       0.0  max       0.0  ms
+session sign                       n= 20  median       0.3  p90       0.7  min       0.3  max       0.8  ms
+session seal                       n= 20  median       0.2  p90       0.3  min       0.2  max       0.6  ms
+session bind                       n= 20  median       6.2  p90       6.5  min       5.8  max       6.9  ms
+session judge                      n= 20  median       0.1  p90       0.2  min       0.1  max       0.3  ms
+session start                      n= 20  median       7.1  p90       7.5  min       6.5  max       7.7  ms
+session first_exec                 n= 20  median       1.1  p90       1.3  min       0.3  max       1.4  ms
+session first_cmd                  n= 20  median       8.1  p90       8.6  min       7.4  max       8.7  ms
+session quote                      n= 20  median       2.0  p90       2.5  min       1.7  max       2.5  ms
+session confirmed                  n= 20  median       9.0  p90       9.6  min       8.5  max       9.6  ms
+session attest                     n= 20  median       2.0  p90       2.3  min       1.7  max       2.3  ms
+session destroy                    n= 20  median       0.5  p90       0.6  min       0.4  max       0.6  ms
+of 20 rounds, the bind claimed its TD with no claim before it in 20, and found that TD taken first in 0
+of 20 rounds, the guest took the first command with its bind in 20, the command's answer was taken on the receipt in 20, and the connection for commands was made ahead in 20; the quote came with the bind's answer in 20
+of 20 rounds, the guest was judged before its claim in 20, and had a credential sealed with its bind in place in 0
+ready TD judged ahead              n= 20  median       3.1  p90       3.8  min       2.5  max       4.0  ms (before the round: no part of its times)
+vendor documents fetched           n=  1  median       0.7  p90       0.7  min       0.7  max       0.7  ms (before the rounds: no part of their times)
+key service replica judged         n=  1  median       7.4  p90       7.4  min       7.4  max       7.4  ms (before the rounds, and beside them when it failed: no part of their times)
+session later command              n= 60  median       1.6  p90       2.7  min       1.2  max       3.0  ms
+the first round, caches cold: start 7.8 ms, first command 9.0 ms
+session guest launch to ready      n= 22  median    4101.0  p90    4122.0  min    4041.0  max    4182.0  ms (its kernel clears all of its memory first)
+this side's guests ran in no TEE: build tag c8s_simtee, authority /work/run/w20-m-pb/sim/authority (root sha256 4ba1514609569107c17bbf6dab144bc0a1fbfb999c18f411e1a4ee5890f8c635)
+--- what the hardware and the vendor's quoting add: the TD side's median less the simulated side's
+session ready_check                     +0.0 ms  (TD 0.0, simulated 0.0)
+session members                         +0.0 ms  (TD 0.0, simulated 0.0)
+session sign                            +0.0 ms  (TD 0.3, simulated 0.3)
+session seal                            +0.0 ms  (TD 0.3, simulated 0.2)
+session bind                            +1.0 ms  (TD 7.2, simulated 6.2)
+session judge                           +0.0 ms  (TD 0.1, simulated 0.1)
+session start                           +1.0 ms  (TD 8.1, simulated 7.1)
+session first_exec                      +0.1 ms  (TD 1.2, simulated 1.1)
+session first_cmd                       +1.2 ms  (TD 9.3, simulated 8.1)
+session quote                           +1.3 ms  (TD 3.2, simulated 2.0)
+session confirmed                       +2.5 ms  (TD 11.5, simulated 9.0)
+session attest                          +2.5 ms  (TD 4.5, simulated 2.0)
+session destroy                         +0.0 ms  (TD 0.5, simulated 0.5)
+Firecracker cold to first command  n= 21  median    1080.3  p90    1124.5  min    1033.8  max    1173.1  ms (serial console: a floor)
+Firecracker snapshot load to first command n= 21  median       8.1  p90       8.8  min       7.1  max       9.1  ms (serial console: a floor)
+Firecracker snapshot load to first command n= 21  median      13.0  p90      13.7  min      11.8  max      14.4  ms (vsock to an agent in the guest)
+Firecracker later command          n= 21  median       1.9  p90       2.2  min       1.3  max       2.3  ms (vsock to an agent in the guest)
+method: power pinned; 0 other VMs on the host, and its other programs at 181% of one CPU in all (listed below); TDX on in the firmware, for every side; baseline Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved; second baseline: the same start in guests with no TEE and one simulated in software, taking turns with the TD side round by round in an order that alternates, each turn beginning with every pool full and idle; CPUs: TD guests 2,26,3,27,4,28,5,29,6,30,7,31, simulated guests 8,32,9,33,10,34,11,35,12,36,13,37, key services 14,38,15,39,16,40,17,41, Firecracker 18,42,19,43,20,44,21,45, daemons and drivers 22,46,23,47; no claim: each bind claims its TD; before the measured path: the vendor's documents fetched by the binder (timed beside the rounds); each ready TD judged when it became ready (timed beside the rounds); the key service's replica judged by the binder, for its binds to name (timed beside the rounds)
