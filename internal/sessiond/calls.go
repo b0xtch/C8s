@@ -210,9 +210,9 @@ func (d *Daemon) claimed(ctx context.Context, t *td, pool *poolState, picked tim
 		ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
 		defer cancel()
 		asked := time.Now()
-		d.guests.reconnect()
+		t.guests.reconnect()
 		var err error
-		if evidence, err = d.guests.evidence(ctx, t.rec.Address); err != nil {
+		if evidence, err = t.guests.evidence(ctx, t.rec.Address); err != nil {
 			return nil, err
 		}
 		if session.Phase(evidence.GetPhase()) != session.PhaseReady {
@@ -339,7 +339,7 @@ func (d *Daemon) lateCommand(stream sessionv1alpha1.Sessions_BindServer, relayin
 	d.mu.Lock()
 	address := t.rec.Address
 	d.mu.Unlock()
-	answer, err := d.guests.command(ctx, address, next.GetCommand())
+	answer, err := t.guests.command(ctx, address, next.GetCommand())
 	if err != nil {
 		// The guest took it or did not: its sender sends the command over a
 		// connection of its own, which the guest answers either way.
@@ -506,7 +506,7 @@ func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sess
 		cancel()
 	}
 	for {
-		answer, err := d.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetCommand(), wrote)
+		answer, err := t.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetCommand(), wrote)
 		if err == nil && answer.wait != nil {
 			wait := answer.wait
 			answer.wait = func() (*session.CommandAnswer, error) {
@@ -608,7 +608,7 @@ func (d *Daemon) GetEvidence(ctx context.Context, req *sessionv1alpha1.EvidenceR
 	}
 	ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
 	defer cancel()
-	evidence, err := d.guests.evidence(ctx, address)
+	evidence, err := t.guests.evidence(ctx, address)
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, "the guest did not answer")
 	}

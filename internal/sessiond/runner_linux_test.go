@@ -4,15 +4,20 @@ package sessiond
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -173,5 +178,54 @@ func TestProcessStart(t *testing.T) {
 	}
 	if _, err := processStart(1 << 30); err == nil {
 		t.Fatal("a process that is not there has a start time")
+	}
+}
+
+// The host asks a guest's end of its tap for its Ethernet address every few
+// milliseconds until it answers, where the kernel would ask once a second: a
+// guest is reached as it comes up.
+func TestTapAsksForItsGuestOften(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to make a tap")
+	}
+	const slot = 3
+	host, _, err := slotAddresses(netip.MustParsePrefix("10.99.7.0/24"), slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		// A network namespace of this test's own. The thread that enters it
+		// never leaves, and ends with this goroutine.
+		runtime.LockOSThread()
+		done <- func() error {
+			if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+				return fmt.Errorf("a network namespace: %w", err)
+			}
+			tap, vhost, err := (&QEMURunner{}).tap(slot, host)
+			if err != nil {
+				return err
+			}
+			defer tap.Close()
+			if vhost != nil {
+				defer vhost.Close()
+			}
+			link, err := netlink.LinkByName(tapName(slot))
+			if err != nil {
+				return err
+			}
+			addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+			if err != nil || len(addrs) != 1 || !addrs[0].IP.Equal(net.IP(host.AsSlice())) {
+				return fmt.Errorf("the host's end has addresses %v, %v", addrs, err)
+			}
+			every, err := os.ReadFile("/proc/sys/net/ipv4/neigh/" + tapName(slot) + "/retrans_time_ms")
+			if err != nil || strings.TrimSpace(string(every)) != tapAskEvery {
+				return fmt.Errorf("the guest's end is asked every %q ms, %v: want %s", every, err, tapAskEvery)
+			}
+			return nil
+		}()
+	}()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }

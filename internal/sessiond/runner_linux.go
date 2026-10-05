@@ -177,9 +177,13 @@ func (r *QEMURunner) Start(_ context.Context, spec Spec) (Instance, error) {
 	return inst, nil
 }
 
-// tap makes the TD's tap, gives the host's end its address and brings it up.
-// The tap lives as long as a descriptor of it is open, which is as long as
-// its VMM runs.
+// tapAskEvery is how often, in milliseconds, the host asks a guest's end of
+// its tap for its Ethernet address until it answers.
+const tapAskEvery = "20"
+
+// tap makes the TD's tap, gives the host's end its address and brings the tap
+// up. The tap lives as long as a descriptor of it is open, which is as long
+// as its VMM runs.
 func (r *QEMURunner) tap(slot int, host netip.Addr) (tap, vhost *os.File, err error) {
 	name := tapName(slot)
 	if tap, err = sessionlauncher.OpenTap(name); err != nil {
@@ -199,6 +203,16 @@ func (r *QEMURunner) tap(slot int, host netip.Addr) (tap, vhost *os.File, err er
 	}
 	if err := netlink.LinkSetUp(link); err != nil {
 		return fail(fmt.Errorf("bring it up: %w", err))
+	}
+	// The host's first packet to a guest waits until the guest's end answers
+	// for its Ethernet address, and the kernel asks for that once a second.
+	// A guest that came up just after one question would be found only at the
+	// next. Asked every few milliseconds it is found as it comes up. An entry
+	// set here for good would not last: the host's device manager gives a new
+	// interface an address of its own a moment later, and the kernel forgets
+	// what it knew of the interface's neighbours when that changes.
+	if err := os.WriteFile(filepath.Join("/proc/sys/net/ipv4/neigh", name, "retrans_time_ms"), []byte(tapAskEvery), 0o644); err != nil {
+		return fail(fmt.Errorf("how often its guest is asked for its address: %w", err))
 	}
 	// vhost-net moves the data path into the host's kernel. Without it the
 	// VMM copies every packet in user space.

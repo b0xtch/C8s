@@ -53,7 +53,6 @@ type Daemon struct {
 	cfg    *Config
 	log    *slog.Logger
 	runner Runner
-	guests *guestClient
 	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
 	now    func() time.Time
 	// bootTimeout is how long a TD may take to serve.
@@ -95,7 +94,6 @@ func New(cfg *Config, runner Runner, log *slog.Logger) *Daemon {
 		stop:   make(chan struct{}),
 		relays: make(chan struct{}, maxRelays),
 	}
-	d.guests = newGuestClient(d.dial)
 	for i := range cfg.Pools {
 		d.pools[cfg.Pools[i].name] = &poolState{cfg: &cfg.Pools[i]}
 	}
@@ -169,7 +167,7 @@ func (d *Daemon) adopt() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, rec := range records {
-		t := &td{rec: rec, gone: true}
+		t := &td{rec: rec, gone: true, guests: newGuestClient(d.dial)}
 		t.ctx, t.cancel = context.WithCancel(context.Background())
 		d.tds[rec.ID] = t
 		if rec.State == StateEnded {
@@ -281,7 +279,7 @@ func (d *Daemon) newTD(pool *poolState) (*td, error) {
 	for taken[slot] {
 		slot++
 	}
-	t := &td{rec: record{ID: id, Pool: pool.cfg.name, State: StateBooting, Slot: slot, Created: d.now()}}
+	t := &td{rec: record{ID: id, Pool: pool.cfg.name, State: StateBooting, Slot: slot, Created: d.now()}, guests: newGuestClient(d.dial)}
 	t.ctx, t.cancel = context.WithCancel(context.Background())
 	if err := os.MkdirAll(d.dir(id), 0o700); err != nil {
 		return nil, err
@@ -327,8 +325,8 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 	var leaf, collateral []byte
 	for {
 		probe, cancel := context.WithTimeout(withDialLimit(t.ctx, readyDial), 5*time.Second)
-		if offered, leaf = d.guests.ready(probe, t.rec.Address); offered != nil {
-			collateral = d.guests.collateral(probe, t.rec.Address)
+		if offered, leaf = t.guests.ready(probe, t.rec.Address); offered != nil {
+			collateral = t.guests.collateral(probe, t.rec.Address)
 		}
 		cancel()
 		if offered != nil {
@@ -406,6 +404,9 @@ func (d *Daemon) endLocked(t *td, reason, requestID string) {
 		t.lapse.Stop()
 	}
 	t.cancel()
+	// Its connections end with it: none is kept for whatever has its address
+	// next.
+	t.guests.reconnect()
 	if err := d.save(t); err != nil {
 		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
 	}
@@ -481,14 +482,14 @@ func (d *Daemon) keepWarm(ctx context.Context) {
 		d.mu.Unlock()
 		for _, t := range ready {
 			probe, cancel := context.WithTimeout(ctx, 5*time.Second)
-			offered, leaf := d.guests.ready(probe, t.rec.Address)
+			offered, leaf := t.guests.ready(probe, t.rec.Address)
 			if offered != nil && !lasts(leaf, d.now()) {
-				d.guests.reconnect()
-				offered, leaf = d.guests.ready(probe, t.rec.Address)
+				t.guests.reconnect()
+				offered, leaf = t.guests.ready(probe, t.rec.Address)
 			}
 			var collateral []byte
 			if offered != nil {
-				collateral = d.guests.collateral(probe, t.rec.Address)
+				collateral = t.guests.collateral(probe, t.rec.Address)
 			}
 			cancel()
 			if offered == nil {

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -226,6 +228,63 @@ func TestBootProbeGivesUpOnAConnectionThatDoesNotOpen(t *testing.T) {
 	if waited := time.Since(began); waited < 150*time.Millisecond {
 		t.Fatalf("an ask with no limit on its connection gave up after %s", waited)
 	}
+}
+
+// A TD's connections to its guest are its own and end with it. The next TD in
+// its slot has its address: a connection kept from the guest that is gone
+// would carry the daemon's first question to the new one into nothing, and
+// the daemon would wait on it instead of on the guest.
+func TestEndedTDKeepsNoConnectionForTheNextAtItsAddress(t *testing.T) {
+	guest := &saidGuest{state: session.StateResponse{Phase: session.PhaseReady, Prepared: true}}
+	server := httptest.NewUnstartedServer(guest)
+	states := make(chan http.ConnState, 16)
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew || state == http.StateClosed {
+			states <- state
+		}
+	}
+	server.StartTLS()
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "https://")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	d := &Daemon{
+		cfg: &Config{StateDir: t.TempDir()}, log: slog.New(slog.DiscardHandler), now: time.Now,
+		tds: map[string]*td{}, changed: make(chan struct{}),
+	}
+	dial := (&net.Dialer{}).DialContext
+	first := &td{rec: record{ID: "td-first", State: StateReady, Address: addr}, guests: newGuestClient(dial)}
+	first.ctx, first.cancel = context.WithCancel(context.Background())
+	if err := os.MkdirAll(d.dir(first.rec.ID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if state, _ := first.guests.ready(ctx, addr); state == nil {
+		t.Fatal("the first TD's guest did not answer")
+	}
+	if got := <-states; got != http.StateNew {
+		t.Fatalf("the guest saw %v, want the daemon's connection", got)
+	}
+	d.mu.Lock()
+	d.endLocked(first, "destroyed", "")
+	d.mu.Unlock()
+	select {
+	case got := <-states:
+		if got != http.StateClosed {
+			t.Fatalf("after its TD ended the guest saw %v", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection to an ended TD's guest was kept")
+	}
+	// The next TD at the address is asked over a connection of its own.
+	next := &td{rec: record{ID: "td-next", State: StateBooting, Address: addr}, guests: newGuestClient(dial)}
+	if state, _ := next.guests.ready(ctx, addr); state == nil {
+		t.Fatal("the next TD's guest did not answer")
+	}
+	if got := <-states; got != http.StateNew {
+		t.Fatalf("the next TD's guest was asked over a connection that was not new: %v", got)
+	}
+	next.guests.reconnect()
 }
 
 // commandGuest is a guest that took a first command with its bind: it

@@ -105,6 +105,11 @@ type td struct {
 	// gone is set once the TD's process is no more: its slot and its share of
 	// the host's capacity are free.
 	gone bool
+	// guests is how the daemon talks to this TD's guest, over connections
+	// of this TD's own. The next TD in its slot has its address, and a
+	// connection kept from one guest must never carry a request to another:
+	// it would wait on a guest that is gone until the kernel gave up on it.
+	guests *guestClient
 	// offered is what the guest said of itself when it became ready, leaf
 	// the certificate it said it under, and collateral the vendor's
 	// documents as it last handed them over. A claim relays all three as
