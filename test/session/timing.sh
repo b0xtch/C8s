@@ -81,6 +81,10 @@
 #                            is sent, where the default takes the command's
 #                            answer on the guest's receipt and judges the
 #                            quote beside it
+#   C8S_TIMING_PRECONNECT=0  leave the connection a first command goes over
+#                            to that command, where the default makes it
+#                            ahead: its parts are then all on the command's
+#                            path, which is how to read what it costs
 #   C8S_TIMING_REST          seconds of rest before each round (default 3): a
 #                            long one shows what a start costs once the
 #                            guests' connections have sat idle
@@ -635,7 +639,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
     [ "$claim_with_bind" = 1 ] && printf 'no claim: each bind claims its TD%s; ' "$([ "$lose_first" = 1 ] && echo ", and a second bind for that TD comes first")"
     printf 'before the measured path: the vendor'"'"'s documents fetched by the binder (timed beside the rounds); %s%s\n' "$([ "$watch" = 1 ] && echo "each ready TD judged when it became ready (timed beside the rounds)" || echo "each TD judged at its claim")" \
         "$([ "$stored" = 1 ] && echo "; the key service's replica judged by the binder, for its binds to name (timed beside the rounds)")"
-    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, ready TDs watched $watch, claim with the bind $claim_with_bind, as a binder of its own certificate $as_binder, a second bind first $lose_first, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
+    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, ready TDs watched $watch, claim with the bind $claim_with_bind, as a binder of its own certificate $as_binder, a second bind first $lose_first, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, connection made ahead ${C8S_TIMING_PRECONNECT:-1}, rest $rest s, Firecracker ${fc:-not sampled}"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
@@ -692,6 +696,7 @@ for side in "${sides[@]}"; do
         args+=(--daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --orchestrator-cert "$pki/orchestrator.pem" --orchestrator-key "$pki/orchestrator.key")
     fi
     [ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
+    [ "${C8S_TIMING_PRECONNECT:-1}" = 0 ] && args+=(--preconnect=false)
     [ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
     if [ "$side" = sim ]; then
         args+=(--simulated-tee "$tee")
@@ -814,6 +819,7 @@ for ready in entries(os.path.join(d, "daemon.log")):
         continue
     record = {"kind": "session-cold", "td": ready.get("td"), "boot_ms": ready["boot_ms"]}
     started = asked = None
+    said = []
     for entry in entries(os.path.join(d, "state", "tds", str(ready.get("td")), "launcher.log")):
         if entry["msg"].startswith("this guest runs in no TEE") and "checked_ms" in entry:
             record["checked_ms"] = entry["checked_ms"]
@@ -821,12 +827,19 @@ for ready in entries(os.path.join(d, "daemon.log")):
             started = at(entry)
         elif entry["msg"].startswith("answered the guest with") and asked is None:
             asked = at(entry)
+        # What a guest with a console says of its own bind and of the quote
+        # it took beside it, each in parts.
+        elif entry["msg"] in ("a bind was served", "took the quote over the bind's nonce"):
+            kind = "guest-bind" if entry["msg"] == "a bind was served" else "guest-quote"
+            said.append({"kind": kind, "td": ready.get("td"), **{k: v for k, v in entry.items() if k.endswith("_us")}})
     if started is not None:
         record["before_vmm_ms"] = round(ready["boot_ms"] - (at(ready) - started) * 1000)
         if asked is not None:
             record["vmm_to_documents_ms"] = round((asked - started) * 1000)
             record["documents_to_ready_ms"] = round((at(ready) - asked) * 1000)
     print(json.dumps(record))
+    for each in said:
+        print(json.dumps(each))
 COLD
 done
 echo "load at the end $(cat /proc/loadavg)" >> "$out/env.txt"
@@ -868,6 +881,13 @@ for name, rows in sides:
             medians.setdefault(key, {})[name] = statistics.median(values)
     for key in parts:
         show("session " + key[:-3], [r[key] / 1000 for r in steady if r.get(key)], "ms")
+    # A guest with a console says how long its bind took in parts, each from
+    # the bind's arrival, and the quote it took beside it. The first round's
+    # guest is among them.
+    for kind, label in (("guest-bind", "guest's bind, to "), ("guest-quote", "guest's quote: ")):
+        told = [r for r in rows if r.get("kind") == kind]
+        for key in dict.fromkeys(k for r in told for k in r if k.endswith("_us")):
+            show(label + key[:-3], [r[key] / 1000 for r in told if key in r], "ms (the guest's own clock)")
     show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
     if steady:
         count = lambda key: sum(1 for r in steady if r.get(key))
