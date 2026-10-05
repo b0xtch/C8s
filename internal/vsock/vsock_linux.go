@@ -3,7 +3,10 @@
 package vsock
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net"
 	"os"
 
@@ -11,13 +14,43 @@ import (
 )
 
 // Conn is a vsock stream. Its deadlines work, and Close ends a Read or a
-// Write that waits.
+// Write that waits. Its errors are a network connection's: a deadline that
+// passed is a timeout the stream outlives, which is what a TLS session and
+// an HTTP server on it take one for.
 type Conn struct {
 	*os.File
 	local, remote Addr
 }
 
 var _ net.Conn = (*Conn)(nil)
+
+// Read reads from the stream.
+func (c *Conn) Read(b []byte) (int, error) {
+	n, err := c.File.Read(b)
+	return n, c.failure("read", err)
+}
+
+// Write writes to the stream.
+func (c *Conn) Write(b []byte) (int, error) {
+	n, err := c.File.Write(b)
+	return n, c.failure("write", err)
+}
+
+// failure gives a failed read or write the form a network connection's has.
+// The file under the stream reports one as a failure of a path, which no
+// reader of a connection's errors takes for a timeout: crypto/tls ends a
+// session on any read error that does not say it is temporary, and an HTTP
+// server ends a connection whose interrupted read is no timeout.
+func (c *Conn) failure(op string, err error) error {
+	if err == nil || err == io.EOF {
+		return err
+	}
+	var path *fs.PathError
+	if errors.As(err, &path) {
+		err = path.Err
+	}
+	return &net.OpError{Op: op, Net: "vsock", Source: c.local, Addr: c.remote, Err: err}
+}
 
 // LocalAddr is this end of the stream.
 func (c *Conn) LocalAddr() net.Addr { return c.local }

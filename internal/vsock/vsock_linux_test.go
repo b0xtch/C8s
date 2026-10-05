@@ -3,9 +3,13 @@
 package vsock
 
 import (
+	"bufio"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -73,6 +77,90 @@ func TestDeadlineEndsARead(t *testing.T) {
 	}
 	if waited := time.Since(began); waited > 2*time.Second {
 		t.Fatalf("the read waited %s", waited)
+	}
+}
+
+// A deadline that passed is a timeout, as a network connection reports one,
+// and the stream goes on after it. A TLS session ends for good on a read
+// error that does not say it is temporary, and an HTTP server interrupts an
+// idle connection's read with a deadline after every request it answers.
+func TestDeadlineIsATimeoutTheStreamOutlives(t *testing.T) {
+	dialed, accepted := pair(t)
+	if err := dialed.SetReadDeadline(time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := dialed.Read(make([]byte, 1))
+	var timeout net.Error
+	if !errors.As(err, &timeout) || !timeout.Timeout() {
+		t.Fatalf("a read past its deadline: %v (%T), want a network timeout", err, err)
+	}
+	if temporary, ok := err.(interface{ Temporary() bool }); !ok || !temporary.Temporary() {
+		t.Fatalf("a read past its deadline: %v (%T) does not say the stream goes on", err, err)
+	}
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("a read past its deadline: %v", err)
+	}
+	if err := dialed.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := accepted.Write([]byte("on")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 2)
+	if _, err := io.ReadFull(dialed, got); err != nil || string(got) != "on" {
+		t.Fatalf("the stream after a deadline passed: %q, %v", got, err)
+	}
+	// A closed stream says so, in the words every reader of a connection
+	// checks for.
+	_ = dialed.Close()
+	if _, err := dialed.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("a read on a closed stream: %v", err)
+	}
+	if _, err := dialed.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("a write on a closed stream: %v", err)
+	}
+}
+
+// An HTTP server over TLS keeps a vsock connection for the next request, as
+// it keeps any other: the second request on one connection is answered.
+func TestServerKeepsAConnectionBetweenRequests(t *testing.T) {
+	ln, err := Listen(AnyPort, 4)
+	if err != nil {
+		t.Skipf("no vsock here: %v", err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, r.URL.Path)
+	}))
+	server.Listener = ln
+	server.StartTLS()
+	defer server.Close()
+	raw, err := Dial(LocalCID, ln.Port())
+	if err != nil {
+		t.Skipf("no vsock loopback transport here: %v", err)
+	}
+	conn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // a test's own server
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(20 * time.Second))
+	reader := bufio.NewReader(conn)
+	for _, path := range []string{"/first", "/second", "/third"} {
+		req, err := http.NewRequest(http.MethodGet, "https://replica"+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := req.Write(conn); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		resp, err := http.ReadResponse(reader, req)
+		if err != nil {
+			t.Fatalf("%s on the kept connection: %v", path, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil || string(body) != path {
+			t.Fatalf("%s answered %q, %v", path, body, err)
+		}
+		// Long enough for the server to have gone back to waiting.
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
