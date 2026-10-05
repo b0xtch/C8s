@@ -95,7 +95,7 @@ Each lever must keep the rules in
 | warm activation | snapshot load to the first command; from a pool of VMs booted ahead, the claim to the first command | claim, if any, and bind to the first command |
 | a start, in parts | none | the claim, unless the bind makes it; the binder's check of the ready evidence, or finding the verdict it reached before the claim; signing and sealing; the bind, with the sandbox's start and any answer from the key service inside it; the receipt's check; and the first command, on its own or sent with the bind |
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
-| a burst of 100 starts at once | median and tail latency, and success rate, of snapshot loads and of starts from a pool | the same |
+| a burst of 100 starts at once | median and tail latency, success rate, and the host's CPU each start costs, of snapshot loads and of starts from a pool | the same |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |
 | a request through the egress gateway | the same request through OpenShell's proxy, with TLS ended and a credential put in | the time the gateway adds, with and without a credential, and with a program to attribute |
 | snapshot and restore at 1, 4 and 16 GiB | snapshot create and load, and gVisor's checkpoint and restore | seal and restore, to the first instruction |
@@ -144,8 +144,9 @@ memory-acceptance floor; work inside within the published floors.
   this baseline's guests hold all their memory from boot, it takes no part in
   the rows a host's memory bounds at a session's full size: a burst of starts,
   idle memory and sessions per host compare with Firecracker alone.
-- **The same settings.** Power settings (governor, C-states, turbo) are pinned
-  and recorded, versions are named, and the sides interleave round by round
+- **The same settings.** Power settings (governor, C-states, turbo) and the
+  host's halt polling, which every guest on it shares, are pinned and
+  recorded, versions are named, and the sides interleave round by round
   within one run. Nothing else runs on the host during a run: no TD or VM but
   the sides' own, and a side that waits keeps its guests idle, with no boot or
   ending in flight, on cores apart from those of the side being measured, as
