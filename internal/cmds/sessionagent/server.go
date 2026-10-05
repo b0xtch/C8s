@@ -415,8 +415,12 @@ func (a *Agent) bindEvidence(ctx context.Context, bind *session.SignedBind, even
 	if err == nil {
 		quoting, cancel := context.WithTimeout(ctx, attestTimeout)
 		defer cancel()
+		quoting, times := timedQuote(quoting)
+		began := time.Now()
 		var evidence teetypes.AttestationEvidence
 		if evidence, err = a.tee.Evidence(quoting, reportData); err == nil {
+			a.log.Info("took the quote over the bind's nonce", "took_us", time.Since(began).Microseconds(), "report_us", times.Report.Microseconds(),
+				"connect_us", times.Connect.Microseconds(), "service_us", times.Service.Microseconds())
 			return &session.AttestResponse{
 				Evidence: evidence, Launch: a.launch, Signature: a.signature, Events: events, Phase: session.PhaseRunning,
 				Bind: bind.Raw, BindSignature: bind.Signature,

@@ -1,6 +1,7 @@
 package sessionagent
 
 import (
+	"context"
 	"math"
 	"sync"
 	"time"
@@ -69,4 +70,21 @@ func (b *quoteBudget) take() bool {
 	}
 	b.tokens--
 	return true
+}
+
+// quoteTimes is how long the parts of one quote took, for the guest's log:
+// the report from the TEE, the connection to the host's quoting service, and
+// that service's answer, from the request's first byte to the answer's last.
+// A TEE that has no such part leaves it at nothing.
+type quoteTimes struct {
+	Report, Connect, Service time.Duration
+}
+
+type quoteTimesKey struct{}
+
+// timedQuote returns a context under which a quote says how long its parts
+// took, and where it says so.
+func timedQuote(ctx context.Context) (context.Context, *quoteTimes) {
+	times := &quoteTimes{}
+	return context.WithValue(ctx, quoteTimesKey{}, times), times
 }

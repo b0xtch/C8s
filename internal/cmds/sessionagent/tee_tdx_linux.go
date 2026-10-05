@@ -64,13 +64,15 @@ func (t *tdxTEE) Measurements(context.Context) (*teetypes.VerificationResult, er
 	return claimsFromTDReport(report)
 }
 
-func (t *tdxTEE) Evidence(_ context.Context, reportData []byte) (teetypes.AttestationEvidence, error) {
+func (t *tdxTEE) Evidence(ctx context.Context, reportData []byte) (teetypes.AttestationEvidence, error) {
 	if len(reportData) == 0 || len(reportData) > 64 {
 		return teetypes.AttestationEvidence{}, fmt.Errorf("report data must be 1..64 bytes, got %d", len(reportData))
 	}
 	var rd [64]byte
 	copy(rd[:], reportData)
-	quote, err := t.quote(rd)
+	// A quote taken under timedQuote is told how long its parts took.
+	times, _ := ctx.Value(quoteTimesKey{}).(*quoteTimes)
+	quote, err := t.quote(rd, times)
 	if err != nil {
 		return teetypes.AttestationEvidence{}, err
 	}
@@ -78,11 +80,12 @@ func (t *tdxTEE) Evidence(_ context.Context, reportData []byte) (teetypes.Attest
 }
 
 // quote prefers the direct vsock path to the host's QGS (milliseconds) and
-// falls back to ConfigFS-TSM, where the kernel polls once a second.
-func (t *tdxTEE) quote(rd [64]byte) ([]byte, error) {
+// falls back to ConfigFS-TSM, where the kernel polls once a second. times,
+// if not nil, is told how long the parts of the vsock path took.
+func (t *tdxTEE) quote(rd [64]byte, times *quoteTimes) ([]byte, error) {
 	var vsockErr error
 	if now := time.Now().UnixNano(); now >= t.vsockRetryAt.Load() {
-		quote, err := quoteVsock(rd)
+		quote, err := quoteVsock(rd, times)
 		if err == nil {
 			return quote, nil
 		}
@@ -113,11 +116,16 @@ func tdReport(rd [64]byte) ([]byte, error) {
 	return req.TDReport[:], nil
 }
 
-func quoteVsock(rd [64]byte) ([]byte, error) {
+func quoteVsock(rd [64]byte, times *quoteTimes) ([]byte, error) {
+	if times == nil {
+		times = &quoteTimes{}
+	}
+	began := time.Now()
 	report, err := tdReport(rd)
 	if err != nil {
 		return nil, err
 	}
+	times.Report = time.Since(began)
 	request, err := qgsRequest(report)
 	if err != nil {
 		return nil, err
@@ -135,9 +143,12 @@ func quoteVsock(rd [64]byte) ([]byte, error) {
 			return nil, fmt.Errorf("vsock timeout: %w", err)
 		}
 	}
+	began = time.Now()
 	if err := unix.Connect(fd, &unix.SockaddrVM{CID: vsockHostCID, Port: qgsVsockPort}); err != nil {
 		return nil, fmt.Errorf("vsock connect to host QGS port %d: %w", qgsVsockPort, err)
 	}
+	times.Connect = time.Since(began)
+	began = time.Now()
 	if _, err := sock.Write(request); err != nil {
 		return nil, fmt.Errorf("vsock send: %w", err)
 	}
@@ -153,5 +164,6 @@ func quoteVsock(rd [64]byte) ([]byte, error) {
 	if _, err := io.ReadFull(sock, body); err != nil {
 		return nil, fmt.Errorf("vsock read response: %w", err)
 	}
+	times.Service = time.Since(began)
 	return qgsQuote(body)
 }
