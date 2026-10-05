@@ -117,6 +117,15 @@ but not confidentiality.
   of the one TD it fits.
 - **The host rebinds a bound TD.** Binding is one way, and a refused bind
   ends the guest.
+- **A session that reads its own TD's keys**, while its host shows that TD's
+  ready evidence to another binder. Code that breaks out of its sandbox can
+  read anything in its TD (A4), the instance key and the key service's channel
+  among them, and the evidence the TD gave when it became ready still
+  verifies. So nothing another binder relies on rests on them: a bind's
+  receipt is signed by a one-time key that the guest erases before anything of
+  the tenant runs, the key service releases only against such a receipt and
+  for one bind per instance key, and the bind's quote shows the bind in
+  RTMR[3].
 - **A revision the owner did not make, or one beyond the bind.** A revision of
   a session's egress or credential rules is signed by the bind's authority,
   must lie inside the bind's boundary, and is measured before it takes effect,
@@ -137,16 +146,16 @@ but not confidentiality.
   guest's measured image carries from its build or a launch document raised.
   The guest judges them again by the key service's time once it has it ([Its
   clock](session-key-service.md#its-clock)).
-- **Stale evidence.** A bind's answer is a receipt the instance key signs over
-  the binder's nonce, and the quote over the same nonce follows; a verifier
-  can ask for a quote over its own nonce through `Connect`; and the RA-TLS
-  handshake proves that the key is live. A receipt adds freshness, not trust:
-  it is worth what the quote that binds its key is worth, and what it says of
-  RTMR[3] is the measured agent's word until the quote confirms it, so the
-  verdict that is kept rests on the quote, and a session whose quote disagrees
-  with its receipt, or never comes, ends. Each quote carries the events and
-  phase it covers, so a verifier replays exactly those, whatever the guest
-  extends later.
+- **Stale evidence.** A bind's answer is a receipt the guest's one-time key
+  signs over the binder's nonce, and the quote over the same nonce follows; a
+  verifier can ask for a quote over its own nonce through `Connect`; and the
+  RA-TLS handshake proves that the instance key is live. A receipt adds
+  freshness, not trust: it is worth what the ready quote that binds its key is
+  worth, and what it says of RTMR[3] is the measured agent's word until the
+  quote confirms it, so the verdict that is kept rests on the quote, and a
+  session whose quote disagrees with its receipt, or never comes, ends. Each
+  quote carries the events and phase it covers, so a verifier replays exactly
+  those, whatever the guest extends later.
 - **A pooled TD carrying something from an earlier session.** A bound TD never
   returns to a pool, and a pooled TD holds no tenant data, code or keys before
   its bind.

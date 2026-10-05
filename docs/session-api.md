@@ -173,10 +173,10 @@ message BindRequest {
 }
 message Bound {
   Evidence evidence = 1;               // includes the bind
-  bytes receipt = 2;                   // c8s-bind-receipt/v1, signed by the instance key over the bind's nonce
+  bytes receipt = 2;                   // c8s-bind-receipt/v1, signed by the guest's one-time key over the bind's nonce
 }
 message Evidence {
-  bytes certificate = 1;               // RA-TLS; report data binds the instance key
+  bytes certificate = 1;               // RA-TLS; report data binds the instance key and, until a bind, the one-time key
   bytes launch_document = 2;
   bytes launch_signature = 3;
   repeated string events = 4;          // the digests the guest extended, in order
@@ -401,34 +401,38 @@ reach, no new HTTP method and no cloud metadata endpoint.
    The binder checks it as any verifier does, on the quote in the TD's RA-TLS
    certificate: the vendor's collateral, the image pins, the TCB status at
    each level ([An old TCB](session-threat-model.md#launch-and-measurement))
-   and the instance key the quote binds. That quote is as old as the
-   certificate, since a guest quotes fresh only for a bind or over `Connect`.
-   Then the binder signs a bind naming the TD's instance key, the session, the
-   disks (a fresh root, and the read-only images by root hash), the policy, a
-   nonce and a `notAfter` a minute away.
-4. The daemon calls `Bind`. The guest checks the bind, extends RTMR[3] with
-   its digest and then the sandbox's image, takes the credentials the bind
-   names and starts the sandbox on the root file system it made before any
-   bind, under a key it generated, while it takes the quote over the binder's
-   nonce. It answers with a receipt that its instance key signs over that
-   nonce: the bind's digest, the events it extended and the phase it reached.
-   The quote follows in the evidence it serves, and the binder holds it to the
-   receipt. A guest whose admission fails after it extended RTMR[3] ends and
-   gives no quote, and a bind sent again is answered with the same receipt and
-   quote.
+   and the instance key and one-time key the quote binds. That quote is as old
+   as the certificate, since a guest quotes fresh only for a bind or over
+   `Connect`. Then the binder signs a bind naming the TD's instance key, the
+   session, the disks (a fresh root, and the read-only images by root hash),
+   the policy, a nonce and a `notAfter` a minute away.
+4. The daemon calls `Bind`. The guest checks the bind and extends RTMR[3] with
+   its digest and then the sandbox's image. It signs a receipt over the
+   binder's nonce with its one-time key, naming the bind's digest, the events
+   it extended and the phase it reached, and erases that key. Then it takes
+   the credentials the bind names, showing the key service the receipt, and
+   starts the sandbox on the root file system it made before any bind, under a
+   key it generated, while it takes the quote over the binder's nonce. It
+   answers with the receipt. The quote follows in the evidence it serves, and
+   the binder holds it to the receipt. A guest whose admission fails after it
+   extended RTMR[3] ends and gives no quote, and a bind sent again is answered
+   with the same receipt and quote.
 
-A receipt is fresh because the nonce is the binder's, and it is worth what the
-instance key is worth: the binder checked the quote that binds that key to the
-measured TD before it signed the bind, and every channel to the session, the
-key service's among them, already rests on that key
-([Release](session-key-service.md#release)). What the receipt says of RTMR[3]
-is the measured agent's word until the quote confirms it, so the binder holds
-the quote to the receipt as soon as it has it: its signature must chain to the
-vendor's root, its report data must bind the nonce and the instance key, and
-its RTMR[3] must replay from the events it covers, which begin with the
-receipt's. None of that needs the vendor's other documents, so a quote that
-passes it but cannot yet be judged for want of one leaves the session running,
-and its verdict is kept once the document comes.
+A receipt is fresh because the nonce is the binder's, and only the guest's
+agent, as it takes its one bind, can sign one: the binder checks the quote
+that binds the one-time key to the measured TD before it takes the receipt,
+and the key is gone before anything of the tenant runs. The instance key would
+not do: it lives as long as the session, so code that broke out of a sandbox
+could sign with it for any binder its host showed the TD's ready evidence to
+([A session that reads its own
+TD](session-threat-model.md#binding-and-identity)). What the receipt says of
+RTMR[3] is the measured agent's word until the quote confirms it, so the
+binder holds the quote to the receipt as soon as it has it: its signature must
+chain to the vendor's root, its report data must bind the nonce and the
+instance key, and its RTMR[3] must replay from the events it covers, which
+begin with the receipt's. None of that needs the vendor's other documents, so
+a quote that passes it but cannot yet be judged for want of one leaves the
+session running, and its verdict is kept once the document comes.
 
 A quote that fails that check ends the session, and so does no quote at all. A
 guest whose quote fails tries again a few times, then says in its state that

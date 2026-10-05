@@ -161,6 +161,14 @@ Session TDs follow c8s's current launch-key and measurement contracts
   hybrid encryption key, ML-KEM-768 with X25519, which the instance key
   signs and to which keys are released, so what reaches the TD stays closed
   to anyone who records it now and has a quantum computer later.
+- **One-time key.** Beside its instance key, a pooled guest makes a signing
+  key for its one bind. Every report it makes before that bind carries the
+  key's digest in its report data, beside the instance key's, and its evidence
+  keeps the last such quote. The guest signs its answer to the bind with this
+  key, then erases it before it takes anything for the tenant or starts the
+  sandbox. The instance key must outlive the bind, so code that broke out of
+  the sandbox could read it; the one-time key is gone by then ([A session that
+  reads its own TD](session-threat-model.md#binding-and-identity)).
 - **Bind.** On TDX the guest extends RTMR[3] with the bind's digest, on top
   of the launch key's seed: the chain a node's per-workload measurement uses
   today. SEV-SNP has no runtime register, so there the guest puts the bind's

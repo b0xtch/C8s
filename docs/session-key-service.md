@@ -187,7 +187,8 @@ stored credential, only when all of these hold:
    evidence.
 3. The TD presents a bind naming that instance key, signed by the authority
    the key service holds for the tenant that owns the session, template or
-   credential.
+   credential, with its receipt for that bind, signed by the one-time key its
+   evidence binds.
 4. The bind's purpose and policy allow what is asked.
 5. For a session, the generation asked for is the latest, read through the
    quorum, and the lease is free or already this TD's.
@@ -208,6 +209,14 @@ stored credential, only when all of these hold:
   signed, inside the attested channel. A log or a proxy that ever saw the
   channel's plaintext would see no key, and traffic recorded now stays closed
   to a quantum computer later.
+- **Against the session in the TD.** A TD's instance key and its channel to
+  the key service outlive its bind, so code that broke out of the session's
+  sandbox could use them to present a bind that another binder signed after
+  the host showed it the TD's ready evidence. Rule 3's receipt stops that:
+  only the agent, as it takes the TD's one bind, can sign one, since the key
+  it signs with is erased before anything of the tenant runs, and rule 6 gives
+  an instance key one bind ([A session that reads its own
+  TD](session-threat-model.md#binding-and-identity)).
 
 ## Who decides
 
