@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -184,6 +185,38 @@ func TestRunDeclaresTheRegistersOfTheImageItBoots(t *testing.T) {
 			t.Errorf("%s is not on the launch disk: %v", name, err)
 		}
 	}
+}
+
+// The launcher of a simulated guest says what its guest is in its log, and
+// how long its own check of the image took: a record of a boot names that
+// time apart, since no launcher of a TD does that work.
+func TestSimulatedLaunchSaysWhatItsGuestIsAndWhatItsCheckTook(t *testing.T) {
+	qemu, record := fakeQEMU(t, "exec sleep 30")
+	cfg := launchConfig(t, qemu)
+	simulated(t, &cfg)
+	var said bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg, slog.New(slog.NewJSONHandler(&said, nil))) }()
+	waitFor(t, filepath.Join(record, "fd9"), done)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("a requested stop: %v", err)
+	}
+	for _, line := range strings.Split(said.String(), "\n") {
+		var entry struct {
+			Level, Msg string
+			Checked    *int64 `json:"checked_ms"`
+		}
+		if json.Unmarshal([]byte(line), &entry) != nil || !strings.HasPrefix(entry.Msg, "this guest runs in no TEE") {
+			continue
+		}
+		if entry.Level != "WARN" || entry.Checked == nil || *entry.Checked < 0 {
+			t.Fatalf("the launcher's warning: %s", line)
+		}
+		return
+	}
+	t.Fatalf("the launcher never said its guest runs in no TEE:\n%s", said.String())
 }
 
 // A launcher declares no registers for files they were not computed from,

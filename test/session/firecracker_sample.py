@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """One sample of the Firecracker baseline of test/session/timing.sh, run as root.
 
-  firecracker_sample.py <dir> cold        boot to a guest that takes a command
-  firecracker_sample.py <dir> snapshot    boot, log in, and snapshot the paused guest
-  firecracker_sample.py <dir> load        snapshot load to the first command
-  firecracker_sample.py <dir> load-vsock  the same, with the command sent to an agent in the guest
+  firecracker_sample.py <dir> cold              boot to a guest that takes a command
+  firecracker_sample.py <dir> snapshot [bytes]  boot, log in, and snapshot the paused guest
+  firecracker_sample.py <dir> load              snapshot load to the first command
+  firecracker_sample.py <dir> load-vsock        the same, with the command sent to an agent in the guest
 
 <dir> is a directory written by firecracker-setup.sh. Prints one JSON record.
 Times are from the start of the VMM's process, in milliseconds and, for the
@@ -16,11 +16,21 @@ the console's. That is a floor for Firecracker: any channel a platform puts
 on top costs more.
 
 load-vsock reaches the first command the way a session's is reached: over a
-connection to an agent in the guest, which runs it and answers. It needs
-<dir>/fcagent, the program of test/session/fcagent built for the guest, when
-the snapshot is taken: the guest is given it on a second, read-only drive
-and starts it before it is paused. The agent authenticates nobody and
-encrypts nothing, so this is still less than a platform would run.
+connection to an agent in the guest, which runs it and answers. When the
+snapshot is taken it needs <dir>/fcagent, the program of test/session/fcagent
+built for the guest, and <dir>/busybox, the static busybox the session's
+sandbox image was made from. The guest is given both on a second, read-only
+drive, a squashfs it mounts. It reads the shell into its memory, as a pooled
+session guest has its sandbox image unpacked before a bind, and starts the
+agent before it is paused.
+
+The first command is then the work a session's is. With bytes, it is the
+session's own words: that shell reading a file of that many bytes, which the
+guest has not read before, from the read-only drive, as a session's first
+command reads its credential back. With none it is true, as a session's is
+that has no credential. Later commands are that shell's true, as a
+session's are. The agent authenticates nobody and encrypts nothing, so this
+is still less than a platform would run.
 
   ready_ms       a shell is at the console (cold) or the load returned
   first_cmd_ms   a command has given its answer
@@ -28,13 +38,17 @@ encrypts nothing, so this is still less than a platform would run.
   next_cmd_us    load-vsock: what one more command took, over a connection of
                  its own to the guest that now runs
 """
+import base64
+import hashlib
 import http.client
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -42,6 +56,11 @@ VCPUS, MEM_MIB = 4, 16384
 # The port the guest's agent listens on, and the guest's address on vsock.
 AGENT_PORT, GUEST_CID = 5000, 3
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 quiet"
+# Where the guest mounts the agent's drive, in memory since its root is
+# read-only, and a session's own first command: test/session/warmstart sends
+# these words.
+DRIVE, CREDENTIAL = "/run/drive", "api-token"
+READ_BACK = ["sh", "-c", 'cat "$C8S_CREDENTIALS_DIR/' + CREDENTIAL + '"']
 PROMPT = re.compile(rb"[#$] $")
 LOGIN = re.compile(rb"login: |[#$] $")
 PASSWORD = re.compile(rb"[Pp]assword: |[#$] $")
@@ -161,6 +180,41 @@ def over_vsock(d, argv, record=None, since=0, patience=5.0):
         time.sleep(0.0002)
 
 
+def agent_drive(d, size):
+    """Write <d>/agent.img and return the file a first command reads back.
+
+    The drive holds the agent, the session's shell under the names a command
+    finds it by, and a file of size bytes when a session has a credential.
+    Nothing in it is compressed: a read costs a read.
+    """
+    if not shutil.which("mksquashfs"):
+        raise SystemExit("mksquashfs (squashfs-tools) makes the drive of the guest's agent")
+    stage = tempfile.mkdtemp(dir=d)
+    try:
+        os.mkdir(f"{stage}/bin")
+        for source, name in (("fcagent", "fcagent"), ("busybox", "bin/busybox")):
+            shutil.copyfile(f"{d}/{source}", f"{stage}/{name}")
+            os.chmod(f"{stage}/{name}", 0o755)
+        for applet in ("sh", "cat", "true"):
+            os.symlink("busybox", f"{stage}/bin/{applet}")
+        secret = b""
+        if size:
+            # Text, as a session's credential is.
+            secret = os.urandom((size + 1) // 2).hex()[:size].encode()
+            os.mkdir(f"{stage}/credentials")
+            with open(f"{stage}/credentials/{CREDENTIAL}", "wb") as f:
+                f.write(secret)
+        os.chmod(stage, 0o755)
+        image = f"{d}/agent.img"
+        if os.path.exists(image):
+            os.unlink(image)
+        subprocess.run(["mksquashfs", stage, image, "-noappend", "-all-root", "-no-xattrs", "-noI", "-noD", "-noF", "-noX", "-no-progress"],
+                       check=True, stdout=subprocess.DEVNULL)
+    finally:
+        shutil.rmtree(stage)
+    return secret
+
+
 def stop(p):
     p.terminate()
     try:
@@ -172,6 +226,7 @@ def stop(p):
 
 def main():
     d, kind = os.path.abspath(sys.argv[1]), sys.argv[2]
+    size = int(sys.argv[3]) if len(sys.argv) > 3 else 0
     sock = f"{d}/fc.sock"
     if os.path.exists(sock):
         os.unlink(sock)
@@ -191,11 +246,9 @@ def main():
         }
         agent = kind == "snapshot" and os.path.exists(f"{d}/fcagent")
         if agent:
-            # The agent's program, as a second drive that holds nothing else:
-            # the guest copies it out by its size. A drive is whole sectors.
-            program = open(f"{d}/fcagent", "rb").read()
-            with open(f"{d}/agent.img", "wb") as f:
-                f.write(program + b"\0" * (-len(program) % 512))
+            if not os.path.exists(f"{d}/busybox"):
+                raise SystemExit(f"{d}/busybox is missing: the static busybox the session's sandbox image was made from")
+            secret = agent_drive(d, size)
             machine["drives"].append({"drive_id": "agent", "path_on_host": f"{d}/agent.img", "is_root_device": False, "is_read_only": True})
             machine["vsock"] = {"guest_cid": GUEST_CID, "uds_path": f"{d}/v.sock"}
         with open(cfg, "w") as f:
@@ -225,13 +278,20 @@ def main():
             command(console, 41)
             record["first_cmd_ms"], record["first_cmd_us"] = ms(since), us(since)
             if agent:
-                # Memory is the one place in this guest a program can be
-                # written to and run from.
-                console.type(f"mount -o remount,exec /dev/shm; head -c {len(program)} /dev/vdb > /dev/shm/fcagent && chmod +x /dev/shm/fcagent"
-                             f" && (/dev/shm/fcagent {AGENT_PORT} < /dev/null > /dev/null 2>&1 &); sleep 0.5; echo agent-$((1+1))\n")
+                # The agent runs from memory, the one place in this guest a
+                # program can be written to, and finds the session's shell
+                # before the guest's own. The shell is read once, whole.
+                console.type(f"mount -o remount,exec /dev/shm; mkdir -p {DRIVE} && mount -o ro /dev/vdb {DRIVE} && cat {DRIVE}/bin/busybox > /dev/null"
+                             f" && cp {DRIVE}/fcagent /dev/shm/fcagent && (PATH={DRIVE}/bin:$PATH C8S_CREDENTIALS_DIR={DRIVE}/credentials"
+                             f" /dev/shm/fcagent {AGENT_PORT} < /dev/null > /dev/null 2>&1 &); sleep 0.5; echo agent-$((1+1))\n")
                 console.wait(re.compile(rb"agent-2\b"))
                 over_vsock(d, ["true"])
-                record["agent"] = True
+                first = {"argv": READ_BACK if size else ["true"], "stdout": base64.b64encode(secret).decode()}
+                with open(f"{d}/first.json", "w") as f:
+                    json.dump(first, f)
+                record["agent"], record["first_command"], record["credential_bytes"] = True, first["argv"], size
+                with open(f"{d}/busybox", "rb") as f:
+                    record["shell_sha256"] = hashlib.sha256(f.read()).hexdigest()
             if kind == "snapshot":
                 for old in ("snap.state", "snap.mem"):
                     if os.path.exists(f"{d}/{old}"):
@@ -258,7 +318,11 @@ def main():
             })
             record["ready_ms"], record["ready_us"] = ms(since), us(since)
             if kind == "load-vsock":
-                over_vsock(d, ["true"], record, since)
+                with open(f"{d}/first.json") as f:
+                    first = json.load(f)
+                answer = over_vsock(d, first["argv"], record, since)
+                if (answer.get("stdout") or "") != first["stdout"]:
+                    raise SystemExit("the first command did not read back the file its snapshot's drive holds")
             else:
                 command(console, 54)
             record["first_cmd_ms"], record["first_cmd_us"] = ms(since), us(since)

@@ -18,7 +18,9 @@
 # platform's on top: it is a floor, and a record says so. With
 # C8S_FIRECRACKER_AGENT too, each round takes a second snapshot load whose
 # first command goes over vsock to an agent in the guest, which is how a
-# session's first command is reached: the baseline to hold a session to.
+# session's first command is reached: the baseline to hold a session to. That
+# command is the work a session's is: the shell of the sandbox image, reading
+# a file of the credential's size from a read-only drive.
 #
 # With C8S_SIM_BIN and the three settings that go with it, the run takes the
 # document's second baseline too: the same start in guests that boot with no
@@ -81,8 +83,9 @@
 #                            (default 0: not at all): the CPU time each ready
 #                            guest's VMM takes while it waits
 #   C8S_TIMING_PIN_POWER=1   for the run, set every CPU's governor to
-#                            performance and turn off idle states deeper than
-#                            C1E; both are put back when the run ends
+#                            performance, turn off idle states deeper than
+#                            C1E and turn turbo on, as a host in production
+#                            has it; all three are put back when the run ends
 #   C8S_SIM_BIN              a c8s binary built with -tags c8s_simtee: with
 #                            it the run takes the second baseline, and needs
 #                            the next three
@@ -91,6 +94,12 @@
 #                            (C8S_SIMTEE=1 session-guest-image/build)
 #   C8S_SIM_KEY_SERVICE_IMAGE
 #                            simulating key service image directory
+#   C8S_SIM_CONSOLE_IMAGE    a simulating session image with a console (a dev
+#                            build of the simulated side's): with it the run
+#                            boots that image once, alone and before anything
+#                            else, for what its kernel says of clearing the
+#                            guest's memory, which most of a simulated
+#                            guest's launch to ready is
 #   C8S_TIMING_CPUS          five CPU lists, as taskset takes them, separated
 #                            by spaces: the TD side's guests, the simulated
 #                            side's, the two key services, the Firecracker
@@ -106,6 +115,10 @@
 #   C8S_FIRECRACKER_AGENT    the baseline's guest agent, built for the guest
 #                            (CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
 #                            ./test/session/fcagent)
+#   C8S_FIRECRACKER_BUSYBOX  the static busybox the sandbox image was made
+#                            from (default /usr/bin/busybox, as
+#                            test/session/sandboximage's): the shell of the
+#                            baseline's first command
 #   C8S_SESSION_DEV=1        the images are dev builds: attach their consoles.
 #                            Not a measured configuration.
 #   C8S_QUOTE_SOCKET, C8S_SESSION_CONFINE, C8S_ACCEPT_TCB, C8S_SESSION_PORT,
@@ -156,6 +169,7 @@ pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
 fc_sample=${C8S_FIRECRACKER_SAMPLE:-$(dirname "$(readlink -f "$0")")/firecracker_sample.py}
 fc_agent=${C8S_FIRECRACKER_AGENT:-}
+fc_busybox=${C8S_FIRECRACKER_BUSYBOX:-/usr/bin/busybox}
 dev=${C8S_SESSION_DEV:-0}
 quote_socket=${C8S_QUOTE_SOCKET:-/var/run/tdx-qgs/qgs.socket}
 confine=${C8S_SESSION_CONFINE:-}
@@ -190,10 +204,13 @@ if [ -n "$fc" ]; then
     [ -x "$fc/firecracker" ] && [ -f "$fc_sample" ] || { echo "$fc holds no firecracker, or $fc_sample is missing" >&2; exit 2; }
     fc=$(readlink -f "$fc")
     # The snapshot is taken with the agent this run names, or with none.
-    rm -f "$fc/fcagent"
+    rm -f "$fc/fcagent" "$fc/busybox"
     if [ -n "$fc_agent" ]; then
         [ -f "$fc_agent" ] || { echo "C8S_FIRECRACKER_AGENT=$fc_agent is not a file" >&2; exit 2; }
+        [ -f "$fc_busybox" ] || { echo "C8S_FIRECRACKER_BUSYBOX=$fc_busybox is not a file" >&2; exit 2; }
+        command -v mksquashfs > /dev/null || { echo "the baseline's agent needs mksquashfs (squashfs-tools)" >&2; exit 2; }
         install -m 0755 "$fc_agent" "$fc/fcagent"
+        install -m 0755 "$fc_busybox" "$fc/busybox"
     fi
 elif [ -n "$fc_agent" ]; then
     echo "C8S_FIRECRACKER_AGENT needs C8S_FIRECRACKER" >&2
@@ -233,10 +250,41 @@ on() {
     if [ -n "$cpus" ]; then exec taskset -c "$cpus" "$@"; else exec "$@"; fi
 }
 
-# What else the host runs, before anything of this run does: the share of
-# one CPU each process has had since it started, in all and for the busiest.
-busy=$(ps -eo pcpu= | awk '{ s += $1 } END { printf "%.0f", s }')
-busiest=$(ps -eo pcpu=,comm= --sort=-pcpu | head -12 | sed 's/^/  /')
+# What else the host runs, before anything of this run does: the CPU time its
+# programs took over five seconds, as a share of one CPU, in all and by
+# program for the busiest.
+busiest=$(python3 - <<'BUSY'
+import collections, os, time
+def ticks():
+    seen = {}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                name, fields = f.read().rsplit(")", 1)
+        except OSError:
+            continue
+        fields = fields.split()
+        # After the name: state, parent, ..., user and system time as the
+        # 12th and 13th, and the start time, which tells a reused id, as
+        # the 20th.
+        seen[(pid, fields[19])] = (name.split("(", 1)[1], int(fields[11]) + int(fields[12]))
+    return seen
+before, began = ticks(), time.monotonic()
+time.sleep(5)
+after, took = ticks(), time.monotonic() - began
+spent = collections.Counter()
+for key, (name, now) in after.items():
+    if key[0] != str(os.getpid()):
+        spent[name] += now - before.get(key, (name, 0))[1]
+share = lambda n: n * 100 / os.sysconf("SC_CLK_TCK") / took
+print(f"{share(sum(spent.values())):.0f}")
+for name, n in spent.most_common(12):
+    if n:
+        print(f"  {share(n):5.1f} {name}")
+BUSY
+)
+busy=${busiest%%$'\n'*}
+busiest=${busiest#*$'\n'}
 
 out=${C8S_SESSION_WORK:-$(mktemp -d "${TMPDIR:-/tmp}/c8s-session-timing.XXXXXX")}
 mkdir -p "$out/pki" || exit 2
@@ -290,6 +338,13 @@ for side in "${sides[@]}"; do
     unset -n each
 done
 
+# Where this host's frequency driver takes turbo, and what turns it on there.
+turbo_file="" turbo_on=""
+if [ -e /sys/devices/system/cpu/intel_pstate/no_turbo ]; then
+    turbo_file=/sys/devices/system/cpu/intel_pstate/no_turbo turbo_on=0
+elif [ -e /sys/devices/system/cpu/cpufreq/boost ]; then
+    turbo_file=/sys/devices/system/cpu/cpufreq/boost turbo_on=1
+fi
 pki=$out/pki
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key"
 quiet openssl req -x509 -new -key "$pki/ca.key" -subj "/CN=session test authority" -days 2 -out "$pki/ca.pem"
@@ -305,7 +360,7 @@ quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key"
 quiet openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem"
 
-vendor_pid="" governor="" idle_off=()
+vendor_pid="" governor="" turbo="" idle_off=()
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
@@ -315,7 +370,8 @@ restore_power() {
     [ -n "$governor" ] || return 0
     echo "$governor" | sudo -n tee /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor > /dev/null
     for state in "${idle_off[@]}"; do echo 0 | sudo -n tee "$state" > /dev/null; done
-    governor=""
+    [ -n "$turbo" ] && echo "$turbo" | sudo -n tee "$turbo_file" > /dev/null
+    governor="" turbo=""
 }
 cleanup() {
     local side
@@ -374,6 +430,19 @@ own_binder=$(key_digest "$pki/binder.pem")
 authority=sha256:$(openssl pkey -in "$out/authority.key" -pubout -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)
 [ ${#binder} = 71 ] && [ ${#own_binder} = 71 ] && [ ${#authority} = 71 ] || die "the digest of a public key"
 printf 'timing-secret-%s' "$run" > "$out/stored"
+# The size of the credential a session's first command reads back, which the
+# baseline's first command reads a file of: the stored one, or the 48 bytes
+# the orchestrator makes for a bind, or none.
+credential_bytes=0
+[ "$stored" = 1 ] && credential_bytes=$(stat -c %s "$out/stored")
+[ "$sealed" = 1 ] && credential_bytes=48
+first_command() {
+    if [ "$credential_bytes" -gt 0 ]; then
+        echo "the sandbox image's shell reading a file of $credential_bytes bytes from a read-only drive"
+    else
+        echo "true"
+    fi
+}
 
 # stand_up <side>: its key service, its tenant's credential, and its daemon
 # with one pool. Two machines are read from evidence first, as in
@@ -447,6 +516,39 @@ stand_up() {
     on "${guest_cpus[$side]}" sudo -n "$c" session-daemon run --config "$d/config.yaml" >> "$d/daemon.log" 2>&1 &
     daemon_pid[$side]=$!
 }
+# What a plain guest's kernel says of clearing its memory: one boot of a
+# simulating image that has a console, alone, on the machine a launcher
+# builds, until its init runs.
+if [ -n "$SIM" ] && [ -n "${C8S_SIM_CONSOLE_IMAGE:-}" ]; then
+    con=$(readlink -f "$C8S_SIM_CONSOLE_IMAGE")
+    [ -f "$con/SIMULATED-TEE" ] && [ -f "$con/disk.raw" ] || die "C8S_SIM_CONSOLE_IMAGE is no image built with C8S_SIMTEE=1"
+    on "$cpus_sim" sudo -n qemu-system-x86_64 -name "guest=c8s-clearing-$run" -nodefaults -no-user-config -nographic -no-reboot \
+        -accel kvm -cpu host -smp 4 -m 16384M -monitor none -serial "file:$out/sim/clearing.log" \
+        -machine q35,kernel-irqchip=split,sata=off,smbus=off,i8042=off,hpet=off,usb=off,vmport=off \
+        -bios "$con/OVMF.tdx.fd" -drive "file=$con/disk.raw,format=raw,if=none,id=root0,readonly=on" \
+        -device virtio-blk-pci,drive=root0,bootindex=0,disable-legacy=on > "$out/sim/clearing.out" 2>&1 &
+    clearing_pid=$!
+    deadline=$(( $(date +%s) + 240 ))
+    until grep -a -q "Run /init as init process" "$out/sim/clearing.log" 2>/dev/null; do
+        kill -0 "$clearing_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ] || die "the console image never ran its init: $(tail -c 300 "$out/sim/clearing.out")"
+        sleep 0.2
+    done
+    stop_pid "$clearing_pid"
+    python3 - "$out/sim/clearing.log" "$(basename "$con")" <<'CLEAR' >> "$out/sim/timing.jsonl" || die "the console of $con never showed its kernel clearing its memory"
+import json, re, sys
+stamped = []
+for raw in open(sys.argv[1], "rb"):
+    found = re.search(rb"\[\s*(\d+\.\d+)\] (.*)", raw)
+    if found:
+        stamped.append((float(found.group(1)), found.group(2)))
+began = next(i for i, (_, said) in enumerate(stamped) if b"clearing system memory" in said)
+init = next(at for at, said in stamped if b"Run /init as init process" in said)
+# The kernel says when it begins, and its next line comes when it is done.
+print(json.dumps({"kind": "clearing", "image": sys.argv[2], "vcpus": 4, "mem_mib": 16384,
+                  "clear_ms": round((stamped[began + 1][0] - stamped[began][0]) * 1000), "kernel_to_init_ms": round(init * 1000)}))
+CLEAR
+fi
+
 for side in "${sides[@]}"; do
     stand_up "$side"
 done
@@ -490,6 +592,10 @@ if [ "$pin_power" = 1 ]; then
         *) [ "$(cat "$state/disable")" = 0 ] && { echo 1 | sudo -n tee "$state/disable" > /dev/null; idle_off+=("$state/disable"); } ;;
         esac
     done
+    # Turbo on: written, so that the run has the state it names and inherits none.
+    [ -n "$turbo_file" ] || die "this host's frequency driver names no turbo setting: the run cannot pin it"
+    turbo=$(cat "$turbo_file")
+    echo "$turbo_on" | sudo -n tee "$turbo_file" > /dev/null
 fi
 field() { # field <manifest> <dotted path>: that value of it
     python3 -c 'import json,sys
@@ -499,10 +605,11 @@ print(v)' "$1" "$2"
 }
 others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-z]*-$run")
 {
-    printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU in all (listed below); TDX on in the firmware, for every side; ' "$([ "$pin_power" = 1 ] && echo pinned || echo "as the host had it")" "$others" "$busy"
+    printf 'method: power %s; %s other VMs on the host, and its other programs at %s%% of one CPU over the five seconds before the run (listed below); TDX on in the firmware, for every side; ' \
+        "$([ "$pin_power" = 1 ] && echo "pinned (governor performance, idle states past C1E off, turbo on)" || echo "as the host had it")" "$others" "$busy"
     baseline="not sampled"
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
-    [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
+    [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, its first command $(first_command) as a session's is, and over its serial console (a floor), interleaved"
     printf 'baseline %s; ' "$baseline"
     if [ -n "$SIM" ]; then
         printf 'second baseline: the same start in guests with no TEE and one simulated in software, taking turns with the TD side round by round in an order that alternates, each turn beginning with every pool full and idle; '
@@ -517,13 +624,14 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
-    echo "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) driver $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver) no_turbo $(cat /sys/devices/system/cpu/intel_pstate/no_turbo 2>/dev/null) preference $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
+    echo "governor $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor) driver $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver) turbo $([ -n "$turbo_file" ] && { [ "$(cat "$turbo_file")" = "$turbo_on" ] && echo on || echo off; } || echo unknown)$([ -n "$turbo" ] && echo ", set by this run") preference $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null)"
     echo "idle states of CPU 0: $(for s in /sys/devices/system/cpu/cpu0/cpuidle/state[0-9]*; do printf '%s%s ' "$(cat "$s/name")" "$([ "$(cat "$s/disable")" = 1 ] && echo '(off)')"; done)"
     echo "kvm_intel.tdx $(cat /sys/module/kvm_intel/parameters/tdx); the TDX module is named at the end, by its measurement in a TD's quote"
     echo "transparent huge pages $(cat /sys/kernel/mm/transparent_hugepage/enabled), defrag $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
     echo "microcode $(grep -m1 microcode /proc/cpuinfo | sed 's/.*: //')"
     qemu-system-x86_64 --version | head -1
     [ -n "$fc" ] && cat "$fc/versions.txt"
+    [ -n "$fc_agent" ] && echo "Firecracker's first command runs the sandbox image's shell: $("$fc/busybox" 2>&1 | head -1) sha256 $(sha256sum "$fc/busybox" | cut -c1-64), from $fc_busybox"
     for side in "${sides[@]}"; do
         m=${img[$side]}/manifest.json km=${ksimg[$side]}/manifest.json
         echo "${label[$side]} side: c8s $("${bin[$side]}" --version 2>/dev/null | head -1) sha256 $(sha256sum "${bin[$side]}" | cut -c1-64); warmstart sha256 $(sha256sum "${warm[$side]}" | cut -c1-64)"
@@ -541,13 +649,13 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
     echo "work directory on $(df --output=fstype,source "$out" | tail -1)"
     echo "load $(cat /proc/loadavg)"
     free -g | sed -n 2p
-    echo "the host's busiest programs before the run, by share of one CPU since each started:"
+    echo "the host's busiest programs over the five seconds before the run, by share of one CPU:"
     echo "$busiest"
 } > "$out/env.txt" 2>&1
 
 records=$out/timing.jsonl
 if [ -n "$fc" ]; then
-    (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" snapshot) >> "$records" || die "the Firecracker snapshot"
+    (on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" snapshot "$credential_bytes") >> "$records" || die "the Firecracker snapshot"
 fi
 for side in "${sides[@]}"; do
     d=${dir[$side]}
@@ -654,9 +762,50 @@ IDLE
 fi
 restore_power
 
-# How long each guest took from its launch to ready.
+# How long each guest took from its launch to ready, and in parts where its
+# launcher's log has them: what came before its VMM started, with the time a
+# simulated guest's launcher took to hold the image to its manifest; the
+# VMM's start to the guest's ask of its host for the vendor's documents; and
+# that ask to ready.
 for side in "${sides[@]}"; do
-    grep -o '"boot_ms":[0-9]*' "${dir[$side]}/daemon.log" | sed 's/"boot_ms":\([0-9]*\)/{"kind":"session-cold","boot_ms":\1}/' >> "${dir[$side]}/timing.jsonl"
+    sudo -n python3 - "${dir[$side]}" <<'COLD' >> "${dir[$side]}/timing.jsonl"
+import datetime, json, os, re, sys
+d = sys.argv[1]
+def at(entry):
+    # A log's stamp has more digits than a datetime reads.
+    stamp = re.sub(r"(\.\d{6})\d+", r"\1", entry["time"]).replace("Z", "+00:00")
+    return datetime.datetime.fromisoformat(stamp).timestamp()
+def entries(path):
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and "msg" in entry and "time" in entry:
+                    yield entry
+    except OSError:
+        return
+for ready in entries(os.path.join(d, "daemon.log")):
+    if ready["msg"] != "a TD is ready":
+        continue
+    record = {"kind": "session-cold", "td": ready.get("td"), "boot_ms": ready["boot_ms"]}
+    started = asked = None
+    for entry in entries(os.path.join(d, "state", "tds", str(ready.get("td")), "launcher.log")):
+        if entry["msg"].startswith("this guest runs in no TEE") and "checked_ms" in entry:
+            record["checked_ms"] = entry["checked_ms"]
+        elif entry["msg"] == "starting guest":
+            started = at(entry)
+        elif entry["msg"].startswith("answered the guest with") and asked is None:
+            asked = at(entry)
+    if started is not None:
+        record["before_vmm_ms"] = round(ready["boot_ms"] - (at(ready) - started) * 1000)
+        if asked is not None:
+            record["vmm_to_documents_ms"] = round((asked - started) * 1000)
+            record["documents_to_ready_ms"] = round((at(ready) - asked) * 1000)
+    print(json.dumps(record))
+COLD
 done
 echo "load at the end $(cat /proc/loadavg)" >> "$out/env.txt"
 # The TDX module, as the TD side's quotes name it: this host's kernel states
@@ -712,7 +861,14 @@ for name, rows in sides:
     first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
     if first:
         print(f"the first round, caches cold: start {first[0]['start_us'] / 1000:.1f} ms, first command {first[0]['first_cmd_us'] / 1000:.1f} ms")
-    show("session guest launch to ready", [r["boot_ms"] for r in rows if r.get("kind") == "session-cold"], "ms" + (" (its kernel clears all of its memory first)" if name != "TD" else ""))
+    cold = [r for r in rows if r.get("kind") == "session-cold"]
+    show("session guest launch to ready", [r["boot_ms"] for r in cold], "ms" + (" (its kernel clears all of its memory first)" if name != "TD" else ""))
+    show("  before the VMM starts", [r["before_vmm_ms"] for r in cold if "before_vmm_ms" in r], "ms")
+    show("    its launcher's check", [r["checked_ms"] for r in cold if "checked_ms" in r], "ms (it holds the firmware and the disk to the image's manifest: no launcher of a TD does)")
+    show("  VMM start to documents asked", [r["vmm_to_documents_ms"] for r in cold if "vmm_to_documents_ms" in r], "ms (the guest's first ask of its host)")
+    show("  documents asked to ready", [r["documents_to_ready_ms"] for r in cold if "documents_to_ready_ms" in r], "ms")
+    show("a plain guest's kernel clearing", [r["clear_ms"] for r in rows if r.get("kind") == "clearing"],
+         "ms for 16 GiB (one boot of the console image, alone, by its kernel's log: part of each launch above)")
     show("ready guest, idle", [r["cpu_ms_per_s"] for r in rows if r.get("kind") == "idle"], "ms of CPU a second, its VMM's with its vCPUs and device threads")
     for r in rows:
         if r.get("kind") == "tee" and r.get("simulated"):
@@ -725,6 +881,13 @@ if len(sides) > 1:
             td, sim = both["TD"], both["simulated TEE"]
             print(f"{'session ' + key[:-3]:34} {td - sim:+9.1f} ms  (TD {td:.1f}, simulated {sim:.1f})")
 rows = sides[0][1]
+show("Firecracker snapshot made", [r["snapshot_create_ms"] for r in rows if r.get("kind") == "fc-snapshot"], "ms (before the rounds, after a cold boot: no part of their times)")
+for r in rows:
+    if r.get("kind") == "fc-snapshot" and r.get("first_command"):
+        said = "Firecracker's first command over vsock: " + " ".join(r["first_command"])
+        if r.get("credential_bytes"):
+            said += f" (a file of {r['credential_bytes']} bytes on a read-only drive, unread before; its shell is busybox sha256 {r['shell_sha256']}, read into the guest's memory before the snapshot)"
+        print(said)
 for kind, label, how in (("fc-cold", "Firecracker cold", "serial console: a floor"), ("fc-load", "Firecracker snapshot load", "serial console: a floor"),
                          ("fc-load-vsock", "Firecracker snapshot load", "vsock to an agent in the guest")):
     show(label + " to first command", [r.get("first_cmd_us", r["first_cmd_ms"] * 1000) / 1000 for r in rows if r.get("kind") == kind], f"ms ({how})")

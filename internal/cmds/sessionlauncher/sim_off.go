@@ -20,6 +20,8 @@ func (*simulation) flags(*pflag.FlagSet) {}
 
 func (*simulation) on() bool { return false }
 
+func (*simulation) note() []any { return nil }
+
 func (*simulation) open(*Config) error { return nil }
 
 // vendor is where a guest's road to one of the vendor's services leads.

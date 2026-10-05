@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/pflag"
 
@@ -33,6 +34,10 @@ type simulation struct {
 	// served.
 	authority     *simtee.Directory
 	vendorAddress string
+	// checked is how long the launcher took to hold what it boots to the
+	// image's manifest: work no launcher of a TD does, since the TDX module
+	// measures what a TD boots.
+	checked time.Duration
 }
 
 // open reads the authority, before the launcher makes any road that leads
@@ -57,6 +62,10 @@ func (s *simulation) flags(f *pflag.FlagSet) {
 }
 
 func (s *simulation) on() bool { return s.Dir != "" }
+
+// note is what the launcher's log says of the simulation beside its warning:
+// the time of its own check, which a record of a boot names apart.
+func (s *simulation) note() []any { return []any{"checked_ms", s.checked.Milliseconds()} }
 
 // vendor is where a guest's road to one of the vendor's services leads: to
 // whoever serves the simulated authority's documents, whichever service the
@@ -132,6 +141,7 @@ func (s *simulation) declare(cfg *Config, firmware, disk *os.File) ([]ISOFile, e
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, fmt.Errorf("%s: %w", manifestFile, err)
 	}
+	began := time.Now()
 	for _, file := range []struct {
 		name string
 		f    *os.File
@@ -148,6 +158,7 @@ func (s *simulation) declare(cfg *Config, firmware, disk *os.File) ([]ISOFile, e
 			return nil, fmt.Errorf("%s is %s and %s names %s: the registers it names are another image's", file.name, got, manifestFile, file.want)
 		}
 	}
+	s.checked = time.Since(began)
 	var registers [3][48]byte
 	for i, value := range []string{manifest.TDX.MRTD, manifest.TDX.RTMR1, manifest.TDX.RTMR2} {
 		raw, err := hex.DecodeString(value)

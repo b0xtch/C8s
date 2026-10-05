@@ -248,7 +248,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = shutdownGrace
 	if cfg.sim.on() {
-		log.Warn("this guest runs in no TEE: its launcher declared its registers and handed it its platform's quoting enclave")
+		log.Warn("this guest runs in no TEE: its launcher declared its registers and handed it its platform's quoting enclave", cfg.sim.note()...)
 	}
 	log.Info("starting guest", append([]any{"platform", cfg.Platform,
 		"launch_digest", session.DocumentDigest(launch), "vcpus", cfg.VCPUs, "memory_mib", cfg.MemoryMiB, "network", cfg.Network},
