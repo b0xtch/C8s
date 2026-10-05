@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/user"
@@ -16,6 +17,7 @@ import (
 
 	containerdlog "github.com/containerd/log"
 	"github.com/spf13/cobra"
+	"golang.org/x/sys/unix"
 
 	"github.com/confidential-dot-ai/c8s/internal/imagestore"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -167,7 +169,14 @@ func newRunCmd() *cobra.Command {
 			if guard.Expected != "" {
 				// The filter keeps the sandbox off the guest's ports, which
 				// protects the guest's services only while they listen nowhere else.
-				listeners := ListenerGuard{Proc: "/proc"}
+				listeners := ListenerGuard{Proc: "/proc", TCP: func(family int) ([]int, error) {
+					ports, err := tcpListeners(family)
+					// A kernel without an address family has no socket of it.
+					if family == unix.AF_INET6 && errors.Is(err, unix.ENOENT) {
+						return nil, fs.ErrNotExist
+					}
+					return ports, err
+				}}
 				// Listed before the guest serves, and from then on held to
 				// the kernel's count of its changes.
 				filter := &RulesetWatch{Guard: guard, Generation: rulesetGeneration}

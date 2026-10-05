@@ -39,19 +39,38 @@ func portIn(ranges [][2]int, port int) bool {
 type ListenerGuard struct {
 	// Proc is where the proc filesystem is mounted.
 	Proc string
+	// TCP, when set, returns the local ports of the listening TCP sockets of
+	// one address family (unix.AF_INET, unix.AF_INET6) in the guest's own
+	// namespace, and fs.ErrNotExist for a family the kernel does not have.
+	// Without it they are read from the socket tables under Proc, which the
+	// kernel walks whole for every read, connected sockets included.
+	TCP func(family int) ([]int, error)
 }
+
+// The address families of the kernel's two TCP socket tables (AF_INET,
+// AF_INET6).
+const (
+	familyIPv4 = 2
+	familyIPv6 = 10
+)
 
 // Check fails if a TCP socket listens outside the guest's ports, a UDP socket
 // takes datagrams from anyone outside them, or any socket accepts connections
 // on an abstract unix name.
 func (g ListenerGuard) Check(context.Context) error {
+	asked := func(family int) func(string) ([]int, error) {
+		if g.TCP == nil {
+			return listeningPorts
+		}
+		return func(string) ([]int, error) { return g.TCP(family) }
+	}
 	for _, table := range []struct {
 		name, protocol string
 		open           func(path string) ([]int, error)
 		ports          [][2]int
 	}{
-		{"net/tcp", "TCP", listeningPorts, guestPorts},
-		{"net/tcp6", "TCP", listeningPorts, guestPorts},
+		{"net/tcp", "TCP", asked(familyIPv4), guestPorts},
+		{"net/tcp6", "TCP", asked(familyIPv6), guestPorts},
 		{"net/udp", "UDP", unconnectedPorts, guestPorts},
 		{"net/udp6", "UDP", unconnectedPorts, guestPorts},
 	} {

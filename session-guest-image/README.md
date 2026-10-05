@@ -129,6 +129,12 @@ and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=16384`). The kernel's
 own choice for a confidential guest is 6% of memory up to 1 GiB, turned from
 private to shared one page at a time during boot.
 
+The kernel answers sock_diag for TCP (`CONFIG_INET_DIAG`,
+`CONFIG_INET_TCP_DIAG`), and for nothing else. Before it starts a sandbox the
+agent asks it for the guest's listening TCP sockets alone: a read of
+`/proc/net/tcp` walks the table of connected sockets too, which the kernel
+sizes for the guest's memory.
+
 ## Knobs
 
 | Variable | Meaning |

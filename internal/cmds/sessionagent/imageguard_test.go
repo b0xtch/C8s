@@ -164,6 +164,42 @@ func TestGuestKernelTakesNoDeviceAndNoCodeOnceItRuns(t *testing.T) {
 	}
 }
 
+// The agent asks the kernel for its listening TCP sockets through sock_diag,
+// so both kernels answer it for TCP. They answer it for nothing else, and
+// close no socket through it: what a sandbox's code can ask the kernel is no
+// more than the agent's check needs.
+func TestGuestKernelAnswersSockDiagForTCPAlone(t *testing.T) {
+	const kernels = "../../../session-guest-image/kernel/"
+	for _, name := range []string{"config-x86_64-session.snapshot", "config-x86_64-session-dev.snapshot"} {
+		config := kernelConfig(t, kernels+name)
+		for _, symbol := range []string{"INET_DIAG", "INET_TCP_DIAG"} {
+			if config[symbol] != "y" {
+				t.Errorf("%s: the kernel has CONFIG_%s=%q, and the agent asks it for its listening sockets", name, symbol, config[symbol])
+			}
+		}
+		for _, symbol := range []string{"INET_UDP_DIAG", "INET_RAW_DIAG", "INET_DIAG_DESTROY", "INET_MPTCP_DIAG", "INET_SCTP_DIAG", "UNIX_DIAG", "NETLINK_DIAG", "PACKET_DIAG"} {
+			if value, set := config[symbol]; set {
+				t.Errorf("%s: the kernel has CONFIG_%s=%s, which nothing in the guest asks for", name, symbol, value)
+			}
+		}
+	}
+	for _, name := range []string{"session.config", "session-dev.config"} {
+		fragment, err := os.ReadFile(kernels + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		common, _, marked := strings.Cut(string(fragment), "# end of common\n")
+		if !marked {
+			t.Fatalf("%s has no end of its common block", name)
+		}
+		for _, line := range []string{"CONFIG_INET_DIAG=y\n", "CONFIG_INET_TCP_DIAG=y\n", "# CONFIG_INET_UDP_DIAG is not set\n", "# CONFIG_INET_DIAG_DESTROY is not set\n"} {
+			if !strings.Contains(common, line) {
+				t.Errorf("%s does not say %q in the block both kernels share", name, strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
 // The guest's packet filter is its nftables ruleset and nothing beside it:
 // no iptables table of the old kind, and no xtables match inside nftables.
 // The agent lists the ruleset once and from then on asks the kernel for its
