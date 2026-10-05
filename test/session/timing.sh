@@ -543,9 +543,15 @@ for raw in open(sys.argv[1], "rb"):
         stamped.append((float(found.group(1)), found.group(2)))
 began = next(i for i, (_, said) in enumerate(stamped) if b"clearing system memory" in said)
 init = next(at for at, said in stamped if b"Run /init as init process" in said)
-# The kernel says when it begins, and its next line comes when it is done.
-print(json.dumps({"kind": "clearing", "image": sys.argv[2], "vcpus": 4, "mem_mib": 16384,
-                  "clear_ms": round((stamped[began + 1][0] - stamped[began][0]) * 1000), "kernel_to_init_ms": round(init * 1000)}))
+record = {"kind": "clearing", "image": sys.argv[2], "vcpus": 4, "mem_mib": 16384}
+if stamped[began][0] > 0:
+    # The kernel says when it begins, and its next line comes when it is done.
+    record["clear_ms"], record["kernel_to_init_ms"] = round((stamped[began + 1][0] - stamped[began][0]) * 1000), round(init * 1000)
+else:
+    # A kernel stamps its lines with zero until its clock runs, which in
+    # some boots is after it has cleared its memory.
+    record["untimed"] = "the kernel's clock had not started when it cleared its memory"
+print(json.dumps(record))
 CLEAR
 fi
 
@@ -867,7 +873,7 @@ for name, rows in sides:
     show("    its launcher's check", [r["checked_ms"] for r in cold if "checked_ms" in r], "ms (it holds the firmware and the disk to the image's manifest: no launcher of a TD does)")
     show("  VMM start to documents asked", [r["vmm_to_documents_ms"] for r in cold if "vmm_to_documents_ms" in r], "ms (the guest's first ask of its host)")
     show("  documents asked to ready", [r["documents_to_ready_ms"] for r in cold if "documents_to_ready_ms" in r], "ms")
-    show("a plain guest's kernel clearing", [r["clear_ms"] for r in rows if r.get("kind") == "clearing"],
+    show("a plain guest's kernel clearing", [r["clear_ms"] for r in rows if r.get("kind") == "clearing" and "clear_ms" in r],
          "ms for 16 GiB (one boot of the console image, alone, by its kernel's log: part of each launch above)")
     show("ready guest, idle", [r["cpu_ms_per_s"] for r in rows if r.get("kind") == "idle"], "ms of CPU a second, its VMM's with its vCPUs and device threads")
     for r in rows:
