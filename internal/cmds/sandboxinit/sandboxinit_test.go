@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -222,5 +223,115 @@ func TestInitThatEndsUntoldTookNothing(t *testing.T) {
 	long := strings.Repeat("x", 10*sandboxinit.MaxAnswer)
 	if _, reason := sandboxinit.ReadAnswer(strings.NewReader(long)); len(reason) != sandboxinit.MaxAnswer {
 		t.Errorf("an answer of %d bytes was read as %d", len(long), len(reason))
+	}
+}
+
+// ended reports when the other end of a pipe has closed everywhere.
+func ended(pipe *os.File) <-chan time.Time {
+	at := make(chan time.Time, 1)
+	go func() {
+		var none [1]byte
+		_, _ = pipe.Read(none[:])
+		at <- time.Now()
+	}()
+	return at
+}
+
+// The agent passes the init one end of a pipe with its message. The init
+// keeps it and does nothing with it, and it closes at the exec: the agent's
+// end reads the pipe's end while the process the init became still runs, and
+// that process does not have the descriptor. One more than the init keeps is
+// closed as it arrives.
+func TestInitHoldsAPassedDescriptorUntilItsExec(t *testing.T) {
+	cmd, agent := start(t)
+	became, theirs, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer became.Close()
+	spare, more, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spare.Close()
+	data, err := json.Marshal(sandboxinit.Process{Argv: []string{"sleep", "3"}, Env: []string{"PATH=/usr/bin:/bin"}, Cwd: "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first half of the message carries both descriptors.
+	half := len(data) / 2
+	if err := unix.Sendmsg(int(agent.Fd()), data[:half], unix.UnixRights(int(theirs.Fd()), int(more.Fd())), nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Close()
+	more.Close()
+	execed, dropped := ended(became), ended(spare)
+	select {
+	case <-dropped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the init kept a second descriptor")
+	}
+	// The init waits for the rest of its message, and holds the first.
+	select {
+	case <-execed:
+		t.Fatal("the pipe closed before the init had its message")
+	case <-time.After(100 * time.Millisecond):
+	}
+	began := time.Now()
+	if _, err := agent.Write(data[half:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Shutdown(int(agent.Fd()), unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case at := <-execed:
+		// The process sleeps for seconds: had it inherited the descriptor,
+		// the pipe would have closed at its end and not at its start.
+		if took := at.Sub(began); took > 2*time.Second {
+			t.Fatalf("the pipe closed %s after the message: at the process's end, not at the exec", took)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pipe never closed")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+}
+
+// An init that cannot become the process is gone, and the pipe it was passed
+// closes with it: the agent's end does not wait for a process that will not
+// come.
+func TestPassedDescriptorClosesWithAnInitThatFailed(t *testing.T) {
+	cmd, agent := start(t)
+	became, theirs, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer became.Close()
+	data, err := json.Marshal(sandboxinit.Process{Argv: []string{"/nonexistent/command"}, Env: []string{"PATH=/usr/bin:/bin"}, Cwd: "/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Sendmsg(int(agent.Fd()), data, unix.UnixRights(int(theirs.Fd())), nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	theirs.Close()
+	if err := unix.Shutdown(int(agent.Fd()), unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ended(became):
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pipe outlived an init that failed")
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("an init that could not become its process exited with status 0")
+	}
+	// It had found the command's path and took the message: the exec is
+	// what failed, and it says so.
+	if _, reason := sandboxinit.ReadAnswer(agent); !strings.Contains(reason, "command not found") {
+		t.Fatalf("the init's reason: %q", reason)
 	}
 }

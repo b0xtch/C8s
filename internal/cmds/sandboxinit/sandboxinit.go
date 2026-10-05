@@ -17,6 +17,11 @@
 // If it cannot, it says why on a line and exits. Neither descriptor outlives
 // it: the image's process inherits no way back to the agent.
 //
+// The agent may pass one more descriptor with its message, the write end of
+// a pipe. This program does nothing with it but keep it, closed at its exec:
+// the agent's end then reads the end of the pipe the moment this process has
+// become the image's, or is gone, and need not look for either.
+//
 // The agent also starts this program for a command, ahead of the command
 // (see the agent's warmCommand). A process that ends without a word, before
 // it took its message, has started nothing, and its command is started
@@ -49,6 +54,9 @@ const (
 	Taken = "ok"
 	// MaxAnswer bounds what the agent reads of this program's answer.
 	MaxAnswer = 4096
+	// maxPassed is how many descriptors this program keeps of those that
+	// come with its message. Any more are closed as they arrive.
+	maxPassed = 1
 	// defaultPath is searched for a command named without a directory when
 	// the process's environment sets no PATH.
 	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -81,7 +89,10 @@ func Main() int {
 	if control == nil {
 		return FailureStatus
 	}
-	err := become(control)
+	err := become(struct {
+		io.Reader
+		io.Writer
+	}{&taking{fd: ControlFD}, control})
 	// Reached only when the exec did not happen.
 	fmt.Fprintf(control, "%v\n", err)
 	return FailureStatus
@@ -112,6 +123,54 @@ func become(control io.ReadWriter) error {
 		return fmt.Errorf("%s: command not found", path)
 	}
 	return fmt.Errorf("run %s: %w", path, err)
+}
+
+// taking reads the agent's message off the control socket, and keeps the
+// descriptors that come with it, closed at this program's exec.
+type taking struct {
+	fd   int
+	kept int
+}
+
+func (t *taking) Read(p []byte) (int, error) {
+	oob := make([]byte, unix.CmsgSpace(4*8))
+	for {
+		n, oobn, _, _, err := unix.Recvmsg(t.fd, p, oob, 0)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		t.keep(oob[:oobn])
+		if n == 0 {
+			return 0, io.EOF
+		}
+		return n, nil
+	}
+}
+
+// keep holds on to the descriptors in one message's control data, up to
+// maxPassed of them, and closes the rest. None survives this program's exec.
+func (t *taking) keep(control []byte) {
+	messages, err := unix.ParseSocketControlMessage(control)
+	if err != nil {
+		return
+	}
+	for i := range messages {
+		passed, err := unix.ParseUnixRights(&messages[i])
+		if err != nil {
+			continue
+		}
+		for _, fd := range passed {
+			if t.kept >= maxPassed {
+				_ = unix.Close(fd)
+				continue
+			}
+			unix.CloseOnExec(fd)
+			t.kept++
+		}
+	}
 }
 
 // ReadAnswer reads what an init said on its way, from the agent's end of its

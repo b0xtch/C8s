@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -615,7 +616,7 @@ func (r *ImageRunner) makeSandbox(ctx context.Context, digest, rootfs string, im
 		made.exitErr = err
 		close(made.exited)
 	}()
-	if err := r.await(ctx, made, sandboxNet, true, nil); err != nil {
+	if err := r.await(ctx, made, sandboxNet, true, nil, nil); err != nil {
 		if reason := readTrimmed(made.logPath); reason != "" {
 			err = fmt.Errorf("%w: %s", err, reason)
 		}
@@ -688,9 +689,26 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 		return err
 	}
 	control := w.made.control
-	if _, err := control.Write(message); err != nil {
+	// With the message goes one end of a pipe, which the init keeps closed
+	// at its exec: the other end reads the pipe's end the moment the init
+	// has become the sandbox's process, or is gone.
+	became, theirs, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	err = sendWith(control, message, theirs)
+	_ = theirs.Close()
+	if err != nil {
+		_ = became.Close()
 		return fmt.Errorf("tell the sandbox's init its process: %w", err)
 	}
+	execed := make(chan struct{})
+	go func() {
+		defer became.Close()
+		var none [1]byte
+		_, _ = became.Read(none[:])
+		close(execed)
+	}()
 	// The message ends where the agent stops writing.
 	if err := unix.Shutdown(int(control.Fd()), unix.SHUT_WR); err != nil {
 		return fmt.Errorf("tell the sandbox's init its process: %w", err)
@@ -707,7 +725,7 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 		answered <- time.Since(began)
 		refused <- reason
 	}()
-	if err := r.await(ctx, w.made, sandboxNet, false, refused); err != nil {
+	if err := r.await(ctx, w.made, sandboxNet, false, refused, execed); err != nil {
 		if reason := readTrimmed(w.made.logPath); reason != "" {
 			err = fmt.Errorf("%w: %s", err, reason)
 		}
@@ -733,7 +751,9 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 // the container's only if it is in the container's cgroup, whatever the file
 // says, and it must run in the namespaces the agent made for it. refused,
 // when set, delivers what the init says if it could not become the process.
-func (r *ImageRunner) await(ctx context.Context, made *madeSandbox, namespaces *sandboxNet, init bool, refused <-chan string) error {
+// The process is looked at every so often, and at once when soon is closed:
+// that is when the init has become something else, or is gone.
+func (r *ImageRunner) await(ctx context.Context, made *madeSandbox, namespaces *sandboxNet, init bool, refused <-chan string, soon <-chan struct{}) error {
 	runtime, err := os.Stat(r.cfg.Crun)
 	if err != nil {
 		return err
@@ -777,8 +797,25 @@ func (r *ImageRunner) await(ctx context.Context, made *madeSandbox, namespaces *
 		if time.Now().After(deadline) {
 			return fmt.Errorf("the sandbox was not running after %s", startTimeout)
 		}
-		time.Sleep(awaitRunningEvery)
+		select {
+		case <-soon:
+			// Once: from here the process is looked at every so often again.
+			soon = nil
+		case <-time.After(awaitRunningEvery):
+		}
 	}
+}
+
+// sendWith writes message to the init's control socket and passes it one
+// descriptor with the first of its bytes.
+func sendWith(control *os.File, message []byte, pass *os.File) error {
+	n, err := unix.SendmsgN(int(control.Fd()), message, unix.UnixRights(int(pass.Fd())), nil, 0)
+	runtime.KeepAlive(pass)
+	if err != nil {
+		return err
+	}
+	_, err = control.Write(message[n:])
+	return err
 }
 
 // Wait returns when the container's main process has ended. A guest waits
