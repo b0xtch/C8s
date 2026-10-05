@@ -56,6 +56,15 @@
 // documents before it has seen a guest it fetches when it starts, and prints
 // a record of kind "documents" for.
 //
+// With --burst a round starts that many sessions at the same instant, once
+// this side holds a standing verdict on as many ready TDs, which is how a
+// burst of starts meets a pool. Each session is a record of its own, as
+// above, and a record of kind "burst" follows them: how many started, when
+// the first and the last had their first command's answer, and what failed.
+// No session of a burst runs anything after its first command, or ends,
+// before every other has its answer or has failed. --first-command names
+// the first command in place of the one that reads a credential back.
+//
 // Each round prints one JSON record on standard output, with times in
 // microseconds on this process's monotonic clock and the wall clock's time
 // when it began. The first round finds the engine's documents unread and its
@@ -82,6 +91,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,12 +115,16 @@ type options struct {
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
+	sandboxCommand                     string
 	members                            string
-	sealedCredential                   string
+	sealedCredential, first            string
 	acceptTCB, collateralCache, before string
-	rounds, commands                   int
+	afterAnswers                       string
+	rounds, commands, burst, ready     int
+	firstRound                         int
 	wait, timeout                      time.Duration
 	keep, attest, quoteFirst           bool
+	leaveFailed                        bool
 	prejudge, preconnect, withBind     bool
 	watchReady, claimWithBind          bool
 	loseFirst                          bool
@@ -143,12 +157,47 @@ type judged struct {
 	Error string   `json:"error,omitempty"`
 }
 
+// together is what the sessions of one burst share: when it began, a word
+// each gives once its first command has answered, and the signal that every
+// one has, before which none goes on.
+type together struct {
+	began    time.Time
+	answered func()
+	release  <-chan struct{}
+}
+
+// volley is one burst of starts: kind "burst". Every time is in
+// microseconds from the instant the sessions were all let go.
+type volley struct {
+	Kind  string `json:"kind"`
+	Round int    `json:"round"`
+	// At is that instant, on the wall clock.
+	At int64 `json:"at_unix_us"`
+	// Sessions were let go at once, and Started of them started: each had
+	// its first command's answer, and its quote then agreed with its
+	// receipt. First and Wall are when the first and the last of those had
+	// their answer.
+	Sessions int   `json:"sessions"`
+	Started  int   `json:"started"`
+	First    int64 `json:"first_us,omitempty"`
+	Wall     int64 `json:"wall_us,omitempty"`
+	// Ready is how many ready TDs this side held a verdict on at that
+	// instant: with fewer than Sessions, the rest started as more booted.
+	Ready int `json:"ready"`
+	// Errors are what the others failed with: the first five that differ.
+	Errors []string `json:"errors,omitempty"`
+}
+
 // record is one round. Every time is in microseconds.
 type record struct {
 	Kind    string `json:"kind"`
 	Round   int    `json:"round"`
 	Session string `json:"session"`
 	TD      string `json:"td"`
+	// Offset is how long after its burst began the session's own start did,
+	// and Output what its first command wrote, when --first-command names it.
+	Offset int64  `json:"offset_us,omitempty"`
+	Output string `json:"first_output,omitempty"`
 	// At is when the round's claim began, on the wall clock.
 	At int64 `json:"at_unix_us"`
 	// ClaimedByBind says the round made no claim: its bind claimed the TD.
@@ -241,6 +290,7 @@ func main() {
 	flag.StringVar(&o.tenant, "tenant", "acme", "the tenant")
 	flag.StringVar(&o.prefix, "session-prefix", "warm", "each session is named <prefix>-<round>")
 	flag.StringVar(&o.sandboxImage, "sandbox-image", "", "OCI image each session runs, as name@sha256:<digest>")
+	flag.StringVar(&o.sandboxCommand, "sandbox-command", "", "the process each session's sandbox runs, as words separated by spaces, in place of the image's own: a session ends when that process does")
 	flag.StringVar(&o.keyService, "key-service", "", "pin of the key service the sessions trust")
 	flag.StringVar(&o.stored, "stored-credential", "", "a credential each guest takes from the key service at its bind (needs --key-service); the first command then reads it")
 	flag.StringVar(&o.members, "key-service-member", "", "instance keys, as sha256:<hex> and comma-separated, to name in each bind as the key service's replicas in place of the one this side judged: for a test of a guest that can reach none of them")
@@ -248,11 +298,17 @@ func main() {
 	flag.StringVar(&o.acceptTCB, "accept-tcb-status", "", "Intel TCB statuses, besides UpToDate, that the guests' platform may have, comma-separated")
 	flag.StringVar(&o.collateralCache, "collateral-cache", "", "directory that keeps Intel's collateral between runs")
 	flag.StringVar(&o.before, "before-round", "", "a program run before each round, with the round's number: it returns once the host is as a round should find it")
-	flag.IntVar(&o.rounds, "rounds", 1, "how many sessions to start")
+	flag.StringVar(&o.afterAnswers, "after-answers", "", "with --burst, a program run with the round's number once every session's first command has answered or failed, before any session is ended")
+	flag.IntVar(&o.rounds, "rounds", 1, "how many sessions to start, or with --burst how many bursts")
+	flag.IntVar(&o.firstRound, "first-round", 0, "the number the first round says it has, for a run that starts this program once a round")
+	flag.IntVar(&o.burst, "burst", 0, "start this many sessions at the same instant in each round, once as many ready TDs are judged (needs --claim-with-bind)")
+	flag.IntVar(&o.ready, "burst-ready", 0, "with --burst, how many ready TDs this side holds a verdict on before it lets a burst go (default: as many as the burst); the rest of a burst then start as the pool's next TDs become ready")
+	flag.StringVar(&o.first, "first-command", "", "the first command of each session, as words separated by spaces, in place of the one that reads a credential back")
 	flag.IntVar(&o.commands, "commands", 3, "commands each session runs after its first")
 	flag.DurationVar(&o.wait, "wait", 2*time.Minute, "how long a claim waits for a ready TD")
 	flag.DurationVar(&o.timeout, "timeout", 5*time.Minute, "deadline of one round")
 	flag.BoolVar(&o.keep, "keep", false, "leave each session's TD running")
+	flag.BoolVar(&o.leaveFailed, "leave-failed", false, "for a trial: leave the TD of a session whose start failed running, to be looked at, where it would be ended")
 	flag.BoolVar(&o.attest, "attest", false, "after the commands, ask each guest for one more attestation and time it")
 	flag.BoolVar(&o.quoteFirst, "quote-first", false, "judge the quote over the bind's nonce before the first command is sent")
 	flag.BoolVar(&o.prejudge, "prejudge", true, "judge the guest's serving certificate while the guest takes its bind, so that the first command's connection does not wait for it")
@@ -300,6 +356,24 @@ func run(o *options) error {
 	}
 	if o.loseFirst && !o.claimWithBind {
 		return errors.New("--lose-first times a bind that claims: it needs --claim-with-bind")
+	}
+	if o.burst < 0 || o.burst > 0 && (!o.claimWithBind || o.loseFirst) {
+		return errors.New("--burst starts its sessions on TDs this side has judged: it needs --claim-with-bind, and goes with no --lose-first")
+	}
+	if o.ready < 0 || o.ready > o.burst {
+		return errors.New("--burst-ready is at most --burst")
+	}
+	if o.ready == 0 {
+		o.ready = o.burst
+	}
+	if o.sandboxCommand != "" && o.sandboxImage == "" {
+		return errors.New("--sandbox-command names the process of a --sandbox-image")
+	}
+	if o.firstRound < 0 {
+		return errors.New("--first-round is no negative number")
+	}
+	if o.first != "" && len(strings.Fields(o.first)) == 0 {
+		return errors.New("--first-command names no command")
 	}
 	if o.sealedCredential != "" && (o.stored != "" || o.quoteFirst || !o.withBind) {
 		return errors.New("--sealed-credential goes with the bind's first command: not with --stored-credential, --quote-first or --command-with-bind=false")
@@ -469,7 +543,7 @@ func run(o *options) error {
 			_ = emit(rec)
 		})
 	}
-	for round := range o.rounds {
+	for round := o.firstRound; round < o.firstRound+o.rounds; round++ {
 		if o.before != "" {
 			hook := exec.Command(o.before, strconv.Itoa(round))
 			hook.Stdout, hook.Stderr = os.Stderr, os.Stderr
@@ -477,8 +551,17 @@ func run(o *options) error {
 				return fmt.Errorf("--before-round, round %d: %w", round, err)
 			}
 		}
+		start := func(ctx context.Context, name string, with *together) (*record, error) {
+			return one(ctx, o, round, name, with, host, ender, engine, verdicts, identity, launchKey, authority, pin, named, accepted)
+		}
+		if o.burst > 0 {
+			if err := burst(o, round, verdicts, start, emit); err != nil {
+				return fmt.Errorf("round %d: %w", round, err)
+			}
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
-		rec, err := one(ctx, o, round, host, ender, engine, verdicts, identity, launchKey, authority, pin, named, accepted)
+		rec, err := start(ctx, fmt.Sprintf("%s-%d", o.prefix, round), nil)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("round %d: %w", round, err)
@@ -488,6 +571,83 @@ func run(o *options) error {
 		}
 	}
 	return nil
+}
+
+// burst starts o.burst sessions at the same instant, once this side holds a
+// standing verdict on as many ready TDs, and prints a record for each that
+// started and one for the burst. A session that fails is counted, and fails
+// no other.
+func burst(o *options, round int, verdicts *session.ReadyVerdicts,
+	start func(ctx context.Context, name string, with *together) (*record, error), emit func(any) error,
+) error {
+	for deadline := time.Now().Add(o.wait); verdicts.Standing() < o.ready; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d ready TDs were shown and judged within %s, and the burst waits for %d", verdicts.Standing(), o.wait, o.ready)
+		}
+	}
+	type outcome struct {
+		rec *record
+		err error
+		at  time.Duration
+	}
+	outcomes := make([]outcome, o.burst)
+	answered := make(chan int, o.burst)
+	release := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
+	defer cancel()
+	var all sync.WaitGroup
+	began := time.Now()
+	for i := range outcomes {
+		all.Add(1)
+		go func() {
+			defer all.Done()
+			said := false
+			with := &together{began: began, release: release, answered: func() {
+				said = true
+				outcomes[i].at = time.Since(began)
+				answered <- i
+			}}
+			outcomes[i].rec, outcomes[i].err = start(ctx, fmt.Sprintf("%s-%d-%d", o.prefix, round, i), with)
+			if !said {
+				answered <- i
+			}
+		}()
+	}
+	for range outcomes {
+		<-answered
+	}
+	if o.afterAnswers != "" {
+		// Every guest still runs: none is confirmed or ended before this.
+		hook := exec.Command(o.afterAnswers, strconv.Itoa(round))
+		hook.Stdout, hook.Stderr = os.Stderr, os.Stderr
+		if err := hook.Run(); err != nil {
+			close(release)
+			all.Wait()
+			return fmt.Errorf("--after-answers: %w", err)
+		}
+	}
+	close(release)
+	all.Wait()
+	said := &volley{Kind: "burst", Round: round, At: began.UnixMicro(), Sessions: o.burst, Ready: o.ready}
+	for _, each := range outcomes {
+		// A session whose quote disagreed after its answer did not start.
+		if each.err != nil {
+			if len(said.Errors) < 5 && !slices.Contains(said.Errors, each.err.Error()) {
+				said.Errors = append(said.Errors, each.err.Error())
+			}
+			continue
+		}
+		said.Started++
+		at := each.at.Microseconds()
+		if said.First == 0 || at < said.First {
+			said.First = at
+		}
+		said.Wall = max(said.Wall, at)
+		if err := emit(each.rec); err != nil {
+			return err
+		}
+	}
+	return emit(said)
 }
 
 func micros(since time.Time) int64 { return time.Since(since).Microseconds() }
@@ -514,12 +674,14 @@ func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *sess
 	}
 }
 
-// one starts one session and runs its commands. ender is who ends it.
-func one(ctx context.Context, o *options, round int, host, ender *daemon.Client, engine session.Engine, verdicts *session.ReadyVerdicts,
-	identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey, pin *session.KeyService,
-	named func(context.Context) ([]string, error), accepted []string,
+// one starts one session and runs its commands. ender is who ends it. with
+// is the burst the session is one of, if it is: it then says when its first
+// command has answered, and goes no further until every other has.
+func one(ctx context.Context, o *options, round int, name string, with *together, host, ender *daemon.Client, engine session.Engine,
+	verdicts *session.ReadyVerdicts, identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey,
+	pin *session.KeyService, named func(context.Context) ([]string, error), accepted []string,
 ) (*record, error) {
-	rec := &record{Kind: "session", Round: round, Session: fmt.Sprintf("%s-%d", o.prefix, round)}
+	rec := &record{Kind: "session", Round: round, Session: name}
 
 	// What an orchestrator has before a session is asked of it: a key for
 	// the session, and the policy its bind will carry.
@@ -541,7 +703,7 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	}
 	policy := session.BindPolicy{Access: session.Access{Exec: []string{string(accessPub)}, Credentials: []string{string(accessPub)}}}
 	if o.sandboxImage != "" {
-		policy.Sandbox = &session.Sandbox{Image: o.sandboxImage}
+		policy.Sandbox = &session.Sandbox{Image: o.sandboxImage, Command: strings.Fields(o.sandboxCommand)}
 	}
 	argv := []string{"true"}
 	if o.stored != "" {
@@ -562,6 +724,9 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		policy.Credentials = []session.Credential{{Name: o.sealedCredential, Source: session.SourceBinder, MaxBytes: 256}}
 		argv = []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/` + o.sealedCredential + `"`}
 	}
+	if o.first != "" {
+		argv = strings.Fields(o.first)
+	}
 	claimID, err := daemon.NewRequestID()
 	if err != nil {
 		return nil, err
@@ -574,6 +739,9 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	began := time.Now()
 	step := began
 	rec.At = began.UnixMicro()
+	if with != nil {
+		rec.Offset = began.Sub(with.began).Microseconds()
+	}
 	// The TD's name and the certificate its guest served while it was ready:
 	// from the claim, or with no claim from the verdict and the bind's answer.
 	var td string
@@ -621,10 +789,12 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		}
 		rec.Destroy = micros(at)
 	}
+	failed := true
 	defer func() {
-		if !o.keep {
-			destroy()
+		if o.keep || failed && o.leaveFailed {
+			return
 		}
+		destroy()
 	}()
 
 	// signed signs a bind for the guest that was judged, and seals what goes
@@ -977,8 +1147,11 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 			if said.Command.ExitCode != 0 {
 				return nil, fmt.Errorf("the first command exited %d: %s", said.Command.ExitCode, said.Command.Stderr)
 			}
-			if secret != nil && !bytes.Equal(said.Command.Stdout, secret) {
+			if secret != nil && o.first == "" && !bytes.Equal(said.Command.Stdout, secret) {
 				return nil, errors.New("the first command did not read back the credential sealed with its bind")
+			}
+			if o.first != "" {
+				rec.Output = strings.TrimSpace(string(said.Command.Stdout[:min(len(said.Command.Stdout), 64)]))
 			}
 			rec.WithBind = true
 		}
@@ -1014,11 +1187,21 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		rec.FirstRequest = took.took(session.TimedRequest + " " + session.PathExec)
 	}
 	rec.FirstExec, rec.FirstCommand = micros(step), micros(began)
+	if with != nil {
+		with.answered()
+		select {
+		case <-with.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	// A guest whose quote disagrees with its receipt is ended, whatever
 	// --keep says, and the round fails.
 	final := <-confirmed
 	if final.err != nil {
-		destroy()
+		if !o.leaveFailed {
+			destroy()
+		}
 		return nil, final.err
 	}
 	// What ran the guest, as the quote over its bind names it.
@@ -1059,6 +1242,7 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 			}
 		}
 	}
+	failed = false
 	return rec, nil
 }
 
