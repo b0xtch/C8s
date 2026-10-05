@@ -119,8 +119,15 @@ memory-acceptance floor; work inside within the published floors.
 - **The same hardware.** The baseline runs on the same host model, with TDX
   off in firmware, or on an identical host. A host with TDX on can cost the
   baseline itself, so a run that keeps TDX on says so.
-- **A second baseline**: the same guest image and VMM with TDX off, which
-  separates the cost of confidentiality from the cost of the VMM.
+- **A second baseline**: the same guest and VMM with TDX off, which separates
+  the cost of confidentiality from the cost of the VMM. A session image stops
+  without a TEE, so this baseline runs a development build of it whose TEE is
+  simulated in software: the same image but for that, with measurements of its
+  own and quotes in the vendor's format under a development root of the same
+  algorithms, so that every check costs what it costs on TDX and the
+  difference is what the hardware and the vendor's quoting add. No verifier or
+  key service but a development one accepts that root, and a session image
+  never falls back to the simulation.
 - **The same settings.** Power settings (governor, C-states, turbo) are pinned
   and recorded, versions are named, and runs of the two sides interleave.
   Nothing else runs on the host during a run: no other TD or VM.
