@@ -464,6 +464,7 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 			recordStep(ctx, stepChecks, time.Since(began))
 		}
 	}
+	traced(ctx, "checked")
 	events, err := a.settle(ctx, sandbox != nil)
 	if err != nil {
 		return nil, nil, err
@@ -478,13 +479,17 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	if err != nil {
 		return nil, nil, err
 	}
+	traced(ctx, "signed")
 	// What signing left on the heap, and opening a first command before it,
 	// is erased by a collection, which runs beside what follows and is done
 	// before the sandbox starts.
 	collected := make(chan struct{})
+	var collecting time.Duration
 	go func() {
 		defer close(collected)
+		began := time.Now()
 		a.oneTime.collect()
+		collecting = time.Since(began)
 	}()
 	evidence := make(chan *session.AttestResponse, 1)
 	go func() { evidence <- a.bindEvidence(ctx, bind, events) }()
@@ -495,9 +500,12 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	}
 	// Nothing of the tenant has run yet, and the next step runs it. A first
 	// command that has not come by now is not opened any more.
+	traced(ctx, "acquired")
 	a.closeCommand()
 	<-collected
 	a.oneTime.collect()
+	tracedFor(ctx, "collection", collecting)
+	traced(ctx, "collected")
 	if sandbox != nil {
 		began := time.Now()
 		if err := a.cfg.Runner.Start(ctx, a.creds.dir); err != nil {
@@ -505,6 +513,7 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		}
 		recordStep(ctx, stepStart, time.Since(began))
 	}
+	traced(ctx, "started")
 	a.settled(receipt)
 	// The quote goes with the answer only if it is there. Otherwise it is
 	// served with the guest's state once it is, and nobody waits.
@@ -725,6 +734,7 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, comm
 		}
 	}
 	bind, events, refusal := a.acceptable(raw, signature)
+	traced(ctx, "accepted")
 	if err := refusal; err != nil {
 		a.measured.Lock()
 		a.retired = true
@@ -754,11 +764,13 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, comm
 		a.readyCert = *der
 	}
 	a.measured.Unlock()
+	traced(ctx, "extended")
 	// A first command that came with the bind is opened now, with the guest's
 	// other one-time key, which is erased by it: before any command that
 	// follows the bind is looked at. It is run once the sandbox runs.
 	if len(command) > 0 {
 		a.takeCommand(bind, command)
+		traced(ctx, "opened")
 	}
 	a.binding.Unlock()
 	a.log.Info("bound", "bind_digest", session.DocumentDigest(raw), "sandbox", bind.Doc.Policy.Sandbox != nil)

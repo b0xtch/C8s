@@ -282,11 +282,13 @@ func (a *Agent) verifier(keys []*ecdsa.PublicKey) operatorauth.Verifier {
 // signature and the guest it names are what admit it.
 func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 	var req session.BindRequest
+	ctx, trace := withBindTrace(r.Context())
 	if !decodeStrict(body, &req) || len(req.Bind) == 0 {
 		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
 		return
 	}
-	replayed, answer, err := a.BindWith(r.Context(), req.Bind, req.Signature, req.Command)
+	traced(ctx, "decoded")
+	replayed, answer, err := a.BindWith(ctx, req.Bind, req.Signature, req.Command)
 	var refusal *bindRefusal
 	switch {
 	case errors.Is(err, errAlreadyBound):
@@ -315,17 +317,22 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		phase, _ := a.stateLocked()
 		admission := a.admission
 		a.measured.RUnlock()
+		traced(ctx, "admitted")
 		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{
 			Phase: phase, Replayed: replayed, Command: answer.Command, Admission: admission,
 			Receipt: answer.Receipt, Attestation: answer.Attestation,
 		})
-		if answer.Command != session.CommandTaken {
-			return
-		}
-		// The receipt goes out now. The first command's sealed answer follows
-		// it as a second document, once the command has run.
+		// The receipt goes out now. The sealed answer of a first command
+		// follows it as a second document, once the command has run.
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
+		}
+		traced(ctx, "answered")
+		if !replayed {
+			trace.log(a.log)
+		}
+		if answer.Command != session.CommandTaken {
+			return
 		}
 		result, err := a.commandAnswer(r.Context())
 		if err != nil {
