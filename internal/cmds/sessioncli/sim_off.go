@@ -20,5 +20,8 @@ func (*simulatedTrust) flags(*pflag.FlagSet) {}
 // simulated authority, or nil for one that was not.
 func (*simulatedTrust) engine(session.EngineOptions) session.Engine { return nil }
 
+// unproven is what a verdict under a simulated authority leaves unproven.
+func (*simulatedTrust) unproven() []string { return nil }
+
 // simulationCmds are the commands that make and serve a simulated authority.
 func simulationCmds() []*cobra.Command { return nil }

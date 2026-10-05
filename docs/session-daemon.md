@@ -585,6 +585,8 @@ What keeps the two kinds apart:
   manifest.
 - A program of the development build states its version with `+c8s_simtee`
   at its end, so a record that names versions names the build.
+- `c8s session verify --simulated-tee` lists first, among what its verdict
+  does not prove, everything about the guest's hardware.
 
 Where a simulated guest's own work differs from a TD's, a run's record says
 so:

@@ -906,6 +906,8 @@ func runVerify(ctx context.Context, t *trust, asJSON bool, stdout, stderr io.Wri
 		}
 		v.CollateralVerified = att.Result.CollateralVerified
 		v.Collateral = session.CollateralOf(att.Result)
+		// Before every other gap: a verdict under a simulated authority.
+		v.NotProven = append(v.NotProven, t.simulated.unproven()...)
 		if !att.Result.CollateralVerified {
 			v.NotProven = append(v.NotProven, "platform TCB level, quoting enclave version and certificate revocation (collateral was not checked)")
 		}

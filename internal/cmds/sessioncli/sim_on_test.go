@@ -21,6 +21,7 @@ import (
 	"github.com/confidential-dot-ai/attestation-go/attestation/teetypes"
 	"github.com/confidential-dot-ai/c8s/internal/simtee"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
+	"github.com/confidential-dot-ai/c8s/pkg/session/sessionsim"
 )
 
 // run runs one command of the session tree to its end.
@@ -186,5 +187,40 @@ func TestEveryJudgingCommandTakesTheSimulatedAuthority(t *testing.T) {
 	s.flags(set)
 	if err := set.Parse([]string{"--simulated-tee", "/authority"}); err != nil || s.dir != "/authority" {
 		t.Fatalf("--simulated-tee /authority: %v, %q", err, s.dir)
+	}
+}
+
+// A verdict a command prints under a simulated authority says, before every
+// other gap, that it proves nothing about the guest's hardware. A command
+// that was given no directory says no such thing.
+func TestVerdictUnderASimulatedAuthoritySaysWhatItDoesNotProve(t *testing.T) {
+	b := unbound(t, sessionsim.NewGuest(t, nil))
+	bind(t, b)
+	for _, simulated := range []bool{true, false} {
+		flags := driving(b)
+		if simulated {
+			// The engine is the test's own: only what the command says of
+			// its verdict is under test.
+			flags.simulated.dir = "/authority"
+		}
+		var stdout, stderr bytes.Buffer
+		if code := runVerify(context.Background(), flags, true, &stdout, &stderr); code != ExitOK {
+			t.Fatalf("verify: exit %d: %s%s", code, stdout.String(), stderr.String())
+		}
+		var v verdict
+		if err := json.Unmarshal(stdout.Bytes(), &v); err != nil || !v.Verified {
+			t.Fatalf("verdict %+v, %v", v, err)
+		}
+		said := len(v.NotProven) > 0 && strings.Contains(v.NotProven[0], "its TEE is simulated in software")
+		if said != simulated {
+			t.Fatalf("simulated %v, and the verdict's gaps are %q", simulated, v.NotProven)
+		}
+		stdout.Reset()
+		if code := runVerify(context.Background(), flags, false, &stdout, &stderr); code != ExitOK {
+			t.Fatalf("verify: exit %d", code)
+		}
+		if strings.Contains(stdout.String(), "NOT PROVEN    anything about the guest's hardware") != simulated {
+			t.Fatalf("simulated %v, and the command printed:\n%s", simulated, stdout.String())
+		}
 	}
 }

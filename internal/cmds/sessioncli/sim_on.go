@@ -50,6 +50,16 @@ func (s *simulatedTrust) engine(opts session.EngineOptions) session.Engine {
 	return engine
 }
 
+// unproven is what a verdict under a simulated authority leaves unproven:
+// everything a TEE would have proved. A command says so with every verdict
+// it prints.
+func (s *simulatedTrust) unproven() []string {
+	if s.dir == "" {
+		return nil
+	}
+	return []string{"anything about the guest's hardware: its TEE is simulated in software (--simulated-tee). Its registers are what its launcher declared, and whoever reads the authority's directory makes any quote"}
+}
+
 // simulatedEngine judges under the authority in dir and asks whoever serves
 // its documents.
 func simulatedEngine(dir string, opts session.EngineOptions) (session.Engine, error) {
