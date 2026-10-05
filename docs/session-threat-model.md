@@ -118,7 +118,11 @@ but not confidentiality.
   those are the newest it has. A verifier that cannot reach the vendor for
   longer than that sends no secret, which costs availability only, as the host
   can always cost it. Stapled documents serve verdicts that send no secret,
-  such as a binder's before it signs a bind, which holds none.
+  such as a binder's before it signs a bind, which holds none. A session that
+  already runs meets a revocation through its lease: the key service judges
+  each lease holder's platform again as documents change, and renews no lease
+  on one it now refuses ([When things
+  fail](session-state.md#when-things-fail)).
 
 ### Binding and identity
 
@@ -153,8 +157,10 @@ but not confidentiality.
   revisions](session-api.md#policy-revisions)).
 - **An outsider binds a pooled TD for itself**, to run on the platform's
   compute. An unbound guest takes the first valid bind it is sent, so the
-  daemon lets nothing reach it but its own requests and the bind of its
-  claim, and refuses `Connect` to it; TD names are random besides.
+  daemon lets nothing reach it but its own requests, the bind of its claim,
+  and a bind that claims it from the orchestrator or from a binder its pool
+  names, under an authority the pool names for that binder. It refuses
+  `Connect` to an unbound TD, and TD names are random besides.
 - **A host that sets the guest's clock.** A guest's wall clock is its host's,
   so no check rests on it: durations run on the TD's monotonic clock, which
   the host can stop but not slow, and dates such as a bind's `notAfter` are

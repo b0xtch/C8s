@@ -204,12 +204,15 @@ stored credential, only when all of these hold:
   with the vendor's documents it checked the quote against, which it fetches
   from the vendor itself once per platform, asks for again each hour and
   judges by its own clock, and newer ones in a later answer when the vendor
-  publishes them. When a newer document arrives it judges the evidence it
-  keeps again, still with no new quote, so no release rests on a document it
-  has since replaced ([Old vendor
-  documents](session-threat-model.md#launch-and-measurement)). The TD staples
-  them to its evidence, so no TD fetches them itself and no boot waits on the
-  vendor's service.
+  publishes them. When a newer document arrives it judges again, still with no
+  new quote, the evidence it keeps: each pooled TD's, so that no release rests
+  on a document it has since replaced ([Old vendor
+  documents](session-threat-model.md#launch-and-measurement)), and each lease
+  holder's, once for each platform, so that no lease is renewed on a platform
+  the vendor has since revoked or a pool no longer accepts ([When things
+  fail](session-state.md#when-things-fail)). The TD staples them to its
+  evidence, so no TD fetches them itself and no boot waits on the vendor's
+  service.
 - **Sealed to the instance key.** What is released is also encrypted with
   HPKE, under the hybrid KEM, to the encryption key that the TD's instance key
   signed, inside the attested channel. A log or a proxy that ever saw the

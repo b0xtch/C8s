@@ -351,7 +351,7 @@ spends nothing, since its own outputs wait for its own commits.
 | Call | Made by | Does |
 |---|---|---|
 | acquire | a TD whose bind names the session | for `start`, creates the record at generation 0, with this TD's lease; for `restore`, grants the lease if it is free, or at once in continuous mode, releases the stack if the bind names the latest generation, and spends its process layer unless the TD runs in continuous mode; for `fork`, releases a template's stack and creates the new session's record at generation 0, with this TD's lease |
-| renew | the lease holder | extends the lease at the holder's grant number, even once it has lapsed if no grant has followed, answered inside the attested channel with the key service's time, so no answer can be replayed |
+| renew | the lease holder | extends the lease at the holder's grant number, even once it has lapsed if no grant has followed, answered inside the attested channel with the key service's time, so no answer can be replayed; it and `advance` are refused once the vendor's documents the key service holds refuse the holder's platform |
 | advance | the lease holder | moves the generation from g to g+1 by compare-and-swap, with the new layers or journal record; releases the lease for a seal and keeps it for a commit or an epoch |
 | release | the lease holder | frees the lease at a clean end without a seal |
 | spend | the lease holder | takes from its review budget before a signal leaves |
@@ -420,6 +420,7 @@ next.
 | the host cuts a live TD off from the key service and restores the session elsewhere | the old TD stops its effects at 45 s, and the new one gets the lease after 60 s; at no moment do two copies act. In continuous mode the new one gets the lease at once, and the old one's outputs, which wait for commits it can no longer make, never leave |
 | the host offers an older seal | the key service releases keys only for the latest generation |
 | the host holds a TD past its lease and releases it | its gateways stop every effect until a renewal at its grant number succeeds, which it does only if the key service has granted the lease to no other TD meanwhile; a refused renewal ends it |
+| the vendor revokes a platform, or its TCB falls below what a pool accepts | once the key service holds the vendor's documents that say so, it renews no lease and takes no generation from a TD on that platform, after asking the TD for a fresh quote in case the platform was updated under it: the sessions there stop their effects within 45 s, at once in continuous mode, and are restored elsewhere from their last generation. Renewals rest on the newest documents the key service holds, however old, so an outage of the vendor's service delays this but stops no live session |
 
 ## The session key
 

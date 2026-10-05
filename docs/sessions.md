@@ -259,8 +259,10 @@ that is acceptable is the owner's choice, made per tenant.
  fork:    many new TDs start from one template sealed before any secret
 ```
 
-- **Start.** The daemon claims a ready TD; the owner's binder checks its
-  evidence and signs a bind; the guest takes the bind and starts the sandbox.
+- **Start.** The daemon claims a ready TD and the owner's binder checks its
+  evidence and signs a bind, or a binder that checked the pool's ready TDs
+  ahead signs a bind for one, which claims it; the guest takes the bind and
+  starts the sandbox.
 - **Hold and release** stop and restart the TD's vCPUs, keeping its memory.
 - **Commit** records the session's files as a new layer while it runs,
   without stopping it. In **continuous mode** the guest commits the
