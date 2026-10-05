@@ -571,6 +571,13 @@ func TestStartRefusesACredentialItCannotSeal(t *testing.T) {
 			t.Errorf("%s: start said %q", name, stderr.String())
 		}
 	}
+	// The pool's guest boots beside the starts that were refused, and none
+	// of them waited for it.
+	for deadline := time.Now().Add(10 * time.Second); host.Runner.Booted() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the pool never launched its guest")
+		}
+	}
 	if n := host.Runner.All()[0].Asked(session.PathBind); n != 0 {
 		t.Fatalf("a guest was sent %d binds for starts that were refused", n)
 	}
