@@ -336,12 +336,15 @@ learns whose it is only from its bind.
 ## The bind
 
 A bind is a canonical JSON document (RFC 8785), `c8s-bind/v1`, signed by the
-owner's authority. The guest refuses a bind with a field it does not know.
-The fields and purposes an agent accepts are its image's bind schema. The
-build writes it from the agent's own definitions, and publishes it as it does
-the disclosure schema: on the image's verity root, beside its manifest, and
-in the release log with its reference values
-([session-disclosure.md](session-disclosure.md#rules), rule 3).
+owner's authority. The guest refuses a bind with a field it does not know. The
+fields and purposes an agent accepts are its image's bind schema, which also
+gives some fields a default, such as `none` for `process`: a bind leaves out a
+field at its default, and the guest refuses one that writes it out, so that a
+policy is always written one way. The build writes the schema from the agent's
+own definitions, and publishes it as it does the disclosure schema: on the
+image's verity root, beside its manifest, and in the release log with its
+reference values ([session-disclosure.md](session-disclosure.md#rules),
+rule 3).
 
 | Field | What it fixes |
 |---|---|
