@@ -719,7 +719,7 @@ template sealed before any secret, and each fork makes its own keys.
 | agent-sandbox | Session API | What changes |
 |---|---|---|
 | `SandboxWarmPool` | `CreatePool`, `UpdatePool` | the template's pod is a c8s launcher for one class and image |
-| `SandboxClaim` | `Start`, through the binder | environment and volumes arrive in the bind after the claim, so they no longer cost a cold start |
+| `SandboxClaim` | `Start`, through the binder | volumes arrive in the bind after the claim, and an environment with a command, sealed with the bind or over `Connect`, so neither costs a cold start |
 | `Sandbox` suspended, then running | `Seal`, then `Restore` | the seal is made, and stays sealed, inside the TD |
 | `shutdownTime`, `shutdownPolicy` | `Destroy` | |
 | the sandbox router | `Connect` | TLS ends in the guest, not at the router |
