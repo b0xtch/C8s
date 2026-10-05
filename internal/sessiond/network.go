@@ -3,20 +3,44 @@ package sessiond
 import (
 	"fmt"
 	"net/netip"
+	"regexp"
 	"strconv"
 	"strings"
 )
 
 const (
-	// tapPrefix starts the name of every TD's tap. The host's packet filter
-	// matches on it, so its rules hold for a tap made after they were loaded.
-	tapPrefix = "c8st"
-	// filterTable is the daemon's table in the host's packet filter.
+	// defaultTapPrefix starts the name of every TD's tap unless the
+	// configuration names another. The host's packet filter matches on the
+	// prefix, so its rules hold for a tap made after they were loaded.
+	defaultTapPrefix = "c8st"
+	// filterTable is the daemon's table in the host's packet filter, for a
+	// daemon whose taps have that prefix.
 	filterTable = "c8s_sessions"
 )
 
+// tapPrefixRE bounds a prefix: with a slot's number it is an interface name.
+var tapPrefixRE = regexp.MustCompile(`^[a-z][a-z0-9]{0,9}$`)
+
+// tapPrefix starts the name of every TD's tap.
+func (n *Network) tapPrefix() string {
+	if n.TapPrefix == "" {
+		return defaultTapPrefix
+	}
+	return n.TapPrefix
+}
+
+// table is the daemon's table in the host's packet filter. A daemon with a
+// prefix of its own has a table of its own, so that a second daemon on a
+// host replaces nothing of the first's.
+func (n *Network) table() string {
+	if n.tapPrefix() == defaultTapPrefix {
+		return filterTable
+	}
+	return filterTable + "_" + n.tapPrefix()
+}
+
 // tapName is the tap of the TD in slot.
-func tapName(slot int) string { return tapPrefix + strconv.Itoa(slot) }
+func (n *Network) tapName(slot int) string { return n.tapPrefix() + strconv.Itoa(slot) }
 
 // slotAddresses cuts the four addresses of a slot from the guests' block:
 // the host's end of the tap, and the guest's.
@@ -49,10 +73,10 @@ func slotMAC(slot int) string {
 // interface alone, under the host's address. reach lists the destinations
 // every guest may connect to whatever else is closed, on the host or beyond
 // it: a pool's key service.
-func filterRuleset(egress string, reach []netip.AddrPort) string {
-	taps := `"` + tapPrefix + `*"`
+func (n *Network) filterRuleset(egress string, reach []netip.AddrPort) string {
+	taps := `"` + n.tapPrefix() + `*"`
 	var b strings.Builder
-	fmt.Fprintf(&b, "table inet %s\ndelete table inet %s\ntable inet %s {\n", filterTable, filterTable, filterTable)
+	fmt.Fprintf(&b, "table inet %[1]s\ndelete table inet %[1]s\ntable inet %[1]s {\n", n.table())
 	// The counters say what a guest tried: nothing of a tenant's is in them.
 	fmt.Fprintf(&b, `	chain prerouting {
 		type filter hook prerouting priority raw; policy accept;

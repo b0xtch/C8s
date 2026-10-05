@@ -191,17 +191,62 @@ func TestSlotAddresses(t *testing.T) {
 	if a, b := slotMAC(0), slotMAC(0x01ffff); a != "02:c8:53:00:00:00" || b != "02:c8:53:01:ff:ff" {
 		t.Errorf("slot MACs %s and %s", a, b)
 	}
-	if name := tapName(16383); len(name) > 15 {
-		t.Errorf("tap name %s is longer than an interface name may be", name)
+	// The longest prefix with the last slot of the largest block is still an
+	// interface's name.
+	for _, network := range []*Network{{}, {TapPrefix: "c8s0123456"}} {
+		if name := network.tapName(16383); len(name) > 15 {
+			t.Errorf("tap name %s is longer than an interface name may be", name)
+		}
+	}
+}
+
+// A daemon's taps and its table in the packet filter are named for its
+// prefix, so that a second daemon on a host has its own and replaces nothing
+// of the first's. With none configured both have the names they always had.
+func TestTapPrefixNamesADaemonsTapsAndItsTable(t *testing.T) {
+	plain := &Network{}
+	if plain.tapName(7) != "c8st7" || plain.table() != "c8s_sessions" {
+		t.Fatalf("a daemon with no prefix of its own: tap %s, table %s", plain.tapName(7), plain.table())
+	}
+	same := &Network{TapPrefix: "c8st"}
+	if same.tapName(7) != "c8st7" || same.table() != "c8s_sessions" {
+		t.Fatalf("a daemon that names the usual prefix: tap %s, table %s", same.tapName(7), same.table())
+	}
+	second := &Network{TapPrefix: "c8su"}
+	if second.tapName(7) != "c8su7" || second.table() != "c8s_sessions_c8su" {
+		t.Fatalf("a second daemon: tap %s, table %s", second.tapName(7), second.table())
+	}
+	rules := second.filterRuleset("eth0", []netip.AddrPort{netip.MustParseAddrPort("192.0.2.7:8443")})
+	if !strings.HasPrefix(rules, "table inet c8s_sessions_c8su\ndelete table inet c8s_sessions_c8su\ntable inet c8s_sessions_c8su {\n") {
+		t.Fatalf("a second daemon's ruleset replaces another table than its own:\n%s", rules)
+	}
+	if strings.Contains(rules, "c8st") || strings.Count(rules, `"c8su*"`) < 8 {
+		t.Fatalf("a second daemon's rules match other taps than its own:\n%s", rules)
+	}
+	launch := bundle(t)
+	body := func(network string) string {
+		return strings.Replace(strings.ReplaceAll(validConfig, "LAUNCH", launch), "network: {mode: tap, guestCIDR: 10.99.0.0/24, dns: [192.0.2.53]}", network, 1)
+	}
+	cfg, err := LoadConfig(writeConfig(t, body("network: {mode: tap, guestCIDR: 10.99.0.0/24, tapPrefix: c8su}")))
+	if err != nil || cfg.Network.tapPrefix() != "c8su" {
+		t.Fatalf("a configuration that names a prefix: %v", err)
+	}
+	for _, bad := range []string{"C8su", "8su", "c8s-u", "c8s_u", "c8s01234567", "c8s u"} {
+		if _, err := LoadConfig(writeConfig(t, body("network: {mode: tap, guestCIDR: 10.99.0.0/24, tapPrefix: \""+bad+"\"}"))); err == nil || !strings.Contains(err.Error(), "tapPrefix") {
+			t.Errorf("tapPrefix %q: %v", bad, err)
+		}
+	}
+	if _, err := LoadConfig(writeConfig(t, body("network: {mode: user, firstPort: 39000, tapPrefix: c8su}"))); err == nil || !strings.Contains(err.Error(), "belong to mode tap") {
+		t.Errorf("a prefix for taps in a mode that has none: %v", err)
 	}
 }
 
 func TestFilterRuleset(t *testing.T) {
-	closed := filterRuleset("", nil)
+	closed := (&Network{}).filterRuleset("", nil)
 	if strings.Contains(closed, "masquerade") || strings.Contains(closed, "accept\n\t\tiifname \"c8st*\" counter drop\n\t}\n}") {
 		t.Errorf("with no egress interface a guest's traffic is let out:\n%s", closed)
 	}
-	open := filterRuleset("eth0", []netip.AddrPort{netip.MustParseAddrPort("192.0.2.7:8443")})
+	open := (&Network{}).filterRuleset("eth0", []netip.AddrPort{netip.MustParseAddrPort("192.0.2.7:8443")})
 	for _, rule := range []string{
 		`iifname "c8st*" oifname "eth0" accept`,
 		`iifname "c8st*" oifname "eth0" masquerade`,

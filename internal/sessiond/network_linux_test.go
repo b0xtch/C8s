@@ -112,14 +112,14 @@ func newWorld(t *testing.T) *world {
 		w.in(peerNS, "ip", "link", "set", "eth0", "up")
 		w.in(peerNS, "ip", "route", "add", "default", "via", hostAddr)
 	}
-	link(tapName(0), hostEnd1, "g1", guest1)
-	link(tapName(1), hostEnd2, "g2", guest2)
+	link((&Network{}).tapName(0), hostEnd1, "g1", guest1)
+	link((&Network{}).tapName(1), hostEnd2, "g2", guest2)
 	link("up0", hostUp, "up", upstream)
 	w.in("host", "sysctl", "-q", "-w", "net.ipv4.ip_forward=1")
 	// The reverse path filter is the kernel's own guard against a spoofed
 	// source. Off, so that the ruleset's guard is the one under test.
 	w.in("host", "sysctl", "-q", "-w", "net.ipv4.conf.all.rp_filter=0", "net.ipv4.conf.default.rp_filter=0")
-	for _, iface := range []string{tapName(0), tapName(1), "up0"} {
+	for _, iface := range []string{(&Network{}).tapName(0), (&Network{}).tapName(1), "up0"} {
 		w.in("host", "sysctl", "-q", "-w", "net.ipv4.conf."+iface+".rp_filter=0")
 	}
 	w.listen("host", "0.0.0.0:2222")
@@ -147,9 +147,10 @@ func (w *world) in(ns string, args ...string) {
 func (w *world) load(egress string, reach ...netip.AddrPort) {
 	w.t.Helper()
 	cmd := exec.Command("ip", "netns", "exec", w.ns("host"), "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(filterRuleset(egress, reach))
+	rules := (&Network{}).filterRuleset(egress, reach)
+	cmd.Stdin = strings.NewReader(rules)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		w.t.Fatalf("load the ruleset: %v: %s\n%s", err, out, filterRuleset(egress, reach))
+		w.t.Fatalf("load the ruleset: %v: %s\n%s", err, out, rules)
 	}
 }
 
@@ -264,4 +265,49 @@ func TestFilterEgress(t *testing.T) {
 	if seen := w.dial("g1", "-", upstream+":8080"); seen != hostUp {
 		t.Errorf("the guest's own address stopped working: seen from %q", seen)
 	}
+}
+
+// Two daemons on one host each load a table of their own. A daemon that
+// loads its ruleset again replaces its own table and leaves the other's.
+func TestSecondDaemonsTableLeavesTheFirstsAlone(t *testing.T) {
+	w := newWorld(t)
+	first, second := &Network{}, &Network{TapPrefix: "c8su"}
+	load := func(n *Network, reach ...netip.AddrPort) {
+		t.Helper()
+		cmd := exec.Command("ip", "netns", "exec", w.ns("host"), "nft", "-f", "-")
+		cmd.Stdin = strings.NewReader(n.filterRuleset("", reach))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("load %s: %v: %s", n.table(), err, out)
+		}
+	}
+	listed := func(table string) string {
+		t.Helper()
+		out, err := exec.Command("ip", "netns", "exec", w.ns("host"), "nft", "list", "table", "inet", table).CombinedOutput()
+		if err != nil {
+			t.Fatalf("list %s: %v: %s", table, err, out)
+		}
+		return string(out)
+	}
+	opened := netip.MustParseAddrPort("192.0.2.7:8443")
+	load(first, opened)
+	load(second)
+	if rules := listed(first.table()); !strings.Contains(rules, "192.0.2.7") || strings.Contains(rules, "c8su") {
+		t.Fatalf("the first daemon's table after the second loaded its own:\n%s", rules)
+	}
+	if rules := listed(second.table()); strings.Contains(rules, "192.0.2.7") || strings.Contains(rules, `"c8st*"`) || !strings.Contains(rules, `"c8su*"`) {
+		t.Fatalf("the second daemon's table:\n%s", rules)
+	}
+	// The second loads again, as a daemon that restarts does.
+	load(second, netip.MustParseAddrPort("192.0.2.9:8443"))
+	if rules := listed(first.table()); !strings.Contains(rules, "192.0.2.7") || strings.Contains(rules, "192.0.2.9") {
+		t.Fatalf("the first daemon's table after the second loaded again:\n%s", rules)
+	}
+	if rules := listed(second.table()); !strings.Contains(rules, "192.0.2.9") {
+		t.Fatalf("the second daemon's table after it loaded again:\n%s", rules)
+	}
+	// With both loaded, the first's guests are held as before, and reached
+	// as before: the second's rules match none of the first's taps.
+	w.blocked("g1", hostEnd1+":2222", "a guest and its host, with a second daemon's table loaded")
+	w.blocked("g1", guest2+":8443", "two guests, with a second daemon's table loaded")
+	w.reaches("host", guest1+":8443", "the daemon's road to a guest, with a second daemon's table loaded")
 }

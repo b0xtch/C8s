@@ -155,6 +155,11 @@ type Network struct {
 	// address:port over TCP: the key service of its pool, for one
 	// (NetworkTap).
 	Reach []string `yaml:"reach,omitempty"`
+	// TapPrefix starts the name of each TD's tap (NetworkTap), and names
+	// the daemon's table in the packet filter. A second daemon on a host
+	// takes one of its own, which neither begins the other's: each then
+	// matches its own taps alone. Empty is "c8st".
+	TapPrefix string `yaml:"tapPrefix,omitempty"`
 	// DNS are the resolvers a guest is told, up to three.
 	DNS []string `yaml:"dns,omitempty"`
 	// FirstPort is the loopback port of the first TD (NetworkUser).
@@ -349,6 +354,9 @@ func (n *Network) validate(capacity int) error {
 		if n.FirstPort != 0 {
 			return errors.New("firstPort belongs to mode user")
 		}
+		if n.TapPrefix != "" && !tapPrefixRE.MatchString(n.TapPrefix) {
+			return fmt.Errorf("tapPrefix %q is not a lower-case letter and up to nine more letters or digits", n.TapPrefix)
+		}
 		if len(n.Reach) > maxReach {
 			return fmt.Errorf("reach lists more than %d destinations", maxReach)
 		}
@@ -356,8 +364,8 @@ func (n *Network) validate(capacity int) error {
 			return err
 		}
 	case NetworkUser:
-		if n.GuestCIDR != "" || n.EgressInterface != "" || len(n.Reach) > 0 {
-			return errors.New("guestCIDR, egressInterface and reach belong to mode tap")
+		if n.GuestCIDR != "" || n.EgressInterface != "" || len(n.Reach) > 0 || n.TapPrefix != "" {
+			return errors.New("guestCIDR, egressInterface, reach and tapPrefix belong to mode tap")
 		}
 		if n.FirstPort < 1024 || n.FirstPort+capacity > 65535 {
 			return fmt.Errorf("firstPort %d leaves no room for %d loopback ports above 1023", n.FirstPort, capacity)

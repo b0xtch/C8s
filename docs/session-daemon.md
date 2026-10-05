@@ -233,6 +233,7 @@ pools:
 | `pools[].imageStore` | A store of public images (`c8s session image-store write`) handed read-only to every guest, so that a bind which names one starts it without a pull. |
 | `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). The certificate may be self-signed. With none, nobody watches the pool. An entry is that digest alone, or a `key` with `authorities`: the tenants' authority keys, named the same way (`openssl pkey -in authority.key -pubout -outform DER \| sha256sum`), whose binds that binder may claim a TD of the pool with. A binder with no authority watches and claims nothing, and an orchestrator needs no entry to claim with a bind. |
 | `vmm.console` | Attach each guest's console to its launcher's log. For dev images only: a locked image prints nothing there. |
+| `network.tapPrefix` | What the name of each TD's tap begins with, a lower-case letter and up to nine more letters or digits. Default `c8st`. A second daemon on a host takes another: see [Network](#network). |
 
 Relative paths are taken from the configuration file's directory. An unknown
 key is an error.
@@ -270,6 +271,12 @@ What a sandbox may reach is decided a second time inside the guest, by the
 egress policy of its bind, which the host cannot change. The host's rules are
 the outer wall: they keep a tenant's guest away from the host's own services
 and from other tenants whatever the guest does.
+
+Two daemons can share a host. The second names a `tapPrefix` of its own, and
+with it a table of its own, `inet c8s_sessions_<prefix>`, so that each daemon
+loads and replaces its own rules alone. Neither prefix may begin the other:
+a daemon's rules match every tap whose name starts with its prefix. Each
+daemon also needs a `guestCIDR`, a `stateDir` and a port of its own.
 
 `user` mode gives a guest the VMM's user-mode stack, with its TLS port
 forwarded to a loopback port. It needs no privilege and filters nothing. It

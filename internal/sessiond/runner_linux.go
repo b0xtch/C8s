@@ -83,7 +83,7 @@ func NewQEMURunner(cfg *Config, log *slog.Logger) (Runner, error) {
 		return nil, err
 	}
 	nft := exec.Command("nft", "-f", "-")
-	nft.Stdin = strings.NewReader(filterRuleset(egress, reach))
+	nft.Stdin = strings.NewReader(cfg.Network.filterRuleset(egress, reach))
 	if out, err := nft.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("load the guests' packet filter: %w: %s", err, bytes.TrimSpace(out))
 	}
@@ -185,7 +185,7 @@ const tapAskEvery = "20"
 // up. The tap lives as long as a descriptor of it is open, which is as long
 // as its VMM runs.
 func (r *QEMURunner) tap(slot int, host netip.Addr) (tap, vhost *os.File, err error) {
-	name := tapName(slot)
+	name := r.cfg.Network.tapName(slot)
 	if tap, err = sessionlauncher.OpenTap(name); err != nil {
 		return nil, nil, err
 	}

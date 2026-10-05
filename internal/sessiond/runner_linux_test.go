@@ -193,39 +193,42 @@ func TestTapAsksForItsGuestOften(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() {
-		// A network namespace of this test's own. The thread that enters it
-		// never leaves, and ends with this goroutine.
-		runtime.LockOSThread()
-		done <- func() error {
-			if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
-				return fmt.Errorf("a network namespace: %w", err)
-			}
-			tap, vhost, err := (&QEMURunner{}).tap(slot, host)
-			if err != nil {
-				return err
-			}
-			defer tap.Close()
-			if vhost != nil {
-				defer vhost.Close()
-			}
-			link, err := netlink.LinkByName(tapName(slot))
-			if err != nil {
-				return err
-			}
-			addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
-			if err != nil || len(addrs) != 1 || !addrs[0].IP.Equal(net.IP(host.AsSlice())) {
-				return fmt.Errorf("the host's end has addresses %v, %v", addrs, err)
-			}
-			every, err := os.ReadFile("/proc/sys/net/ipv4/neigh/" + tapName(slot) + "/retrans_time_ms")
-			if err != nil || strings.TrimSpace(string(every)) != tapAskEvery {
-				return fmt.Errorf("the guest's end is asked every %q ms, %v: want %s", every, err, tapAskEvery)
-			}
-			return nil
+	// A daemon's taps carry its prefix: the usual one, or its own.
+	for prefix, name := range map[string]string{"": "c8st3", "c8su": "c8su3"} {
+		done := make(chan error, 1)
+		go func() {
+			// A network namespace of this test's own. The thread that enters it
+			// never leaves, and ends with this goroutine.
+			runtime.LockOSThread()
+			done <- func() error {
+				if err := unix.Unshare(unix.CLONE_NEWNET); err != nil {
+					return fmt.Errorf("a network namespace: %w", err)
+				}
+				tap, vhost, err := (&QEMURunner{cfg: &Config{Network: Network{TapPrefix: prefix}}}).tap(slot, host)
+				if err != nil {
+					return err
+				}
+				defer tap.Close()
+				if vhost != nil {
+					defer vhost.Close()
+				}
+				link, err := netlink.LinkByName(name)
+				if err != nil {
+					return fmt.Errorf("the tap of slot %d under prefix %q is not %s: %w", slot, prefix, name, err)
+				}
+				addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+				if err != nil || len(addrs) != 1 || !addrs[0].IP.Equal(net.IP(host.AsSlice())) {
+					return fmt.Errorf("the host's end has addresses %v, %v", addrs, err)
+				}
+				every, err := os.ReadFile("/proc/sys/net/ipv4/neigh/" + name + "/retrans_time_ms")
+				if err != nil || strings.TrimSpace(string(every)) != tapAskEvery {
+					return fmt.Errorf("the guest's end is asked every %q ms, %v: want %s", every, err, tapAskEvery)
+				}
+				return nil
+			}()
 		}()
-	}()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
