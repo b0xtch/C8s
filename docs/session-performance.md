@@ -126,16 +126,19 @@ memory-acceptance floor; work inside within the published floors.
   the cost of confidentiality from the cost of the VMM. A session image stops
   without a TEE, so this baseline runs a development build of it whose TEE is
   simulated in software: the same image, firmware and kernel but for that,
-  with measurements of its own and quotes in the vendor's format under a
-  development root of the same algorithms, signed in the guest, so that every
-  check costs what it costs on TDX. The difference is then what the hardware
-  and the vendor's quoting add: memory acceptance, the TDX module's exits,
-  bounce buffers for device I/O and the quoting service. Only a development
-  build of a verifier or key service can accept that root, and then in place
-  of the vendor's, never beside it; a release build has no option that would,
-  and a session image never falls back to the simulation. Where the guest's
-  own work differs without a TEE, the record says so, as when a plain VM's
-  kernel zeroes all its memory at boot where a TD's accepts it as it goes.
+  with measurements of its own, which its launcher declares from the image's
+  manifest where the TDX module would measure them, and quotes in the vendor's
+  format under a development root of the same algorithms, signed in the guest,
+  on a platform that is always UpToDate, so that every check costs what it
+  costs on TDX. The difference is then what the hardware and the vendor's
+  quoting add: memory acceptance, the TDX module's exits, bounce buffers for
+  device I/O and the quoting service. Only a development build of a verifier
+  or key service can accept that root, and then in place of the vendor's,
+  never beside it; a release build has no option that would, a session image
+  never falls back to the simulation, and a simulation build refuses to run in
+  a TD. Where the guest's own work differs without a TEE, the record says so,
+  as when a plain VM's kernel zeroes all its memory at boot where a TD's
+  accepts it as it goes.
 - **The same settings.** Power settings (governor, C-states, turbo) are pinned
   and recorded, versions are named, and the sides interleave round by round
   within one run. Nothing else runs on the host during a run: no TD or VM but
