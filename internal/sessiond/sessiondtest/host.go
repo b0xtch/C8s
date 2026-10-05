@@ -152,13 +152,17 @@ type Host struct {
 	CAFile string
 	// Orchestrator is a certificate the daemon takes claims under, with its
 	// files: the pool's configuration names it as a binder. Other is one of
-	// the same authority that no pool names. Stranger is one of an authority
-	// the daemon does not know.
+	// the same authority that no pool names, and Ended one of that authority
+	// whose time is over. Stranger is one of an authority the daemon does
+	// not know. Binder is one of its holder's own making, which nobody
+	// signed: the pool's configuration names its key as a binder's.
 	Orchestrator         tls.Certificate
 	OrchestratorCertFile string
 	OrchestratorKeyFile  string
 	Other                tls.Certificate
+	Ended                tls.Certificate
 	Stranger             tls.Certificate
+	Binder               tls.Certificate
 
 	// What a binder pins: the image, with its manifest, and the pool's
 	// launch key, with its file.
@@ -219,9 +223,13 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 		t.Fatal(err)
 	}
 	dir := h.pki()
-	binder, err := daemon.BinderName(h.Orchestrator.Leaf)
-	if err != nil {
-		t.Fatal(err)
+	var binders []string
+	for _, cert := range []*tls.Certificate{&h.Orchestrator, &h.Binder} {
+		binder, err := daemon.BinderName(cert.Leaf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binders = append(binders, binder)
 	}
 	h.Config = &sessiond.Config{
 		Listen: "127.0.0.1:0", Host: "host-a", StateDir: t.TempDir(), Capacity: 4,
@@ -232,7 +240,7 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 		Classes: map[string]sessiond.Class{"sim": {VCPUs: 1, Memory: "1G"}},
 		Pools: []sessiond.Pool{{
 			ImageDir: t.TempDir(), LaunchDir: filepath.Dir(first.LaunchKeyPath), Depth: depth,
-			BindGrace: sessiond.Duration(time.Second), Binders: []string{binder},
+			BindGrace: sessiond.Duration(time.Second), Binders: binders,
 		}},
 	}
 	if mutate != nil {
@@ -249,6 +257,7 @@ func newHost(t testing.TB, depth int, mutate func(*sessiond.Config), keyService 
 // returns the directory that holds their files.
 func (h *Host) pki() string {
 	h.t.Helper()
+	ends := time.Now().Add(time.Hour)
 	issue := func(name string, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (tls.Certificate, *x509.Certificate, *ecdsa.PrivateKey) {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -260,7 +269,7 @@ func (h *Host) pki() string {
 		}
 		template := &x509.Certificate{
 			SerialNumber: serial, Subject: pkix.Name{CommonName: name},
-			NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+			NotBefore: time.Now().Add(-time.Hour), NotAfter: ends,
 			KeyUsage:    x509.KeyUsageDigitalSignature,
 			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 			IPAddresses: []net.IP{net.ParseIP("127.0.0.1")},
@@ -295,8 +304,12 @@ func (h *Host) pki() string {
 	var orchestratorKey *ecdsa.PrivateKey
 	h.Orchestrator, _, orchestratorKey = issue("orchestrator", ca, caKey)
 	h.Other, _, _ = issue("another orchestrator", ca, caKey)
+	ends = time.Now().Add(-time.Minute)
+	h.Ended, _, _ = issue("an orchestrator of before", ca, caKey)
+	ends = time.Now().Add(time.Hour)
 	_, other, otherKey := issue("another authority", nil, nil)
 	h.Stranger, _, _ = issue("stranger", other, otherKey)
+	h.Binder, _, _ = issue("a binder of its own making", nil, nil)
 	h.Roots = x509.NewCertPool()
 	h.Roots.AddCert(ca)
 

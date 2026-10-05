@@ -456,11 +456,18 @@ func TestCallersAreHeldToTheirCertificates(t *testing.T) {
 	wantCode(t, err, codes.Unauthenticated, "a claim with no certificate")
 	_, err = anyone.Destroy(ctx(t), requestID(t), "s1")
 	wantCode(t, err, codes.Unauthenticated, "a destroy with no certificate")
-	// A certificate of another authority is as good as none. A client that
-	// presents it anyway fails the handshake instead.
-	_, err = h.Client(&h.Stranger).Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 0)
-	if code := status.Code(err); code != codes.Unauthenticated && code != codes.Unavailable {
-		t.Fatalf("a claim under a stranger's certificate: %v", err)
+	// A certificate of another authority is as good as none, and so is one
+	// of the orchestrators' authority whose time is over. The handshake takes
+	// either: it proves a key, and each call decides whose.
+	for name, cert := range map[string]*tls.Certificate{"a stranger's certificate": &h.Stranger, "a certificate that has ended": &h.Ended} {
+		c := h.Client(cert)
+		_, err = c.Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 0)
+		wantCode(t, err, codes.Unauthenticated, "a claim under "+name)
+		_, err = c.Destroy(ctx(t), requestID(t), "s1")
+		wantCode(t, err, codes.Unauthenticated, "a destroy under "+name)
+		if _, err := c.Evidence(ctx(t), "no-such-td"); status.Code(err) == codes.Unauthenticated {
+			t.Fatalf("evidence under %s: %v", name, err)
+		}
 	}
 
 	s, err := h.begin(h.AsOrchestrator(), o, "s1")

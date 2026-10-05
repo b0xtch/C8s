@@ -3,6 +3,7 @@ package sessiond
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
@@ -73,6 +74,10 @@ type Daemon struct {
 	relays chan struct{}
 	// watchers counts the WatchReady streams in flight.
 	watchers int
+	// orchestrators is the authority an orchestrator's certificate chains
+	// to, and chains the outcome of that check for the certificates seen.
+	orchestrators *x509.CertPool
+	chains        chains
 	// stop is closed when Run's context ends: the daemon's own work stops,
 	// and its TDs run on.
 	stop chan struct{}

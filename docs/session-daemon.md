@@ -109,10 +109,18 @@ reach the guest through the daemon.
 
 | Call | Caller | Needs |
 |---|---|---|
-| `Claim`, `Bind`, `Destroy` | an orchestrator | a client certificate of the authority in `tls.clientCA` |
-| `WatchReady` | a binder the pool names | such a certificate whose public key the pool's `binders` lists: a stream shows how fast the pool refills, which is every tenant's starts together |
+| `Claim`, `Bind`, `Destroy` | an orchestrator | a client certificate that chains to the authority in `tls.clientCA` |
+| `WatchReady` | a binder the pool names | a client certificate whose public key the pool's `binders` lists, whoever issued it: a stream shows how fast the pool refills, which is every tenant's starts together |
 | `GetEvidence` | anyone | nothing: what a guest serves to anyone is public |
 | `Connect` | anyone | nothing at the daemon: the guest authenticates every request under the keys its bind names |
+
+The handshake asks a caller for a certificate and proves that it holds the
+key of the one it presents, and nothing more. Each call then decides whose
+certificate it takes. An orchestrator's must chain to the authority, which
+the daemon checks once per certificate and remembers until the chain's first
+certificate ends. A binder's need not: the pool names its key, so a binder
+may present a certificate of its own making, and that key opens the pool's
+stream and no orchestrator call.
 
 A TD carries connections only once it is bound. Before that, the only bytes
 that reach its guest are the daemon's own requests and the bind of its claim,
@@ -161,7 +169,7 @@ pools:
 | `pools[].depth` | How many TDs the pool keeps ready. Two boot at a time. |
 | `pools[].bindGrace` | How long a claim waits for its bind. After it the TD returns to the pool: the daemon sent it nothing, so nothing of a tenant entered it. |
 | `pools[].imageStore` | A store of public images (`c8s session image-store write`) handed read-only to every guest, so that a bind which names one starts it without a pull. |
-| `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). With none, nobody watches the pool. |
+| `pools[].binders` | The callers that may watch the pool's ready TDs with `WatchReady`, each by the SHA-256 of the public key in its certificate, as `sha256:` and 64 hex digits (`openssl x509 -in cert.pem -noout -pubkey \| openssl pkey -pubin -outform DER \| sha256sum`). The certificate may be self-signed. With none, nobody watches the pool. |
 | `vmm.console` | Attach each guest's console to its launcher's log. For dev images only: a locked image prints nothing there. |
 
 Relative paths are taken from the configuration file's directory. An unknown
@@ -367,8 +375,9 @@ evidence of one guest, and lists them in the two launch documents. It checks
 that a session's command reads the stored credential and one that a key of
 its bind released, that a first command and a credential sealed with a bind
 reach the guest with it, and, given the timing tool, that a binder the pool
-names finds a claimed guest judged ahead while a caller it does not name is
-shown nothing. Then what must be refused:
+names by its key watches under a certificate of its own making and finds a
+claimed guest judged ahead, while that certificate claims nothing and a
+caller the pool does not name is shown nothing. Then what must be refused:
 
 | Refused | By whom |
 |---|---|
@@ -380,7 +389,7 @@ shown nothing. Then what must be refused:
 | a sandbox image whose content was changed | the guest |
 | a stranger's key; one session's binding on another session's TD | the guest |
 | a bind to a guest of a pool the key service does not serve | the guest, which is never ready |
-| a destroy without an orchestrator's certificate | the daemon |
+| a destroy without an orchestrator's certificate; a claim under a binder's own certificate | the daemon |
 
 With dev images it also probes, from inside a guest, every address of its
 host and of the other guests, and requires the host's filter to have counted

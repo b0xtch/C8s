@@ -3,6 +3,7 @@ package sessiond_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -134,6 +135,7 @@ func TestWatchReadyIsForThePoolsBindersAlone(t *testing.T) {
 		want   codes.Code
 	}{
 		"an orchestrator the pool does not name": {h.Client(&h.Other), sessiondtest.Pool, codes.PermissionDenied},
+		"a stranger the pool does not name":      {h.Client(&h.Stranger), sessiondtest.Pool, codes.PermissionDenied},
 		"a caller with no certificate":           {h.Client(nil), sessiondtest.Pool, codes.Unauthenticated},
 		"a pool the host does not have":          {h.AsOrchestrator(), "another", codes.NotFound},
 	} {
@@ -145,16 +147,43 @@ func TestWatchReadyIsForThePoolsBindersAlone(t *testing.T) {
 			t.Errorf("%s was shown %d TDs", name, n)
 		}
 	}
-	// A certificate of an authority the daemon does not know opens no
-	// connection at all.
-	if w := watch(t, h.Client(&h.Stranger), sessiondtest.Pool); w.refused(t) == codes.OK || len(w.seen()) != 0 {
-		t.Error("a stranger watched the pool")
-	}
 
 	// A pool that names nobody is watched by nobody.
 	closed := newHost(t, 1, func(c *sessiond.Config) { c.Pools[0].Binders = nil })
 	if code := watch(t, closed.AsOrchestrator(), sessiondtest.Pool).refused(t); code != codes.PermissionDenied {
 		t.Errorf("a pool that names no binder was watched: %s", code)
+	}
+}
+
+// A pool's binder is named by its key, and needs no certificate of the
+// orchestrators' authority: one of its own making opens the pool's stream.
+// That key opens no orchestrator call.
+func TestWatchReadyIsOpenedByThePinnedKeyAlone(t *testing.T) {
+	h := newHost(t, 1, nil)
+	binder := h.Client(&h.Binder)
+	w := watch(t, binder, sessiondtest.Pool)
+	eventually(t, "a binder with a certificate of its own is shown the pool's ready TD", func() bool { return len(w.seen()) == 1 })
+	w.stop()
+	_, err := binder.Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 0)
+	wantCode(t, err, codes.Unauthenticated, "a claim under a binder's own certificate")
+	_, err = binder.Destroy(ctx(t), requestID(t), "s1")
+	wantCode(t, err, codes.Unauthenticated, "a destroy under a binder's own certificate")
+	// Who issued a certificate says nothing of its key: one of the
+	// orchestrators' authority that has ended still shows the key the pool
+	// would have to name, and it names another.
+	if code := watch(t, h.Client(&h.Ended), sessiondtest.Pool).refused(t); code != codes.PermissionDenied {
+		t.Fatalf("a key the pool does not name, under a certificate that has ended: %s", code)
+	}
+	// The orchestrator still claims, call after call.
+	c := h.AsOrchestrator()
+	for i := range 3 {
+		name := fmt.Sprintf("o%d", i)
+		if _, err := c.Claim(ctx(t), requestID(t), sessiondtest.Pool, name, 5*time.Second); err != nil {
+			t.Fatalf("the orchestrator's claim: %v", err)
+		}
+		if _, err := c.Destroy(ctx(t), requestID(t), name); err != nil {
+			t.Fatalf("the orchestrator's destroy: %v", err)
+		}
 	}
 }
 

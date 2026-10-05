@@ -7,8 +7,6 @@ import (
 	"slices"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
@@ -119,17 +117,14 @@ func readyEvidence(t *td) *sessionv1alpha1.Evidence {
 }
 
 // watches reports whether the caller of ctx is one of the binders pool's
-// configuration names: the public key of the certificate it presented, which
-// the server verified, is one of them.
+// configuration names: the public key of the certificate it presented, whose
+// private key the handshake proved it holds, is one of them. Who issued the
+// certificate does not matter, and is not checked.
 func watches(ctx context.Context, pool *Pool) bool {
-	p, ok := peer.FromContext(ctx)
-	if !ok {
+	certs := presented(ctx)
+	if len(certs) == 0 {
 		return false
 	}
-	info, ok := p.AuthInfo.(credentials.TLSInfo)
-	if !ok || len(info.State.VerifiedChains) == 0 || len(info.State.VerifiedChains[0]) == 0 {
-		return false
-	}
-	digest, err := session.InstanceKeyDigest(info.State.VerifiedChains[0][0].PublicKey)
+	digest, err := session.InstanceKeyDigest(certs[0].PublicKey)
 	return err == nil && slices.Contains(pool.Binders, digest)
 }

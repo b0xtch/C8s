@@ -147,9 +147,10 @@ finish() {
 # A guest's VMM, by the name its launcher gave it.
 guests() { pgrep -cf "[q]emu-system.*guest=$1"; }
 
-# The daemon's certificate and two orchestrators', under one authority, and
-# the keys of two tenants and a stranger. The pool names the first
-# orchestrator as a binder, and the other not.
+# The daemon's certificate and two orchestrators', under one authority, a
+# binder's certificate of its own making, and the keys of two tenants and a
+# stranger. The pool names the first orchestrator and the binder as its
+# binders, each by its key, and the other orchestrator not.
 pki=$out/pki
 openssl ecparam -name prime256v1 -genkey -noout -out "$pki/ca.key" 2>/dev/null
 openssl req -x509 -new -key "$pki/ca.key" -subj "/CN=session test authority" -days 2 -out "$pki/ca.pem" 2>/dev/null
@@ -164,6 +165,12 @@ for who in authority other-authority stranger; do
     openssl ecparam -name prime256v1 -genkey -noout -out "$out/$who.key" 2>/dev/null
 done
 openssl req -x509 -new -key "$out/stranger.key" -subj "/CN=stranger" -days 2 -out "$out/stranger.pem" 2>/dev/null
+openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key" 2>/dev/null
+openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem" 2>/dev/null
+# key_digest <certificate>: its public key as a pool's configuration names it.
+key_digest() {
+    echo "sha256:$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64)"
+}
 
 # The pool's key first, then the key service's bundle and pin, then the pool's
 # bundle, which pins the key service. Each of the two bundles is written
@@ -442,7 +449,7 @@ expect 3 "another key cannot store the tenant's credential" put-usurper \
     echo "    launchDir: $out/bundle/opkeydata"
     echo "    depth: 2"
     [ -n "$store" ] && echo "    imageStore: $store"
-    echo "    binders: [\"sha256:$(openssl x509 -in "$pki/orchestrator.pem" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64)\"]"
+    echo "    binders: [\"$(key_digest "$pki/orchestrator.pem")\", \"$(key_digest "$pki/binder.pem")\"]"
 } > "$out/config.yaml"
 start_daemon() {
     sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
@@ -570,8 +577,9 @@ expect 0 "destroy s3" destroy-s3 "$C8S" session destroy --binding "$out/s3" --da
 
 # A binder the pool names watches its ready TDs and judges each before its
 # claim: the second of two starts finds its guest judged, by its certificate
-# alone. A caller the pool does not name is shown nothing, and judges its
-# guest at the claim.
+# alone. The pool names the binder by its key: the certificate it watches
+# under is of its own making, and opens no orchestrator call. A caller the
+# pool does not name is shown nothing, and judges its guest at the claim.
 if [ -n "$warm" ]; then
     # Both of the pool's TDs are ready first, so that the stream shows the
     # second start's guest before any claim can take it.
@@ -582,11 +590,17 @@ if [ -n "$warm" ]; then
     watcher=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --pool agents --image-manifest "$manifest" --launch-key "$launch_key"
         --authority-key "$out/authority.key" --tenant acme --sealed-credential bind-token --commands 1 --wait 120s
         --collateral-cache "$out/cache-watch" "${sandbox[@]}" "${accept[@]}")
-    expect 0 "a binder the pool names watches its ready TDs" watch \
-        "$warm" "${watcher[@]}" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key" --session-prefix w --rounds 2
+    expect 0 "a binder the pool names watches its ready TDs under a certificate of its own" watch \
+        "$warm" "${watcher[@]}" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key" \
+        --watch-cert "$pki/binder.pem" --watch-key "$pki/binder.key" --session-prefix w --rounds 2
     cat "$out/watch.out" >> "$out/records.jsonl"
     check "the second start found its guest judged before its claim" \
-        sh -c "sed -n 2p '$out/watch.out' | grep -q '\"ready_ahead\":true'"
+        sh -c "grep '\"kind\":\"session\"' '$out/watch.out' | sed -n 2p | grep -q '\"ready_ahead\":true'"
+    check "the binder fetched the vendor's documents itself before its first start" \
+        sh -c "grep '\"kind\":\"documents\"' '$out/watch.out' | grep -v -q '\"error\"'"
+    expect 1 "the binder's own certificate claims nothing" watch-claim \
+        "$warm" "${watcher[@]}" --daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --session-prefix y --rounds 1 --wait 5s
+    check "the daemon said the call needs an orchestrator's certificate" grep -q "needs an orchestrator's certificate" "$out/watch-claim.err"
     check "both starts sealed a credential with the bind, which the first command read back" \
         [ "$(grep -c '"credential_with_bind":true' "$out/watch.out")" = 2 ]
     expect 0 "a caller the pool does not name starts a session all the same" watch-other \
