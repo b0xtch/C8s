@@ -110,6 +110,9 @@ type containerOptions struct {
 	tamper func(c *container)
 	// runtime is run in place of crun, when set.
 	runtime string
+	// cold has the runtime start every command when it comes, and none
+	// ahead.
+	cold bool
 }
 
 func mkdirTemp(t *testing.T, parent string, mode os.FileMode) string {
@@ -143,7 +146,7 @@ func newContainer(t *testing.T, o containerOptions) *container {
 	if o.runtime != "" {
 		crun = o.runtime
 	}
-	c.runner, c.stateDir, c.cgroup = imageRunner(t, c.harness, crun, nil)
+	c.runner, c.stateDir, c.cgroup = imageRunner(t, c.harness, crun, nil, func(cfg *sessionagent.ImageRunnerConfig) { cfg.ColdCommands = o.cold })
 	if o.tamper != nil {
 		o.tamper(c)
 	}
@@ -153,7 +156,7 @@ func newContainer(t *testing.T, o containerOptions) *container {
 // imageRunner gives h's agent a runner of sandbox images, as a guest image
 // with crun does: credentials on a RAM-backed path the sandbox's user can
 // reach, the image on disk, and images the host's image store, if any.
-func imageRunner(t *testing.T, h *harness, crun string, images *imagestore.Store) (runner *sessionagent.ImageRunner, stateDir, cgroup string) {
+func imageRunner(t *testing.T, h *harness, crun string, images *imagestore.Store, configure ...func(*sessionagent.ImageRunnerConfig)) (runner *sessionagent.ImageRunner, stateDir, cgroup string) {
 	t.Helper()
 	h.credDir = filepath.Join(mkdirTemp(t, "/dev/shm", 0o755), "c8s", "credentials")
 	h.cfg.CredentialDir = h.credDir
@@ -175,13 +178,17 @@ func imageRunner(t *testing.T, h *harness, crun string, images *imagestore.Store
 	if err != nil {
 		t.Skipf("needs the sandbox's init: %v", err)
 	}
-	runner, err = sessionagent.NewImageRunner(sessionagent.ImageRunnerConfig{
+	cfg := sessionagent.ImageRunnerConfig{
 		StateDir: stateDir, RunDir: t.TempDir(), CredentialDir: h.credDir, CgroupParent: cgroup,
 		PidsLimit: testPidsLimit, Crun: crun, SandboxInit: init, PlainHTTP: func(string) bool { return true },
 		Pull:   imagestore.PullLimits{Layers: 4, BlobBytes: 64 << 20, TotalBytes: 128 << 20},
 		Unpack: imagestore.UnpackLimits{Entries: 1000, Bytes: 64 << 20},
 		Images: images,
-	}, bare)
+	}
+	for _, change := range configure {
+		change(&cfg)
+	}
+	runner, err = sessionagent.NewImageRunner(cfg, bare)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,6 +430,254 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 			t.Error("a command ran in a sandbox that has ended")
 		}
 	})
+}
+
+// awaitWarm waits until a command's process waits in the sandbox for the
+// next command.
+func (c *container) awaitWarm(t *testing.T) {
+	t.Helper()
+	for deadline := time.Now().Add(20 * time.Second); ; time.Sleep(2 * time.Millisecond) {
+		if waiting, _ := c.runner.WarmCommands(); waiting {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no process was started ahead for the next command")
+		}
+	}
+}
+
+func (c *container) warmUsed() int64 {
+	_, used := c.runner.WarmCommands()
+	return used
+}
+
+// A command runs as a process the runtime started before the command came:
+// in the container, in a cgroup of its own, as the image's user, under the
+// container's capabilities and system call filter. What a caller sees of a
+// command is what it sees of one the runtime starts when asked: its
+// directory and environment, its input and output, its status, a reason when
+// it could not start, and its end at its limit with everything it started.
+func TestCommandsRunAsProcessesStartedAhead(t *testing.T) {
+	c := newContainer(t, containerOptions{
+		image:   ocispec.ImageConfig{Env: []string{"FROM_IMAGE=1", "BOTH=image"}, WorkingDir: "/srv"},
+		sandbox: session.Sandbox{Env: map[string]string{"FROM_DOC": "2", "BOTH": "doc"}},
+	})
+	c.start(t)
+	client := c.client(t, c.owner)
+	if _, err := client.Attest(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	// run is one command that must run as a process started ahead.
+	run := func(what string, req session.ExecRequest) *session.ExecResponse {
+		t.Helper()
+		c.awaitWarm(t)
+		before := c.warmUsed()
+		resp, err := client.Exec(ctxT(t), req)
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+		if c.warmUsed() != before+1 {
+			t.Fatalf("%s: the command was started by the runtime, with a process waiting for it", what)
+		}
+		return resp
+	}
+	sh := func(script string) session.ExecRequest {
+		return session.ExecRequest{Argv: []string{"/bin/sh", "-c", script}}
+	}
+
+	resp := run("directory and environment", session.ExecRequest{
+		Argv: []string{"/bin/sh", "-c", `pwd; echo "$FROM_IMAGE $FROM_DOC $BOTH $MINE"; echo "$C8S_CREDENTIALS_DIR"`}, Cwd: "/tmp", Env: map[string]string{"BOTH": "request", "MINE": "3"},
+	})
+	if got := strings.TrimSpace(string(resp.Stdout)); resp.ExitCode != 0 || got != "/tmp\n1 2 request 3\n"+c.credDir {
+		t.Errorf("request directory and environment: exit %d, %q, stderr %q", resp.ExitCode, got, resp.Stderr)
+	}
+	resp = run("the image's directory and the bind's environment", sh(`pwd; echo "$BOTH"`))
+	if got := strings.TrimSpace(string(resp.Stdout)); got != "/srv\ndoc" {
+		t.Errorf("default directory and environment: %q", got)
+	}
+	// A command named without a directory is found in the PATH of its
+	// environment, as the runtime finds one.
+	if resp := run("a command found by its name", session.ExecRequest{Argv: []string{"socket-inet"}}); resp.ExitCode != 0 {
+		t.Errorf("a command named without a directory: %+v", resp)
+	}
+	resp = run("input, output and status", session.ExecRequest{Argv: []string{"/bin/sh", "-c", "cat; echo err >&2; exit 7"}, Stdin: []byte("in")})
+	if resp.ExitCode != 7 || string(resp.Stdout) != "in" || string(resp.Stderr) != "err\n" {
+		t.Errorf("input, output and status: %+v", resp)
+	}
+	big := bytes.Repeat([]byte("0123456789abcdef"), 16<<10)
+	resp = run("input larger than a pipe holds, unread", session.ExecRequest{Argv: []string{"/bin/true"}, Stdin: big})
+	if resp.ExitCode != 0 {
+		t.Errorf("a command that reads none of its input: %+v", resp)
+	}
+	resp = run("input larger than a pipe holds, read", session.ExecRequest{Argv: []string{"/bin/sh", "-c", "wc -c"}, Stdin: big})
+	if got := strings.TrimSpace(string(resp.Stdout)); got != fmt.Sprint(len(big)) {
+		t.Errorf("a command read %s bytes of %d", got, len(big))
+	}
+
+	status := strings.TrimSpace(string(run("its own limits", sh("grep -E '^(CapInh|CapPrm|CapEff|CapBnd|CapAmb|NoNewPrivs|Seccomp):' /proc/self/status; cat /proc/self/uid_map")).Stdout))
+	const caps = "00000000800401fb"
+	for _, line := range []string{"CapPrm:\t" + caps, "CapEff:\t" + caps, "CapBnd:\t" + caps, "CapInh:\t0000000000000000", "CapAmb:\t0000000000000000", "NoNewPrivs:\t1", "Seccomp:\t2"} {
+		if !strings.Contains(status, line) {
+			t.Errorf("a command's process status lacks %q:\n%s", line, status)
+		}
+	}
+	if !strings.Contains(strings.Join(strings.Fields(status), " "), fmt.Sprintf("0 %d %d", imagestore.IDBase, imagestore.IDCount)) {
+		t.Errorf("a command's user namespace is not the sandbox's:\n%s", status)
+	}
+	// The command inherits neither descriptor the runtime preserved for
+	// the init: its standard three, and the one that lists them.
+	if got := strings.TrimSpace(string(run("descriptors", session.ExecRequest{Argv: []string{"/bin/ls", "/proc/self/fd"}}).Stdout)); strings.Join(strings.Fields(got), " ") != "0 1 2 3" {
+		t.Errorf("a command's descriptors: %q", got)
+	}
+	for probe, want := range map[string]int{"/bin/socket-inet": 0, "/bin/socket-vsock": int(syscall.EPERM)} {
+		if resp := run(probe, session.ExecRequest{Argv: []string{probe}}); resp.ExitCode != want {
+			t.Errorf("%s exited %d, want %d: the system call filter", probe, resp.ExitCode, want)
+		}
+	}
+
+	for name, tc := range map[string]struct {
+		req  session.ExecRequest
+		exit int
+	}{
+		"no such command":         {session.ExecRequest{Argv: []string{"/bin/absent"}}, 127},
+		"no such command by name": {session.ExecRequest{Argv: []string{"c8s-absent"}}, 127},
+		"not executable":          {session.ExecRequest{Argv: []string{"/etc/passwd"}}, 126},
+		"no such cwd":             {session.ExecRequest{Argv: []string{"/bin/true"}, Cwd: "/absent"}, 127},
+		"killed by signal":        {sh("kill -TERM $$"), 143},
+		"exits 255":               {sh("exit 255"), 255},
+		"exits 127 by itself":     {sh("exit 127"), 127},
+		"exits 126 by itself":     {sh("exit 126"), 126},
+	} {
+		resp := run(name, tc.req)
+		if resp.ExitCode != tc.exit {
+			t.Errorf("%s: %+v, want exit %d", name, resp, tc.exit)
+		}
+		told := strings.HasPrefix(name, "no such") || name == "not executable"
+		if told != (len(resp.Stderr) > 0) {
+			t.Errorf("%s: a reason on stderr: %q", name, resp.Stderr)
+		}
+	}
+
+	const id = "0123456789abcdef0123456789abcdef"
+	began := time.Now()
+	resp = run("a command past its limit", session.ExecRequest{ID: id, Argv: []string{"/bin/sh", "-c", "sleep 300 & sleep 300"}, TimeoutSeconds: 1})
+	if !resp.TimedOut || resp.ExitCode != 137 {
+		t.Fatalf("a command past its limit: %+v", resp)
+	}
+	if took := time.Since(began); took > 12*time.Second {
+		t.Errorf("a one second limit took %s", took)
+	}
+	if got := c.out(t, client, "ps | grep -c '[s]leep 300' || true"); got != "0" {
+		t.Errorf("%s sleepers outlived the command", got)
+	}
+	// Of the cgroups below the sandbox's, only the waiting process's is left.
+	c.awaitWarm(t)
+	left, err := filepath.Glob(filepath.Join(c.cgroup, "sandbox", "exec-*"))
+	if err != nil || len(left) != 1 || !strings.Contains(filepath.Base(left[0]), "ahead") {
+		t.Errorf("command cgroups left behind: %v, %v", left, err)
+	}
+
+	// More commands at once than processes wait: each is run, by whichever
+	// way starts it.
+	var group sync.WaitGroup
+	results := make([]string, 6)
+	for i := range results {
+		group.Go(func() {
+			resp, err := client.Exec(ctxT(t), sh(fmt.Sprintf("echo %d", i)))
+			if err == nil && resp.ExitCode == 0 {
+				results[i] = strings.TrimSpace(string(resp.Stdout))
+			}
+		})
+	}
+	group.Wait()
+	for i, got := range results {
+		if got != fmt.Sprint(i) {
+			t.Errorf("command %d of six at once printed %q", i, got)
+		}
+	}
+}
+
+// While it waits for a command, the process started ahead holds a socket to
+// the agent, and the tenant's code runs beside it under the same user. That
+// code cannot attach to it or open what it holds: the process marks itself
+// undumpable, and the sandbox has no capability to trace. As the sandbox's
+// root it can still list the numbers of the process's descriptors, which
+// tell it nothing. It can end the process, as it can end anything of its
+// user's, and the next command is then started another way and is none the
+// wiser.
+func TestWaitingProcessIsOutOfTheTenantsReach(t *testing.T) {
+	c := newContainer(t, containerOptions{})
+	c.start(t)
+	client := c.client(t, c.owner)
+	if _, err := client.Attest(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	// A command looks for the process that waits beside it, which is the one
+	// whose command line is the descriptor it was started from, and tries
+	// to open what that process holds. The command may have been the
+	// waiting process itself a moment ago, so it first gives the next one
+	// time to be started.
+	probe := `sleep 0.5
+for p in /proc/[0-9]*; do
+	[ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 " ] || continue
+	echo "found ${p#/proc/}"
+	cat $p/environ > /dev/null 2>&1; echo "environment $?"
+	cat $p/maps > /dev/null 2>&1; echo "memory-map $?"
+	head -c 1 $p/exe > /dev/null 2>&1; echo "program $?"
+	readlink $p/fd/4 > /dev/null 2>&1; echo "socket's-name $?"
+	cat $p/fd/4 > /dev/null 2>&1 < /dev/null; echo "socket $?"
+	cat $p/fd/0 > /dev/null 2>&1 < /dev/null; echo "input $?"
+done`
+	resp, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", probe}})
+	if err != nil || resp.ExitCode != 0 {
+		t.Fatalf("the probe: %+v, %v", resp, err)
+	}
+	report := string(resp.Stdout)
+	if !strings.Contains(report, "found ") {
+		t.Fatalf("no waiting process was found in the sandbox: %q", report)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(report), "\n") {
+		what, status, _ := strings.Cut(line, " ")
+		if what != "found" && status == "0" {
+			t.Errorf("a command opened the %s of the process that waits beside it: %q", what, report)
+		}
+	}
+	// The same command can open its own, so the probe tells a refusal
+	// from a file that is not there.
+	if got := c.out(t, client, "ls /proc/self/fd > /dev/null && cat /proc/self/maps > /dev/null && echo own"); got != "own" {
+		t.Fatalf("a command cannot open its own files: %q", got)
+	}
+
+	// Ended by the tenant's own code: the next commands still run, and
+	// say what they were asked to say.
+	c.awaitWarm(t)
+	if _, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", `for p in /proc/[0-9]*; do if [ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 " ]; then kill -9 ${p#/proc/}; fi; done; true`}}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4 {
+		resp, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", fmt.Sprintf("echo after-%d", i)}})
+		if err != nil || resp.ExitCode != 0 || strings.TrimSpace(string(resp.Stdout)) != fmt.Sprintf("after-%d", i) {
+			t.Fatalf("command %d after the waiting process was killed: %+v, %v", i, resp, err)
+		}
+	}
+	c.awaitWarm(t)
+}
+
+// A runner that starts no process ahead runs every command by the runtime,
+// as before.
+func TestCommandsStartedByTheRuntimeWhenAsked(t *testing.T) {
+	c := newContainer(t, containerOptions{cold: true})
+	c.start(t)
+	client := c.client(t, c.owner)
+	if got := c.out(t, client, "echo cold"); got != "cold" {
+		t.Fatalf("a command: %q", got)
+	}
+	if waiting, used := c.runner.WarmCommands(); waiting || used != 0 {
+		t.Fatalf("a runner that starts none ahead has one waiting (%v) or used %d", waiting, used)
+	}
+	if left, _ := filepath.Glob(filepath.Join(c.cgroup, "sandbox", "exec-*")); len(left) != 0 {
+		t.Fatalf("command cgroups left behind: %v", left)
+	}
 }
 
 // An image that names a user runs as that user, and its credentials are that

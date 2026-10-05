@@ -12,9 +12,15 @@
 // The runtime preserves two descriptors for it. ProgramFD is this program's
 // own file, which is how a container that does not hold the file starts it.
 // ControlFD is one end of a socket pair. The agent writes a Process to it and
-// shuts its side down. This program answers only if it cannot become the
-// process, with the reason on one line, and then exits. Neither descriptor
-// outlives it: the image's process inherits no way back to the agent.
+// shuts its side down. This program answers with one line, Taken, once it
+// has the message and has found the command, and then becomes the process.
+// If it cannot, it says why on a line and exits. Neither descriptor outlives
+// it: the image's process inherits no way back to the agent.
+//
+// The agent also starts this program for a command, ahead of the command
+// (see the agent's warmCommand). A process that ends without a word, before
+// it took its message, has started nothing, and its command is started
+// another way.
 package sandboxinit
 
 import (
@@ -38,6 +44,11 @@ const (
 	// FailureStatus is the status this program exits with when it could not
 	// become the process: a shell's for a command that was not run.
 	FailureStatus = 127
+	// Taken is the line this program writes when it has its message and has
+	// found the command: the exec is what follows.
+	Taken = "ok"
+	// MaxAnswer bounds what the agent reads of this program's answer.
+	MaxAnswer = 4096
 	// defaultPath is searched for a command named without a directory when
 	// the process's environment sets no PATH.
 	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -61,6 +72,11 @@ func Main() int {
 	// neither.
 	unix.CloseOnExec(ProgramFD)
 	unix.CloseOnExec(ControlFD)
+	// While it waits, this process holds a socket to the agent, and other
+	// code may run beside it under its user. Undumpable, it is one such
+	// code cannot attach to, and whose descriptors and memory it cannot
+	// open. The process it becomes is an ordinary one again.
+	undumpable()
 	control := os.NewFile(ControlFD, "control")
 	if control == nil {
 		return FailureStatus
@@ -71,7 +87,7 @@ func Main() int {
 	return FailureStatus
 }
 
-func become(control io.Reader) error {
+func become(control io.ReadWriter) error {
 	p, err := Read(control)
 	if err != nil {
 		return err
@@ -85,12 +101,31 @@ func become(control io.Reader) error {
 	if err != nil {
 		return err
 	}
+	// From here the message is taken: whatever becomes of this process is
+	// the outcome of the command it was for.
+	if _, err := io.WriteString(control, Taken+"\n"); err != nil {
+		return fmt.Errorf("tell the agent the command is taken: %w", err)
+	}
 	err = unix.Exec(path, p.Argv, p.Env)
 	if errors.Is(err, unix.ENOENT) {
 		// The file, or the interpreter its first line names.
 		return fmt.Errorf("%s: command not found", path)
 	}
 	return fmt.Errorf("run %s: %w", path, err)
+}
+
+// ReadAnswer reads what an init said on its way, from the agent's end of its
+// socket: whether it took its message, and why it could not become the
+// process, if it could not. It returns when the init's end has closed, which
+// is at its exec or at its end. An init that says nothing and took nothing
+// ended before it was told anything.
+func ReadAnswer(control io.Reader) (taken bool, reason string) {
+	data, _ := io.ReadAll(io.LimitReader(control, MaxAnswer))
+	text := string(data)
+	if rest, ok := strings.CutPrefix(text, Taken+"\n"); ok {
+		taken, text = true, rest
+	}
+	return taken, strings.TrimSpace(text)
 }
 
 // Read reads one message, which ends where its sender stops writing.

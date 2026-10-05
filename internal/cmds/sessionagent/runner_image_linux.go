@@ -3,12 +3,12 @@
 package sessionagent
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containerd/containerd/v2/contrib/seccomp"
@@ -73,7 +74,10 @@ type ImageRunnerConfig struct {
 	Images *imagestore.Store
 	// PlainHTTP marks the registries reached without TLS.
 	PlainHTTP func(host string) bool
-	Logger    *slog.Logger
+	// ColdCommands has every command started by the runtime when it is
+	// asked for, and none ahead of its command: see warmCommand.
+	ColdCommands bool
+	Logger       *slog.Logger
 }
 
 // ImageRunner runs the launch document's OCI image as one crun container in a
@@ -140,6 +144,17 @@ type madeSandbox struct {
 	// then says how.
 	exited  chan struct{}
 	exitErr error
+	// warm holds the one process that was started ahead for whichever
+	// command comes next: see warmCommand. A command that takes it says so
+	// on warmTaken, and the next is started. stopWarm ends the starting of
+	// them, and warmDone is closed when it has ended. All four are nil for a
+	// container whose commands the runtime starts as they come.
+	warm      chan *warmCommand
+	warmTaken chan struct{}
+	stopWarm  context.CancelFunc
+	warmDone  chan struct{}
+	// warmUsed counts the commands that ran as a process started ahead.
+	warmUsed atomic.Int64
 }
 
 // NewImageRunner returns the runner of a guest image that carries crun.
@@ -607,6 +622,15 @@ func (r *ImageRunner) makeSandbox(ctx context.Context, digest, rootfs string, im
 		r.endContainer(made)
 		return nil, err
 	}
+	if !r.cfg.ColdCommands {
+		// The user, capabilities and limits of a command are the image's,
+		// which no bind changes: a command's process can wait for its
+		// command from now on.
+		keeping, stop := context.WithCancel(context.Background())
+		made.warm, made.warmTaken = make(chan *warmCommand, 1), make(chan struct{}, 1)
+		made.stopWarm, made.warmDone = stop, make(chan struct{})
+		go r.keepWarm(keeping, made, image)
+	}
 	return made, nil
 }
 
@@ -614,6 +638,10 @@ func (r *ImageRunner) makeSandbox(ctx context.Context, digest, rootfs string, im
 // init ends by itself when the agent's end of its socket closes, and the
 // cgroup's kill switch reaches whatever else is in it.
 func (r *ImageRunner) endContainer(made *madeSandbox) {
+	if made.stopWarm != nil {
+		made.stopWarm()
+		<-made.warmDone
+	}
 	_ = made.control.Close()
 	if err := os.WriteFile(filepath.Join(r.cgroupDir(), "cgroup.kill"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
 		r.cfg.Logger.Warn("end the sandbox's container", "error", err)
@@ -670,11 +698,11 @@ func (r *ImageRunner) Start(ctx context.Context, credentialDir string) error {
 	r.mu.Lock()
 	r.started = true
 	r.mu.Unlock()
-	// The init answers only when it could not become the process.
+	// The init says why when it could not become the process.
 	refused := make(chan string, 1)
 	go func() {
-		line, _ := bufio.NewReader(control).ReadString('\n')
-		refused <- strings.TrimSpace(line)
+		_, reason := sandboxinit.ReadAnswer(control)
+		refused <- reason
 	}()
 	if err := r.await(ctx, w.made, sandboxNet, false, refused); err != nil {
 		if reason := readTrimmed(w.made.logPath); reason != "" {
@@ -773,6 +801,16 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// A process that was started for whichever command comes next, if one
+	// waits. Otherwise the runtime starts this command's.
+	if warm := w.made.takeWarm(); warm != nil {
+		if resp, started := r.execWarm(ctx, warm, w.process, req); started {
+			w.made.warmUsed.Add(1)
+			return resp, nil
+		}
+		// It ended before it took the command, which started nothing.
+	}
+
 	dir := filepath.Join(r.cfg.RunDir, "exec-"+req.ID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -828,6 +866,259 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 		}
 	}
 	return resp, nil
+}
+
+// warmCommand is a command's process started ahead of its command: the
+// sandbox init, started by the runtime in the sandbox's container and in a
+// cgroup of its own, waiting to be told what to become. The runtime's part of
+// starting a command is done before the command comes, and what is left is
+// one message and one exec.
+//
+// Tenant code runs beside the waiting init under the same user. The init is
+// undumpable until its exec, so that code cannot attach to it or open its
+// socket to the agent, and the agent reads a bounded answer from it.
+type warmCommand struct {
+	cmd   *exec.Cmd
+	group *processGroup
+	// dir holds the runtime's description of the process and its log.
+	dir     string
+	logPath string
+	// control is the agent's end of the socket pair the init reads.
+	control        *os.File
+	stdin          io.WriteCloser
+	stdout, stderr *cappedBuffer
+	// done is closed when the runtime has ended, and with it the process.
+	done chan struct{}
+}
+
+// keepWarm keeps one command's process waiting in made's container for as
+// long as the container lives, and starts the next when one is taken.
+func (r *ImageRunner) keepWarm(ctx context.Context, made *madeSandbox, image *specs.Process) {
+	defer close(made.warmDone)
+	for n := 0; ; n++ {
+		warm, err := r.startWarm(image, n)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-made.exited:
+				return
+			default:
+			}
+			r.cfg.Logger.Warn("a command's process was not started ahead", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-made.exited:
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+		// Room for one, and nothing else is ever in it.
+		made.warm <- warm
+		select {
+		case <-made.warmTaken:
+		case <-ctx.Done():
+		case <-made.exited:
+		}
+		if ctx.Err() != nil || ended(made.exited) {
+			// The one that waits, unless a command took it just now.
+			select {
+			case left := <-made.warm:
+				r.endWarm(left)
+			default:
+			}
+			return
+		}
+	}
+}
+
+func ended(done <-chan struct{}) bool {
+	select {
+	case <-done:
+		return true
+	default:
+		return false
+	}
+}
+
+// startWarm starts the sandbox init in the sandbox's container, as a command
+// is started: by the runtime, in a cgroup of its own below the container's,
+// as the image's user and under its limits.
+func (r *ImageRunner) startWarm(image *specs.Process, n int) (_ *warmCommand, err error) {
+	id := fmt.Sprintf("ahead-%d", n)
+	warm := &warmCommand{dir: filepath.Join(r.cfg.RunDir, "exec-"+id), done: make(chan struct{})}
+	if err := os.MkdirAll(warm.dir, 0o700); err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			if warm.control != nil {
+				_ = warm.control.Close()
+			}
+			if warm.group != nil {
+				warm.group.close()
+			}
+			_ = os.RemoveAll(warm.dir)
+		}
+	}()
+	init := *image
+	init.Args = []string{fmt.Sprintf("/proc/self/fd/%d", sandboxinit.ProgramFD)}
+	init.Env = []string{"PATH=" + defaultSandboxPath}
+	init.Cwd = "/"
+	process, err := json.Marshal(&init)
+	if err != nil {
+		return nil, err
+	}
+	processPath := filepath.Join(warm.dir, "process.json")
+	warm.logPath = filepath.Join(warm.dir, "crun.log")
+	if err := os.WriteFile(processPath, process, 0o600); err != nil {
+		return nil, err
+	}
+	if warm.group, err = newProcessGroup(r.cgroupDir(), id); err != nil {
+		return nil, err
+	}
+	program, err := os.Open(r.cfg.SandboxInit)
+	if err != nil {
+		return nil, fmt.Errorf("the sandbox's init: %w", err)
+	}
+	defer program.Close()
+	pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("the init's control socket: %w", err)
+	}
+	warm.control = os.NewFile(uintptr(pair[0]), "command-init-control")
+	theirs := os.NewFile(uintptr(pair[1]), "command-init")
+	defer theirs.Close()
+	// Not under a context: the process waits for a command that has not
+	// come, and that command's limit is what ends it.
+	cmd := r.crun(context.Background(), "--log", "file:"+warm.logPath, "exec", "--process", processPath,
+		"--cgroup", filepath.Base(warm.group.dir), "--preserve-fds", "2", sandboxID)
+	cmd.ExtraFiles = []*os.File{program, theirs}
+	warm.stdout, warm.stderr = &cappedBuffer{limit: session.MaxExecOutput}, &cappedBuffer{limit: session.MaxExecOutput}
+	cmd.Stdout, cmd.Stderr = warm.stdout, warm.stderr
+	if warm.stdin, err = cmd.StdinPipe(); err != nil {
+		return nil, err
+	}
+	cmd.SysProcAttr = warm.group.sysProcAttr(-1, -1)
+	cmd.WaitDelay = waitDelay
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start crun: %w", err)
+	}
+	warm.group.started(cmd.Process)
+	warm.cmd = cmd
+	go func() {
+		_ = cmd.Wait()
+		close(warm.done)
+	}()
+	return warm, nil
+}
+
+// endWarm ends a command's process that no command took, or whose command
+// is over, and removes what was made for it.
+func (r *ImageRunner) endWarm(warm *warmCommand) {
+	_ = warm.control.Close()
+	_ = warm.stdin.Close()
+	_ = warm.group.kill(warm.cmd.Process)
+	select {
+	case <-warm.done:
+	case <-time.After(stopTimeout):
+		r.cfg.Logger.Warn("a command's process was still there after it was killed", "after", stopTimeout.String())
+	}
+	warm.group.close()
+	_ = os.RemoveAll(warm.dir)
+}
+
+// takeWarm returns a command's process that waits for its command, or nil
+// when none does: the next one is still being started, or the container
+// starts none ahead.
+func (m *madeSandbox) takeWarm() *warmCommand {
+	if m.warm == nil {
+		return nil
+	}
+	select {
+	case warm := <-m.warm:
+		select {
+		case m.warmTaken <- struct{}{}:
+		default:
+		}
+		return warm
+	default:
+		return nil
+	}
+}
+
+// execWarm runs one command as a process that was started ahead: it tells
+// the init what to become and waits for the runtime to end, as Exec does for
+// a command the runtime starts. started is false when the process ended
+// before it took the command: nothing ran, and the caller starts the command
+// another way.
+func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *specs.Process, req *session.ExecRequest) (_ *session.ExecResponse, started bool) {
+	defer r.endWarm(warm)
+	start := time.Now()
+	p := execProcess(main, req)
+	message, err := json.Marshal(sandboxinit.Process{Argv: p.Args, Env: p.Env, Cwd: p.Cwd})
+	if err != nil {
+		return nil, false
+	}
+	if _, err := warm.control.Write(message); err != nil {
+		return nil, false
+	}
+	// The message ends where the agent stops writing.
+	if err := unix.Shutdown(int(warm.control.Fd()), unix.SHUT_WR); err != nil {
+		return nil, false
+	}
+	type answer struct {
+		taken  bool
+		reason string
+	}
+	said := make(chan answer, 1)
+	go func() {
+		taken, reason := sandboxinit.ReadAnswer(warm.control)
+		said <- answer{taken, reason}
+	}()
+	go func() {
+		_, _ = warm.stdin.Write(req.Stdin)
+		_ = warm.stdin.Close()
+	}()
+	select {
+	case <-warm.done:
+	case <-ctx.Done():
+		_ = warm.group.kill(warm.cmd.Process)
+		<-warm.done
+	}
+	// Stragglers that outlived the command must not outlive its result.
+	_ = warm.group.kill(warm.cmd.Process)
+	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	var init answer
+	select {
+	case init = <-said:
+	case <-time.After(waitDelay):
+	}
+	if !init.taken && init.reason == "" && !timedOut && ctx.Err() == nil {
+		return nil, false
+	}
+	resp := &session.ExecResponse{
+		ExitCode: exitStatus(warm.cmd.ProcessState),
+		Stdout:   warm.stdout.bytes(), Stderr: warm.stderr.bytes(),
+		StdoutTruncated: warm.stdout.truncated(), StderrTruncated: warm.stderr.truncated(),
+		DurationMillis: time.Since(start).Milliseconds(),
+		TimedOut:       timedOut,
+	}
+	// A reason from the init means the command never started. That is a
+	// result, with the status a shell would give and the reason where the
+	// command's own errors go.
+	if init.reason != "" && resp.ExitCode == sandboxinit.FailureStatus {
+		resp.ExitCode = exitNotExecutable
+		if lower := strings.ToLower(init.reason); strings.Contains(lower, "command not found") || strings.Contains(lower, "no such file or directory") {
+			resp.ExitCode = exitNotFound
+		}
+		if !resp.StderrTruncated {
+			resp.Stderr = append(resp.Stderr, []byte(init.reason+"\n")...)
+		}
+	}
+	return resp, true
 }
 
 // Dial connects to a port on the loopback of the sandbox's network

@@ -3,7 +3,6 @@
 package sandboxinit_test
 
 import (
-	"bufio"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -85,9 +84,10 @@ func TestInitBecomesTheProcess(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("the process ended with %v", err)
 	}
-	// It said nothing: an answer is a failure's.
-	if said, _ := bufio.NewReader(agent).ReadString('\n'); said != "" {
-		t.Fatalf("the init answered %q", said)
+	// It said that it took the message, and nothing after: a reason is a
+	// failure's.
+	if taken, reason := sandboxinit.ReadAnswer(agent); !taken || reason != "" {
+		t.Fatalf("the init answered taken %v, reason %q", taken, reason)
 	}
 	got, err := os.ReadFile(out)
 	if err != nil {
@@ -110,16 +110,18 @@ func TestInitBecomesTheProcess(t *testing.T) {
 }
 
 // What it cannot become, it says on one line, and exits as a shell does for
-// a command that did not run.
+// a command that did not run. It says that it took the message only once it
+// has found the command: a failure after that is the exec's.
 func TestInitSaysWhyItCouldNotBecomeTheProcess(t *testing.T) {
 	for name, tc := range map[string]struct {
 		process sandboxinit.Process
 		raw     string
 		want    string
+		taken   bool
 	}{
 		"no such command":      {process: sandboxinit.Process{Argv: []string{"c8s-no-such-command"}, Env: []string{"PATH=/usr/bin:/bin"}}, want: "c8s-no-such-command: command not found in /usr/bin:/bin"},
-		"no such file":         {process: sandboxinit.Process{Argv: []string{"/nonexistent/program"}}, want: "/nonexistent/program: command not found"},
-		"no program":           {process: sandboxinit.Process{Argv: []string{"/"}}, want: "run /:"},
+		"no such file":         {process: sandboxinit.Process{Argv: []string{"/nonexistent/program"}}, want: "/nonexistent/program: command not found", taken: true},
+		"no program":           {process: sandboxinit.Process{Argv: []string{"/"}}, want: "run /:", taken: true},
 		"no such directory":    {process: sandboxinit.Process{Argv: []string{"true"}, Cwd: "/nonexistent"}, want: "working directory"},
 		"no command":           {process: sandboxinit.Process{}, want: "names no command"},
 		"something else":       {raw: "not json", want: "the process to become"},
@@ -137,11 +139,14 @@ func TestInitSaysWhyItCouldNotBecomeTheProcess(t *testing.T) {
 		} else {
 			send(t, agent, tc.process)
 		}
-		said, _ := bufio.NewReader(agent).ReadString('\n')
+		taken, said := sandboxinit.ReadAnswer(agent)
 		err := cmd.Wait()
 		var status *exec.ExitError
-		if !strings.Contains(said, tc.want) {
-			t.Errorf("%s: it said %q, want %q", name, said, tc.want)
+		if !strings.Contains(said, tc.want) || strings.Contains(said, "\n") {
+			t.Errorf("%s: it said %q, want one line with %q", name, said, tc.want)
+		}
+		if taken != tc.taken {
+			t.Errorf("%s: it said it took the message: %v, want %v", name, taken, tc.taken)
 		}
 		if ok := errorsAs(err, &status); !ok || status.ExitCode() != sandboxinit.FailureStatus {
 			t.Errorf("%s: it ended with %v, want status %d", name, err, sandboxinit.FailureStatus)
@@ -184,5 +189,38 @@ func TestLookup(t *testing.T) {
 	// With no PATH of its own, the usual directories.
 	if got, err := sandboxinit.Lookup("sh", nil); err != nil || !strings.HasSuffix(got, "/sh") {
 		t.Fatalf("sh with no PATH: %q, %v", got, err)
+	}
+}
+
+// An init that ends before it is told anything says nothing and took
+// nothing: whoever started it for a command starts the command another way.
+// What the agent reads of an answer is bounded.
+func TestInitThatEndsUntoldTookNothing(t *testing.T) {
+	cmd, agent := start(t)
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	if taken, reason := sandboxinit.ReadAnswer(agent); taken || reason != "" {
+		t.Fatalf("an init that was killed untold answered taken %v, reason %q", taken, reason)
+	}
+	for said, want := range map[string]struct {
+		taken  bool
+		reason string
+	}{
+		"":                                {false, ""},
+		"ok\n":                            {true, ""},
+		"ok\nrun /x: permission denied\n": {true, "run /x: permission denied"},
+		"x: command not found in /bin\n":  {false, "x: command not found in /bin"},
+		"okay then\n":                     {false, "okay then"},
+		"ok":                              {false, "ok"},
+	} {
+		if taken, reason := sandboxinit.ReadAnswer(strings.NewReader(said)); taken != want.taken || reason != want.reason {
+			t.Errorf("%q read as taken %v, reason %q", said, taken, reason)
+		}
+	}
+	long := strings.Repeat("x", 10*sandboxinit.MaxAnswer)
+	if _, reason := sandboxinit.ReadAnswer(strings.NewReader(long)); len(reason) != sandboxinit.MaxAnswer {
+		t.Errorf("an answer of %d bytes was read as %d", len(long), len(reason))
 	}
 }
