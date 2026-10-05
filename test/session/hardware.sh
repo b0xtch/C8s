@@ -58,7 +58,13 @@
 #                            ./test/session/warmstart). With it the test also
 #                            has a binder watch the pool's ready TDs and find
 #                            a claimed guest judged, and a caller the pool
-#                            does not name shown nothing.
+#                            does not name shown nothing. The binder then
+#                            starts a session with a bind that claims its TD,
+#                            which the orchestrator is shown, and loses a TD
+#                            to a bind that came first. A bind under an
+#                            authority the pool does not name for the binder,
+#                            and one from a key it does not name, claim
+#                            nothing.
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -171,6 +177,10 @@ openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own mak
 key_digest() {
     echo "sha256:$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -c1-64)"
 }
+# authority_digest <private key>: its public key, named the same way.
+authority_digest() {
+    echo "sha256:$(openssl pkey -in "$1" -pubout -outform DER 2>/dev/null | sha256sum | cut -c1-64)"
+}
 
 # The pool's key first, then the key service's bundle and pin, then the pool's
 # bundle, which pins the key service. Each of the two bundles is written
@@ -182,7 +192,7 @@ ks_pool=(--image-manifest "$KSIMG/manifest.json" --pool "$manifest:$out/pool.key
 expect 0 "the pool's launch key" pool-key "$C8S" session launch-config key --out "$out/pool.key"
 expect 0 "a key service bundle that lists no machine" ks-bundle-probe "$C8S" session key-service launch-config new --out "$out/ks-probe" "${ks_pool[@]}"
 
-ks_pid="" daemon_pid="" stray_pid="" probe_pid=""
+ks_pid="" daemon_pid="" stray_pid="" probe_pid="" events_pid=""
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
@@ -192,6 +202,7 @@ drain() {
     [ -f "$out/config.yaml" ] && sudo -n "$C8S" session-daemon drain --config "$out/config.yaml" --wait 3m >> "$out/drain.out" 2>> "$out/daemon.log"
 }
 cleanup() {
+    stop_pid "$events_pid"; events_pid=""
     stop_pid "$daemon_pid"; daemon_pid=""
     drain
     sudo -n nft delete table inet c8s_sessions 2>/dev/null
@@ -449,7 +460,11 @@ expect 3 "another key cannot store the tenant's credential" put-usurper \
     echo "    launchDir: $out/bundle/opkeydata"
     echo "    depth: 2"
     [ -n "$store" ] && echo "    imageStore: $store"
-    echo "    binders: [\"$(key_digest "$pki/orchestrator.pem")\", \"$(key_digest "$pki/binder.pem")\"]"
+    # The orchestrator watches the pool. The binder watches it too, and may
+    # claim a TD with a bind under the first tenant's authority.
+    echo "    binders:"
+    echo "      - \"$(key_digest "$pki/orchestrator.pem")\""
+    echo "      - {key: \"$(key_digest "$pki/binder.pem")\", authorities: [\"$(authority_digest "$out/authority.key")\"]}"
 } > "$out/config.yaml"
 start_daemon() {
     sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
@@ -580,13 +595,18 @@ expect 0 "destroy s3" destroy-s3 "$C8S" session destroy --binding "$out/s3" --da
 # alone. The pool names the binder by its key: the certificate it watches
 # under is of its own making, and opens no orchestrator call. A caller the
 # pool does not name is shown nothing, and judges its guest at the claim.
+ready_tds() { sudo -n sh -c "grep -l '\"state\": *\"ready\"' '$out'/state/tds/*/td.json 2>/dev/null | wc -l"; }
+# pool_full: wait until both of the pool's TDs are ready.
+pool_full() {
+    local deadline=$(( $(date +%s) + 300 ))
+    until [ "$(ready_tds)" -ge 2 ] || [ "$(date +%s)" -ge "$deadline" ]; do
+        sleep 0.2
+    done
+}
 if [ -n "$warm" ]; then
     # Both of the pool's TDs are ready first, so that the stream shows the
     # second start's guest before any claim can take it.
-    deadline=$(( $(date +%s) + 300 ))
-    until [ "$(sudo -n sh -c "grep -l '\"state\": *\"ready\"' '$out'/state/tds/*/td.json 2>/dev/null | wc -l")" -ge 2 ] || [ "$(date +%s)" -ge "$deadline" ]; do
-        sleep 0.2
-    done
+    pool_full
     watcher=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --pool agents --image-manifest "$manifest" --launch-key "$launch_key"
         --authority-key "$out/authority.key" --tenant acme --sealed-credential bind-token --commands 1 --wait 120s
         --collateral-cache "$out/cache-watch" "${sandbox[@]}" "${accept[@]}")
@@ -607,6 +627,55 @@ if [ -n "$warm" ]; then
         "$warm" "${watcher[@]}" --daemon-cert "$pki/other.pem" --daemon-key "$pki/other.key" --session-prefix x --rounds 1
     check "it was shown none of the pool's ready TDs" grep -q "are not watched" "$out/watch-other.err"
     check "it judged its guest at the claim" grep -q '"ready_ahead":false' "$out/watch-other.out"
+
+    # A binder that watches a pool needs no claim: it signs a bind for a ready
+    # TD it has judged, and the bind claims that TD. The pool lets the binder,
+    # by its key, under the first tenant's authority and no other, and the
+    # orchestrator, which ends every session, is shown each one that starts
+    # so. Whoever the pool does not name claims nothing with a bind.
+    "$C8S" session watch "${orchestrator[@]}" > "$out/events.jsonl" 2> "$out/events.err" &
+    events_pid=$!
+    as_binder=(--daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --orchestrator-cert "$pki/orchestrator.pem" --orchestrator-key "$pki/orchestrator.key" --claim-with-bind)
+    pool_full
+    before=$(ready_tds)
+    expect 1 "a binder's bind under an authority its pool does not name for it claims no TD" bind-other-authority \
+        "$warm" "${watcher[@]}" "${as_binder[@]}" --authority-key "$out/other-authority.key" --session-prefix n --rounds 1
+    check "the daemon said no pool lets that caller claim under that authority" grep -q "no pool lets this caller claim" "$out/bind-other-authority.err"
+    expect 1 "a key the pool does not name claims no TD with a bind" bind-stranger \
+        "$warm" "${watcher[@]}" --daemon-cert "$out/stranger.pem" --daemon-key "$out/stranger.key" --watch-cert "$pki/binder.pem" --watch-key "$pki/binder.key" \
+        --claim-with-bind --session-prefix o --rounds 1
+    check "the daemon told it the same" grep -q "no pool lets this caller claim" "$out/bind-stranger.err"
+    check "the refused binds took no TD from the pool" [ "$(ready_tds)" = "$before" ]
+    expect 3 "nobody but an orchestrator is shown the host's TDs" events-binder \
+        "$C8S" session watch --daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key"
+    expect 0 "a binder the pool names starts a session with a bind that claims its TD" bind-claims \
+        "$warm" "${watcher[@]}" "${as_binder[@]}" --session-prefix b --rounds 1 --keep
+    cat "$out/bind-claims.out" >> "$out/records.jsonl"
+    check "the start made no claim, and found its guest judged" \
+        sh -c "grep '\"kind\":\"session\"' '$out/bind-claims.out' | grep '\"claimed_by_bind\":true' | grep -q '\"ready_ahead\":true'"
+    check "it sealed a credential with that bind, which the first command read back" grep -q '"credential_with_bind":true' "$out/bind-claims.out"
+    check "the daemon recorded that the bind claimed its TD" grep -q '"msg":"bound a TD".*"session":"b-0".*"claimed_by_bind":true' "$out/daemon.log"
+    shown=0
+    deadline=$(( $(date +%s) + 30 ))
+    until [ "$(date +%s)" -ge "$deadline" ]; do
+        grep '"session":"b-0"' "$out/events.jsonl" 2>/dev/null | grep '"state":"running"' | grep -q "\"claimed_by\":\"$(key_digest "$pki/binder.pem")\"" && { shown=1; break; }
+        sleep 0.2
+    done
+    check "the orchestrator was shown the session, running, and the binder that started it" [ "$shown" = 1 ]
+    expect 3 "the binder ends no session" destroy-binder "$C8S" session destroy --daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" \
+        --daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --session b-0
+    expect 0 "the orchestrator ends the session the binder started" destroy-b0 "$C8S" session destroy "${orchestrator[@]}" --session b-0
+    check "the orchestrator was shown its end" sh -c "sleep 1; grep '\"session\":\"b-0\"' '$out/events.jsonl' | grep -q '\"state\":\"ended\"'"
+    # Two binders sign for the same TD, and one bind comes first: the other
+    # is told the TD is not ready before anything reaches a guest, and its
+    # binder signs for the next TD it has judged.
+    pool_full
+    expect 0 "a binder whose TD another bind took first starts its session on the next" bind-lost \
+        "$warm" "${watcher[@]}" "${as_binder[@]}" --lose-first --session-prefix l --rounds 1
+    cat "$out/bind-lost.out" >> "$out/records.jsonl"
+    check "its first bind was answered as not ready, once" grep -q '"not_ready":1' "$out/bind-lost.out"
+    check "its session started all the same, with its sealed credential" grep -q '"credential_with_bind":true' "$out/bind-lost.out"
+    stop_pid "$events_pid"; events_pid=""
 fi
 
 s1=(--binding "$out/s1" --image-manifest "$manifest" "${accept[@]}")
@@ -681,7 +750,14 @@ if [ "$dev" = 1 ] && [ -z "$store_dir" ]; then
     fi
 fi
 
-# A daemon restarted under live sessions finds its TDs.
+# A daemon restarted under live sessions finds its TDs. A TD that ended keeps
+# its VMM until its memory is the host's again, which takes seconds: those
+# are waited for first, so that the count is of TDs that live.
+live_tds() { sudo -n sh -c "grep -L '\"state\": *\"ended\"' '$out'/state/tds/*/td.json 2>/dev/null | wc -l"; }
+deadline=$(( $(date +%s) + 120 ))
+until [ "$(guests td-)" = "$(live_tds)" ] || [ "$(date +%s)" -ge "$deadline" ]; do
+    sleep 0.2
+done
 before=$(guests td-)
 stop_pid "$daemon_pid"; daemon_pid=""
 check "the TDs outlive their daemon" [ "$(guests td-)" = "$before" ]

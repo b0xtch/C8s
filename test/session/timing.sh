@@ -44,6 +44,19 @@
 #                            watches the pool's ready TDs and judges each
 #                            before its claim: work a round does not time,
 #                            which the summary names and times beside it
+#   C8S_TIMING_CLAIM_WITH_BIND=1
+#                            make no claim: each round signs its bind for a
+#                            ready TD it has judged, and the bind claims that
+#                            TD (needs the watch)
+#   C8S_TIMING_BINDER=1      with that, run the rounds as a binder under a
+#                            certificate of its own making, which the pool
+#                            names with the tenant's authority, where the
+#                            default runs them as the orchestrator; the
+#                            orchestrator ends the sessions either way
+#   C8S_TIMING_LOSE_FIRST=1  with that, have a second bind for the same TD
+#                            come first in each round, to time what a
+#                            collision of two binders costs: a round then
+#                            takes both of the pool's TDs
 #   C8S_TIMING_WITH_BIND=0   send each first command over a connection once
 #                            the guest's receipt is checked, where the default
 #                            sends it with the bind
@@ -83,6 +96,17 @@ stored=${C8S_TIMING_STORED:-1}
 sealed=${C8S_TIMING_SEALED:-0}
 [ "$sealed" = 1 ] && stored=0
 watch=${C8S_TIMING_WATCH:-1}
+claim_with_bind=${C8S_TIMING_CLAIM_WITH_BIND:-0}
+as_binder=${C8S_TIMING_BINDER:-0}
+lose_first=${C8S_TIMING_LOSE_FIRST:-0}
+if [ "$claim_with_bind" = 1 ] && [ "$watch" != 1 ]; then echo "C8S_TIMING_CLAIM_WITH_BIND needs the watch" >&2; exit 2; fi
+if [ "$claim_with_bind" != 1 ] && { [ "$as_binder" = 1 ] || [ "$lose_first" = 1 ]; }; then
+    echo "C8S_TIMING_BINDER and C8S_TIMING_LOSE_FIRST need C8S_TIMING_CLAIM_WITH_BIND=1" >&2
+    exit 2
+fi
+# How many TDs a round takes from the pool.
+per_round=1
+[ "$lose_first" = 1 ] && per_round=2
 rest=${C8S_TIMING_REST:-3}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
@@ -147,6 +171,9 @@ for who in server orchestrator; do
         -extfile "$pki/$who.ext" -out "$pki/$who.pem"
 done
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
+# A binder's certificate is of its own making: the pool names its key.
+quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key"
+quiet openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem"
 
 ks_pid="" daemon_pid="" probe_pid="" governor="" idle_off=()
 stop_pid() { # stop_pid <pid>
@@ -228,8 +255,14 @@ tenant=(--key-service "$pin" --tenant acme --authority-key "$out/authority.key")
 quiet "$C8S" session key-service tenant register "${tenant[@]}" || die "the tenant's registration"
 quiet "$C8S" session key-service credential put api-token "${tenant[@]}" --from-file "$out/stored" || die "the stored credential"
 
-binder=sha256:$(openssl x509 -in "$pki/orchestrator.pem" -noout -pubkey 2>> "$out/setup.err" | openssl pkey -pubin -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)
-[ ${#binder} = 71 ] || die "the digest of the orchestrator's public key"
+# key_digest <certificate>: its public key as a pool's configuration names it.
+key_digest() {
+    echo "sha256:$(openssl x509 -in "$1" -noout -pubkey 2>> "$out/setup.err" | openssl pkey -pubin -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)"
+}
+binder=$(key_digest "$pki/orchestrator.pem")
+own_binder=$(key_digest "$pki/binder.pem")
+authority=sha256:$(openssl pkey -in "$out/authority.key" -pubout -outform DER 2>> "$out/setup.err" | sha256sum | cut -c1-64)
+[ ${#binder} = 71 ] && [ ${#own_binder} = 71 ] && [ ${#authority} = 71 ] || die "the digest of a public key"
 {
     echo "listen: 127.0.0.1:$port"
     echo "host: test-host"
@@ -248,8 +281,12 @@ binder=sha256:$(openssl x509 -in "$pki/orchestrator.pem" -noout -pubkey 2>> "$ou
     echo "    launchDir: $out/bundle/opkeydata"
     echo "    depth: 2"
     echo "    imageStore: $store"
-    # The orchestrator binds its sessions itself, and may watch the pool.
-    echo "    binders: [\"$binder\"]"
+    # The orchestrator binds its sessions itself, and may watch the pool. A
+    # binder of its own certificate may watch it too, and claim a TD with a
+    # bind under the tenant's authority.
+    echo "    binders:"
+    echo "      - \"$binder\""
+    echo "      - {key: \"$own_binder\", authorities: [\"$authority\"]}"
 } > "$out/config.yaml"
 sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -259,7 +296,7 @@ daemon_pid=$!
 cat > "$out/before-round" <<HOOK
 #!/usr/bin/env bash
 deadline=\$(( \$(date +%s) + 300 ))
-until [ "\$(grep -c '"msg":"a TD is ready"' "$out/daemon.log" 2>/dev/null)" -ge \$((\$1 + 2)) ] && [ "\$(pgrep -cf '[q]emu-system.*guest=td-')" = 2 ]; do
+until [ "\$(grep -c '"msg":"a TD is ready"' "$out/daemon.log" 2>/dev/null)" -ge \$((\$1 * $per_round + 2)) ] && [ "\$(pgrep -cf '[q]emu-system.*guest=td-')" = 2 ]; do
     kill -0 $daemon_pid 2>/dev/null || { echo "the daemon ended" >&2; exit 1; }
     [ "\$(date +%s)" -lt "\$deadline" ] || { echo "the pool never filled" >&2; exit 1; }
     sleep 0.5
@@ -293,8 +330,9 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
     [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
     printf 'baseline %s; no second baseline; ' "$baseline"
+    [ "$claim_with_bind" = 1 ] && printf 'no claim: each bind claims its TD%s; ' "$([ "$lose_first" = 1 ] && echo ", and a second bind for that TD comes first")"
     printf 'before the measured path: the vendor'"'"'s documents fetched by the binder (timed beside the rounds); %s\n' "$([ "$watch" = 1 ] && echo "each ready TD judged when it became ready (timed beside the rounds)" || echo "each TD judged at its claim")"
-    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, ready TDs watched $watch, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
+    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, ready TDs watched $watch, claim with the bind $claim_with_bind, as a binder of its own certificate $as_binder, a second bind first $lose_first, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
@@ -326,6 +364,12 @@ args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/o
 [ "$stored" = 1 ] && args+=(--key-service "$pin" --stored-credential api-token)
 [ "$sealed" = 1 ] && args+=(--sealed-credential api-token)
 [ "$watch" = 1 ] || args+=(--watch-ready=false)
+[ "$claim_with_bind" = 1 ] && args+=(--claim-with-bind)
+[ "$lose_first" = 1 ] && args+=(--lose-first)
+if [ "$as_binder" = 1 ]; then
+    # The last of a flag given twice is the one that counts.
+    args+=(--daemon-cert "$pki/binder.pem" --daemon-key "$pki/binder.key" --orchestrator-cert "$pki/orchestrator.pem" --orchestrator-key "$pki/orchestrator.key")
+fi
 [ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
 [ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
 [ -n "${C8S_ACCEPT_TCB:-}" ] && args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
@@ -354,8 +398,11 @@ sessions = [r for r in rows if r.get("kind") == "session" and r["round"] > 0]
 steady = [r for r in sessions if not beside(r)]
 for key in ("claim_us", "ready_check_us", "sign_us", "seal_us", "bind_us", "judge_us", "start_us", "first_exec_us", "first_cmd_us", "quote_us", "confirmed_us", "attest_us", "destroy_us"):
     show("session " + key[:-3], [r[key] / 1000 for r in steady if r.get(key)], "ms")
+show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
 if steady:
     count = lambda key: sum(1 for r in steady if r.get(key))
+    if count("claimed_by_bind"):
+        print(f"of {len(steady)} rounds, the bind claimed its TD with no claim before it in {count('claimed_by_bind')}, and found that TD taken first in {count('not_ready')}")
     print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
     print(f"of {len(steady)} rounds, the guest was judged before its claim in {count('ready_ahead')}, and had a credential sealed with its bind in place in {count('credential_with_bind')}")
 show("ready TD judged ahead", [r["ready_judged_us"] / 1000 for r in steady if r.get("ready_judged_us")], "ms (before the round: no part of its times)")

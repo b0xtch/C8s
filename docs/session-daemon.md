@@ -439,7 +439,10 @@ its bind released, that a first command and a credential sealed with a bind
 reach the guest with it, and, given the timing tool, that a binder the pool
 names by its key watches under a certificate of its own making and finds a
 claimed guest judged ahead, while that certificate claims nothing and a
-caller the pool does not name is shown nothing. Then what must be refused:
+caller the pool does not name is shown nothing. The binder then starts a
+session with a bind that claims its TD, which the orchestrator is shown with
+the binder's key and ends, and starts another whose first TD a second bind
+took first. Then what must be refused:
 
 | Refused | By whom |
 |---|---|
@@ -451,7 +454,7 @@ caller the pool does not name is shown nothing. Then what must be refused:
 | a sandbox image whose content was changed | the guest |
 | a stranger's key; one session's binding on another session's TD | the guest |
 | a bind to a guest of a pool the key service does not serve | the guest, which is never ready |
-| a destroy without an orchestrator's certificate; a claim under a binder's own certificate | the daemon |
+| a destroy without an orchestrator's certificate; a claim or a destroy under a binder's own certificate; a binder's bind that claims under an authority its pool does not name for it; a bind that claims from a key the pool does not name; the host's TDs shown to a binder | the daemon |
 
 With dev images it also probes, from inside a guest, every address of its
 host and of the other guests, and requires the host's filter to have counted

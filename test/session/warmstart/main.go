@@ -24,15 +24,27 @@
 // start: a round's claim then finds its guest judged. That work is done
 // before the round and is no part of its times, so a record says whether the
 // guest was judged ahead and how long that took. --watch-ready=false judges
-// every guest at its claim. The watch may run under a certificate of its
-// own (--watch-cert), which the pool names by its key and no authority has
-// signed. Every verdict here lets a secret go, so it rests on the vendor's
-// documents as this process fetched them within the hour: it asks the vendor
-// again as they come due and judges the waiting guests on what came, each
-// minute, and prints a record of kind "refresh" for each time that did work,
-// so that a reader can tell the rounds it ran beside. What it can name of
-// those documents before it has seen a guest it fetches when it starts, and
-// prints a record of kind "documents" for.
+// every guest at its claim. The watch may run under a certificate of its own
+// (--watch-cert), which the pool names by its key and no authority has
+// signed.
+//
+// With --claim-with-bind a round makes no claim: this side signs its bind
+// for a ready TD it has judged, and the bind claims that TD, as the daemon
+// lets an orchestrator do and a binder its pool names with the bind's
+// authority. --daemon-cert may then be such a binder's own, which no
+// authority has signed, and --orchestrator-cert names the certificate each
+// session is ended under. --lose-first has a second bind for the same TD
+// arrive first, as when two binders that watch one pool sign for the same
+// TD: this side's bind finds the TD gone and it signs for the next, and a
+// record gives the lost attempt's time, which is what a collision costs.
+//
+// Every verdict here lets a secret go, so it rests on the vendor's documents
+// as this process fetched them within the hour: it asks the vendor again as
+// they come due and judges the waiting guests on what came, each minute, and
+// prints a record of kind "refresh" for each time that did work, so that a
+// reader can tell the rounds it ran beside. What it can name of those
+// documents before it has seen a guest it fetches when it starts, and prints
+// a record of kind "documents" for.
 //
 // Each round prints one JSON record on standard output, with times in
 // microseconds on this process's monotonic clock and the wall clock's time
@@ -77,6 +89,7 @@ import (
 type options struct {
 	daemon, ca, cert, key              string
 	watchCert, watchKey                string
+	enderCert, enderKey                string
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
@@ -86,7 +99,8 @@ type options struct {
 	wait, timeout                      time.Duration
 	keep, attest, quoteFirst           bool
 	prejudge, preconnect, withBind     bool
-	watchReady                         bool
+	watchReady, claimWithBind          bool
+	loseFirst                          bool
 }
 
 // refresh is one time this side asked the vendor for the documents that
@@ -113,6 +127,12 @@ type record struct {
 	TD      string `json:"td"`
 	// At is when the round's claim began, on the wall clock.
 	At int64 `json:"at_unix_us"`
+	// ClaimedByBind says the round made no claim: its bind claimed the TD.
+	// NotReady counts the binds before it that found their TD taken, and
+	// Lost is the time those took, signing and sealing included.
+	ClaimedByBind bool  `json:"claimed_by_bind,omitempty"`
+	NotReady      int   `json:"not_ready,omitempty"`
+	Lost          int64 `json:"lost_us,omitempty"`
 	// Claim to Judge are the steps of a start, in order. Seal is the first
 	// command sealed for the guest, with the credential this side holds if
 	// it holds one, when they go with the bind. Bind is the call that
@@ -169,8 +189,10 @@ func main() {
 	var o options
 	flag.StringVar(&o.daemon, "daemon", "", "the session daemon, as host:port")
 	flag.StringVar(&o.ca, "daemon-ca", "", "PEM file of the authority that signed the daemon's certificate")
-	flag.StringVar(&o.cert, "daemon-cert", "", "an orchestrator's certificate, PEM")
-	flag.StringVar(&o.key, "daemon-key", "", "the orchestrator's private key, PEM")
+	flag.StringVar(&o.cert, "daemon-cert", "", "the certificate this side calls the daemon under, PEM: an orchestrator's, or with --claim-with-bind a binder's own that the pool names with --authority-key's authority")
+	flag.StringVar(&o.key, "daemon-key", "", "the private key of --daemon-cert, PEM")
+	flag.StringVar(&o.enderCert, "orchestrator-cert", "", "an orchestrator's certificate to end each session under, PEM, when --daemon-cert is a binder's own")
+	flag.StringVar(&o.enderKey, "orchestrator-key", "", "the private key of --orchestrator-cert, PEM")
 	flag.StringVar(&o.pool, "pool", "", "the pool to start sessions from")
 	flag.StringVar(&o.manifest, "image-manifest", "", "manifest.json published with the session guest image")
 	flag.StringVar(&o.launchKey, "launch-key", "", "the pool's public launch key, PEM")
@@ -195,6 +217,8 @@ func main() {
 	flag.BoolVar(&o.preconnect, "preconnect", true, "with --prejudge, also make the connection the session's commands take ahead of the first that needs it")
 	flag.BoolVar(&o.withBind, "command-with-bind", true, "send the first command with the bind, sealed to the guest's one-time key (not with --quote-first)")
 	flag.BoolVar(&o.watchReady, "watch-ready", true, "watch the pool's ready TDs and judge each before its claim; the pool's configuration must name the key of --watch-cert, or of --daemon-cert without one, as one of its binders")
+	flag.BoolVar(&o.claimWithBind, "claim-with-bind", false, "make no claim: sign each bind for a ready TD this side has judged, which the bind then claims (needs --watch-ready)")
+	flag.BoolVar(&o.loseFirst, "lose-first", false, "with --claim-with-bind, have a second bind for the TD each round signs for arrive first, to time what a collision of two binders costs; each round then takes two TDs")
 	flag.StringVar(&o.watchCert, "watch-cert", "", "a certificate to watch the pool under in place of --daemon-cert, PEM: a binder's own, which no authority need have signed")
 	flag.StringVar(&o.watchKey, "watch-key", "", "the private key of --watch-cert, PEM")
 	flag.Parse()
@@ -218,6 +242,18 @@ func run(o *options) error {
 	}
 	if (o.watchCert == "") != (o.watchKey == "") {
 		return errors.New("--watch-cert and --watch-key go together")
+	}
+	if (o.enderCert == "") != (o.enderKey == "") {
+		return errors.New("--orchestrator-cert and --orchestrator-key go together")
+	}
+	if o.enderCert != "" && !o.claimWithBind {
+		return errors.New("--orchestrator-cert is for a round under a binder's own certificate, which claims with its bind: it needs --claim-with-bind")
+	}
+	if o.claimWithBind && !o.watchReady {
+		return errors.New("--claim-with-bind signs for a TD this side was shown: it needs --watch-ready")
+	}
+	if o.loseFirst && !o.claimWithBind {
+		return errors.New("--lose-first times a bind that claims: it needs --claim-with-bind")
 	}
 	if o.sealedCredential != "" && (o.stored != "" || o.quoteFirst || !o.withBind) {
 		return errors.New("--sealed-credential goes with the bind's first command: not with --stored-credential, --quote-first or --command-with-bind=false")
@@ -274,6 +310,18 @@ func run(o *options) error {
 	cancel()
 	if err != nil {
 		return err
+	}
+	// Who ends the sessions: an orchestrator, which a binder is not.
+	ender := host
+	if o.enderCert != "" {
+		own, err := tls.LoadX509KeyPair(o.enderCert, o.enderKey)
+		if err != nil {
+			return fmt.Errorf("--orchestrator-cert and --orchestrator-key: %w", err)
+		}
+		if ender, err = daemon.Dial(daemon.Options{Address: o.daemon, RootCAs: roots, Certificate: &own}); err != nil {
+			return err
+		}
+		defer ender.Close()
 	}
 
 	var printing sync.Mutex
@@ -338,7 +386,7 @@ func run(o *options) error {
 			}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
-		rec, err := one(ctx, o, round, host, engine, verdicts, identity, launchKey, authority, pin, accepted)
+		rec, err := one(ctx, o, round, host, ender, engine, verdicts, identity, launchKey, authority, pin, accepted)
 		cancel()
 		if err != nil {
 			return fmt.Errorf("round %d: %w", round, err)
@@ -353,9 +401,8 @@ func run(o *options) error {
 func micros(since time.Time) int64 { return time.Since(since).Microseconds() }
 
 // watch judges each ready TD of pool as the daemon shows it, and forgets
-// each that leaves ready, until ctx ends.
-// A daemon that does not let this side watch leaves every guest to be judged
-// at its claim.
+// each that leaves ready, until ctx ends. A daemon that does not let this
+// side watch leaves every guest to be judged at its claim.
 func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *session.ReadyVerdicts) {
 	for ctx.Err() == nil {
 		err := host.WatchReady(ctx, pool, func(shown *session.Relayed) {
@@ -375,8 +422,8 @@ func watch(ctx context.Context, host *daemon.Client, pool string, verdicts *sess
 	}
 }
 
-// one starts one session and runs its commands.
-func one(ctx context.Context, o *options, round int, host *daemon.Client, engine session.Engine, verdicts *session.ReadyVerdicts,
+// one starts one session and runs its commands. ender is who ends it.
+func one(ctx context.Context, o *options, round int, host, ender *daemon.Client, engine session.Engine, verdicts *session.ReadyVerdicts,
 	identity runtimemeasure.ImageIdentity, launchKey []byte, authority *ecdsa.PrivateKey, pin *session.KeyService, accepted []string,
 ) (*record, error) {
 	rec := &record{Kind: "session", Round: round, Session: fmt.Sprintf("%s-%d", o.prefix, round)}
@@ -434,11 +481,34 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	began := time.Now()
 	step := began
 	rec.At = began.UnixMicro()
-	claimed, err := host.Claim(ctx, claimID, o.pool, rec.Session, o.wait)
-	if err != nil {
-		return nil, fmt.Errorf("claim: %w", err)
+	// The TD's name and the certificate its guest served while it was ready:
+	// from the claim, or with no claim from the verdict and the bind's answer.
+	var td string
+	var certificate []byte
+	var judged *session.JudgedReady
+	if o.claimWithBind {
+		rec.ClaimedByBind = true
+		if judged, err = take(ctx, verdicts, o.wait); err != nil {
+			return nil, err
+		}
+		certificate = judged.Certificate
+		rec.ReadyCheck = micros(step)
+	} else {
+		claimed, err := host.Claim(ctx, claimID, o.pool, rec.Session, o.wait)
+		if err != nil {
+			return nil, fmt.Errorf("claim: %w", err)
+		}
+		td, certificate = claimed.TD, claimed.Evidence.Certificate
+		rec.TD, rec.Claim = td, micros(step)
+		// The check of the unbound guest, as one that lets a secret go: what
+		// is sealed with the bind rests on it. A guest this side was shown
+		// when it became ready is found judged, by its certificate alone.
+		step = time.Now()
+		if judged, err = verdicts.Claimed(ctx, claimed.Evidence); err != nil {
+			return nil, fmt.Errorf("the guest the daemon offers: %w", err)
+		}
+		rec.ReadyCheck = micros(step)
 	}
-	rec.TD, rec.Claim = claimed.TD, micros(step)
 	ended := false
 	destroy := func() {
 		if ended {
@@ -452,7 +522,7 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 			return
 		}
 		at := time.Now()
-		if _, err := host.Destroy(ctx, id, rec.Session); err != nil {
+		if _, err := ender.Destroy(ctx, id, rec.Session); err != nil {
 			fmt.Fprintf(os.Stderr, "warmstart: destroy %s: %v\n", rec.Session, err)
 			return
 		}
@@ -464,43 +534,78 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		}
 	}()
 
-	// The check of the unbound guest, as one that lets a secret go: what is
-	// sealed with the bind rests on it. A guest this side was shown when it
-	// became ready is found judged, by its certificate alone.
-	step = time.Now()
-	judged, err := verdicts.Claimed(ctx, claimed.Evidence)
-	if err != nil {
-		return nil, fmt.Errorf("the guest the daemon offers: %w", err)
+	// signed signs a bind for the guest that was judged, and seals what goes
+	// with it: the first command, with the credential this side holds,
+	// sealed to the key the check of the guest's evidence bound. An owner who
+	// waits for the quote sends nothing ahead of it.
+	var ready *session.ReadyTD
+	var bind *session.SignedBind
+	var first *session.SealedMessage
+	signed := func() error {
+		ready = judged.ReadyTD
+		if pin != nil && !pin.Equal(ready.Document.KeyService) {
+			return errors.New("the pool's guests open their sessions with another key service than --key-service pins")
+		}
+		rec.ReadyAhead = judged.Ahead
+		if judged.Ahead {
+			rec.ReadyJudged = judged.Took.Microseconds()
+		}
+		step = time.Now()
+		if bind, err = session.NewBind(session.BindOptions{
+			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: rec.Session, Policy: policy, KeyService: pin,
+		}); err != nil {
+			return err
+		}
+		rec.Sign = micros(step)
+		first = nil
+		if o.withBind && !o.quoteFirst {
+			step = time.Now()
+			parts := session.SealedParts{Command: &session.ExecRequest{Argv: argv}, Credentials: held}
+			if first, err = session.SealWithBind(ready, bind, signer, parts); err != nil {
+				return fmt.Errorf("seal the first command: %w", err)
+			}
+			rec.Seal = micros(step)
+		}
+		return nil
 	}
-	ready := judged.ReadyTD
-	if pin != nil && !pin.Equal(ready.Document.KeyService) {
-		return nil, errors.New("the pool's guests open their sessions with another key service than --key-service pins")
-	}
-	rec.ReadyCheck, rec.ReadyAhead = micros(step), judged.Ahead
-	if judged.Ahead {
-		rec.ReadyJudged = judged.Took.Microseconds()
-	}
-
-	step = time.Now()
-	bind, err := session.NewBind(session.BindOptions{
-		Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: rec.Session, Policy: policy, KeyService: pin,
-	})
-	if err != nil {
+	if err := signed(); err != nil {
 		return nil, err
 	}
-	rec.Sign = micros(step)
-
-	// The first command goes with the bind, with the credential this side
-	// holds, sealed to the key the check of the guest's evidence just bound:
-	// an owner who waits for the quote sends nothing ahead of it.
-	var first *session.SealedMessage
-	if o.withBind && !o.quoteFirst {
-		step = time.Now()
-		parts := session.SealedParts{Command: &session.ExecRequest{Argv: argv}, Credentials: held}
-		if first, err = session.SealWithBind(ready, bind, signer, parts); err != nil {
-			return nil, fmt.Errorf("seal the first command: %w", err)
+	if o.loseFirst {
+		// A second binder's bind for the same TD arrives first, and claims it
+		// for a session of its own. The time that takes is no part of the
+		// round's, and neither is the quote its guest then takes: this side
+		// waits until the guest has it, so that the round runs beside nothing.
+		pause := time.Now()
+		other := rec.Session + "-taken"
+		theirs, err := session.NewBind(session.BindOptions{
+			Authority: authority, InstanceKey: ready.InstanceKey, Tenant: o.tenant, Session: other, Policy: policy, KeyService: pin,
+		})
+		if err != nil {
+			return nil, err
 		}
-		rec.Seal = micros(step)
+		id, err := daemon.NewRequestID()
+		if err != nil {
+			return nil, err
+		}
+		took, err := host.BindWith(ctx, id, "", theirs, nil)
+		if err != nil {
+			return nil, fmt.Errorf("--lose-first: the bind that takes the TD first: %w", err)
+		}
+		took.Close()
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+			defer cancel()
+			if id, err := daemon.NewRequestID(); err == nil {
+				if _, err := ender.Destroy(ctx, id, other); err != nil {
+					fmt.Fprintf(os.Stderr, "warmstart: destroy %s: %v\n", other, err)
+				}
+			}
+		}()
+		if _, err := host.BoundEvidence(ctx, took.TD); err != nil && !errors.Is(err, session.ErrNoBindQuote) {
+			return nil, fmt.Errorf("--lose-first: the guest of the bind that took the TD first: %w", err)
+		}
+		began = began.Add(time.Since(pause))
 	}
 
 	binding := session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
@@ -516,13 +621,18 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	var ahead *session.Client
 	var reached chan bool
 	bindAnswered := make(chan struct{})
-	if o.prejudge && !o.quoteFirst {
-		if ahead, err = session.NewClient(fmt.Sprintf("https://%s:%d", claimed.TD, session.AgentPort), bound, engine, signer,
-			session.Through(host.Dialer(claimed.TD)), session.Receipted(ready.InstanceKey)); err != nil {
-			return nil, err
+	// prepare makes that client once the TD's name is known: before the
+	// bind for a claimed TD, and from the bind's answer for one the bind
+	// claims.
+	prepare := func() error {
+		if !o.prejudge || o.quoteFirst {
+			return nil
 		}
-		defer ahead.Close()
-		if leaf, err := x509.ParseCertificate(claimed.Evidence.Certificate); err == nil {
+		if ahead, err = session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer,
+			session.Through(host.Dialer(td)), session.Receipted(ready.InstanceKey)); err != nil {
+			return err
+		}
+		if leaf, err := x509.ParseCertificate(certificate); err == nil {
 			reached = make(chan bool, 1)
 			go func() {
 				if err := ahead.Prejudge(ctx, leaf); err != nil {
@@ -551,14 +661,49 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 				reached <- false
 			}()
 		}
+		return nil
+	}
+	defer func() {
+		if ahead != nil {
+			ahead.Close()
+		}
+	}()
+	if !o.claimWithBind {
+		if err := prepare(); err != nil {
+			return nil, err
+		}
 	}
 
-	step = time.Now()
-	var sealed []byte
-	if first != nil {
-		sealed = first.Sealed
+	var call *daemon.BindCall
+	for {
+		step = time.Now()
+		var sealed []byte
+		if first != nil {
+			sealed = first.Sealed
+		}
+		call, err = host.BindWith(ctx, bindID, td, bind, sealed)
+		if o.claimWithBind && daemon.NotReady(err) {
+			// Somebody took the TD first, and nothing reached its guest:
+			// this side signs for the next it has judged.
+			rec.NotReady++
+			rec.Lost += rec.Sign + rec.Seal + micros(step)
+			if judged, err = take(ctx, verdicts, o.wait); err != nil {
+				return nil, err
+			}
+			certificate = judged.Certificate
+			if bindID, err = daemon.NewRequestID(); err != nil {
+				return nil, err
+			}
+			if err := signed(); err != nil {
+				return nil, err
+			}
+			binding = session.Binding{LaunchKey: launchKey, Launch: ready.Launch, Bind: bind}
+			bound = binding.Policy(identity)
+			bound.AcceptTCBStatus = accepted
+			continue
+		}
+		break
 	}
-	call, err := host.BindWith(ctx, bindID, claimed.TD, bind, sealed)
 	close(bindAnswered)
 	if err != nil {
 		return nil, fmt.Errorf("bind: %w", err)
@@ -566,6 +711,15 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	defer call.Close()
 	answer := call.Answer
 	rec.Bind = micros(step)
+	if o.claimWithBind {
+		if td = call.TD; td == "" {
+			return nil, errors.New("the daemon did not say which TD the bind claimed")
+		}
+		rec.TD = td
+		if err := prepare(); err != nil {
+			return nil, err
+		}
+	}
 
 	answered := time.Now()
 	step = answered
@@ -591,7 +745,7 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		defer func() { rec.Quote, rec.Confirmed = micros(answered), micros(began) }()
 		relayed := answer
 		if len(relayed.Evidence) == 0 {
-			if relayed, j.err = host.BoundEvidence(ctx, claimed.TD); j.err != nil {
+			if relayed, j.err = host.BoundEvidence(ctx, td); j.err != nil {
 				j.err = fmt.Errorf("the quote over the bind's nonce: %w", j.err)
 				return j
 			}
@@ -681,8 +835,8 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	}
 	client := ahead
 	if pinned != nil {
-		if client, err = session.NewClient(fmt.Sprintf("https://%s:%d", claimed.TD, session.AgentPort), bound, engine, signer,
-			session.Through(host.Dialer(claimed.TD)), pinned); err != nil {
+		if client, err = session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer,
+			session.Through(host.Dialer(td)), pinned); err != nil {
 			return nil, err
 		}
 		defer client.Close()
@@ -738,6 +892,26 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		}
 	}
 	return rec, nil
+}
+
+// take hands this side a ready guest it has judged, and waits for its watch
+// to show it one when it holds none.
+func take(ctx context.Context, verdicts *session.ReadyVerdicts, wait time.Duration) (*session.JudgedReady, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		judged, err := verdicts.Take()
+		if !errors.Is(err, session.ErrNoneJudged) {
+			return judged, err
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("no ready TD was shown and judged within %s: %w", wait, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
 }
 
 func command(ctx context.Context, client *session.Client, req session.ExecRequest) error {
