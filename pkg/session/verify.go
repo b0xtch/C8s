@@ -437,7 +437,7 @@ func (e *dcapEngine) withCollateral(ctx context.Context, check func(*fetchRecord
 	fetches := &fetchRecorder{ctx: ctx, cache: e.cache, inner: e.fetch, freshOnly: e.freshOnly, only: intelDocument}
 	if !e.ownOnly {
 		fetches.source, _ = ctx.Value(collateralSourceKey{}).(CollateralSource)
-		fetches.stapledRoot = ctx.Value(stapledRootKey{}) != nil
+		fetches.stapledRoot = StapledRootCRLAllowed(ctx)
 	}
 	err := check(fetches)
 	if err == nil || authenticCollateral(err) || fetches.caused(err) || !fetches.fromCache() {

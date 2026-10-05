@@ -191,7 +191,7 @@ const (
 	MessageBound       = "bound"
 	MessageAttestation = "attestation"
 	MessageReceipt     = "receipt"
-	MessageCommand     = "command"
+	MessageSealed      = "sealed"
 	MessageStep        = "step"
 	MessageRefusal     = "refusal"
 	MessagePlatform    = "platform"
@@ -228,15 +228,15 @@ const (
 	QuoteGivenUp Code = "given_up"
 )
 
-// What became of a first command sent with a bind or after it.
+// What became of a message sealed with a bind, or sent after it.
 const (
-	CommandTaken    Code = "taken"
-	CommandUnopened Code = "unopened"
-	CommandTooLate  Code = "too_late"
+	SealedTaken    Code = "taken"
+	SealedUnopened Code = "unopened"
+	SealedTooLate  Code = "too_late"
 )
 
 var (
-	commands   = []Code{CommandTaken, CommandUnopened, CommandTooLate}
+	sealings   = []Code{SealedTaken, SealedUnopened, SealedTooLate}
 	bindQuotes = []Code{QuoteTrying, QuoteTaken, QuoteGivenUp}
 	phases     = []Code{"ready", "bound", "running"}
 	// platforms are the tags a guest's evidence comes under.
@@ -251,9 +251,9 @@ const (
 	maxSignature = 4096
 	maxEvidence  = 256 << 10
 	maxReceipt   = 8 << 10
-	// The sealed answer to a first command: an exec result, and what sealing
-	// adds.
-	maxCommandAnswer = 4 << 20
+	// The sealed answer to a sealed message: an exec result, a word on each
+	// credential, and what sealing adds.
+	maxSealedAnswer = 4 << 20
 	// A certificate with a quote and the guest's one-time keys in it.
 	maxCertificate = 32 << 10
 	maxEvents      = 8
@@ -290,14 +290,14 @@ var Schema = []Message{
 	{Name: MessageBound, Says: "to whoever handed it its bind", Fields: []Field{
 		{Name: "phase", Kind: KindCode, Codes: phases},
 		{Name: "replayed", Kind: KindFlag, Optional: true},
-		{Name: "command", Kind: KindCode, Codes: commands, Optional: true},
+		{Name: "sealed", Kind: KindCode, Codes: sealings, Optional: true},
 		{Name: "admission", Kind: KindList, Max: 16, Optional: true, Item: &Field{Kind: KindMessage, Message: MessageStep}},
 		{Name: "receipt", Kind: KindMessage, Message: MessageReceipt, Optional: true},
 		{Name: "attestation", Kind: KindMessage, Message: MessageAttestation, Optional: true},
 	}},
-	{Name: MessageCommand, Says: "after its answer to a bind that came with a first command, and to one sent just after: what became of the command, and its answer sealed to its sender", Fields: []Field{
-		{Name: "command", Kind: KindCode, Codes: commands},
-		{Name: "answer", Kind: KindSealed, Max: maxCommandAnswer, Optional: true},
+	{Name: MessageSealed, Says: "after its answer to a bind that came with a sealed message, and to one sent just after: whether it took the message, and its answer sealed to the message's sender", Fields: []Field{
+		{Name: "sealed", Kind: KindCode, Codes: sealings},
+		{Name: "answer", Kind: KindSealed, Max: maxSealedAnswer, Optional: true},
 	}},
 	{Name: MessageReceipt, Says: "with its answer to a bind: its own word on the bind, signed by its one-time key over the bind's nonce", Fields: []Field{
 		{Name: "receipt", Kind: KindPublic, Max: maxReceipt},

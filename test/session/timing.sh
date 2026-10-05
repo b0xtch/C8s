@@ -37,6 +37,9 @@
 #                            every cache cold and is left out of a summary)
 #   C8S_TIMING_STORED=0      start sessions that take nothing from the key
 #                            service, to tell what its part of a bind costs
+#   C8S_TIMING_SEALED=1      seal a credential with each bind, beside the
+#                            first command, where the default has the guest
+#                            take one from the key service
 #   C8S_TIMING_WITH_BIND=0   send each first command over a connection once
 #                            the guest's receipt is checked, where the default
 #                            sends it with the bind
@@ -73,6 +76,8 @@ KSIMG=${C8S_KEY_SERVICE_IMAGE:?set C8S_KEY_SERVICE_IMAGE to a key service image 
 store_dir=${C8S_SANDBOX_STORE:?set C8S_SANDBOX_STORE to a directory written by test/session/sandboximage}
 rounds=${C8S_TIMING_ROUNDS:-21}
 stored=${C8S_TIMING_STORED:-1}
+sealed=${C8S_TIMING_SEALED:-0}
+[ "$sealed" = 1 ] && stored=0
 rest=${C8S_TIMING_REST:-3}
 pin_power=${C8S_TIMING_PIN_POWER:-0}
 fc=${C8S_FIRECRACKER:-}
@@ -279,7 +284,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     [ -n "$fc" ] && baseline="Firecracker over its serial console (a floor), interleaved"
     [ -n "$fc_agent" ] && baseline="Firecracker over vsock to an agent in its guest, and over its serial console (a floor), interleaved"
     printf 'baseline %s; no second baseline\n' "$baseline"
-    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
+    echo "run $run, $rounds rounds, $(date -u +%FT%TZ), stored credential $stored, sealed credential $sealed, first command with the bind ${C8S_TIMING_WITH_BIND:-1}, quote first ${C8S_TIMING_QUOTE_FIRST:-0}, rest $rest s, Firecracker ${fc:-not sampled}"
     echo "host kernel $(uname -r)"
     lscpu | grep -E "Model name|^CPU\(s\)|Thread|Core|Socket" | sed 's/  */ /g'
     echo "power pinned by this run: $pin_power"
@@ -309,6 +314,7 @@ args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/o
     --tenant acme --session-prefix "t" --sandbox-image "$ref" --collateral-cache "$out/collateral"
     --rounds "$rounds" --commands 3 --attest --before-round "$out/before-round")
 [ "$stored" = 1 ] && args+=(--key-service "$pin" --stored-credential api-token)
+[ "$sealed" = 1 ] && args+=(--sealed-credential api-token)
 [ "${C8S_TIMING_QUOTE_FIRST:-0}" = 1 ] && args+=(--quote-first)
 [ "${C8S_TIMING_WITH_BIND:-1}" = 0 ] && args+=(--command-with-bind=false)
 [ -n "${C8S_ACCEPT_TCB:-}" ] && args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
@@ -333,6 +339,7 @@ for key in ("claim_us", "ready_check_us", "sign_us", "seal_us", "bind_us", "judg
 if steady:
     count = lambda key: sum(1 for r in steady if r.get(key))
     print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
+    print(f"of {len(steady)} rounds, the guest had a credential sealed with its bind in place in {count('credential_with_bind')}")
 show("session later command", [v / 1000 for r in steady for v in r.get("exec_us", [])], "ms")
 first = [r for r in rows if r.get("kind") == "session" and r["round"] == 0]
 if first:

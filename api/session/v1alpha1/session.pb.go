@@ -230,10 +230,10 @@ type BindRequest struct {
 	// c8s-bind/v1, canonical JSON, and its signature.
 	Bind      []byte `protobuf:"bytes,3,opt,name=bind,proto3" json:"bind,omitempty"`
 	Signature []byte `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
-	// The session's first command, sealed to the guest's one-time KEM key
-	// under the bind: with the bind, or alone in the next message of the call.
-	// The daemon carries it unread.
-	Command       []byte `protobuf:"bytes,7,opt,name=command,proto3" json:"command,omitempty"`
+	// The session's first command and the credentials its binder holds,
+	// sealed to the guest's one-time KEM key under the bind: with the bind, or
+	// alone in the next message of the call. The daemon carries it unread.
+	Sealed        []byte `protobuf:"bytes,7,opt,name=sealed,proto3" json:"sealed,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -296,9 +296,9 @@ func (x *BindRequest) GetSignature() []byte {
 	return nil
 }
 
-func (x *BindRequest) GetCommand() []byte {
+func (x *BindRequest) GetSealed() []byte {
 	if x != nil {
-		return x.Command
+		return x.Sealed
 	}
 	return nil
 }
@@ -312,14 +312,15 @@ type Bound struct {
 	// over the same nonce is in the evidence if the guest had it by then, and
 	// in what GetEvidence returns once it has.
 	Receipt []byte `protobuf:"bytes,2,opt,name=receipt,proto3" json:"receipt,omitempty"`
-	// In a later message than the receipt: the first command's output and
-	// status, sealed back to whoever sealed the command.
-	CommandResult []byte `protobuf:"bytes,3,opt,name=command_result,json=commandResult,proto3" json:"command_result,omitempty"`
-	// What became of a first command: taken, unopened or too_late, as the
-	// guest says. With the receipt for a command that came with the bind, and
-	// in a message of its own for one that came after. A result follows only
-	// what was taken.
-	Command       string `protobuf:"bytes,4,opt,name=command,proto3" json:"command,omitempty"`
+	// In a later message than the receipt: what became of each part of the
+	// sealed message, with the command's output and status, sealed back to
+	// whoever sealed the message.
+	SealedAnswer []byte `protobuf:"bytes,3,opt,name=sealed_answer,json=sealedAnswer,proto3" json:"sealed_answer,omitempty"`
+	// What became of a sealed message: taken, unopened or too_late, as the
+	// guest says. With the receipt for a message that came with the bind, and
+	// in a message of its own for one that came after. An answer follows only
+	// what was taken, and a binder relies on that answer alone.
+	SealedStatus  string `protobuf:"bytes,4,opt,name=sealed_status,json=sealedStatus,proto3" json:"sealed_status,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -368,16 +369,16 @@ func (x *Bound) GetReceipt() []byte {
 	return nil
 }
 
-func (x *Bound) GetCommandResult() []byte {
+func (x *Bound) GetSealedAnswer() []byte {
 	if x != nil {
-		return x.CommandResult
+		return x.SealedAnswer
 	}
 	return nil
 }
 
-func (x *Bound) GetCommand() string {
+func (x *Bound) GetSealedStatus() string {
 	if x != nil {
-		return x.Command
+		return x.SealedStatus
 	}
 	return ""
 }
@@ -770,19 +771,19 @@ const file_session_v1alpha1_session_proto_rawDesc = "" +
 	"\x02td\x18\x01 \x01(\tR\x02td\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\x12:\n" +
 	"\bevidence\x18\x03 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x123\n" +
-	"\abind_by\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x06bindBy\"\x94\x01\n" +
+	"\abind_by\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\x06bindBy\"\x92\x01\n" +
 	"\vBindRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x0e\n" +
 	"\x02td\x18\x02 \x01(\tR\x02td\x12\x12\n" +
 	"\x04bind\x18\x03 \x01(\fR\x04bind\x12\x1c\n" +
-	"\tsignature\x18\x04 \x01(\fR\tsignature\x12\x18\n" +
-	"\acommand\x18\a \x01(\fR\acommandJ\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\x9e\x01\n" +
+	"\tsignature\x18\x04 \x01(\fR\tsignature\x12\x16\n" +
+	"\x06sealed\x18\a \x01(\fR\x06sealedJ\x04\b\x05\x10\x06J\x04\b\x06\x10\a\"\xa7\x01\n" +
 	"\x05Bound\x12:\n" +
 	"\bevidence\x18\x01 \x01(\v2\x1e.c8s.session.v1alpha1.EvidenceR\bevidence\x12\x18\n" +
-	"\areceipt\x18\x02 \x01(\fR\areceipt\x12%\n" +
-	"\x0ecommand_result\x18\x03 \x01(\fR\rcommandResult\x12\x18\n" +
-	"\acommand\x18\x04 \x01(\tR\acommand\"\xf1\x02\n" +
+	"\areceipt\x18\x02 \x01(\fR\areceipt\x12#\n" +
+	"\rsealed_answer\x18\x03 \x01(\fR\fsealedAnswer\x12#\n" +
+	"\rsealed_status\x18\x04 \x01(\tR\fsealedStatus\"\xf1\x02\n" +
 	"\bEvidence\x12 \n" +
 	"\vcertificate\x18\x01 \x01(\fR\vcertificate\x12'\n" +
 	"\x0flaunch_document\x18\x02 \x01(\fR\x0elaunchDocument\x12)\n" +

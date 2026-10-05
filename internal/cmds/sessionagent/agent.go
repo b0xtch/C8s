@@ -146,8 +146,8 @@ type Agent struct {
 	// oneTime are the keys the guest makes for its one bind and erases
 	// before anything of the tenant runs.
 	oneTime *oneTime
-	// command is the first command the guest may take with its bind.
-	command firstCommand
+	// sealed is the one sealed message the guest may take with its bind.
+	sealed sealedMessage
 	// issued is the last certificate the guest issued under its one-time
 	// keys, DER, and readyCert the one it had when its bind came: what its
 	// state serves from then on, so that its receipt can be checked for as
@@ -480,7 +480,7 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 		return nil, nil, err
 	}
 	traced(ctx, "signed")
-	// What signing left on the heap, and opening a first command before it,
+	// What signing left on the heap, and opening a sealed message before it,
 	// is erased by a collection, which runs beside what follows and is done
 	// before the sandbox starts.
 	collected := make(chan struct{})
@@ -498,10 +498,12 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	if err := a.acquire(ctx, bind, receipt); err != nil {
 		return nil, nil, err
 	}
-	// Nothing of the tenant has run yet, and the next step runs it. A first
-	// command that has not come by now is not opened any more.
+	// Nothing of the tenant has run yet, and the next step runs it. A sealed
+	// message that has not come by now is not opened any more, and the
+	// credentials of one that has are in place before the sandbox starts.
 	traced(ctx, "acquired")
-	a.closeCommand()
+	a.closeSealed()
+	a.putSealedCredentials()
 	<-collected
 	a.oneTime.collect()
 	tracedFor(ctx, "collection", collecting)
@@ -683,12 +685,14 @@ func (a *Agent) Bind(ctx context.Context, raw []byte, signature string) (replaye
 	return a.BindWith(ctx, raw, signature, nil)
 }
 
-// BindWith is Bind for a bind that comes with the session's first command,
-// sealed to the guest's one-time KEM key (session.SealFirstCommand). The
-// guest opens it while it takes the bind and runs it once the sandbox runs:
-// the answer says what became of it, and CommandAnswer waits for its result.
-// A bind sent again runs nothing again.
-func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, command []byte) (replayed bool, answer *BindAnswer, err error) {
+// BindWith is Bind for a bind that comes with a message sealed to the guest's
+// one-time KEM key (session.SealWithBind): the session's first command, the
+// credentials its binder holds, or both. The guest opens it while it takes
+// the bind, puts the credentials in place before the sandbox starts and runs
+// the command once it runs: the answer says what became of the message, and
+// SealedReply waits for its sealed answer. A bind sent again does nothing
+// again.
+func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, sealed []byte) (replayed bool, answer *BindAnswer, err error) {
 	a.binding.Lock()
 	a.measured.RLock()
 	current, retired := a.bind, a.retired
@@ -723,10 +727,10 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, comm
 		select {
 		case <-a.bound:
 			// As the first time: the receipt, the quote if it is there, and
-			// what became of the first command. A command that comes with a
+			// what became of the sealed message. A message that comes with a
 			// bind sent again is not opened: the key for it is gone.
 			a.measured.RLock()
-			again := &BindAnswer{Receipt: a.receipt, Attestation: a.bindQuote, Command: a.commandFor(command)}
+			again := &BindAnswer{Receipt: a.receipt, Attestation: a.bindQuote, Sealed: a.sealedFor(sealed)}
 			a.measured.RUnlock()
 			return true, again, nil
 		case <-ctx.Done():
@@ -765,11 +769,11 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, comm
 	}
 	a.measured.Unlock()
 	traced(ctx, "extended")
-	// A first command that came with the bind is opened now, with the guest's
-	// other one-time key, which is erased by it: before any command that
-	// follows the bind is looked at. It is run once the sandbox runs.
-	if len(command) > 0 {
-		a.takeCommand(bind, command)
+	// A sealed message that came with the bind is opened now, with the
+	// guest's other one-time key, which is erased by it: before anything that
+	// follows the bind is looked at. It is acted on as the sandbox starts.
+	if len(sealed) > 0 {
+		a.takeSealed(bind, sealed)
 		traced(ctx, "opened")
 	}
 	a.binding.Unlock()
@@ -783,28 +787,28 @@ func (a *Agent) BindWith(ctx context.Context, raw []byte, signature string, comm
 	if err != nil {
 		return false, nil, a.fail(err)
 	}
-	// The sandbox runs: so does the first command, if the guest took one,
-	// whoever is still there to hear its answer.
-	go a.runCommand(context.WithoutCancel(ctx))
-	return false, &BindAnswer{Receipt: receipt, Attestation: evidence, Command: a.commandFor(command)}, nil
+	// The sandbox runs: so does the command of a sealed message the guest
+	// took, whoever is still there to hear its answer.
+	go a.answerSealed(context.WithoutCancel(ctx))
+	return false, &BindAnswer{Receipt: receipt, Attestation: evidence, Sealed: a.sealedFor(sealed)}, nil
 }
 
-// CommandAnswer waits for the sealed answer of the first command the guest
-// took, with its bind or just after.
-func (a *Agent) CommandAnswer(ctx context.Context) (*session.CommandAnswer, error) {
-	return a.commandAnswer(ctx)
+// SealedReply waits for the sealed answer of the message the guest took,
+// with its bind or just after.
+func (a *Agent) SealedReply(ctx context.Context) (*session.SealedReply, error) {
+	return a.sealedReply(ctx)
 }
 
 // BindAnswer is what a guest answers a bind it took with: its receipt, the
 // evidence over the bind's nonce if it has that already, and what became of
-// a first command that came with the bind.
+// a sealed message that came with the bind.
 type BindAnswer struct {
 	Receipt     *session.SignedReceipt
 	Attestation *session.AttestResponse
-	// Command is session.CommandTaken, CommandUnopened or CommandTooLate for
-	// a bind that came with a command, and empty for one that came with
+	// Sealed is session.SealedTaken, SealedUnopened or SealedTooLate for a
+	// bind that came with a sealed message, and empty for one that came with
 	// none.
-	Command string
+	Sealed string
 }
 
 // acceptable checks a bind for this guest: well-formed, signed by the

@@ -98,7 +98,7 @@
           "optional": true
         },
         {
-          "name": "command",
+          "name": "sealed",
           "kind": "code",
           "codes": [
             "taken",
@@ -133,11 +133,11 @@
       ]
     },
     {
-      "name": "command",
-      "says": "after its answer to a bind that came with a first command, and to one sent just after: what became of the command, and its answer sealed to its sender",
+      "name": "sealed",
+      "says": "after its answer to a bind that came with a sealed message, and to one sent just after: whether it took the message, and its answer sealed to the message's sender",
       "fields": [
         {
-          "name": "command",
+          "name": "sealed",
           "kind": "code",
           "codes": [
             "taken",

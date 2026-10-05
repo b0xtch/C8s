@@ -64,7 +64,8 @@ func (r *Relayed) source(context.Context) []CollateralDocument {
 //
 // It proves neither freshness nor that the key is live. That is enough to
 // sign a bind for the key, which is not secret: only the guest holding the
-// key can take the bind, and VerifyBound judges its answer.
+// key can take the bind, and VerifyBound judges its answer. It is not enough
+// to seal anything to the guest with that bind: see VerifyReadyToRelease.
 func VerifyReady(ctx context.Context, policy Policy, engine Engine, r *Relayed, now time.Time) (*ReadyTD, error) {
 	if err := policy.validate(); err != nil {
 		return nil, err
@@ -79,8 +80,9 @@ func VerifyReady(ctx context.Context, policy Policy, engine Engine, r *Relayed, 
 }
 
 // VerifyReadyToRelease is VerifyReady for a verifier whose verdict lets a
-// secret go to the guest later, as a key service's does: the root CA CRL
-// under it is one the verifier fetched itself.
+// secret go to the guest, as a key service's does and a binder's that seals a
+// command or credentials with its bind (SealWithBind): the root CA CRL under
+// it is one the verifier fetched itself.
 func VerifyReadyToRelease(ctx context.Context, policy Policy, engine Engine, r *Relayed, now time.Time) (*ReadyTD, error) {
 	if err := policy.validate(); err != nil {
 		return nil, err
@@ -94,7 +96,9 @@ func VerifyReadyToRelease(ctx context.Context, policy Policy, engine Engine, r *
 }
 
 // verifyReady judges a guest's state and serving certificate as those of a
-// guest nobody has bound.
+// guest nobody has bound. The verdict says until when a secret may be sealed
+// to the guest on it, and that none may when it rests on a root CA CRL
+// somebody handed over.
 func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.Certificate, state *StateResponse, now time.Time) (*ReadyTD, error) {
 	doc, err := VerifySigned(policy.LaunchKey, state.Launch, state.Signature)
 	if err != nil {
@@ -121,6 +125,11 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 		return nil, refuse("the guest's evidence binds no one-time keys: a receipt for its bind could not be told from one its session signed")
 	}
 	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey, OneTime: oneTime}
+	// Intel signs its root CA CRL once a year, so one that was handed over
+	// may hide a newer one. That is enough for a bind, which is not secret.
+	if finding := CollateralOf(res); finding == nil || !finding.RootCRLStapled {
+		ready.Until = stands(now, leaf, res)
+	}
 	// Evidence of a TEE with no such register has no machine to report.
 	if machine, err := res.Claims.RTMR(0); err == nil {
 		ready.Machine = machine

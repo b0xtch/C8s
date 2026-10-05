@@ -252,23 +252,25 @@ func lasts(leaf []byte, now time.Time) bool {
 }
 
 // Bind hands a claimed TD its bind and answers with the guest's receipt for
-// it. The call is a stream both ways. Its first message is the bind, with the
-// session's first command sealed for the guest if its sender had it by then;
-// a command may also come alone in the next message, and is carried to the
-// guest, which opens it while it still takes the bind. The first answer is
-// the receipt, with what became of a command that came with the bind. What
-// became of a command that came after it, and the sealed answer of one the
-// guest took, follow in a later message. The daemon reads none of either.
+// it. The call is a stream both ways. Its first message is the bind, with a
+// message sealed for the guest if its sender had one by then: the session's
+// first command, credentials its binder holds, or both. A sealed message may
+// also come alone in the next message, and is carried to the guest, which
+// opens it while it still takes the bind. The first answer is the receipt,
+// with what the guest says became of a sealed message that came with the
+// bind. What became of one that came after it, and the sealed answer of one
+// the guest took, follow in a later message. The daemon reads none of
+// either.
 //
-// A call whose bind came with no command ends once its caller has closed its
-// side, having sent a command or not.
+// A call whose bind came with no sealed message ends once its caller has
+// closed its side, having sent one or not.
 func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 	req, err := stream.Recv()
 	if err != nil {
 		return status.Error(codes.InvalidArgument, "the call's first message is the bind")
 	}
-	if n := len(req.GetCommand()); n > session.MaxFirstCommandBytes {
-		return status.Errorf(codes.InvalidArgument, "command is at most %d bytes", session.MaxFirstCommandBytes)
+	if n := len(req.GetSealed()); n > session.MaxSealedBytes {
+		return status.Errorf(codes.InvalidArgument, "sealed is at most %d bytes", session.MaxSealedBytes)
 	}
 	ctx := stream.Context()
 	// One answer goes out at a time, and the receipt before any other.
@@ -280,12 +282,12 @@ func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 	}
 	relaying := make(chan *td, 1)
 	receipted := make(chan struct{})
-	// late is what a command that comes in the call's next message comes
-	// to: nil when the bind brought its own.
+	// late is what a sealed message that comes in the call's next message
+	// comes to: nil when the bind brought its own.
 	var late chan error
-	if len(req.GetCommand()) == 0 {
+	if len(req.GetSealed()) == 0 {
 		late = make(chan error, 1)
-		go func() { late <- d.lateCommand(stream, relaying, receipted, send) }()
+		go func() { late <- d.lateSealed(stream, relaying, receipted, send) }()
 	}
 	answer, wait, err := d.bind(ctx, req, relaying)
 	if err != nil {
@@ -298,32 +300,32 @@ func (d *Daemon) Bind(stream sessionv1alpha1.Sessions_BindServer) error {
 	if wait != nil {
 		result, err := wait()
 		if err != nil {
-			d.log.Warn("the answer to a first command was lost", "td", req.GetTd(), "error", err)
-			return status.Error(codes.Unavailable, "the guest's answer to the first command was lost: send the same request again")
+			d.log.Warn("the answer to a sealed message was lost", "td", req.GetTd(), "error", err)
+			return status.Error(codes.Unavailable, "the guest's answer to the sealed message was lost: send the same request again")
 		}
-		return send(&sessionv1alpha1.Bound{Command: result.Command, CommandResult: result.Answer})
+		return send(&sessionv1alpha1.Bound{SealedStatus: result.Sealed, SealedAnswer: result.Answer})
 	}
-	// The caller may still send its command, which the guest answers
+	// The caller may still send its sealed message, which the guest answers
 	// whenever it comes: by now, that it came too late, unless this call
-	// repeats one whose command the guest took.
+	// repeats one whose message the guest took.
 	if late != nil {
 		return <-late
 	}
 	return nil
 }
 
-// lateCommand carries a first command that comes alone in the next message
+// lateSealed carries a sealed message that comes alone in the next message
 // of a Bind call to the guest, once the bind has been sent there, and sends
 // back what became of it after the receipt. It returns once the caller has
 // said all it will.
-func (d *Daemon) lateCommand(stream sessionv1alpha1.Sessions_BindServer, relaying <-chan *td, receipted <-chan struct{}, send func(*sessionv1alpha1.Bound) error) error {
+func (d *Daemon) lateSealed(stream sessionv1alpha1.Sessions_BindServer, relaying <-chan *td, receipted <-chan struct{}, send func(*sessionv1alpha1.Bound) error) error {
 	next, err := stream.Recv()
-	if err != nil || len(next.GetCommand()) == 0 {
+	if err != nil || len(next.GetSealed()) == 0 {
 		// The caller has no more to say, or the call is over.
 		return nil
 	}
-	if len(next.GetCommand()) > session.MaxFirstCommandBytes {
-		return status.Errorf(codes.InvalidArgument, "command is at most %d bytes", session.MaxFirstCommandBytes)
+	if len(next.GetSealed()) > session.MaxSealedBytes {
+		return status.Errorf(codes.InvalidArgument, "sealed is at most %d bytes", session.MaxSealedBytes)
 	}
 	ctx := stream.Context()
 	var t *td
@@ -339,28 +341,29 @@ func (d *Daemon) lateCommand(stream sessionv1alpha1.Sessions_BindServer, relayin
 	d.mu.Lock()
 	address := t.rec.Address
 	d.mu.Unlock()
-	answer, err := t.guests.command(ctx, address, next.GetCommand())
+	answer, err := t.guests.sealed(ctx, address, next.GetSealed())
 	if err != nil {
-		// The guest took it or did not: its sender sends the command over a
-		// connection of its own, which the guest answers either way.
-		d.log.Warn("a first command sent after its bind got no answer", "error", err)
-		answer = &session.CommandAnswer{Command: session.CommandTooLate}
+		// The guest took it or did not: its sender sends what it sealed over
+		// a connection of its own, which the guest answers either way.
+		d.log.Warn("a sealed message sent after its bind got no answer", "error", err)
+		answer = &session.SealedReply{Sealed: session.SealedTooLate}
 	}
 	select {
 	case <-receipted:
 	case <-ctx.Done():
 		return nil
 	}
-	return send(&sessionv1alpha1.Bound{Command: answer.Command, CommandResult: answer.Answer})
+	return send(&sessionv1alpha1.Bound{SealedStatus: answer.Sealed, SealedAnswer: answer.Answer})
 }
 
 // bind is the bind itself: it records it, hands it to the guest and returns
-// the guest's first answer, with how to wait for a first command's sealed
-// answer if the guest took one. relaying is told the TD once its guest has
-// been sent the bind, now or by an earlier call, and nil if it never was: a
-// command that follows the bind is sent to the guest after the bind, on a
-// connection opened after it, which is one the guest's fence lets in.
-func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, commandWait, error) {
+// the guest's first answer, with how to wait for the sealed answer of a
+// sealed message if the guest took one. relaying is told the TD once its
+// guest has been sent the bind, now or by an earlier call, and nil if it
+// never was: a sealed message that follows the bind is sent to the guest
+// after the bind, on a connection opened after it, which is one the guest's
+// fence lets in.
+func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, sealedWait, error) {
 	began := time.Now()
 	var told sync.Once
 	tell := func(t *td) { told.Do(func() { relaying <- t }) }
@@ -394,16 +397,16 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	case b != nil && b.Digest != digest:
 		d.mu.Unlock()
 		return nil, nil, status.Error(codes.InvalidArgument, "request_id was used for another bind")
-	case b != nil && b.Answer != nil && len(req.GetCommand()) == 0:
+	case b != nil && b.Answer != nil && len(req.GetSealed()) == 0:
 		defer d.mu.Unlock()
 		var answer sessionv1alpha1.Bound
 		if err := proto.Unmarshal(b.Answer, &answer); err != nil {
 			return nil, nil, status.Error(codes.Internal, "the first answer could not be read back")
 		}
-		// What became of a command is said to whoever sent one. The guest
-		// has the bind, and answers a command that followed it as it did the
-		// first time.
-		answer.Command = ""
+		// What became of a sealed message is said to whoever sent one. The
+		// guest has the bind, and answers a message that followed it as it
+		// did the first time.
+		answer.SealedStatus = ""
 		tell(t)
 		return &answer, nil, nil
 	case t.busy:
@@ -414,9 +417,9 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		d.mu.Unlock()
 		return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", reason)
 	case b != nil && b.Answer != nil:
-		// The same bind again, with a command: the guest answers it as it
-		// answered the first, and says what became of this command. Only
-		// the guest keeps a command's sealed answer.
+		// The same bind again, with a sealed message: the guest answers it
+		// as it answered the first, and says what became of this message.
+		// Only the guest keeps a sealed answer.
 		replay = true
 	case b == nil && t.rec.State != StateClaimed:
 		state := t.rec.State
@@ -474,7 +477,7 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	if len(evidence.GetCollateral()) == 0 {
 		evidence.Collateral = t.collateral
 	}
-	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, Command: relayed.command}
+	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, SealedStatus: relayed.sealed}
 	if replay {
 		return answer, relayed.wait, nil
 	}
@@ -489,13 +492,13 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	}
 	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
 		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
-		"command", relayed.command)
+		"sealed", relayed.sealed)
 	d.notify()
 	return answer, relayed.wait, nil
 }
 
 // relayBind posts the bind until the guest answers it for good. A guest that
-// took a first command with it answers that later, over the same request,
+// took a sealed message with it answers that later, over the same request,
 // which lives until then.
 func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sessionv1alpha1.BindRequest, wrote func()) (*boundAnswer, error) {
 	ctx, cancel := context.WithTimeout(ctx, maxBindWait)
@@ -506,10 +509,10 @@ func (d *Daemon) relayBind(ctx context.Context, t *td, address string, req *sess
 		cancel()
 	}
 	for {
-		answer, err := t.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetCommand(), wrote)
+		answer, err := t.guests.bind(ctx, address, req.GetBind(), req.GetSignature(), req.GetSealed(), wrote)
 		if err == nil && answer.wait != nil {
 			wait := answer.wait
-			answer.wait = func() (*session.CommandAnswer, error) {
+			answer.wait = func() (*session.SealedReply, error) {
 				defer done()
 				return wait()
 			}

@@ -52,12 +52,12 @@ func TestEncodeTakesWhatAGuestSays(t *testing.T) {
 		}},
 		"a bind's answer":   {disclosure.MessageBound, session.BindResponse{Phase: session.PhaseRunning, Admission: steps, Attestation: attestation()}},
 		"a bind sent again": {disclosure.MessageBound, session.BindResponse{Phase: session.PhaseRunning, Replayed: true}},
-		"a bind that came with a command": {disclosure.MessageBound, session.BindResponse{
-			Phase: session.PhaseRunning, Command: session.CommandTaken, Admission: steps, Attestation: attestation(),
+		"a bind that came with a sealed message": {disclosure.MessageBound, session.BindResponse{
+			Phase: session.PhaseRunning, Sealed: session.SealedTaken, Admission: steps, Attestation: attestation(),
 		}},
-		"a command's sealed answer":    {disclosure.MessageCommand, session.CommandAnswer{Command: session.CommandTaken, Answer: []byte("ciphertext")}},
-		"a command that came too late": {disclosure.MessageCommand, session.CommandAnswer{Command: session.CommandTooLate}},
-		"the platform":                 {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: "platform"}},
+		"a sealed message's sealed answer":    {disclosure.MessageSealed, session.SealedReply{Sealed: session.SealedTaken, Answer: []byte("ciphertext")}},
+		"a sealed message that came too late": {disclosure.MessageSealed, session.SealedReply{Sealed: session.SealedTooLate}},
+		"the platform":                        {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: "platform"}},
 	} {
 		want, err := json.Marshal(tc.value)
 		if err != nil {
@@ -141,17 +141,17 @@ func TestEncodeHoldsBackWhatTheSchemaDoesNotList(t *testing.T) {
 		"evidence beyond its bound": {disclosure.MessageAttestation, map[string]any{
 			"evidence": map[string]any{"platform": "tdx", "evidence": map[string]any{"quote": long}}, "phase": "running", "launch": "bGF1bmNo", "signature": "c2ln", "events": []string{},
 		}},
-		"a platform CA outside the list":  {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: secret}},
-		"a command's fate in words":       {disclosure.MessageCommand, map[string]any{"command": secret}},
-		"a command's answer in the clear": {disclosure.MessageCommand, map[string]any{"command": "taken", "answer": secret + " !"}},
-		"a command's answer with its result beside it": {disclosure.MessageCommand, map[string]any{
-			"command": "taken", "answer": "AAAA", "stdout": secret,
+		"a platform CA outside the list":   {disclosure.MessagePlatform, session.CollateralPlatform{FMSPC: "00806f050000", CA: secret}},
+		"a sealed message's fate in words": {disclosure.MessageSealed, map[string]any{"sealed": secret}},
+		"a sealed answer in the clear":     {disclosure.MessageSealed, map[string]any{"sealed": "taken", "answer": secret + " !"}},
+		"a sealed answer with a result beside it": {disclosure.MessageSealed, map[string]any{
+			"sealed": "taken", "answer": "AAAA", "stdout": secret,
 		}},
-		"a command's answer beyond its bound": {disclosure.MessageCommand, session.CommandAnswer{
-			Command: session.CommandTaken, Answer: make([]byte, 4<<20+1),
+		"a sealed answer beyond its bound": {disclosure.MessageSealed, session.SealedReply{
+			Sealed: session.SealedTaken, Answer: make([]byte, 4<<20+1),
 		}},
-		"a command's fate in a bind's answer, in words": {disclosure.MessageBound, map[string]any{"phase": "running", "command": secret}},
-		"a value that does not render":                  {disclosure.MessageRefusal, map[string]any{"error": make(chan int)}},
+		"a sealed message's fate in a bind's answer, in words": {disclosure.MessageBound, map[string]any{"phase": "running", "sealed": secret}},
+		"a value that does not render":                         {disclosure.MessageRefusal, map[string]any{"error": make(chan int)}},
 	} {
 		got, err := disclosure.Encode(tc.message, tc.value)
 		if err == nil {

@@ -64,4 +64,4 @@ func Stapled(ctx context.Context) (docs []CollateralDocument, ok bool) {
 
 // MayStapleRoot reports whether a judgment's context lets its verdict rest
 // on a root CA CRL from the context's source.
-func MayStapleRoot(ctx context.Context) bool { return ctx.Value(stapledRootKey{}) != nil }
+func MayStapleRoot(ctx context.Context) bool { return StapledRootCRLAllowed(ctx) }

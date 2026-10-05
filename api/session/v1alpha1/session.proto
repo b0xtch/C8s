@@ -19,13 +19,15 @@ service Sessions {
   rpc Claim(ClaimRequest) returns (Claimed);
   // Bind hands a claimed TD its bind and returns the guest's receipt for it.
   // The guest raises its fence as the bind arrives: no connection opened to
-  // it before survives. The first message carries the bind, and may carry
-  // the session's first command, sealed for the guest; a command may also
-  // come alone in the next message. The first answer is the receipt. If the
-  // guest took a command, a second answer follows with its sealed result. A
-  // call whose bind came with no command ends once its caller has closed its
-  // side, and one repeated because its answer was lost sends the same
-  // command with the bind: the guest answers both as it answered the first.
+  // it before survives. The first message carries the bind, and may carry a
+  // message sealed for the guest: the session's first command, credentials
+  // its binder holds, or both. A sealed message may also come alone in the
+  // next message. The first answer is the receipt. If the guest took a
+  // sealed message, a second answer follows with its sealed answer. A call
+  // whose bind came with no sealed message ends once its caller has closed
+  // its side, and one repeated because its answer was lost sends the same
+  // sealed message with the bind: the guest answers both as it answered the
+  // first.
   rpc Bind(stream BindRequest) returns (stream Bound);
   // Connect carries bytes to and from the TLS port of a bound TD, and
   // terminates nothing: the caller's TLS session ends in the guest.
@@ -65,10 +67,10 @@ message BindRequest {
   bytes signature = 4;
   // Disks and layers arrive with the disk slots.
   reserved 5, 6;
-  // The session's first command, sealed to the guest's one-time KEM key
-  // under the bind: with the bind, or alone in the next message of the call.
-  // The daemon carries it unread.
-  bytes command = 7;
+  // The session's first command and the credentials its binder holds,
+  // sealed to the guest's one-time KEM key under the bind: with the bind, or
+  // alone in the next message of the call. The daemon carries it unread.
+  bytes sealed = 7;
 }
 
 message Bound {
@@ -79,14 +81,15 @@ message Bound {
   // over the same nonce is in the evidence if the guest had it by then, and
   // in what GetEvidence returns once it has.
   bytes receipt = 2;
-  // In a later message than the receipt: the first command's output and
-  // status, sealed back to whoever sealed the command.
-  bytes command_result = 3;
-  // What became of a first command: taken, unopened or too_late, as the
-  // guest says. With the receipt for a command that came with the bind, and
-  // in a message of its own for one that came after. A result follows only
-  // what was taken.
-  string command = 4;
+  // In a later message than the receipt: what became of each part of the
+  // sealed message, with the command's output and status, sealed back to
+  // whoever sealed the message.
+  bytes sealed_answer = 3;
+  // What became of a sealed message: taken, unopened or too_late, as the
+  // guest says. With the receipt for a message that came with the bind, and
+  // in a message of its own for one that came after. An answer follows only
+  // what was taken, and a binder relies on that answer alone.
+  string sealed_status = 4;
 }
 
 // Evidence is what a guest says of itself, relayed unread. Each part is

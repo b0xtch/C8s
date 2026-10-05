@@ -18,14 +18,14 @@ import (
 
 // OneTimeKeys are the public halves of the two keys a pooled guest makes for
 // its one bind, beside its instance key. It signs its receipt for the bind
-// with the first, and a binder seals the session's first command to the
-// second. The guest erases both private halves before anything of the tenant
-// runs.
+// with the first, and a binder seals what it sends with the bind to the
+// second: the session's first command, and the credentials it holds. The
+// guest erases both private halves before anything of the tenant runs.
 //
 // The instance key cannot do either job. It outlives the bind, so code that
 // broke out of a session's sandbox could read it, while the guest's host
 // still holds the evidence the guest gave when it was ready and can show it
-// to another binder. A receipt or a sealed command that rested on the
+// to another binder. A receipt or a sealed message that rested on the
 // instance key would rest on that code.
 //
 // The keys travel in every certificate a guest issues before its bind, and
@@ -37,7 +37,7 @@ type OneTimeKeys struct {
 	// Signing is the Ed25519 public key the guest signs its receipt under.
 	Signing []byte
 	// KEM is the public key of the hybrid KEM, ML-KEM-768 with X25519, that
-	// a binder seals the session's first command to.
+	// a binder seals what it sends with the bind to.
 	KEM []byte
 }
 

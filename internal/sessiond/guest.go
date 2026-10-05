@@ -21,7 +21,7 @@ import (
 )
 
 // maxGuestAnswer bounds what the daemon reads of one answer of a guest: its
-// evidence, or a first command's sealed answer in base64.
+// evidence, or the sealed answer of a sealed message in base64.
 const maxGuestAnswer = 8 << 20
 
 // guestClient is how the daemon talks to the agents of its TDs. It verifies
@@ -223,30 +223,31 @@ func attested(leaf []byte, att *session.AttestResponse) (*sessionv1alpha1.Eviden
 	}, nil
 }
 
-// commandWait waits for the sealed answer of a first command a guest took
+// sealedWait waits for the sealed answer of a sealed message a guest took
 // with its bind: the second document of the guest's answer.
-type commandWait func() (*session.CommandAnswer, error)
+type sealedWait func() (*session.SealedReply, error)
 
 // bound is a guest's answer to a bind, as the daemon relays it.
 type boundAnswer struct {
 	evidence *sessionv1alpha1.Evidence
 	receipt  []byte
-	// command is what became of a first command that came with the bind,
-	// and wait how its sealed answer is waited for, when it was taken.
-	command string
-	wait    commandWait
+	// sealed is what the guest says became of a sealed message that came
+	// with the bind, and wait how its sealed answer is waited for, when it
+	// was taken.
+	sealed string
+	wait   sealedWait
 }
 
-// bind hands the guest its bind, with a first command sealed for it if one
-// came, and returns the guest's answer: its receipt for the bind, as it sent
-// it, and its evidence. The evidence holds the quote over the bind's nonce if
-// the guest had it by then. Otherwise it holds the certificate and the phase
+// bind hands the guest its bind, with a message sealed for it if one came,
+// and returns the guest's answer: its receipt for the bind, as it sent it,
+// and its evidence. The evidence holds the quote over the bind's nonce if the
+// guest had it by then. Otherwise it holds the certificate and the phase
 // alone: the receipt says the rest, and the quote comes with the guest's
-// evidence once the guest has it. A guest that took the command sends its
-// sealed answer after that, once the command has run. wrote, if given, is
+// evidence once the guest has it. A guest that took the sealed message sends
+// its sealed answer after that, once it has acted on it. wrote, if given, is
 // called once the bind has been written to the guest's connection.
-func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, command []byte, wrote func()) (*boundAnswer, error) {
-	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature), Command: command})
+func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, sealed []byte, wrote func()) (*boundAnswer, error) {
+	body, err := json.Marshal(session.BindRequest{Bind: bind, Signature: string(signature), Sealed: sealed})
 	if err != nil {
 		return nil, err
 	}
@@ -261,8 +262,8 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, co
 	if err != nil {
 		return nil, err
 	}
-	// The answer is one document, or two for a command that was taken. The
-	// body stays open until the last is read.
+	// The answer is one document, or two for a sealed message that was
+	// taken. The body stays open until the last is read.
 	documents := json.NewDecoder(io.LimitReader(resp.Body, maxGuestAnswer))
 	if err := answered(resp); err != nil {
 		resp.Body.Close()
@@ -277,7 +278,7 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, co
 	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
 		leaf = resp.TLS.PeerCertificates[0].Raw
 	}
-	out := &boundAnswer{command: answer.Command}
+	out := &boundAnswer{sealed: answer.Sealed}
 	if answer.Receipt != nil {
 		if out.receipt, err = json.Marshal(answer.Receipt); err != nil {
 			resp.Body.Close()
@@ -292,20 +293,20 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, co
 	} else {
 		out.evidence = &sessionv1alpha1.Evidence{Certificate: leaf, Phase: string(answer.Phase)}
 	}
-	if answer.Command != session.CommandTaken {
+	if answer.Sealed != session.SealedTaken {
 		// Read to its end, so that the connection is kept for the next request.
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		return out, nil
 	}
 	var once sync.Once
-	var result session.CommandAnswer
+	var result session.SealedReply
 	var failed error
-	out.wait = func() (*session.CommandAnswer, error) {
+	out.wait = func() (*session.SealedReply, error) {
 		once.Do(func() {
 			defer resp.Body.Close()
 			if failed = documents.Decode(&result); failed != nil {
-				failed = fmt.Errorf("the guest's answer to the first command: %w", failed)
+				failed = fmt.Errorf("the guest's answer to the sealed message: %w", failed)
 				return
 			}
 			_, _ = io.Copy(io.Discard, resp.Body)
@@ -318,31 +319,31 @@ func (g *guestClient) bind(ctx context.Context, addr string, bind, signature, co
 	return out, nil
 }
 
-// command hands a guest that is taking its bind a first command that
+// sealed hands a guest that is taking its bind a sealed message that
 // followed the bind, and waits for what became of it.
 //
 // It goes on a connection of its own, since the bind's is taken until the
 // guest has answered. A bind ends every connection its guest accepted before
 // it arrived, and one made as the bind was written may be among them: it
 // breaks, or the guest refuses what came on it unread. A second, made after
-// that, is one the guest lets in, and the guest answers a command it is sent
+// that, is one the guest lets in, and the guest answers a message it is sent
 // twice as it answered the first.
-func (g *guestClient) command(ctx context.Context, addr string, sealed []byte) (*session.CommandAnswer, error) {
-	body, err := json.Marshal(session.CommandRequest{Command: sealed})
+func (g *guestClient) sealed(ctx context.Context, addr string, sealed []byte) (*session.SealedReply, error) {
+	body, err := json.Marshal(session.SealedRequest{Sealed: sealed})
 	if err != nil {
 		return nil, err
 	}
-	data, _, err := g.do(ctx, addr, http.MethodPost, session.PathBindCommand, body)
+	data, _, err := g.do(ctx, addr, http.MethodPost, session.PathBindSealed, body)
 	var refused *refusal
 	if err != nil && ctx.Err() == nil && (!errors.As(err, &refused) || refused.code == string(disclosure.Fenced)) {
-		data, _, err = g.do(ctx, addr, http.MethodPost, session.PathBindCommand, body)
+		data, _, err = g.do(ctx, addr, http.MethodPost, session.PathBindSealed, body)
 	}
 	if err != nil {
 		return nil, err
 	}
-	var answer session.CommandAnswer
+	var answer session.SealedReply
 	if err := json.Unmarshal(data, &answer); err != nil {
-		return nil, fmt.Errorf("the guest's answer to the first command: %w", err)
+		return nil, fmt.Errorf("the guest's answer to the sealed message: %w", err)
 	}
 	return &answer, nil
 }

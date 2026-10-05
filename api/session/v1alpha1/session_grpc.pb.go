@@ -42,13 +42,15 @@ type SessionsClient interface {
 	Claim(ctx context.Context, in *ClaimRequest, opts ...grpc.CallOption) (*Claimed, error)
 	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
 	// The guest raises its fence as the bind arrives: no connection opened to
-	// it before survives. The first message carries the bind, and may carry
-	// the session's first command, sealed for the guest; a command may also
-	// come alone in the next message. The first answer is the receipt. If the
-	// guest took a command, a second answer follows with its sealed result. A
-	// call whose bind came with no command ends once its caller has closed its
-	// side, and one repeated because its answer was lost sends the same
-	// command with the bind: the guest answers both as it answered the first.
+	// it before survives. The first message carries the bind, and may carry a
+	// message sealed for the guest: the session's first command, credentials
+	// its binder holds, or both. A sealed message may also come alone in the
+	// next message. The first answer is the receipt. If the guest took a
+	// sealed message, a second answer follows with its sealed answer. A call
+	// whose bind came with no sealed message ends once its caller has closed
+	// its side, and one repeated because its answer was lost sends the same
+	// sealed message with the bind: the guest answers both as it answered the
+	// first.
 	Bind(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[BindRequest, Bound], error)
 	// Connect carries bytes to and from the TLS port of a bound TD, and
 	// terminates nothing: the caller's TLS session ends in the guest.
@@ -133,13 +135,15 @@ type SessionsServer interface {
 	Claim(context.Context, *ClaimRequest) (*Claimed, error)
 	// Bind hands a claimed TD its bind and returns the guest's receipt for it.
 	// The guest raises its fence as the bind arrives: no connection opened to
-	// it before survives. The first message carries the bind, and may carry
-	// the session's first command, sealed for the guest; a command may also
-	// come alone in the next message. The first answer is the receipt. If the
-	// guest took a command, a second answer follows with its sealed result. A
-	// call whose bind came with no command ends once its caller has closed its
-	// side, and one repeated because its answer was lost sends the same
-	// command with the bind: the guest answers both as it answered the first.
+	// it before survives. The first message carries the bind, and may carry a
+	// message sealed for the guest: the session's first command, credentials
+	// its binder holds, or both. A sealed message may also come alone in the
+	// next message. The first answer is the receipt. If the guest took a
+	// sealed message, a second answer follows with its sealed answer. A call
+	// whose bind came with no sealed message ends once its caller has closed
+	// its side, and one repeated because its answer was lost sends the same
+	// sealed message with the bind: the guest answers both as it answered the
+	// first.
 	Bind(grpc.BidiStreamingServer[BindRequest, Bound]) error
 	// Connect carries bytes to and from the TLS port of a bound TD, and
 	// terminates nothing: the caller's TLS session ends in the guest.

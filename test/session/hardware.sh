@@ -5,7 +5,9 @@
 # credential and starts sessions. Each session is a TD of its own: it is
 # claimed, bound, verified from a fresh quote, handed the stored credential by
 # the key service and a second one by a key its bind grants, and runs one
-# authenticated command that reads both.
+# authenticated command that reads both. One session's first command and a
+# credential its owner holds go with its bind, sealed to a key its guest made
+# for that one bind.
 #
 # Before that it reads two machines (RTMR[0]) from evidence, the key service's
 # and the class's, each from one guest launched under a document that lists
@@ -321,14 +323,14 @@ if [ "$code" = 409 ] && grep -q bind_no_machine "$out/bind-raw.out"; then
 else
     record FAIL "the guest takes no bind, and says its document lists no machine" "HTTP $code: $(head -c 300 "$out/bind-raw.out" | tr '\n' ' ')"
 fi
-# Nor a command for a session: one follows a bind, and a guest that no bind
-# has reached reads none.
-code=$(curl -sk --max-time 10 -o "$out/command-raw.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"command":"AAAA"}' \
-    "https://127.0.0.1:$probe_port/v1/bind/command")
-if [ "$code" = 409 ] && grep -q fenced "$out/command-raw.out"; then
-    record PASS "a guest that no bind has reached reads no command"
+# Nor a sealed message for a session: one comes with a bind or just after
+# it, and a guest that no bind has reached reads none.
+code=$(curl -sk --max-time 10 -o "$out/sealed-raw.out" -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"sealed":"AAAA"}' \
+    "https://127.0.0.1:$probe_port/v1/bind/sealed")
+if [ "$code" = 409 ] && grep -q fenced "$out/sealed-raw.out"; then
+    record PASS "a guest that no bind has reached reads no sealed message"
 else
-    record FAIL "a guest that no bind has reached reads no command" "HTTP $code: $(head -c 300 "$out/command-raw.out" | tr '\n' ' ')"
+    record FAIL "a guest that no bind has reached reads no sealed message" "HTTP $code: $(head -c 300 "$out/sealed-raw.out" | tr '\n' ' ')"
 fi
 stop_pid "$probe_pid"; probe_pid=""
 
@@ -532,17 +534,27 @@ cat "$out/start-s2.out" >> "$out/records.jsonl"
 expect 3 "a second start of a live session is refused" start-s1-again \
     start_session s1 "$out/s1-again" acme "$out/authority.key" "$manifest" "$launch_key" "${sandbox[@]}"
 
-# A session whose first command goes with its bind, sealed to the key its
-# guest made for its one bind: the daemon carries it unread, and the guest
-# runs it as soon as its sandbox does. The command reads what the key service
-# released at that bind, and leaves a line each time it runs.
-expect 0 "start session s3 with its first command in the bind" start-s3 start_session s3 "$out/s3" acme "$out/authority.key" "$manifest" "$launch_key" \
-    "${sandbox[@]}" "${stored[@]}" -- sh -c 'echo ran >> /tmp/first; cat "$C8S_CREDENTIALS_DIR/api-token"'
+# A session whose first command and a credential its owner holds go with its
+# bind, sealed to the key its guest made for its one bind: the daemon carries
+# them unread, the guest has the credential in place before its sandbox
+# starts, and runs the command as soon as the sandbox does. The command reads
+# that credential and what the key service released at that bind, and leaves
+# a line each time it runs.
+printf 'sealed-secret-%s' "$run" > "$out/sealed"
+expect 0 "start session s3 with its first command and a credential in the bind" start-s3 start_session s3 "$out/s3" acme "$out/authority.key" "$manifest" "$launch_key" \
+    "${sandbox[@]}" "${stored[@]}" --sealed-credential "bind-token:256=$out/sealed" \
+    -- sh -c 'echo ran >> /tmp/first; cat "$C8S_CREDENTIALS_DIR/api-token"; echo; cat "$C8S_CREDENTIALS_DIR/bind-token"'
 cat "$out/start-s3.out" >> "$out/records.jsonl"
 check "its guest took the command with the bind" [ "$(first start-s3 with_bind)" = True ]
-check "the command read the credential released at that bind" [ "$(first start-s3 stdout)" = "stored-secret-$run" ]
-check "the daemon carried the command, and its guest took it" grep -q '"msg":"bound a TD".*"command":"taken"' "$out/daemon.log"
-reason "its guest opened the command while it took the bind" start-s3 'a first command came.*taken'
+check "the command read the credential released at that bind" [ "$(first start-s3 stdout | sed -n 1p)" = "stored-secret-$run" ]
+check "the command read the credential sealed with that bind" [ "$(first start-s3 stdout | sed -n 2p)" = "sealed-secret-$run" ]
+check "its guest had the sealed credential in place before its sandbox started" \
+    [ "$(python3 -c 'import json,sys; print(",".join((json.load(open(sys.argv[1])).get("credentials") or {}).get("with_bind") or []))' "$out/start-s3.out")" = bind-token ]
+check "the daemon carried the sealed message, and its guest took it" grep -q '"msg":"bound a TD".*"sealed":"taken"' "$out/daemon.log"
+check "the host holds the sealed credential in none of the daemon's files" \
+    sh -c "! sudo -n grep -r -a -q 'sealed-secret-$run' '$out/state' '$out/daemon.log'"
+reason "its guest opened the sealed message while it took the bind" start-s3 'a sealed message came.*taken'
+reason "its guest put the sealed credential in place" start-s3 'credential released.*bind-token.*"sealed":true'
 s3=(--binding "$out/s3" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "a later command in s3" exec-s3 "$C8S" session exec "${s3[@]}" -- cat /tmp/first
 check "the first command ran once" [ "$(cat "$out/exec-s3.out")" = ran ]

@@ -2,6 +2,7 @@ package sessionagent
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"log/slog"
 	"time"
 
@@ -64,10 +65,16 @@ func OneTimeKEMGone(a *Agent) bool {
 	return a.oneTime.kem == nil
 }
 
-// CommandState is what became of the guest's first command so far: empty
+// SealedState is what became of the guest's sealed message so far: empty
 // while one may still come.
-func CommandState(a *Agent) string {
-	a.command.mu.Lock()
-	defer a.command.mu.Unlock()
-	return a.command.state
+func SealedState(a *Agent) string {
+	a.sealed.mu.Lock()
+	defer a.sealed.mu.Unlock()
+	return a.sealed.state
+}
+
+// PutSealedCredential is what the guest makes of one sealed credential, for
+// a bind that grants granted its credentials and declares declared.
+func PutSealedCredential(a *Agent, c *session.OpenedCredential, granted []*ecdsa.PublicKey, declared []session.Credential) string {
+	return a.putSealedCredential(c, granted, declared)
 }

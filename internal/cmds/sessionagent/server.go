@@ -45,7 +45,7 @@ func (a *Agent) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET "+session.PathState, a.serveState)
 	mux.HandleFunc("POST "+session.PathBind, a.letIn(a.boundedTo(session.MaxBindRequestBytes, a.serveBind)))
-	mux.HandleFunc("POST "+session.PathBindCommand, a.afterBind(a.boundedTo(session.MaxBindRequestBytes, a.serveBindCommand)))
+	mux.HandleFunc("POST "+session.PathBindSealed, a.afterBind(a.boundedTo(session.MaxBindRequestBytes, a.serveBindSealed)))
 	mux.HandleFunc("POST "+session.PathAttest, a.authorized(session.Access.AttestKeys, a.serveAttest))
 	mux.HandleFunc("POST "+session.PathExec, a.authorized(session.Access.ExecKeys, a.serveExec))
 	mux.HandleFunc("PUT "+session.PathCredentials+"{name}", a.authorized(session.Access.CredentialKeys, a.serveCredential))
@@ -150,7 +150,7 @@ func (a *Agent) letIn(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // afterBind admits what follows a bind by the connection it came on, before
-// any of its body is read: a first command sent after its bind. A guest no
+// any of its body is read: a sealed message sent after its bind. A guest no
 // bind has reached reads none, and neither does one from a connection the
 // fence ended.
 func (a *Agent) afterBind(next http.HandlerFunc) http.HandlerFunc {
@@ -288,7 +288,7 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		return
 	}
 	traced(ctx, "decoded")
-	replayed, answer, err := a.BindWith(ctx, req.Bind, req.Signature, req.Command)
+	replayed, answer, err := a.BindWith(ctx, req.Bind, req.Signature, req.Sealed)
 	var refusal *bindRefusal
 	switch {
 	case errors.Is(err, errAlreadyBound):
@@ -319,11 +319,11 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		a.measured.RUnlock()
 		traced(ctx, "admitted")
 		a.say(w, http.StatusOK, disclosure.MessageBound, session.BindResponse{
-			Phase: phase, Replayed: replayed, Command: answer.Command, Admission: admission,
+			Phase: phase, Replayed: replayed, Sealed: answer.Sealed, Admission: admission,
 			Receipt: answer.Receipt, Attestation: answer.Attestation,
 		})
-		// The receipt goes out now. The sealed answer of a first command
-		// follows it as a second document, once the command has run.
+		// The receipt goes out now. The sealed answer of a sealed message
+		// follows it as a second document, once the guest has acted on it.
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
@@ -331,16 +331,16 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 		if !replayed {
 			trace.log(a.log)
 		}
-		if answer.Command != session.CommandTaken {
+		if answer.Sealed != session.SealedTaken {
 			return
 		}
-		result, err := a.commandAnswer(r.Context())
+		result, err := a.sealedReply(r.Context())
 		if err != nil {
-			// The caller went away. The command runs on, and its answer is
-			// kept for the bind sent again.
+			// The caller went away. The guest acts on the message all the
+			// same, and its answer is kept for the bind sent again.
 			return
 		}
-		body, err := disclosure.Encode(disclosure.MessageCommand, result)
+		body, err := disclosure.Encode(disclosure.MessageSealed, result)
 		if err != nil {
 			a.log.Error("an answer was held back: it is beyond the disclosure schema", "error", err)
 			return
@@ -349,22 +349,22 @@ func (a *Agent) serveBind(w http.ResponseWriter, r *http.Request, body []byte) {
 	}
 }
 
-// serveBindCommand takes a first command that follows its bind instead of
-// coming with it: see Agent.LateCommand. Like the bind it needs no token:
+// serveBindSealed takes a sealed message that follows its bind instead of
+// coming with it: see Agent.LateSealed. Like the bind it needs no token:
 // what admits it is that it opens under the guest's one-time key and that
-// bind, and that a key the bind grants signed what is inside.
-func (a *Agent) serveBindCommand(w http.ResponseWriter, r *http.Request, body []byte) {
-	var req session.CommandRequest
-	if !decodeStrict(body, &req) || len(req.Command) == 0 {
+// bind, and that a key the bind grants signed each part inside.
+func (a *Agent) serveBindSealed(w http.ResponseWriter, r *http.Request, body []byte) {
+	var req session.SealedRequest
+	if !decodeStrict(body, &req) || len(req.Sealed) == 0 {
 		a.refuse(w, http.StatusBadRequest, disclosure.Malformed)
 		return
 	}
-	result, err := a.LateCommand(r.Context(), req.Command)
+	result, err := a.LateSealed(r.Context(), req.Sealed)
 	if err != nil {
 		a.refuse(w, http.StatusServiceUnavailable, disclosure.BindIncomplete)
 		return
 	}
-	a.say(w, http.StatusOK, disclosure.MessageCommand, result)
+	a.say(w, http.StatusOK, disclosure.MessageSealed, result)
 }
 
 // bindEvidence is the evidence a bind's sender would ask for next, taken for

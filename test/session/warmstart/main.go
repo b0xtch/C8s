@@ -15,7 +15,9 @@
 // and a guest whose quote disagrees is destroyed. With
 // --command-with-bind=false the first command is sent over that connection
 // once the receipt is checked, and with --quote-first once the quote is
-// judged, as an owner does who sends nothing on a receipt.
+// judged, as an owner does who sends nothing on a receipt. With
+// --sealed-credential the bind's sealed message also holds a credential this
+// side makes for the round, which the first command reads back.
 // Each round prints one JSON record on standard output, with times in
 // microseconds on this process's monotonic clock. The first round finds the
 // engine's documents unread and its connections unmade: a reader who wants
@@ -27,12 +29,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -55,6 +59,7 @@ type options struct {
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
+	sealedCredential                   string
 	acceptTCB, collateralCache, before string
 	rounds, commands                   int
 	wait, timeout                      time.Duration
@@ -69,12 +74,13 @@ type record struct {
 	Session string `json:"session"`
 	TD      string `json:"td"`
 	// Claim to Judge are the steps of a start, in order. Seal is the first
-	// command sealed for the guest, when it goes with the bind. Bind is the
-	// call that carries the bind to the guest and its answer back: the guest
-	// measures the bind, takes what its key service releases, admits its
-	// sandbox and signs its receipt. Judge is what this side checks before it
-	// takes the first command's answer, or sends the command: the receipt, or
-	// with --quote-first the quote.
+	// command sealed for the guest, with the credential this side holds if
+	// it holds one, when they go with the bind. Bind is the call that
+	// carries the bind to the guest and its answer back: the guest measures
+	// the bind, takes what its key service releases and what was sealed with
+	// the bind, admits its sandbox and signs its receipt. Judge is what this
+	// side checks before it takes the first command's answer, or sends the
+	// command: the receipt, or with --quote-first the quote.
 	Claim      int64 `json:"claim_us"`
 	ReadyCheck int64 `json:"ready_check_us"`
 	Sign       int64 `json:"sign_us"`
@@ -90,19 +96,21 @@ type record struct {
 	FirstExec int64 `json:"first_exec_us"`
 	// FirstCommand is from the claim to the first command's answer.
 	FirstCommand int64 `json:"first_cmd_us"`
-	// WithBind says the guest took the first command with its bind. OnReceipt
-	// says the command's answer was taken, or the command sent, on the
-	// guest's receipt, and ReachedAhead that the first command sent over a
-	// connection found that connection made already. QuoteInAnswer says the
-	// quote came with the bind's answer. Quote is from the bind's answer
-	// until the quote was there, judged and held to the receipt, and
-	// Confirmed the same from the claim.
-	WithBind      bool  `json:"with_bind"`
-	OnReceipt     bool  `json:"on_receipt"`
-	ReachedAhead  bool  `json:"reached_ahead"`
-	QuoteInAnswer bool  `json:"quote_in_answer"`
-	Quote         int64 `json:"quote_us"`
-	Confirmed     int64 `json:"confirmed_us"`
+	// WithBind says the guest took the first command with its bind, and
+	// CredentialWithBind that it had the sealed credential in place before
+	// its sandbox started. OnReceipt says the command's answer was taken, or
+	// the command sent, on the guest's receipt, and ReachedAhead that the
+	// first command sent over a connection found that connection made
+	// already. QuoteInAnswer says the quote came with the bind's answer.
+	// Quote is from the bind's answer until the quote was there, judged and
+	// held to the receipt, and Confirmed the same from the claim.
+	WithBind           bool  `json:"with_bind"`
+	CredentialWithBind bool  `json:"credential_with_bind,omitempty"`
+	OnReceipt          bool  `json:"on_receipt"`
+	ReachedAhead       bool  `json:"reached_ahead"`
+	QuoteInAnswer      bool  `json:"quote_in_answer"`
+	Quote              int64 `json:"quote_us"`
+	Confirmed          int64 `json:"confirmed_us"`
 	// Exec are the commands after the first, on the kept connection.
 	Exec []int64 `json:"exec_us,omitempty"`
 	// Attest is one more attestation, asked for after the commands: a quote
@@ -126,6 +134,7 @@ func main() {
 	flag.StringVar(&o.sandboxImage, "sandbox-image", "", "OCI image each session runs, as name@sha256:<digest>")
 	flag.StringVar(&o.keyService, "key-service", "", "pin of the key service the sessions trust")
 	flag.StringVar(&o.stored, "stored-credential", "", "a credential each guest takes from the key service at its bind (needs --key-service); the first command then reads it")
+	flag.StringVar(&o.sealedCredential, "sealed-credential", "", "a credential this side makes for each session and seals with its bind beside the first command, which then reads it back (not with --stored-credential, --quote-first or --command-with-bind=false)")
 	flag.StringVar(&o.acceptTCB, "accept-tcb-status", "", "Intel TCB statuses, besides UpToDate, that the guests' platform may have, comma-separated")
 	flag.StringVar(&o.collateralCache, "collateral-cache", "", "directory that keeps Intel's collateral between runs")
 	flag.StringVar(&o.before, "before-round", "", "a program run before each round, with the round's number: it returns once the host is as a round should find it")
@@ -157,6 +166,9 @@ func run(o *options) error {
 	}
 	if o.stored != "" && o.keyService == "" {
 		return errors.New("--stored-credential needs --key-service")
+	}
+	if o.sealedCredential != "" && (o.stored != "" || o.quoteFirst || !o.withBind) {
+		return errors.New("--sealed-credential goes with the bind's first command: not with --stored-credential, --quote-first or --command-with-bind=false")
 	}
 	identity, err := runtimemeasure.LoadImageManifest(o.manifest)
 	if err != nil {
@@ -213,6 +225,9 @@ func run(o *options) error {
 	}
 
 	engine := session.NewEngine(session.EngineOptions{CollateralCacheDir: o.collateralCache})
+	// The one document a verdict that lets a secret go takes from the vendor
+	// alone is fetched before a start needs it.
+	session.Prefetch(engine)
 	out := json.NewEncoder(os.Stdout)
 	for round := range o.rounds {
 		if o.before != "" {
@@ -270,6 +285,20 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		policy.Credentials = []session.Credential{{Name: o.stored, Source: session.SourceKeyService, MaxBytes: 256}}
 		argv = []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/` + o.stored + `"`}
 	}
+	// A credential this side holds: made for this session, so that reading
+	// it back shows the guest put this one in place.
+	var held map[string][]byte
+	var secret []byte
+	if o.sealedCredential != "" {
+		random := make([]byte, 24)
+		if _, err := rand.Read(random); err != nil {
+			return nil, err
+		}
+		secret = []byte(hex.EncodeToString(random))
+		held = map[string][]byte{o.sealedCredential: secret}
+		policy.Credentials = []session.Credential{{Name: o.sealedCredential, Source: session.SourceBinder, MaxBytes: 256}}
+		argv = []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/` + o.sealedCredential + `"`}
+	}
 	claimID, err := daemon.NewRequestID()
 	if err != nil {
 		return nil, err
@@ -311,9 +340,11 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		}
 	}()
 
+	// The check of the unbound guest, as one that lets a secret go: what is
+	// sealed with the bind rests on it.
 	step = time.Now()
 	readyPolicy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, AcceptTCBStatus: accepted}
-	ready, err := session.VerifyReady(ctx, readyPolicy, engine, claimed.Evidence, time.Now())
+	ready, err := session.VerifyReadyToRelease(ctx, readyPolicy, engine, claimed.Evidence, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("the guest the daemon offers: %w", err)
 	}
@@ -331,13 +362,14 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	}
 	rec.Sign = micros(step)
 
-	// The first command goes with the bind, sealed to the key the check of
-	// the guest's evidence just bound: an owner who waits for the quote
-	// sends nothing ahead of it.
-	var first *session.FirstCommand
+	// The first command goes with the bind, with the credential this side
+	// holds, sealed to the key the check of the guest's evidence just bound:
+	// an owner who waits for the quote sends nothing ahead of it.
+	var first *session.SealedMessage
 	if o.withBind && !o.quoteFirst {
 		step = time.Now()
-		if first, err = session.SealFirstCommand(ready, bind, signer, session.ExecRequest{Argv: argv}); err != nil {
+		parts := session.SealedParts{Command: &session.ExecRequest{Argv: argv}, Credentials: held}
+		if first, err = session.SealWithBind(ready, bind, signer, parts); err != nil {
 			return nil, fmt.Errorf("seal the first command: %w", err)
 		}
 		rec.Seal = micros(step)
@@ -472,29 +504,45 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 	rec.Judge, rec.Start = micros(step), micros(began)
 
 	step = time.Now()
-	// The answer of a command the guest took with its bind follows the
-	// receipt on the same call, sealed to this side.
+	// The answer to what the guest took with its bind follows the receipt on
+	// the same call, sealed to this side. Only an answer that opens says the
+	// guest acted on the message: with none, what was sealed goes over the
+	// session's connection.
 	request := session.ExecRequest{Argv: argv}
 	if first != nil {
-		request = first.Request
+		request = *first.Command
 		if receipt == nil {
-			return nil, errors.New("the guest gave no receipt for a bind that carried a command")
+			return nil, errors.New("the guest gave no receipt for a bind that carried a sealed message")
 		}
-		answer, state, err := call.Result()
+		answer, state, err := call.SealedAnswer()
 		if err != nil {
-			return nil, fmt.Errorf("the first command's answer: %w", err)
+			return nil, fmt.Errorf("the sealed answer: %w", err)
 		}
-		if state == session.CommandTaken {
-			result, err := first.Open(answer)
-			if err != nil {
-				return nil, fmt.Errorf("the first command's answer: %w", err)
+		var said *session.SealedAnswer
+		if state == session.SealedTaken {
+			if said, err = first.Open(answer); err != nil {
+				fmt.Fprintf(os.Stderr, "warmstart: round %d: the sealed answer is not the guest's: %v\n", round, err)
 			}
-			if result.ExitCode != 0 {
-				return nil, fmt.Errorf("the first command exited %d: %s", result.ExitCode, result.Stderr)
+		} else {
+			fmt.Fprintf(os.Stderr, "warmstart: round %d: the guest did not take what was sent with its bind: %s\n", round, state)
+		}
+		if said != nil {
+			if o.sealedCredential != "" {
+				if status := said.Credentials[o.sealedCredential]; status != session.SealedHeld {
+					return nil, fmt.Errorf("the guest did not take the sealed credential: %q", status)
+				}
+				rec.CredentialWithBind = true
+			}
+			if said.Command == nil {
+				return nil, fmt.Errorf("the guest opened the first command and did not run it: %s", said.CommandError)
+			}
+			if said.Command.ExitCode != 0 {
+				return nil, fmt.Errorf("the first command exited %d: %s", said.Command.ExitCode, said.Command.Stderr)
+			}
+			if secret != nil && !bytes.Equal(said.Command.Stdout, secret) {
+				return nil, errors.New("the first command did not read back the credential sealed with its bind")
 			}
 			rec.WithBind = true
-		} else {
-			fmt.Fprintf(os.Stderr, "warmstart: round %d: the guest did not take the command sent with its bind: %s\n", round, state)
 		}
 	}
 	if reached != nil && pinned == nil && !rec.WithBind {
@@ -512,8 +560,14 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 		defer client.Close()
 	}
 	if !rec.WithBind {
-		// Over the session's connection, under the id it was sealed with if
-		// it was: the guest runs a command once, whatever carried it there.
+		// Over the session's connection: the credential again, which the
+		// guest takes once, and the command under the id it was sealed with
+		// if it was, which the guest runs once, whatever carried it there.
+		for name, value := range held {
+			if _, err := client.PutCredential(ctx, name, value); err != nil {
+				return nil, fmt.Errorf("credential %s: %w", name, err)
+			}
+		}
 		if err := command(ctx, client, request); err != nil {
 			return nil, fmt.Errorf("the first command: %w", err)
 		}

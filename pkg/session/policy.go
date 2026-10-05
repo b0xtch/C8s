@@ -65,7 +65,9 @@ type Credential struct {
 	MaxBytes int    `json:"maxBytes,omitempty"`
 	// Source is where the secret comes from. Empty, a key the bind grants
 	// hands it over. SourceKeyService, the guest takes it from the bind's key
-	// service when it is bound, and no key may hand it over.
+	// service when it is bound, and no key may hand it over. SourceBinder,
+	// the binder may seal it with the bind, or a key the bind grants hands
+	// it over.
 	Source string `json:"source,omitempty"`
 }
 
@@ -155,7 +157,9 @@ func validateAccess(field string, access Access, credentials []Credential) error
 	}
 	handed := 0
 	for _, c := range credentials {
-		if c.Source == "" {
+		// Sealed with the bind or put over a connection, a key the bind
+		// grants signs for it.
+		if c.Source == "" || c.Source == SourceBinder {
 			handed++
 		}
 	}
@@ -164,8 +168,8 @@ func validateAccess(field string, access Access, credentials []Credential) error
 	}
 	seen := make(map[string]bool, len(credentials))
 	for _, c := range credentials {
-		if c.Source != "" && c.Source != SourceKeyService {
-			return fmt.Errorf("credential %q source must be empty or %s", c.Name, SourceKeyService)
+		if c.Source != "" && c.Source != SourceKeyService && c.Source != SourceBinder {
+			return fmt.Errorf("credential %q source must be empty, %s or %s", c.Name, SourceKeyService, SourceBinder)
 		}
 		if !credentialRE.MatchString(c.Name) {
 			return fmt.Errorf("credential name %q must match %s", c.Name, credentialRE)

@@ -129,7 +129,7 @@ func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.S
 		return nil, err
 	}
 	defer call.Close()
-	// The call carries no command.
+	// The call carries no sealed message.
 	if err := call.closeSend(); err != nil {
 		return nil, err
 	}
@@ -139,42 +139,45 @@ func (c *Client) Bind(ctx context.Context, requestID, td string, bind *session.S
 	return call.Answer, nil
 }
 
-// BindCall is a Bind call that may carry the session's first command: see
+// BindCall is a Bind call that may carry a message sealed for the guest: see
 // BindWith.
 type BindCall struct {
 	// Answer is the guest's answer to the bind, relayed and unjudged.
 	Answer *session.Relayed
-	// Command says what became of a first command that came with the bind:
-	// session.CommandTaken, CommandUnopened or CommandTooLate, as the guest
-	// says. Empty for a bind that came with none.
-	Command string
+	// SealedStatus is the daemon's word on what became of a sealed message
+	// that came with the bind: session.SealedTaken, SealedUnopened or
+	// SealedTooLate. Empty for a bind that came with none. Only a sealed
+	// answer that opens says the guest acted on a message.
+	SealedStatus string
 
 	stream sessionv1alpha1.Sessions_BindClient
 	cancel context.CancelFunc
-	// carried says the call has carried its command, and closed that its
-	// caller's side of it is closed.
+	// carried says the call has carried its sealed message, and closed that
+	// its caller's side of it is closed.
 	carried, closed bool
 }
 
-// BindWith hands the TD its bind, with the session's first command sealed
-// for the guest (session.SealFirstCommand) when command is not nil, and
-// returns once the guest has answered the bind. The daemon carries the
-// command and its answer unread.
+// BindWith hands the TD its bind, with a message sealed for the guest
+// (session.SealWithBind) when sealed is not nil, and returns once the guest
+// has answered the bind. The daemon carries the message and its answer
+// unread.
 //
-// A command the guest took is answered by Result, once it has run. A binder
-// that had not sealed its command when it sent the bind, because its check of
-// the guest's evidence was still running, uses StartBind and sends it with
-// SendCommand meanwhile: the guest opens it if it is still taking the bind.
+// A message the guest took is answered by SealedAnswer, once the guest has
+// acted on it. A binder that had not sealed its message when it sent the
+// bind, because its check of the guest's evidence was still running, uses
+// StartBind and sends it with SendSealed meanwhile: the guest opens it if it
+// is still taking the bind.
 //
-// A guest runs a command once, whatever carried it there: a caller that is
-// not told its command was taken sends session.FirstCommand.Request over a
-// connection of its own, and is answered with the first run's result if the
-// command did run. A call repeated because its answer was lost sends the
-// same command with the bind.
+// A guest runs a command once, whatever carried it there, and takes each
+// credential once: a caller that has no sealed answer when it needs one
+// sends session.SealedMessage.Command over a connection of its own, and is
+// answered with the first run's result if the command did run, and puts its
+// credentials the same way. A call repeated because its answer was lost
+// sends the same sealed message with the bind.
 //
 // The caller closes the call.
-func (c *Client) BindWith(ctx context.Context, requestID, td string, bind *session.SignedBind, command []byte) (*BindCall, error) {
-	call, err := c.StartBind(ctx, requestID, td, bind, command)
+func (c *Client) BindWith(ctx context.Context, requestID, td string, bind *session.SignedBind, sealed []byte) (*BindCall, error) {
+	call, err := c.StartBind(ctx, requestID, td, bind, sealed)
 	if err != nil {
 		return nil, err
 	}
@@ -185,19 +188,19 @@ func (c *Client) BindWith(ctx context.Context, requestID, td string, bind *sessi
 	return call, nil
 }
 
-// StartBind sends the bind, with command if it is not nil, and returns
+// StartBind sends the bind, with sealed if it is not nil, and returns
 // without waiting for the guest's answer: Await does that. In between, a
-// binder that now has its command sealed sends it with SendCommand.
-func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *session.SignedBind, command []byte) (*BindCall, error) {
+// binder that now has its message sealed sends it with SendSealed.
+func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *session.SignedBind, sealed []byte) (*BindCall, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	stream, err := c.api.Bind(ctx)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	call := &BindCall{stream: stream, cancel: cancel, carried: len(command) > 0}
+	call := &BindCall{stream: stream, cancel: cancel, carried: len(sealed) > 0}
 	if err := stream.Send(&sessionv1alpha1.BindRequest{
-		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature), Command: command,
+		RequestId: requestID, Td: td, Bind: bind.Raw, Signature: []byte(bind.Signature), Sealed: sealed,
 	}); err != nil {
 		// The stream's own error says why.
 		_, err = stream.Recv()
@@ -205,7 +208,8 @@ func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *sess
 		return nil, err
 	}
 	if call.carried {
-		// The command went with the bind: the call has no more to carry.
+		// The sealed message went with the bind: the call has no more to
+		// carry.
 		if err := call.closeSend(); err != nil {
 			cancel()
 			return nil, err
@@ -215,7 +219,7 @@ func (c *Client) StartBind(ctx context.Context, requestID, td string, bind *sess
 }
 
 // closeSend closes the caller's side of the call: the daemon ends a call
-// whose bind came with no command once it has.
+// whose bind came with no sealed message once it has.
 func (b *BindCall) closeSend() error {
 	if b.closed {
 		return nil
@@ -239,45 +243,46 @@ func (b *BindCall) Await() error {
 			out.Receipt = &receipt
 		}
 	}
-	b.Answer, b.Command = out, answer.GetCommand()
+	b.Answer, b.SealedStatus = out, answer.GetSealedStatus()
 	return nil
 }
 
-// SendCommand sends the session's first command in the call's next message,
-// for a binder that sent its bind without one. It is sent once, and before
-// the guest has answered the bind if the guest is to open it.
-func (b *BindCall) SendCommand(sealed []byte) error {
+// SendSealed sends a sealed message in the call's next message, for a binder
+// that sent its bind without one. It is sent once, and before the guest has
+// answered the bind if the guest is to open it.
+func (b *BindCall) SendSealed(sealed []byte) error {
 	if b.carried || b.closed {
-		return errors.New("the call has carried its command, or its caller's side is closed")
+		return errors.New("the call has carried its sealed message, or its caller's side is closed")
 	}
 	b.carried = true
-	if err := b.stream.Send(&sessionv1alpha1.BindRequest{Command: sealed}); err != nil {
+	if err := b.stream.Send(&sessionv1alpha1.BindRequest{Sealed: sealed}); err != nil {
 		return err
 	}
 	return b.closeSend()
 }
 
-// Result waits for the sealed answer of the first command, which
-// session.FirstCommand.Open opens. For a command that came after the bind it
-// also says what became of it. An answer that is none is a command the guest
-// did not take: its sender sends it over a connection of its own.
-func (b *BindCall) Result() (sealed []byte, command string, err error) {
+// SealedAnswer waits for the guest's sealed answer, which
+// session.SealedMessage.Open opens. With it comes the daemon's word on what
+// became of the message. An answer that is none is a message the guest did
+// not take, by that word: its sender sends what it sealed over a connection
+// of its own, which costs a repeat at most if the word was wrong.
+func (b *BindCall) SealedAnswer() (answer []byte, status string, err error) {
 	if !b.carried {
-		return nil, "", errors.New("the call carried no command")
+		return nil, "", errors.New("the call carried no sealed message")
 	}
-	if b.Command != "" && b.Command != session.CommandTaken {
-		return nil, b.Command, nil
+	if b.SealedStatus != "" && b.SealedStatus != session.SealedTaken {
+		return nil, b.SealedStatus, nil
 	}
-	answer, err := b.stream.Recv()
+	next, err := b.stream.Recv()
 	if errors.Is(err, io.EOF) {
-		// The call ended with no word on the command: it came too late to
+		// The call ended with no word on the message: it came too late to
 		// be carried.
-		return nil, session.CommandTooLate, nil
+		return nil, session.SealedTooLate, nil
 	}
 	if err != nil {
 		return nil, "", err
 	}
-	return answer.GetCommandResult(), answer.GetCommand(), nil
+	return next.GetSealedAnswer(), next.GetSealedStatus(), nil
 }
 
 // Close ends the call.

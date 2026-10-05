@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/confidential-dot-ai/c8s/pkg/certutil"
 	"github.com/confidential-dot-ai/c8s/pkg/operatorauth"
@@ -147,7 +148,7 @@ func containsMasked(data, masked []byte) bool {
 // nothing: not the keys where they were kept, and not what signing with one
 // or expanding the other put on a stack or on the heap. A session that broke
 // out of its sandbox reads this process's memory and finds no key that signs
-// a receipt, and none that opens a command sealed to the guest.
+// a receipt, and none that opens a message sealed to the guest.
 func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	if !erasesTemporaries {
 		t.Fatal("this build does not erase what work on a secret leaves behind")
@@ -198,24 +199,24 @@ func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	runtime.KeepAlive(expanded)
 	expanded = nil
 
-	// The bind: the receipt is signed and the signing key erased, a command
+	// The bind: the receipt is signed and the signing key erased, a message
 	// sealed to the KEM key is opened, and the KEM key erased.
 	message := []byte("a receipt")
 	signature, err := keys.sign(message)
 	if err != nil || !ed25519.Verify(keys.public.Signing, message, signature) {
 		t.Fatalf("the receipt's signature: %v", err)
 	}
-	bind, command := sealedCommand(t, &keys.public)
-	opened, err := keys.open(bind, command.Sealed)
-	if err != nil || len(opened.Exec) == 0 {
-		t.Fatalf("the command sealed to the KEM key: %v", err)
+	bind, sealed := sealedCommand(t, &keys.public)
+	opened, err := keys.open(bind, sealed.Sealed)
+	if err != nil || opened.Command == nil || len(opened.Credentials) != 1 {
+		t.Fatalf("the message sealed to the KEM key: %v", err)
 	}
 	if !keys.gone() {
 		t.Fatal("the keys are not gone")
 	}
-	// A second command finds no key to open under.
-	if _, err := keys.open(bind, command.Sealed); !errors.Is(err, errKEMGone) {
-		t.Fatalf("a second command: %v, want the key gone", err)
+	// A second message finds no key to open under.
+	if _, err := keys.open(bind, sealed.Sealed); !errors.Is(err, errKEMGone) {
+		t.Fatalf("a second message: %v, want the key gone", err)
 	}
 	// What the work allocated is erased when the collector finds it
 	// unreachable, and the guest's own collection is what makes it look.
@@ -226,9 +227,9 @@ func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	}
 }
 
-// sealedCommand is a first command its owner sealed to a guest's one-time
-// keys, and the bind it was sealed for.
-func sealedCommand(t *testing.T, oneTime *session.OneTimeKeys) (*session.SignedBind, *session.FirstCommand) {
+// sealedCommand is a first command and a credential their owner sealed to a
+// guest's one-time keys, and the bind they were sealed for.
+func sealedCommand(t *testing.T, oneTime *session.OneTimeKeys) (*session.SignedBind, *session.SealedMessage) {
 	t.Helper()
 	newKey := func() *ecdsa.PrivateKey {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -253,19 +254,23 @@ func sealedCommand(t *testing.T, oneTime *session.OneTimeKeys) (*session.SignedB
 	bind, err := session.NewBind(session.BindOptions{
 		Authority: newKey(), InstanceKey: &instance.PublicKey, Tenant: "acme", Session: "sbx-1",
 		Policy: session.BindPolicy{
-			Sandbox: &session.Sandbox{Image: "ghcr.io/acme/agent@sha256:" + strings.Repeat("1", 64)},
-			Access:  session.Access{Exec: []string{string(granted)}},
+			Sandbox:     &session.Sandbox{Image: "ghcr.io/acme/agent@sha256:" + strings.Repeat("1", 64)},
+			Access:      session.Access{Exec: []string{string(granted)}, Credentials: []string{string(granted)}},
+			Credentials: []session.Credential{{Name: "api-token", Source: session.SourceBinder}},
 		},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	ready := &session.ReadyTD{InstanceKey: &instance.PublicKey, OneTime: oneTime}
-	command, err := session.SealFirstCommand(ready, bind, signer, session.ExecRequest{Argv: []string{"/bin/true"}})
+	ready := &session.ReadyTD{InstanceKey: &instance.PublicKey, OneTime: oneTime, Until: time.Now().Add(time.Hour)}
+	message, err := session.SealWithBind(ready, bind, signer, session.SealedParts{
+		Command:     &session.ExecRequest{Argv: []string{"/bin/true"}},
+		Credentials: map[string][]byte{"api-token": []byte("a credential its binder holds")},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bind, command
+	return bind, message
 }
 
 func contains(names []string, want string) bool {

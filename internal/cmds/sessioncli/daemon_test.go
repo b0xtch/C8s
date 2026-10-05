@@ -416,3 +416,165 @@ func TestStartCarriesTheSessionsFirstCommand(t *testing.T) {
 		t.Fatalf("start printed %q", out)
 	}
 }
+
+// A start given a credential it holds seals it with the bind, beside the
+// session's first command: the guest has it in place before its sandbox
+// starts, where that command finds it, and is asked for nothing over its own
+// routes.
+func TestStartSealsTheCredentialsItHolds(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	token := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(token, []byte("s3cr3t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := starting(t, host, "sbx-1")
+	s.sealed = []string{"api-token:16=" + token}
+	s.command = []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/api-token"`}
+	res := start(t, s)
+	if !res.Started || res.FirstCommand == nil || res.Credentials == nil {
+		t.Fatalf("start result = %+v", res)
+	}
+	if first := res.FirstCommand; !first.WithBind || first.ExitCode != 0 || string(first.Stdout) != "s3cr3t" {
+		t.Fatalf("the first command: %+v", first)
+	}
+	if got := res.Credentials; len(got.WithBind) != 1 || got.WithBind[0] != "api-token" || len(got.After) != 0 {
+		t.Fatalf("the credentials: %+v", got)
+	}
+	guest := host.Runner.All()[0]
+	if n := guest.Asked(session.PathExec) + guest.Asked(session.PathCredentials+"api-token"); n != 0 {
+		t.Fatalf("the guest was asked %d times over its own routes", n)
+	}
+	// The bind the start wrote declares the credential as its binder's.
+	binding, err := session.LoadBinding(s.out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declared, ok := binding.Bind.Doc.Policy.Credential("api-token")
+	if !ok || declared.Source != session.SourceBinder || declared.MaxBytes != 16 {
+		t.Fatalf("the bind declares the credential as %+v", declared)
+	}
+
+	// With no command, the credential goes alone, and the start says so.
+	alone := starting(t, host, "sbx-2")
+	alone.sealed = []string{"api-token=" + token}
+	var stdout, stderr bytes.Buffer
+	if code := runStart(context.Background(), alone, false, &stdout, &stderr); code != ExitOK {
+		t.Fatalf("start exit %d: %s%s", code, stdout.String(), stderr.String())
+	}
+	if out := stdout.String(); !strings.Contains(out, "credentials   api-token in place before the sandbox started\n") || strings.Contains(out, "first command") {
+		t.Fatalf("start printed %q", out)
+	}
+}
+
+// rooted is an engine whose verdict rests on a root CA CRL the guest's host
+// handed over whenever its verification lets it: a verifier that has none of
+// its own at hand.
+type rooted struct{ session.Engine }
+
+func (e rooted) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	res, err := e.Engine.VerifyEvidence(ctx, env, reportData)
+	if err != nil {
+		return nil, err
+	}
+	finding := &session.CollateralFinding{RootCRLFetched: time.Now(), Expires: time.Now().Add(time.Hour)}
+	if session.StapledRootCRLAllowed(ctx) {
+		finding = &session.CollateralFinding{Stapled: true, RootCRLStapled: true, Expires: time.Now().Add(time.Hour)}
+	}
+	if res.Claims.PlatformData == nil {
+		res.Claims.PlatformData = map[string]any{}
+	}
+	res.Claims.PlatformData[session.CollateralClaim] = finding
+	return res, nil
+}
+
+// A start that sends something with its bind judges the guest as a verifier
+// does whose verdict lets a secret go: on a root CA CRL of its own, never on
+// one the guest's host handed over. A start that sends nothing with its bind
+// needs no more than a verdict that leads to a bind.
+func TestStartSealsOnAVerdictMadeForRelease(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	s := starting(t, host, "sbx-1")
+	s.engineForTest = rooted{s.engineForTest}
+	s.command = []string{"echo", "sealed"}
+	if res := start(t, s); !res.Started || res.FirstCommand == nil || !res.FirstCommand.WithBind {
+		t.Fatalf("a start with a command: %+v", res)
+	}
+	plain := starting(t, host, "sbx-2")
+	plain.engineForTest = rooted{plain.engineForTest}
+	if res := start(t, plain); !res.Started || res.FirstCommand != nil {
+		t.Fatalf("a start with nothing to seal: %+v", res)
+	}
+}
+
+// With no sealed answer a start owes its guest everything it sealed, over
+// the session's connection: every credential, then the command. With one, it
+// owes the credentials the answer does not say the guest holds, and no
+// command: what the answer says of the command is the guest's last word.
+func TestStartOwesWhatNoSealedAnswerSaysIsDone(t *testing.T) {
+	credentials := map[string][]byte{"b-token": []byte("b"), "a-token": []byte("a")}
+	both := &session.SealedMessage{Command: &session.ExecRequest{Argv: []string{"true"}}}
+	alone := &session.SealedMessage{}
+	for name, tc := range map[string]struct {
+		message     *session.SealedMessage
+		said        *session.SealedAnswer
+		held, again string
+		resend      bool
+	}{
+		"no answer":                      {both, nil, "", "a-token,b-token", true},
+		"no answer, and no command":      {alone, nil, "", "a-token,b-token", false},
+		"an answer that holds both":      {both, &session.SealedAnswer{Credentials: map[string]string{"a-token": session.SealedHeld, "b-token": session.SealedHeld}}, "a-token,b-token", "", false},
+		"an answer that refused one":     {both, &session.SealedAnswer{Credentials: map[string]string{"a-token": session.SealedHeld, "b-token": session.SealedUnauthorized}}, "a-token", "b-token", false},
+		"an answer that says of neither": {both, &session.SealedAnswer{}, "", "a-token,b-token", false},
+	} {
+		held, again, resend := owed(tc.message, credentials, tc.said)
+		if strings.Join(held, ",") != tc.held || strings.Join(again, ",") != tc.again || resend != tc.resend {
+			t.Errorf("%s: held %v, owed %v, the command again %t", name, held, again, resend)
+		}
+	}
+}
+
+// A start reads what it is to seal before it claims a guest: a credential it
+// cannot read, cannot declare, or declares twice is a usage error, and no
+// guest is taken for it.
+func TestStartRefusesACredentialItCannotSeal(t *testing.T) {
+	host := sessiondtest.NewHost(t, 1, nil)
+	dir := t.TempDir()
+	token, long := filepath.Join(dir, "token"), filepath.Join(dir, "long")
+	for path, data := range map[string]string{token: "s3cr3t", long: strings.Repeat("x", 17)} {
+		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, set := range map[string]func(s *startFlags){
+		"no file":                    func(s *startFlags) { s.sealed = []string{"api-token"} },
+		"an empty file name":         func(s *startFlags) { s.sealed = []string{"api-token="} },
+		"a file that is not there":   func(s *startFlags) { s.sealed = []string{"api-token=" + filepath.Join(dir, "absent")} },
+		"a value beyond its size":    func(s *startFlags) { s.sealed = []string{"api-token:16=" + long} },
+		"a size that is none":        func(s *startFlags) { s.sealed = []string{"api-token:0=" + token} },
+		"a name that is none":        func(s *startFlags) { s.sealed = []string{"../token=" + token} },
+		"one name twice":             func(s *startFlags) { s.sealed = []string{"api-token=" + token, "api-token=" + token} },
+		"a name a key hands over":    func(s *startFlags) { s.sealed, s.w.credentials = []string{"api-token=" + token}, []string{"api-token"} },
+		"a name of the key services": func(s *startFlags) { s.sealed, s.w.stored = []string{"api-token=" + token}, []string{"api-token"} },
+	} {
+		s := starting(t, host, "sbx-1")
+		set(s)
+		var stdout, stderr bytes.Buffer
+		if code := runStart(context.Background(), s, false, &stdout, &stderr); code != ExitUsage {
+			t.Errorf("%s: start exit %d: %s%s", name, code, stdout.String(), stderr.String())
+		}
+		// Told apart from the bind's own refusal of one name twice, which
+		// comes once a guest is claimed.
+		if (name == "a name a key hands over" || name == "a name of the key services") && !strings.Contains(stderr.String(), "declared by more than one flag") {
+			t.Errorf("%s: start said %q", name, stderr.String())
+		}
+	}
+	if n := host.Runner.All()[0].Asked(session.PathBind); n != 0 {
+		t.Fatalf("a guest was sent %d binds for starts that were refused", n)
+	}
+	// The pool still has its guest for a start that is in order.
+	s := starting(t, host, "sbx-1")
+	s.sealed = []string{"api-token=" + token}
+	if res := start(t, s); !res.Started {
+		t.Fatalf("start result = %+v", res)
+	}
+}

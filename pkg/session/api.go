@@ -22,7 +22,7 @@ const (
 	PathHealth      = "/healthz"
 	PathState       = "/v1/state"
 	PathBind        = "/v1/bind"
-	PathBindCommand = "/v1/bind/command"
+	PathBindSealed  = "/v1/bind/sealed"
 	PathAttest      = "/v1/attest"
 	PathExec        = "/v1/exec"
 	PathCredentials = "/v1/credentials/"
@@ -72,7 +72,7 @@ const MaxForwardRequestBytes = 256
 const (
 	MaxRequestBytes = 2 << 20
 	// MaxBindRequestBytes bounds a bind as it is posted: the bind, and a
-	// first command sealed for it.
+	// message sealed with it.
 	MaxBindRequestBytes = 4 << 20
 	MaxExecArgs         = 256
 	MaxExecArgBytes     = 128 * 1024
@@ -158,41 +158,43 @@ const (
 type BindRequest struct {
 	Bind      []byte `json:"bind"`
 	Signature string `json:"signature"`
-	// Command is the session's first command, sealed to the guest's one-time
-	// KEM key: see SealFirstCommand. The guest opens it while it takes the
-	// bind, runs it once the sandbox runs, and sends its sealed answer after
-	// its answer to the bind, as a second document: see CommandAnswer.
-	Command []byte `json:"command,omitempty"`
+	// Sealed is a message sealed to the guest's one-time KEM key: the
+	// session's first command, credentials its binder holds, or both (see
+	// SealWithBind). The guest opens it while it takes the bind, puts the
+	// credentials in place before its sandbox starts, runs the command once
+	// the sandbox runs, and sends its sealed answer after its answer to the
+	// bind, as a second document: see SealedReply.
+	Sealed []byte `json:"sealed,omitempty"`
 }
 
-// What became of a first command that came with a bind or after it.
+// What became of a message sealed with a bind, or sent after it.
 const (
-	// CommandTaken: the guest opened it, and runs it once the sandbox runs.
-	CommandTaken = string(disclosure.CommandTaken)
-	// CommandUnopened: it did not open under the guest's one-time KEM key
+	// SealedTaken: the guest opened it, and acts on it.
+	SealedTaken = string(disclosure.SealedTaken)
+	// SealedUnopened: it did not open under the guest's one-time KEM key
 	// and this bind. The guest read nothing of it and erased the key.
-	CommandUnopened = string(disclosure.CommandUnopened)
-	// CommandTooLate: it came after the guest had erased its one-time KEM
+	SealedUnopened = string(disclosure.SealedUnopened)
+	// SealedTooLate: it came after the guest had erased its one-time KEM
 	// key, which it does before the sandbox runs anything, or after another
-	// had been tried. It was not opened: its sender sends it over a
-	// connection of its own.
-	CommandTooLate = string(disclosure.CommandTooLate)
+	// had been tried. It was not opened: its sender sends its command and
+	// puts its credentials over a connection of its own.
+	SealedTooLate = string(disclosure.SealedTooLate)
 )
 
-// CommandRequest hands a guest that is taking its bind the session's first
-// command, for a sender that had not sealed it when it sent the bind.
-type CommandRequest struct {
-	Command []byte `json:"command"`
+// SealedRequest hands a guest that is taking its bind a sealed message, for
+// a sender that had not sealed it when it sent the bind.
+type SealedRequest struct {
+	Sealed []byte `json:"sealed"`
 }
 
-// CommandAnswer is the sealed answer to a session's first command, as
-// FirstCommand.Open opens it. It follows the guest's answer to the bind the
-// command came with, as a second document, and answers PathBindCommand.
-type CommandAnswer struct {
-	// Command says what became of the command: CommandTaken with Answer, or
+// SealedReply is the guest's sealed answer to a sealed message, as
+// SealedMessage.Open opens it. It follows the guest's answer to the bind the
+// message came with, as a second document, and answers PathBindSealed.
+type SealedReply struct {
+	// Sealed says what became of the message: SealedTaken with Answer, or
 	// why there is none.
-	Command string `json:"command"`
-	Answer  []byte `json:"answer,omitempty"`
+	Sealed string `json:"sealed"`
+	Answer []byte `json:"answer,omitempty"`
 }
 
 // BindResponse reports the guest's phase once the bind is measured and its
@@ -201,11 +203,11 @@ type BindResponse struct {
 	Phase Phase `json:"phase"`
 	// Replayed: the guest was already bound by this same bind.
 	Replayed bool `json:"replayed,omitempty"`
-	// Command says what became of a first command that came with the bind:
-	// CommandTaken, CommandUnopened or CommandTooLate. After CommandTaken a
-	// second document follows this one, once the command has run: a
-	// CommandAnswer.
-	Command string `json:"command,omitempty"`
+	// Sealed says what became of a sealed message that came with the bind:
+	// SealedTaken, SealedUnopened or SealedTooLate. After SealedTaken a
+	// second document follows this one, once the guest has acted on every
+	// part: a SealedReply.
+	Sealed string `json:"sealed,omitempty"`
 	// Admission is how the guest spent the time between measuring the bind
 	// and running its sandbox, step by step in order.
 	Admission []AdmissionStep `json:"admission,omitempty"`

@@ -1277,8 +1277,14 @@ type ReadyTD struct {
 	InstanceKey crypto.PublicKey
 	// OneTime are the keys the guest made for its one bind, as the quote in
 	// its certificate binds them: its receipt for the bind is signed under
-	// the first, and a command sent with the bind is sealed to the second.
+	// the first, and what is sent with the bind is sealed to the second.
 	OneTime *OneTimeKeys
+	// Until is until when a secret may be sealed to the guest on this
+	// verdict: for as long as a kept verdict stands (the reuse period of the
+	// vendor's documents under it, their own dates, the certificate's end).
+	// Zero is a verdict nothing may be sealed on, which rests on a root CA
+	// CRL the guest's host handed over. That is enough to send a bind.
+	Until time.Time
 	// Machine is what the guest's evidence holds for the machine its host
 	// built it: RTMR[0] of a TD. Nil where the TEE has no such register. A
 	// launch document lists the values its guests may hold.

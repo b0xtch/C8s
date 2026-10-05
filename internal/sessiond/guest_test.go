@@ -101,8 +101,8 @@ func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 		t.Fatal(err)
 	}
 	evidence, relayed := answer.evidence, answer.receipt
-	if answer.command != "" || answer.wait != nil {
-		t.Fatalf("a bind that came with no command was answered as one that did: %+v", answer)
+	if answer.sealed != "" || answer.wait != nil {
+		t.Fatalf("a bind that came with no sealed message was answered as one that did: %+v", answer)
 	}
 	if !bytes.Equal(relayed, wantReceipt) {
 		t.Fatalf("the receipt was relayed as %s", relayed)
@@ -287,28 +287,28 @@ func TestEndedTDKeepsNoConnectionForTheNextAtItsAddress(t *testing.T) {
 	next.guests.reconnect()
 }
 
-// commandGuest is a guest that took a first command with its bind: it
-// answers the bind, and the command's sealed answer when the test lets it.
-type commandGuest struct {
+// sealedGuest is a guest that took a sealed message with its bind: it
+// answers the bind, and the message's sealed answer when the test lets it.
+type sealedGuest struct {
 	answer chan []byte
-	// cut is how many requests for a command after its bind it breaks the
-	// connection of, and fence how many more it refuses as fenced.
+	// cut is how many requests with a sealed message after its bind it
+	// breaks the connection of, and fence how many more it refuses as fenced.
 	cut, fence atomic.Int32
-	commands   atomic.Int32
+	messages   atomic.Int32
 }
 
-func (g *commandGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (g *sealedGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case session.PathBind:
-		_ = json.NewEncoder(w).Encode(session.BindResponse{Phase: session.PhaseRunning, Command: session.CommandTaken})
+		_ = json.NewEncoder(w).Encode(session.BindResponse{Phase: session.PhaseRunning, Sealed: session.SealedTaken})
 		w.(http.Flusher).Flush()
 		select {
 		case sealed := <-g.answer:
-			_ = json.NewEncoder(w).Encode(session.CommandAnswer{Command: session.CommandTaken, Answer: sealed})
+			_ = json.NewEncoder(w).Encode(session.SealedReply{Sealed: session.SealedTaken, Answer: sealed})
 		case <-r.Context().Done():
 		}
-	case session.PathBindCommand:
-		g.commands.Add(1)
+	case session.PathBindSealed:
+		g.messages.Add(1)
 		switch {
 		case g.cut.Add(-1) >= 0:
 			conn, _, err := w.(http.Hijacker).Hijack()
@@ -320,18 +320,18 @@ func (g *commandGuest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusConflict)
 			_, _ = w.Write([]byte(`{"error":"fenced"}`))
 		default:
-			_ = json.NewEncoder(w).Encode(session.CommandAnswer{Command: session.CommandTaken, Answer: []byte("sealed answer")})
+			_ = json.NewEncoder(w).Encode(session.SealedReply{Sealed: session.SealedTaken, Answer: []byte("sealed answer")})
 		}
 	default:
 		http.NotFound(w, r)
 	}
 }
 
-// A guest that takes a first command with its bind answers twice: the bind
-// at once, and the command once it has run. The daemon hands on the first
-// answer when it has it, and waits for the second apart from it.
-func TestBindAnswerComesBeforeItsCommands(t *testing.T) {
-	guest := &commandGuest{answer: make(chan []byte, 1)}
+// A guest that takes a sealed message with its bind answers twice: the bind
+// at once, and the message once it has acted on it. The daemon hands on the
+// first answer when it has it, and waits for the second apart from it.
+func TestBindAnswerComesBeforeItsSealedAnswer(t *testing.T) {
+	guest := &sealedGuest{answer: make(chan []byte, 1)}
 	server := httptest.NewTLSServer(guest)
 	defer server.Close()
 	addr := strings.TrimPrefix(server.URL, "https://")
@@ -341,12 +341,12 @@ func TestBindAnswerComesBeforeItsCommands(t *testing.T) {
 	defer cancel()
 
 	var wrote atomic.Int32
-	answer, err := client.bind(ctx, addr, []byte("bind"), []byte("bind signature"), []byte("sealed command"), func() { wrote.Add(1) })
+	answer, err := client.bind(ctx, addr, []byte("bind"), []byte("bind signature"), []byte("sealed message"), func() { wrote.Add(1) })
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The guest has not answered the command, and the bind's answer is here.
-	if answer.command != session.CommandTaken || answer.wait == nil || answer.evidence.GetPhase() != string(session.PhaseRunning) {
+	// The guest has not answered the message, and the bind's answer is here.
+	if answer.sealed != session.SealedTaken || answer.wait == nil || answer.evidence.GetPhase() != string(session.PhaseRunning) {
 		t.Fatalf("the bind's answer: %+v", answer)
 	}
 	if wrote.Load() != 1 {
@@ -354,57 +354,57 @@ func TestBindAnswerComesBeforeItsCommands(t *testing.T) {
 	}
 	guest.answer <- []byte("sealed answer")
 	result, err := answer.wait()
-	if err != nil || result.Command != session.CommandTaken || string(result.Answer) != "sealed answer" {
-		t.Fatalf("the command's answer: %+v, %v", result, err)
+	if err != nil || result.Sealed != session.SealedTaken || string(result.Answer) != "sealed answer" {
+		t.Fatalf("the sealed answer: %+v, %v", result, err)
 	}
 	// Asked again, it is the same answer, and the guest is not.
 	if again, err := answer.wait(); err != nil || string(again.Answer) != "sealed answer" {
-		t.Fatalf("the command's answer, asked for again: %+v, %v", again, err)
+		t.Fatalf("the sealed answer, asked for again: %+v, %v", again, err)
 	}
 
-	// A guest that ends before it answers the command: the wait says so.
-	answer, err = client.bind(ctx, addr, []byte("bind"), []byte("bind signature"), []byte("sealed command"), nil)
+	// A guest that ends before it answers the message: the wait says so.
+	answer, err = client.bind(ctx, addr, []byte("bind"), []byte("bind signature"), []byte("sealed message"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	server.CloseClientConnections()
 	if result, err := answer.wait(); err == nil {
-		t.Fatalf("a guest that went away answered its command: %+v", result)
+		t.Fatalf("a guest that went away answered its sealed message: %+v", result)
 	}
 }
 
-// A command that follows its bind goes on a connection of its own, made as
-// the bind is written. If the guest's fence took that connection, the daemon
-// sends the command once more on one made after it.
-func TestCommandAfterItsBindIsSentAgainPastTheFence(t *testing.T) {
-	for name, set := range map[string]func(*commandGuest){
-		"the connection broke":     func(g *commandGuest) { g.cut.Store(1) },
-		"the guest refused unread": func(g *commandGuest) { g.fence.Store(1) },
+// A sealed message that follows its bind goes on a connection of its own,
+// made as the bind is written. If the guest's fence took that connection,
+// the daemon sends the message once more on one made after it.
+func TestSealedMessageAfterItsBindIsSentAgainPastTheFence(t *testing.T) {
+	for name, set := range map[string]func(*sealedGuest){
+		"the connection broke":     func(g *sealedGuest) { g.cut.Store(1) },
+		"the guest refused unread": func(g *sealedGuest) { g.fence.Store(1) },
 	} {
-		guest := &commandGuest{}
+		guest := &sealedGuest{}
 		set(guest)
 		server := httptest.NewTLSServer(guest)
 		addr := strings.TrimPrefix(server.URL, "https://")
 		client := newGuestClient((&net.Dialer{}).DialContext)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		answer, err := client.command(ctx, addr, []byte("sealed command"))
-		if err != nil || answer.Command != session.CommandTaken || string(answer.Answer) != "sealed answer" {
-			t.Errorf("%s: the command's answer: %+v, %v", name, answer, err)
+		answer, err := client.sealed(ctx, addr, []byte("sealed message"))
+		if err != nil || answer.Sealed != session.SealedTaken || string(answer.Answer) != "sealed answer" {
+			t.Errorf("%s: the sealed answer: %+v, %v", name, answer, err)
 		}
-		if n := guest.commands.Load(); n != 2 {
-			t.Errorf("%s: the guest was sent the command %d times", name, n)
+		if n := guest.messages.Load(); n != 2 {
+			t.Errorf("%s: the guest was sent the message %d times", name, n)
 		}
 		// It is sent once more, and no more than that. The connection the
 		// client kept is dropped first: a request that breaks a kept one is
 		// sent again by the transport itself.
 		client.reconnect()
 		guest.cut.Store(2)
-		guest.commands.Store(0)
-		if answer, err := client.command(ctx, addr, []byte("sealed command")); err == nil {
+		guest.messages.Store(0)
+		if answer, err := client.sealed(ctx, addr, []byte("sealed message")); err == nil {
 			t.Errorf("%s: a guest that broke two connections answered: %+v", name, answer)
 		}
-		if n := guest.commands.Load(); n != 2 {
-			t.Errorf("%s: the guest was sent the command %d times after two broken connections", name, n)
+		if n := guest.messages.Load(); n != 2 {
+			t.Errorf("%s: the guest was sent the message %d times after two broken connections", name, n)
 		}
 		cancel()
 		client.reconnect()

@@ -337,3 +337,92 @@ func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
 		t.Errorf("a quote was held under another guest's instance key: %v", err)
 	}
 }
+
+// resting is an engine whose verdicts say they rest on the vendor's
+// documents as finding describes them.
+type resting struct {
+	session.Engine
+	finding *session.CollateralFinding
+}
+
+func (e resting) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	res, err := e.Engine.VerifyEvidence(ctx, env, reportData)
+	if err != nil {
+		return nil, err
+	}
+	if res.Claims.PlatformData == nil {
+		res.Claims.PlatformData = map[string]any{}
+	}
+	res.Claims.PlatformData[session.CollateralClaim] = e.finding
+	return res, nil
+}
+
+// A verdict on a ready guest that rests on a root CA CRL the guest's host
+// handed over is enough to sign a bind, and nothing is sealed on it: Intel
+// signs that list once a year, so a newer one that revokes what is under the
+// verdict would go unseen. One that rests on a list this verifier had from
+// Intel lets a secret go for as long as a kept verdict stands.
+func TestNothingIsSealedOnAVerdictThatRestsOnAHandedOverRootCRL(t *testing.T) {
+	s := serveReady(t, sessiontest.NewTD())
+	now := time.Now()
+	state := relayedState(t, s)
+	leaf, err := x509.ParseCertificate(state.Certificate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seal := func(ready *session.ReadyTD) error {
+		_, err := session.SealWithBind(ready, bindFor(t, s, ready), s.signer, session.SealedParts{Command: &session.ExecRequest{Argv: []string{"/bin/true"}}})
+		return err
+	}
+	later := now.Add(48 * time.Hour)
+
+	handed, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Stapled: true, RootCRLStapled: true, Expires: later}}, state, now)
+	if err != nil {
+		t.Fatalf("VerifyReady on a root CA CRL that was handed over: %v", err)
+	}
+	if !handed.Until.IsZero() {
+		t.Fatalf("a verdict on a handed-over root CA CRL lets a secret go until %s", handed.Until)
+	}
+	// It is a verdict all the same: the bind it leads to is signed.
+	if err := seal(handed); !errors.Is(err, session.ErrNotForRelease) {
+		t.Fatalf("sealing on it: %v, want it refused as not for release", err)
+	}
+
+	own, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{Stapled: true, RootCRLFetched: now.Add(-30 * time.Minute), Expires: later}}, state, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// For the rest of the hour its root CA CRL is reused, and no longer than
+	// the guest's certificate lasts.
+	if !own.Until.After(now.Add(20*time.Minute)) || own.Until.After(now.Add(31*time.Minute)) || own.Until.After(leaf.NotAfter) {
+		t.Fatalf("a verdict on a root CA CRL of this verifier's own, half an hour old, stands until %s", own.Until.Sub(now))
+	}
+	if err := seal(own); err != nil {
+		t.Fatalf("sealing on a verdict made for release: %v", err)
+	}
+
+	// Intel's own date on a document under the verdict ends it sooner.
+	dated, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{RootCRLFetched: now, Expires: now.Add(time.Minute)}}, state, now)
+	if err != nil || !dated.Until.Equal(now.Add(time.Minute)) {
+		t.Fatalf("a verdict under a document that ends in a minute stands until %v, %v", dated.Until, err)
+	}
+	// A list this verifier had from Intel longer ago than it reuses one, with
+	// Intel out of reach for a newer: the verdict's time was up when it was
+	// made.
+	old, err := session.VerifyReady(within(t), s.policy, resting{sessiontest.Engine{}, &session.CollateralFinding{RootCRLFetched: now.Add(-2 * time.Hour), Stale: true, Expires: later}}, state, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seal(old); !errors.Is(err, session.ErrNotForRelease) {
+		t.Fatalf("sealing on a verdict whose root CA CRL is two hours old: %v", err)
+	}
+	// An engine that judges by none of the vendor's documents: for as long
+	// as any kept verdict.
+	plain, err := session.VerifyReady(within(t), s.policy, sessiontest.Engine{}, state, now)
+	if err != nil || !plain.Until.After(now) || plain.Until.After(leaf.NotAfter) {
+		t.Fatalf("a verdict of an engine with no documents stands until %v, %v", plain.Until, err)
+	}
+	if err := seal(plain); err != nil {
+		t.Fatal(err)
+	}
+}
