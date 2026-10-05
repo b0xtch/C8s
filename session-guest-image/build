@@ -18,6 +18,12 @@
 #                   build the key service's image: this image with the key
 #                   service as its measured service where the agent is. Its
 #                   own measurement. Default name: c8s-key-service[-dev].
+#   C8S_SIMTEE=1    DEVELOPMENT ONLY, and protects nothing: compile the
+#                   guest's programs with the c8s_simtee tag. The image then
+#                   boots with no TEE and simulates one in software: the
+#                   second baseline of docs/session-performance.md. Its
+#                   programs refuse to run in a confidential VM. Default
+#                   name: <name>-simtee.
 #   C8S_NAME=...    output name (default c8s-session -> output/c8s-session/)
 #   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
 #   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s-session-guest and
@@ -60,6 +66,12 @@ if [ "${C8S_DEV:-0}" = 1 ]; then
     FRAGMENT="$PGI_DIR/kernel/session-dev.config"
     DEV_PROFILE=(--profile dev)
     DEFAULT_NAME=$DEFAULT_NAME-dev
+fi
+TAGS=()
+if [ "${C8S_SIMTEE:-0}" = 1 ]; then
+    [ "$C8S_PLATFORM" = tdx ] || { echo "session-guest-image/build: C8S_SIMTEE simulates TDX alone, and C8S_PLATFORM is $C8S_PLATFORM" >&2; exit 1; }
+    TAGS=(-tags c8s_simtee)
+    DEFAULT_NAME=$DEFAULT_NAME-simtee
 fi
 : "${C8S_NAME:=$DEFAULT_NAME}"
 
@@ -111,7 +123,7 @@ if [ -z "${C8S_BINARY:-}" ]; then
     # The runtime's secret mode erases what work on the guest's one-time keys
     # leaves on a stack or the heap. The agent refuses to run without it.
     (cd "$REPO_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-buildvcs=false GOEXPERIMENT=runtimesecret \
-        go build -trimpath \
+        go build -trimpath ${TAGS[@]+"${TAGS[@]}"} \
         -ldflags "-s -w -buildid= -X github.com/confidential-dot-ai/c8s/internal/version.Version=$VERSION" \
         -o "$C8S_BINARY" ./cmd/c8s-session-guest)
 fi
@@ -125,9 +137,21 @@ if [ -z "${C8S_INIT_BINARY:-}" ]; then
     C8S_INIT_BINARY="$REPO_DIR/build/c8s-session-init"
     mkdir -p "$REPO_DIR/build"
     (cd "$REPO_DIR" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-buildvcs=false \
-        go build -trimpath -ldflags "-s -w -buildid=" -o "$C8S_INIT_BINARY" ./cmd/c8s-session-init)
+        go build -trimpath ${TAGS[@]+"${TAGS[@]}"} -ldflags "-s -w -buildid=" -o "$C8S_INIT_BINARY" ./cmd/c8s-session-init)
 fi
 [ -f "$C8S_INIT_BINARY" ] || { echo "session-guest-image/build: C8S_INIT_BINARY=$C8S_INIT_BINARY is not a file" >&2; exit 1; }
+
+# A program compiled to simulate a TEE names the tag in its own text. It goes
+# in an image built for that and in no other, whoever compiled it: an image
+# with one such program and one that is not would boot in neither kind of
+# guest, and a release image with one would attest to nobody.
+for program in "$C8S_BINARY" "$C8S_INIT_BINARY"; do
+    if grep -aq '(c8s_simtee)' "$program"; then
+        [ "${C8S_SIMTEE:-0}" = 1 ] || { echo "session-guest-image/build: $program simulates a TEE (it was compiled with -tags c8s_simtee): it goes in no image but one built with C8S_SIMTEE=1" >&2; exit 1; }
+    elif [ "${C8S_SIMTEE:-0}" = 1 ]; then
+        echo "session-guest-image/build: C8S_SIMTEE=1 and $program was compiled without -tags c8s_simtee" >&2; exit 1
+    fi
+done
 
 # The program a sandbox's container runs until its session is bound. It is
 # started from a descriptor inside a container that holds no file of the
@@ -186,3 +210,14 @@ for schema in disclosure bind; do
     "$C8S_BINARY" schema "$schema" > "output/$C8S_NAME/$schema-schema.json"
 done
 echo "session-guest-image/build: published output/$C8S_NAME/disclosure-schema.json and bind-schema.json"
+if [ "${C8S_SIMTEE:-0}" = 1 ]; then
+    # Beside the manifest, so that nobody takes its reference values for a
+    # confidential guest's: no TEE ever measures this image.
+    cat > "output/$C8S_NAME/SIMULATED-TEE" <<'NOTE'
+This image was built with C8S_SIMTEE=1. Its programs simulate a TEE in
+software and refuse to run in a confidential VM. It protects nothing. The
+registers in manifest.json are what a launcher declares for it
+(c8s session-launcher run --simulated-tee); no hardware measures them.
+NOTE
+    echo "session-guest-image/build: output/$C8S_NAME simulates its TEE: see SIMULATED-TEE there"
+fi

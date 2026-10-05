@@ -513,6 +513,88 @@ host and of the other guests, and requires the host's filter to have counted
 the attempts as dropped. The script's header lists what it needs and what it
 changes on the host while it runs.
 
+## A simulated TEE
+
+[session-performance.md](session-performance.md#method) holds a session's
+start to a second baseline: the same guest and VMM with TDX off. A session
+image stops without a TEE, so that baseline runs a development build whose
+guests simulate one in software. The build is made with the Go build tag
+`c8s_simtee`. It protects nothing: its purpose is that every step of a start
+costs what it costs in a TD, so that the difference between the two is what
+the hardware and the vendor's quoting add.
+
+```
+  release build                         development build (c8s_simtee)
+
+  launcher --tdx-guest--> QEMU          launcher --no TEE object--> QEMU
+      |                     |               |  checks firmware and disk
+      |                 TDX module          |  against manifest.json, then
+      |              measures MRTD,         |  declares MRTD, RTMR[0..2]
+      |              RTMR[0..2]             v
+      v                     v           simtee.json on the launch volume
+  +------ TD ------------------+        +------ plain VM ----------------+
+  | init: extend RTMR[3]       |        | init: /run/c8s-simtee/rtmr3    |
+  | agent: TDREPORT, quote     |        | agent: quote signed in guest   |
+  |        from host's QE      |        |        under the handed key    |
+  +----------------------------+        +--------------------------------+
+      verifier: Intel's root                verifier: simulated root,
+      and Intel's documents                 in place of Intel's, and
+                                            'simtee vendor' documents
+```
+
+| Part | In a TD | Simulated |
+|---|---|---|
+| MRTD, RTMR[1], RTMR[2] | measured by the TDX module and the firmware | declared by the guest's launcher from the image's `manifest.json`, after it held the firmware and the disk it hands the VMM to the digests the manifest names |
+| RTMR[0] | the firmware's measurement of the machine | the digest of the launcher's description of the machine: vCPUs, memory and its split, and which devices |
+| RTMR[3] | extended through the guest's kernel | a file in the guest's memory, made by the init with the launch key's digest and extended by the agent |
+| A quote | signed by the host's quoting enclave | the same format, signed in the guest under a platform key its launcher handed it |
+| The vendor's documents | Intel's service | `c8s session simtee vendor`: the same four documents, signed under the simulated authority; the platform is always UpToDate and nothing is revoked |
+| The root evidence is held to | Intel's | the simulated authority's, in its place and never beside it |
+
+The authority is a directory. Whoever reads it makes any quote and any
+document.
+
+```sh
+c8s session simtee new --out /var/lib/c8s/simtee        # the authority, and one platform under it
+c8s session simtee vendor --dir /var/lib/c8s/simtee &   # serves its documents, and writes its address there
+C8S_SIMTEE=1 C8S_PLATFORM=tdx session-guest-image/build # -> c8s-session-simtee, with its own reference values
+```
+
+A daemon of that build launches every guest so with `vmm.simulatedTEE:
+/var/lib/c8s/simtee` in its configuration, a launcher with `--simulated-tee`,
+and every command that judges evidence takes `--simulated-tee` too. With the
+option unset, the development build judges and launches as a release build
+does.
+
+What keeps the two kinds apart:
+
+- A release build has none of it. Each hook is a type or a function defined
+  twice, by build tag, and the release one is empty: no option, no
+  configuration key, and no import of the package that makes simulated
+  quotes. `internal/simtee/release_test.go` reads every file's build
+  constraint and asks the toolchain what each program links.
+- An engine given a simulated authority holds evidence to that root in place
+  of the vendor's. It refuses a TD's evidence, as every other engine refuses
+  a simulated guest's, and it keeps the authority's documents in a directory
+  of their own: they have the addresses of Intel's.
+- A simulating image refuses to run in a confidential VM: its init stops
+  where it finds a TEE's register or guest device, and so does its agent. An
+  image built for a TD stops without one, as always, and never falls back.
+- The image build compiles both programs with the tag or neither, refuses a
+  prebuilt program of the other kind, and writes `SIMULATED-TEE` beside the
+  manifest.
+
+Where a simulated guest's own work differs from a TD's, a run's record says
+so:
+
+| Work | In a TD | Simulated |
+|---|---|---|
+| Memory at boot | accepted and cleared as the guest uses it | all of it cleared by the kernel before the init runs, through the host's page faults |
+| The guest's clock | the TSC, at the rate the TDX module states | the TSC, at the rate the kernel measured at boot: a plain guest's kernel may never finish refining it, and the agent takes the counter under either name |
+| A quote | a report from the TDX module, signed by the host's quoting service | one signature in the guest |
+| An extend of RTMR[3] | a call into the TDX module | a write to a file in memory |
+| Device I/O | through bounce buffers shared with the host | on the guest's own pages |
+
 ## What is missing
 
 - The other calls of the design: pools made and changed through the API,

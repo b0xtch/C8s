@@ -85,6 +85,17 @@ C8S_TEST_COUNT ?= -count=1
 test:
 	go test -race $(C8S_TEST_COUNT) -timeout=120s ./...
 
+# The same tests in the development build that simulates a session guest's
+# TEE in software (the c8s_simtee tag: docs/session-performance.md), over
+# the packages the tag changes. No release build is made with it.
+C8S_SIMTEE_PACKAGES = ./internal/simtee/... ./pkg/session/... ./internal/sessiond/... ./internal/keyservice/... \
+	./internal/cmds/sessionagent/... ./internal/cmds/sessioncli/... ./internal/cmds/sessioninit/... \
+	./internal/cmds/sessionkeyservice/... ./internal/cmds/sessionlauncher/... ./test/session/...
+.PHONY: test-simtee
+test-simtee:
+	go vet -tags c8s_simtee $(C8S_SIMTEE_PACKAGES)
+	go test -race -tags c8s_simtee $(C8S_TEST_COUNT) -timeout=120s $(C8S_SIMTEE_PACKAGES)
+
 test-integration:
 	./test/integration/run.sh
 

@@ -136,6 +136,11 @@ jobs:
         # its mtime and invalidates the cached pass.
         run: make test C8S_TEST_COUNT=
 
+      # The development build that simulates a session guest's TEE: its own
+      # tests, and every other test of the packages it changes.
+      - name: Test (simulated TEE)
+        run: make test-simtee C8S_TEST_COUNT=
+
       # The advisory mutation job only exercises the 0-mutant path on
       # script-only diffs; this guards the summary paths it skips.
       - name: mutation-check selftest
