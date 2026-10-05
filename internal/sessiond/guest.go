@@ -33,9 +33,24 @@ type guestClient struct {
 	http *http.Client
 }
 
+type dialLimitKey struct{}
+
+// withDialLimit bounds how long a connection opened for a request under ctx
+// may take to open, apart from how long the request may take.
+func withDialLimit(ctx context.Context, limit time.Duration) context.Context {
+	return context.WithValue(ctx, dialLimitKey{}, limit)
+}
+
 func newGuestClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *guestClient {
 	return &guestClient{http: &http.Client{Transport: &http.Transport{
-		DialContext: dial,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if limit, ok := ctx.Value(dialLimitKey{}).(time.Duration); ok {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, limit)
+				defer cancel()
+			}
+			return dial(ctx, network, addr)
+		},
 		// One kept connection a guest: more are opened when requests to one
 		// guest overlap, and closed after.
 		MaxIdleConnsPerHost: 1,

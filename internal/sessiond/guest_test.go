@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,5 +160,55 @@ func TestGuestsReceiptAndQuoteAreRelayedAsTheyAre(t *testing.T) {
 	}
 	if relayed != nil || len(evidence.GetQuote()) != 0 || evidence.GetPhase() != string(session.PhaseRunning) {
 		t.Fatalf("an answer with neither was relayed as receipt %s, evidence %+v", relayed, evidence)
+	}
+}
+
+// A booting guest is asked whether it serves over a connection that must
+// open at once. One that does not is given up on, and the next ask opens
+// another: a guest that came up just after the first packet to it is found
+// by the next, and nobody waits for the kernel to send the first again.
+func TestBootProbeGivesUpOnAConnectionThatDoesNotOpen(t *testing.T) {
+	guest := &saidGuest{state: session.StateResponse{Phase: session.PhaseReady, Prepared: true}}
+	server := httptest.NewTLSServer(guest)
+	defer server.Close()
+	addr := strings.TrimPrefix(server.URL, "https://")
+	var dials atomic.Int32
+	// The first connection is to a guest that is not up yet: nothing answers.
+	client := newGuestClient(func(ctx context.Context, network, to string) (net.Conn, error) {
+		if dials.Add(1) == 1 {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, to)
+	})
+	defer client.reconnect()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	began := time.Now()
+	if state := client.ready(withDialLimit(ctx, 20*time.Millisecond), addr); state != nil {
+		t.Fatalf("a guest nothing reached answered: %+v", state)
+	}
+	if waited := time.Since(began); waited > 5*time.Second {
+		t.Fatalf("the ask waited %s for a connection that did not open", waited)
+	}
+	if state := client.ready(withDialLimit(ctx, 5*time.Second), addr); state == nil || !state.Prepared {
+		t.Fatalf("the next ask did not find the guest: %+v", state)
+	}
+	if got := dials.Load(); got != 2 {
+		t.Fatalf("%d connections were opened, want one that was given up on and one that served", got)
+	}
+
+	// Without such a limit an ask waits for its connection as long as it may.
+	client.reconnect()
+	dials.Store(0)
+	short, stop := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer stop()
+	began = time.Now()
+	if state := client.ready(short, addr); state != nil {
+		t.Fatalf("a guest nothing reached answered: %+v", state)
+	}
+	if waited := time.Since(began); waited < 150*time.Millisecond {
+		t.Fatalf("an ask with no limit on its connection gave up after %s", waited)
 	}
 }

@@ -18,8 +18,13 @@ const (
 	// parallelBoots is how many TDs of one pool boot at once. A boot accepts
 	// memory with the host's cores, and the TDs that serve need them too.
 	parallelBoots = 2
-	// readyPoll is how often a booting guest is asked whether it serves.
-	readyPoll = 100 * time.Millisecond
+	// readyPoll is how often a booting guest is asked whether it serves, and
+	// readyDial how long a connection to it may take to open. A guest that is
+	// up accepts within a fraction of that. One that is not answers nothing,
+	// and the kernel would wait a second before it asked again: a new
+	// connection each time asks at once.
+	readyPoll = 20 * time.Millisecond
+	readyDial = 25 * time.Millisecond
 	// warmEvery is how often a ready guest is asked for what a claim relays.
 	// A guest closes a connection that was idle for a minute.
 	warmEvery = 20 * time.Second
@@ -321,7 +326,7 @@ func (d *Daemon) await(t *td, pool *poolState, started time.Time) {
 	var offered *session.StateResponse
 	var collateral []byte
 	for {
-		probe, cancel := context.WithTimeout(t.ctx, 5*time.Second)
+		probe, cancel := context.WithTimeout(withDialLimit(t.ctx, readyDial), 5*time.Second)
 		if offered = d.guests.ready(probe, t.rec.Address); offered != nil {
 			collateral = d.guests.collateral(probe, t.rec.Address)
 		}
