@@ -16,6 +16,8 @@ esac
     || { echo "c8s-session sync: FATAL no guest program staged at usr/local/bin/c8s-session-guest (build with session-guest-image/build)" >&2; exit 1; }
 DEV=$(cat "$SYNC_INPUTS/dev" 2>/dev/null || true)
 ROLE=$(cat "$SYNC_INPUTS/role" 2>/dev/null || echo session)
+RESERVE=$(cat "$SYNC_INPUTS/accept-reserve" 2>/dev/null || echo 0)
+PROCESSORS=$(cat "$SYNC_INPUTS/agent-processors" 2>/dev/null || echo 0)
 
 # The guest's one service. The agent's flags are its configuration, so they
 # are part of the image: the root hash covers this file.
@@ -26,6 +28,14 @@ case "$ROLE" in
             --packet-filter=/etc/c8s-session/firewall.json
             --disclosure-schema=/etc/c8s-session/disclosure-schema.json
             --bind-schema=/etc/c8s-session/bind-schema.json)
+        # Accepted free memory a guest holds while it waits for its bind.
+        if [ "$RESERVE" -gt 0 ]; then
+            SERVICE+=("--accept-reserve=$RESERVE")
+        fi
+        # The processors the agent's own work runs on at once.
+        if [ "$PROCESSORS" -gt 0 ]; then
+            SERVICE+=("--processors=$PROCESSORS")
+        fi
         if [ "$DEV" = 1 ]; then
             # The hardware suite serves its sandbox image from the host over
             # plain HTTP, and QEMU's user-mode network shows the guest its

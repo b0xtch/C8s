@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/user"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -111,7 +112,7 @@ func newRunCmd() *cobra.Command {
 	var cfg Config
 	var listen, sandboxUser string
 	var plainHTTP []string
-	var acceptReserve int
+	var acceptReserve, processors int
 	var acceptRest bool
 	var guard RulesetGuard
 	var schemas SchemaGuard
@@ -136,6 +137,12 @@ func newRunCmd() *cobra.Command {
 			// signing or decrypting with them left behind.
 			if !erasesTemporaries {
 				return errors.New("this guest's program was built without the runtime's secret mode (GOEXPERIMENT=runtimesecret): it cannot erase what its one-time keys leave in memory")
+			}
+			if processors < 0 {
+				return errors.New("--processors is a number of processors, or 0 for all of the guest's")
+			}
+			if processors > 0 {
+				runtime.GOMAXPROCS(processors)
 			}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
 			var err error
@@ -256,6 +263,7 @@ func newRunCmd() *cobra.Command {
 	f.StringVar(&image.StateDir, "sandbox-state-dir", defaultStateDir, "directory on the encrypted scratch volume for the sandbox image")
 	f.StringVar(&image.RunDir, "sandbox-runtime-dir", defaultRuntimeDir, "RAM-backed directory for the container runtime's state")
 	f.Int64Var(&image.PidsLimit, "sandbox-pids-max", defaultPidsMax, "task limit of the sandbox and its commands together")
+	f.IntVar(&processors, "processors", 0, "how many of the guest's processors the agent's own work runs on at once (0: all of them). The sandbox and its commands have every one either way: fewer for the agent means fewer of them woken for its work")
 	f.IntVar(&acceptReserve, "accept-reserve", 0, "megabytes of accepted free memory a guest holds while it waits for a sandbox, on a kernel that accepts memory on request (vm.accept_memory_mb); a pool guest says it is ready once it holds them")
 	f.BoolVar(&acceptRest, "accept-rest", false, "once a sandbox runs, accept the rest of the guest's memory in the background, so that the sandbox finds it accepted. Without it a sandbox accepts what it grows into, and the guest stays as small as its use")
 	f.StringSliceVar(&plainHTTP, "sandbox-plain-http", nil, "registries (host:port) reached without TLS, for a dev image's local registry; an image is verified by its digest either way")

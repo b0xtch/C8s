@@ -24,6 +24,16 @@
 #                   second baseline of docs/session-performance.md. Its
 #                   programs refuse to run in a confidential VM. Default
 #                   name: <name>-simtee.
+#   C8S_ACCEPT_RESERVE_MB=...
+#                   megabytes of accepted free memory the session's agent
+#                   holds while it waits for a bind (its --accept-reserve),
+#                   so that a start touches none the host has yet to give.
+#                   It is part of the measured service line. Default 0: a
+#                   start accepts what it grows into.
+#   C8S_AGENT_PROCESSORS=...
+#                   how many of the guest's processors the session's agent
+#                   runs its own work on at once (its --processors). Part of
+#                   the measured service line. Default 0: all of them.
 #   C8S_NAME=...    output name (default c8s-session -> output/c8s-session/)
 #   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
 #   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s-session-guest and
@@ -55,11 +65,21 @@ REPO_DIR=$(cd "$PGI_DIR/.." && pwd)
 CONFOS_DIR=${CONFOS_DIR:-"$REPO_DIR/../confidential-os-builder"}
 [ -x "$CONFOS_DIR/bin/confos" ] || { echo "session-guest-image/build: confos checkout not found at $CONFOS_DIR (set CONFOS_DIR)" >&2; exit 1; }
 
+case "${C8S_ACCEPT_RESERVE_MB:-0}" in
+''|*[!0-9]*) echo "session-guest-image/build: C8S_ACCEPT_RESERVE_MB must be a number of megabytes, got '${C8S_ACCEPT_RESERVE_MB}'" >&2; exit 1 ;;
+esac
+case "${C8S_AGENT_PROCESSORS:-0}" in
+''|*[!0-9]*) echo "session-guest-image/build: C8S_AGENT_PROCESSORS must be a number of processors, got '${C8S_AGENT_PROCESSORS}'" >&2; exit 1 ;;
+esac
 case "${C8S_ROLE:-session}" in
 session) DEFAULT_NAME=c8s-session ;;
 key-service) DEFAULT_NAME=c8s-key-service ;;
 *)  echo "session-guest-image/build: C8S_ROLE must be session or key-service, got '${C8S_ROLE}'" >&2; exit 1 ;;
 esac
+if [ "${C8S_ROLE:-session}" != session ] && [ "${C8S_ACCEPT_RESERVE_MB:-0}${C8S_AGENT_PROCESSORS:-0}" != 00 ]; then
+    echo "session-guest-image/build: C8S_ACCEPT_RESERVE_MB and C8S_AGENT_PROCESSORS are the session agent's: the key service starts no sandbox" >&2
+    exit 1
+fi
 FRAGMENT="$PGI_DIR/kernel/session.config"
 DEV_PROFILE=()
 if [ "${C8S_DEV:-0}" = 1 ]; then
@@ -196,6 +216,8 @@ bin/confos build "$C8S_NAME" \
     --sync-input "platform=${C8S_PLATFORM}" \
     --sync-input "dev=${C8S_DEV:-0}" \
     --sync-input "role=${C8S_ROLE:-session}" \
+    --sync-input "accept-reserve=${C8S_ACCEPT_RESERVE_MB:-0}" \
+    --sync-input "agent-processors=${C8S_AGENT_PROCESSORS:-0}" \
     --kernel-config-fragment "$FRAGMENT" \
     ${PATCHES[@]+"${PATCHES[@]}"} \
     ${FIRMWARE[@]+"${FIRMWARE[@]}"} \
