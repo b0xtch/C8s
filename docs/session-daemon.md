@@ -484,7 +484,9 @@ claimed guest judged ahead, while that certificate claims nothing and a
 caller the pool does not name is shown nothing. The binder then starts a
 session with a bind that claims its TD, which the orchestrator is shown with
 the binder's key and ends, and starts another whose first TD a second bind
-took first. Then what must be refused:
+took first. A binder also names the key service's replica it judged in a
+bind whose guest takes the stored credential from that replica. Then what
+must be refused:
 
 | Refused | By whom |
 |---|---|
@@ -496,6 +498,7 @@ took first. Then what must be refused:
 | a sandbox image whose content was changed | the guest |
 | a stranger's key; one session's binding on another session's TD | the guest |
 | a bind to a guest of a pool the key service does not serve | the guest, which is never ready |
+| a bind that names another replica of the key service than the one the guest's session is with | the guest, which reaches none the bind names and ends |
 | a destroy without an orchestrator's certificate; a claim or a destroy under a binder's own certificate; a binder's bind that claims under an authority its pool does not name for it; a bind that claims from a key the pool does not name; the host's TDs shown to a binder | the daemon |
 
 With dev images it also probes, from inside a guest, every address of its

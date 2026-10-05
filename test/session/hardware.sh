@@ -64,7 +64,9 @@
 #                            to a bind that came first. A bind under an
 #                            authority the pool does not name for the binder,
 #                            and one from a key it does not name, claim
-#                            nothing.
+#                            nothing. A binder names the key service's
+#                            replica it judged in its bind, and a guest
+#                            takes no bind that names another.
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -676,6 +678,28 @@ if [ -n "$warm" ]; then
     check "its first bind was answered as not ready, once" grep -q '"not_ready":1' "$out/bind-lost.out"
     check "its session started all the same, with its sealed credential" grep -q '"credential_with_bind":true' "$out/bind-lost.out"
     stop_pid "$events_pid"; events_pid=""
+
+    # A bind that names a key service names the replica of it that its binder
+    # judged, on the vendor's documents as the binder fetched them. From its
+    # bind on the guest deals with that replica alone: before it, the guest
+    # judged its key service on what its host handed it. A bind that names
+    # another replica, which the guest's host leads it to no connection
+    # with, is refused, and the guest ends.
+    with_ks=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
+        --pool agents --image-manifest "$manifest" --launch-key "$launch_key" --authority-key "$out/authority.key" --tenant acme
+        --key-service "$pin" --stored-credential api-token --commands 1 --wait 120s --collateral-cache "$out/cache-watch" "${sandbox[@]}" "${accept[@]}")
+    expect 0 "a binder names the key service's replica it judged, and its guest takes the stored credential there" bind-member \
+        "$warm" "${with_ks[@]}" --session-prefix k --rounds 1
+    cat "$out/bind-member.out" >> "$out/records.jsonl"
+    check "the binder judged that replica before its first start" \
+        sh -c "grep '\"kind\":\"members\"' '$out/bind-member.out' | grep -v '\"error\"' | grep -q '\"named\":\[\"sha256:[0-9a-f]\{64\}\"\]'"
+    expect 1 "a guest takes no bind that names another replica than the one its key service session is with" bind-other-member \
+        "$warm" "${with_ks[@]}" --key-service-member "sha256:$(printf '%064d' 1)" --session-prefix m --rounds 1
+    check "the guest said it reached no replica the bind names" grep -q "no replica of its key service that the bind names" "$out/bind-other-member.err"
+    if [ "$dev" = 1 ]; then
+        check "the guest found its session with a replica the bind does not name, and tried for one it names" \
+            sudo -n sh -c "grep -a -q 'the session with the key service is with a replica the bind does not name' '$out'/state/tds/*/launcher.log"
+    fi
 fi
 
 s1=(--binding "$out/s1" --image-manifest "$manifest" "${accept[@]}")

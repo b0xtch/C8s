@@ -43,6 +43,8 @@
 // to. The replica is judged before the first round and again each minute,
 // beside the rounds: a record of kind "members" gives the first judgment's
 // time, and one more is printed for each that failed.
+// --key-service-member names other replicas in its place, for a test of
+// what a guest does with a bind that names none it can reach.
 //
 // Every verdict here lets a secret go, so it rests on the vendor's documents
 // as this process fetched them within the hour: it asks the vendor again as
@@ -100,6 +102,7 @@ type options struct {
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
+	members                            string
 	sealedCredential                   string
 	acceptTCB, collateralCache, before string
 	rounds, commands                   int
@@ -223,6 +226,7 @@ func main() {
 	flag.StringVar(&o.sandboxImage, "sandbox-image", "", "OCI image each session runs, as name@sha256:<digest>")
 	flag.StringVar(&o.keyService, "key-service", "", "pin of the key service the sessions trust")
 	flag.StringVar(&o.stored, "stored-credential", "", "a credential each guest takes from the key service at its bind (needs --key-service); the first command then reads it")
+	flag.StringVar(&o.members, "key-service-member", "", "instance keys, as sha256:<hex> and comma-separated, to name in each bind as the key service's replicas in place of the one this side judged: for a test of a guest that can reach none of them")
 	flag.StringVar(&o.sealedCredential, "sealed-credential", "", "a credential this side makes for each session and seals with its bind beside the first command, which then reads it back (not with --stored-credential, --quote-first or --command-with-bind=false)")
 	flag.StringVar(&o.acceptTCB, "accept-tcb-status", "", "Intel TCB statuses, besides UpToDate, that the guests' platform may have, comma-separated")
 	flag.StringVar(&o.collateralCache, "collateral-cache", "", "directory that keeps Intel's collateral between runs")
@@ -260,6 +264,9 @@ func run(o *options) error {
 	}
 	if o.stored != "" && o.keyService == "" {
 		return errors.New("--stored-credential needs --key-service")
+	}
+	if o.members != "" && o.keyService == "" {
+		return errors.New("--key-service-member needs --key-service")
 	}
 	if (o.watchCert == "") != (o.watchKey == "") {
 		return errors.New("--watch-cert and --watch-key go together")
@@ -404,8 +411,11 @@ func run(o *options) error {
 		})
 	}
 	named := func(ctx context.Context) ([]string, error) {
-		if pin == nil {
+		switch {
+		case pin == nil:
 			return nil, nil
+		case o.members != "":
+			return strings.Split(o.members, ","), nil
 		}
 		return replicas.Named(ctx)
 	}
