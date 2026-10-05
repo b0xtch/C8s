@@ -510,6 +510,15 @@ guest_logged() {
 said() {
     python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' "$out/$1.out" "$2" 2>/dev/null
 }
+# quoted <log>: the quote that start judged came with the guest's answer to
+# the bind or after it on the bind's own call, so that the start asked the
+# daemon for no evidence and the guest for no attestation.
+quoted() {
+    case "$(said "$1" quote)" in
+    answer|call) return 0 ;;
+    esac
+    return 1
+}
 # first <log> <field>: a field of what a start says of its first command.
 # What the command wrote is printed as its bytes.
 first() {
@@ -560,6 +569,7 @@ cat "$out/start-s1.out" >> "$out/records.jsonl"
 reason "its guest reached the key service through its launcher" start-s1 'opened a session with the key service'
 reason "its guest took the stored credential from the key service" start-s1 'took stored credentials from the key service'
 check "its guest answered the bind with a receipt that its quote confirmed" [ "$(said start-s1 receipt)" = True ]
+check "that quote came on the bind's own call, or with its answer" quoted start-s1
 expect 0 "start session s2, another tenant's" start-s2 start_session s2 "$out/s2" globex "$out/other-authority.key" "$manifest" "$launch_key" "${sandbox[@]}" \
     --credential token:256
 cat "$out/start-s2.out" >> "$out/records.jsonl"

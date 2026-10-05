@@ -15,7 +15,9 @@
 // and a guest whose quote disagrees is destroyed. With
 // --command-with-bind=false the first command is sent over that connection
 // once the receipt is checked, and with --quote-first once the quote is
-// judged, as an owner does who sends nothing on a receipt. With
+// judged, as an owner does who sends nothing on a receipt: the connection is
+// then made while that owner waits for the quote, and held to the quote
+// before the command goes over it. With
 // --sealed-credential the bind's sealed message also holds a credential this
 // side makes for the round, which the first command reads back.
 //
@@ -191,7 +193,9 @@ type record struct {
 	// its sandbox started. OnReceipt says the command's answer was taken, or
 	// the command sent, on the guest's receipt, and ReachedAhead that the
 	// first command sent over a connection found that connection made
-	// already. QuoteInAnswer says the quote came with the bind's answer.
+	// already. QuoteInAnswer says the quote came with the bind's answer, and
+	// QuoteAsked that it came neither with it nor after it on the bind's
+	// call, so that this side asked the daemon for the guest's evidence.
 	// Quote is from the bind's answer until the quote was there, judged and
 	// held to the receipt, and Confirmed the same from the claim.
 	WithBind           bool  `json:"with_bind"`
@@ -199,8 +203,17 @@ type record struct {
 	OnReceipt          bool  `json:"on_receipt"`
 	ReachedAhead       bool  `json:"reached_ahead"`
 	QuoteInAnswer      bool  `json:"quote_in_answer"`
+	QuoteAsked         bool  `json:"quote_asked,omitempty"`
 	Quote              int64 `json:"quote_us"`
 	Confirmed          int64 `json:"confirmed_us"`
+	// The connection a first command went over, in parts, wherever it was
+	// made, ahead or by the command: the road to the guest, the handshake,
+	// and inside it the verdict on the guest's certificate. FirstRequest is
+	// the command's own request on that connection, to its answer.
+	ConnDial      int64 `json:"conn_dial_us,omitempty"`
+	ConnHandshake int64 `json:"conn_handshake_us,omitempty"`
+	ConnVerdict   int64 `json:"conn_serving_verdict_us,omitempty"`
+	FirstRequest  int64 `json:"first_request_us,omitempty"`
 	// Exec are the commands after the first, on the kept connection.
 	Exec []int64 `json:"exec_us,omitempty"`
 	// Attest is one more attestation, asked for after the commands: a quote
@@ -711,16 +724,17 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	// ends the connections that reached its guest before it.
 	var ahead *session.Client
 	var reached chan bool
+	var took steps
 	bindAnswered := make(chan struct{})
 	// prepare makes that client once the TD's name is known: before the
 	// bind for a claimed TD, and from the bind's answer for one the bind
 	// claims.
 	prepare := func() error {
-		if !o.prejudge || o.quoteFirst {
+		if !o.prejudge {
 			return nil
 		}
 		if ahead, err = session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer,
-			session.Through(host.Dialer(td)), session.Receipted(ready.InstanceKey)); err != nil {
+			session.Through(host.Dialer(td)), session.Receipted(ready.InstanceKey), session.Timed(took.report)); err != nil {
 			return err
 		}
 		if leaf, err := x509.ParseCertificate(certificate); err == nil {
@@ -824,8 +838,10 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	rec.OnReceipt = receipt != nil && !o.quoteFirst
 
 	// quoted judges the quote the guest took over the bind's nonce, which is
-	// in the answer or comes with the guest's evidence, and holds it to the
-	// receipt. The verdict an owner keeps on its guest is made from it.
+	// in the answer or follows it on the bind's own call, and holds it to
+	// the receipt. The verdict an owner keeps on its guest is made from it.
+	// A call that ends without the quote leaves this side to ask the daemon
+	// for the guest's evidence, and the record says so.
 	type judgment struct {
 		att  *session.Attestation
 		leaf *x509.Certificate
@@ -836,7 +852,11 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		defer func() { rec.Quote, rec.Confirmed = micros(answered), micros(began) }()
 		relayed := answer
 		if len(relayed.Evidence) == 0 {
-			if relayed, j.err = host.BoundEvidence(ctx, td); j.err != nil {
+			if relayed, j.err = call.Quote(ctx); errors.Is(j.err, daemon.ErrQuoteNotSent) {
+				rec.QuoteAsked = true
+				relayed, j.err = host.BoundEvidence(ctx, td)
+			}
+			if j.err != nil {
 				j.err = fmt.Errorf("the quote over the bind's nonce: %w", j.err)
 				return j
 			}
@@ -871,7 +891,16 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		if first.err != nil {
 			return nil, first.err
 		}
-		pinned = session.Kept(first.kept)
+		if ahead != nil {
+			// The connection made while the quote was awaited carried
+			// nothing of this side's, and is held to the quote before the
+			// command goes over it.
+			if err := ahead.Confirmed(first.att, first.leaf); err != nil {
+				return nil, err
+			}
+		} else {
+			pinned = session.Kept(first.kept)
+		}
 		confirmed <- first
 	}
 	rec.Judge, rec.Start = micros(step), micros(began)
@@ -927,7 +956,7 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	client := ahead
 	if pinned != nil {
 		if client, err = session.NewClient(fmt.Sprintf("https://%s:%d", td, session.AgentPort), bound, engine, signer,
-			session.Through(host.Dialer(td)), pinned); err != nil {
+			session.Through(host.Dialer(td)), pinned, session.Timed(took.report)); err != nil {
 			return nil, err
 		}
 		defer client.Close()
@@ -944,6 +973,9 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 		if err := command(ctx, client, request); err != nil {
 			return nil, fmt.Errorf("the first command: %w", err)
 		}
+		rec.ConnDial, rec.ConnHandshake = took.took(session.TimedDial), took.took(session.TimedHandshake)
+		rec.ConnVerdict = took.took(session.TimedServingVerdict)
+		rec.FirstRequest = took.took(session.TimedRequest + " " + session.PathExec)
 	}
 	rec.FirstExec, rec.FirstCommand = micros(step), micros(began)
 	// A guest whose quote disagrees with its receipt is ended, whatever
@@ -952,6 +984,10 @@ func one(ctx context.Context, o *options, round int, host, ender *daemon.Client,
 	if final.err != nil {
 		destroy()
 		return nil, final.err
+	}
+	// What ran the guest, as the quote over its bind names it.
+	if final.att != nil && final.att.Result != nil {
+		rec.Module, _ = final.att.Result.Claims.PlatformData["mr_seam"].(string)
 	}
 	if rec.OnReceipt {
 		if err := client.Confirmed(final.att, final.leaf); err != nil {
@@ -1008,6 +1044,30 @@ func take(ctx context.Context, verdicts *session.ReadyVerdicts, wait time.Durati
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+// steps keeps how long each step of a session's client took the first time
+// the client took it, in microseconds.
+type steps struct {
+	mu    sync.Mutex
+	first map[string]int64
+}
+
+func (s *steps) report(step string, took time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, seen := s.first[step]; !seen {
+		if s.first == nil {
+			s.first = map[string]int64{}
+		}
+		s.first[step] = took.Microseconds()
+	}
+}
+
+func (s *steps) took(step string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.first[step]
 }
 
 func command(ctx context.Context, client *session.Client, req session.ExecRequest) error {

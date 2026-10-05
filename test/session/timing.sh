@@ -836,6 +836,9 @@ def beside(r):
     end = r["at_unix_us"] + max(r.get("first_cmd_us", 0), r.get("confirmed_us", 0))
     return any(f["at_unix_us"] < end and f["at_unix_us"] + f["took_us"] > r["at_unix_us"] for f in refreshes)
 keys = ("claim_us", "ready_check_us", "members_us", "sign_us", "seal_us", "bind_us", "judge_us", "start_us", "first_exec_us", "first_cmd_us", "quote_us", "confirmed_us", "attest_us", "destroy_us")
+# A first command sent over a connection: that connection in parts, wherever
+# it was made, and the command's own request on it.
+parts = ("conn_dial_us", "conn_handshake_us", "conn_serving_verdict_us", "first_request_us")
 medians = {}
 for name, rows in sides:
     if len(sides) > 1:
@@ -847,12 +850,15 @@ for name, rows in sides:
         show("session " + key[:-3], values, "ms")
         if values:
             medians.setdefault(key, {})[name] = statistics.median(values)
+    for key in parts:
+        show("session " + key[:-3], [r[key] / 1000 for r in steady if r.get(key)], "ms")
     show("session lost to a bind that came first", [r["lost_us"] / 1000 for r in steady if r.get("lost_us")], "ms (a sign, a seal and a round trip; part of the start)")
     if steady:
         count = lambda key: sum(1 for r in steady if r.get(key))
         if count("claimed_by_bind"):
             print(f"of {len(steady)} rounds, the bind claimed its TD with no claim before it in {count('claimed_by_bind')}, and found that TD taken first in {count('not_ready')}")
-        print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}")
+        print(f"of {len(steady)} rounds, the guest took the first command with its bind in {count('with_bind')}, the command's answer was taken on the receipt in {count('on_receipt')}, and the connection for commands was made ahead in {count('reached_ahead')}; the quote came with the bind's answer in {count('quote_in_answer')}"
+              + (f", and this side asked the daemon for it in {count('quote_asked')}" if count("quote_asked") else ""))
         print(f"of {len(steady)} rounds, the guest was judged before its claim in {count('ready_ahead')}, and had a credential sealed with its bind in place in {count('credential_with_bind')}")
     show("ready TD judged ahead", [r["ready_judged_us"] / 1000 for r in steady if r.get("ready_judged_us")], "ms (before the round: no part of its times)")
     show("vendor documents fetched", [r["took_us"] / 1000 for r in rows if r.get("kind") == "documents"], "ms (before the rounds: no part of their times)")
