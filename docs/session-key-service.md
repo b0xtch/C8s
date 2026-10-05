@@ -68,9 +68,10 @@ replicated records, a ledger that cannot go back, and recovery.
   it as written, which attestation checks; liveness is the host's to deny, as
   everywhere. From milestone 2 a replica has no network device: its launcher
   listens on a port of the host and carries each connection over vsock, from
-  guests and clients, between replicas and out to the vendor's service, so the
-  host carries the same ciphertext it would on a network, and a replica's
-  kernel needs no network driver.
+  guests and clients, between replicas and out to the vendor's service. A
+  replica takes vsock connections only from its own host, which carries the
+  same ciphertext it would on a network, and a replica's kernel needs no
+  network driver.
 - **No disk is trusted.** A replica keeps its log, term, vote and state in
   memory only. One that restarts comes back as a new member with a new
   instance key, joins as a learner, catches up from the leader's snapshot and

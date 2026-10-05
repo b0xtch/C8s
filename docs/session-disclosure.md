@@ -52,9 +52,9 @@ choosing where the host can read it.
 |---|---|---|
 | the TD as a VM | that it runs, its class, its memory high-water mark, and when it ends | the hardware; this is metadata |
 | the network | sizes, times and endpoints of ciphertext | metadata ([non-goals](session-threat-model.md#goals)) |
-| answers to the daemon | phases; a bind taken, or a refusal code; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
+| answers to the daemon | phases; a bind taken, or a refusal code; whether the bind's quote is taken, still being tried or given up; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
 | events and statistics | VM-level counters, sizes and times | the schema |
-| evidence | certificates, documents, events and quotes | public by design |
+| evidence | certificates, documents, events, receipts and quotes | public by design |
 | a console | nothing once the kernel runs; before that, what a release build of the firmware and the boot stub print, before any session exists | the image ([Logs](#logs-consoles-and-crashes)) |
 | review | a policy's signals, on its schedule, within its budget | [Private review](#private-review) |
 | the session's own traffic | what it sends where its egress policy allows | the owner's policy |

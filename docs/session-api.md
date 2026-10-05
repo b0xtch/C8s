@@ -181,7 +181,7 @@ message Evidence {
   bytes launch_signature = 3;
   repeated string events = 4;          // the digests the guest extended, in order
   bytes bind = 5;                      // when bound
-  bytes quote = 6;                     // once bound: the guest's evidence envelope (JSON) over the bind's nonce, served once taken
+  bytes quote = 6;                     // once bound: the guest's evidence envelope (JSON) over the bind's nonce, with the events and phase it covers, served once taken
   bytes collateral = 7;                // the vendor's documents, from the key service, stapled
   repeated bytes release_proofs = 8;   // the release log's proofs for the image, class and policies, stapled
   bytes bind_signature = 9;            // when bound; a verifier holds the bind to it
@@ -414,17 +414,30 @@ reach, no new HTTP method and no cloud metadata endpoint.
    nonce: the bind's digest, the events it extended and the phase it reached.
    The quote follows in the evidence it serves, and the binder holds it to the
    receipt. A guest whose admission fails after it extended RTMR[3] ends and
-   gives no quote.
+   gives no quote, and a bind sent again is answered with the same receipt and
+   quote.
 
 A receipt is fresh because the nonce is the binder's, and it is worth what the
 instance key is worth: the binder checked the quote that binds that key to the
 measured TD before it signed the bind, and every channel to the session, the
 key service's among them, already rests on that key
 ([Release](session-key-service.md#release)). What the receipt says of RTMR[3]
-is the measured agent's word until the quote confirms it. A quote that
-disagrees with its receipt fails the session, and the binder destroys it; the
-verdict that is kept rests on the quote alone; and a binder whose policy asks
-for the quote first waits for it before it sends anything.
+is the measured agent's word until the quote confirms it, so the binder holds
+the quote to the receipt as soon as it has it: its signature must chain to the
+vendor's root, its report data must bind the nonce and the instance key, and
+its RTMR[3] must replay from the events it covers, which begin with the
+receipt's. None of that needs the vendor's other documents, so a quote that
+passes it but cannot yet be judged for want of one leaves the session running,
+and its verdict is kept once the document comes.
+
+A quote that fails that check ends the session, and so does no quote at all. A
+guest whose quote fails tries again a few times, then says in its state that
+it has given up; a binder that has no quote by then, or within a few seconds,
+asks for one over its own nonce through `Connect`, and destroys the session if
+none comes, since a check that cannot be made counts as failed
+([Rules](sessions.md#rules)). The verdict that is kept rests on a quote alone,
+and a binder whose policy asks for the quote first waits for it before it
+sends anything.
 
 A bind holds no secret, so stale evidence costs at most a wasted bind: keys
 and credentials reach a session only after the key service, or the owner's

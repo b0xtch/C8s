@@ -143,7 +143,10 @@ but not confidentiality.
   handshake proves that the key is live. A receipt adds freshness, not trust:
   it is worth what the quote that binds its key is worth, and what it says of
   RTMR[3] is the measured agent's word until the quote confirms it, so the
-  verdict that is kept rests on the quote.
+  verdict that is kept rests on the quote, and a session whose quote disagrees
+  with its receipt, or never comes, ends. Each quote carries the events and
+  phase it covers, so a verifier replays exactly those, whatever the guest
+  extends later.
 - **A pooled TD carrying something from an earlier session.** A bound TD never
   returns to a pool, and a pooled TD holds no tenant data, code or keys before
   its bind.
