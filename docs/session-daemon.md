@@ -583,6 +583,8 @@ What keeps the two kinds apart:
 - The image build compiles both programs with the tag or neither, refuses a
   prebuilt program of the other kind, and writes `SIMULATED-TEE` beside the
   manifest.
+- A program of the development build states its version with `+c8s_simtee`
+  at its end, so a record that names versions names the build.
 
 Where a simulated guest's own work differs from a TD's, a run's record says
 so:

@@ -88,7 +88,7 @@ test:
 # The same tests in the development build that simulates a session guest's
 # TEE in software (the c8s_simtee tag: docs/session-performance.md), over
 # the packages the tag changes. No release build is made with it.
-C8S_SIMTEE_PACKAGES = ./internal/simtee/... ./pkg/session/... ./internal/sessiond/... ./internal/keyservice/... \
+C8S_SIMTEE_PACKAGES = ./internal/simtee/... ./internal/version/... ./pkg/session/... ./internal/sessiond/... ./internal/keyservice/... \
 	./internal/cmds/sessionagent/... ./internal/cmds/sessioncli/... ./internal/cmds/sessioninit/... \
 	./internal/cmds/sessionkeyservice/... ./internal/cmds/sessionlauncher/... ./test/session/...
 .PHONY: test-simtee
