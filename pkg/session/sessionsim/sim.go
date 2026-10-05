@@ -121,7 +121,7 @@ func (e documentsEngine) Renew(ctx context.Context) error { return e.renew(ctx) 
 func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil, 0)
 }
 
 // NewUnpinnedGuest is NewGuest in a pool whose launch document lists no
@@ -129,7 +129,7 @@ func NewGuest(t testing.TB, sandbox Sandbox) *Guest {
 func NewUnpinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil, nil)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, false, nil, nil, 0)
 }
 
 // Pool is a pool before any guest of it has booted: its image and its launch
@@ -142,6 +142,9 @@ type Pool struct {
 	// KeyServiceDial, when set, is the road the pool's guests take to their
 	// key service: a test's stand-in for the one their host gives them.
 	KeyServiceDial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// CertTTL, when set, is how long a certificate of the pool's guests
+	// lasts. Unset, it lasts a day.
+	CertTTL time.Duration
 
 	td        *sessiontest.TD
 	launchKey string
@@ -182,7 +185,7 @@ func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyServic
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, true, keyService, p.KeyServiceDial)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, true, keyService, p.KeyServiceDial, p.CertTTL)
 }
 
 // NewPinnedGuest is NewGuest: every pool's launch document lists the machine
@@ -190,7 +193,7 @@ func (p *Pool) Boot(t testing.TB, sandbox Sandbox, keyService *session.KeyServic
 func NewPinnedGuest(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
-	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil)
+	return boot(t, td, td.WriteManifest(t), "", sandbox, true, nil, nil, 0)
 }
 
 // Machine is what the guest's RTMR[0] holds: the machine its host built.
@@ -204,13 +207,13 @@ func (p *Guest) Twin(t testing.TB, sandbox Sandbox) *Guest {
 	t.Helper()
 	td := sessiontest.NewTD()
 	td.MRTD, td.RTMR[0], td.RTMR[1], td.RTMR[2] = p.td.MRTD, p.td.RTMR[0], p.td.RTMR[1], p.td.RTMR[2]
-	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned, p.keyService, nil)
+	return boot(t, td, p.ManifestPath, p.launchKey, sandbox, p.pinned, p.keyService, nil, 0)
 }
 
 // boot launches one guest under launchKey, or under a new key when that is
 // empty, and serves its agent.
 func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox Sandbox, pinned bool, keyService *session.KeyService,
-	dial func(ctx context.Context, network, addr string) (net.Conn, error),
+	dial func(ctx context.Context, network, addr string) (net.Conn, error), certTTL time.Duration,
 ) *Guest {
 	t.Helper()
 	bundle := filepath.Join(t.TempDir(), "bundle")
@@ -247,7 +250,8 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 	agent, err := sessionagent.Stage(ctx, sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(keys, session.PubkeyFile), LaunchDir: keys,
 		CredentialDir: credentials, TEE: sessiontest.TEE{TD: td}, Runner: runner, Bare: sandbox == nil,
-		Engine: sessiontest.Engine{}, KeyServiceDial: dial, Logger: slog.New(said{Handler: slog.Default().Handler(), reached: seen}),
+		Engine: sessiontest.Engine{}, KeyServiceDial: dial, CertTTL: certTTL,
+		Logger: slog.New(said{Handler: slog.Default().Handler(), reached: seen}),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -271,7 +275,7 @@ func boot(t testing.TB, td *sessiontest.TD, manifest, launchKey string, sandbox 
 		inner.ServeHTTP(w, r)
 	})
 	go func() { _ = agent.Serve(srv, countingListener{Listener: ln, reached: seen}) }()
-	go agent.OpenKeyService(ctx)
+	go agent.KeepKeyServiceOpen(ctx)
 	stop := sync.OnceFunc(func() {
 		_ = srv.Close()
 		cancel()

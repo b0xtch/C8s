@@ -25,9 +25,16 @@ const (
 	// keyServiceTimeout bounds one call to the key service.
 	keyServiceTimeout = time.Minute
 	// certRenewAhead is how long before its end the certificate the guest
-	// presents to its key service is replaced.
+	// presents to its key service is replaced, or a quarter of its life for
+	// one that lives less than four hours.
 	certRenewAhead = time.Hour
 )
+
+// renewAhead is how long before its end the guest replaces cert, the
+// certificate it presents to its key service.
+func renewAhead(cert *tls.Certificate) time.Duration {
+	return min(certRenewAhead, cert.Leaf.NotAfter.Sub(cert.Leaf.NotBefore)/4)
+}
 
 // keyService is the guest's session with the key service its launch
 // document pins.
@@ -88,7 +95,7 @@ func (a *Agent) newKeyService(pin *session.KeyService) (*keyService, error) {
 func (a *Agent) keyServiceCertificate(ks *keyService) (*tls.Certificate, error) {
 	ks.certMu.Lock()
 	defer ks.certMu.Unlock()
-	if ks.cert != nil && a.cfg.Now().Before(ks.cert.Leaf.NotAfter.Add(-certRenewAhead)) {
+	if ks.cert != nil && a.cfg.Now().Before(ks.cert.Leaf.NotAfter.Add(-renewAhead(ks.cert))) {
 		return ks.cert, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), attestTimeout)
@@ -164,6 +171,66 @@ func (a *Agent) OpenKeyService(ctx context.Context) {
 		case <-time.After(pause):
 		}
 	}
+}
+
+// KeepKeyServiceOpen opens the guest's session with its key service, as
+// OpenKeyService does, and opens it again whenever the certificate the guest
+// presents there is replaced while the guest is still nobody's. The key
+// service keeps its verdict no longer than the certificate that carried the
+// evidence lasts, so a guest that waits longer for its bind shows it a fresh
+// quote. It returns once the guest is bound, or ctx ends.
+func (a *Agent) KeepKeyServiceOpen(ctx context.Context) {
+	a.OpenKeyService(ctx)
+	ks := a.keyService
+	if ks == nil || !ks.isOpen() {
+		return
+	}
+	for {
+		ks.certMu.Lock()
+		cert := ks.cert
+		ks.certMu.Unlock()
+		if cert == nil {
+			return
+		}
+		// Half way between when the certificate is due to be replaced and
+		// its end: the next connection presents another.
+		again := cert.Leaf.NotAfter.Add(-renewAhead(cert) / 2)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(max(again.Sub(a.cfg.Now()), 0)):
+		}
+		a.measured.RLock()
+		bound := a.bind != nil || a.retired
+		a.measured.RUnlock()
+		if bound {
+			return
+		}
+		if err := a.reopenKeyService(ctx); err != nil {
+			a.log.Warn("the session with the key service was not opened again", "error", err, "retry_in", keyServiceRetry.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(keyServiceRetry):
+			}
+		}
+	}
+}
+
+// reopenKeyService opens the guest's session with its key service over a new
+// connection, which presents the guest's newest certificate.
+func (a *Agent) reopenKeyService(ctx context.Context) error {
+	ks := a.keyService
+	ks.mu.Lock()
+	defer ks.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, keyServiceTimeout)
+	defer cancel()
+	ks.client.Close()
+	if err := ks.client.Open(ctx, a.launch, a.signature); err != nil {
+		return err
+	}
+	a.log.Info("opened the session with the key service again, under a new certificate")
+	return nil
 }
 
 // acquire takes the credentials the bind declares as its key service's and

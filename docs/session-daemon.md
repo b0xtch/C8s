@@ -294,6 +294,20 @@ bind's tenant, and declares the credential. The release is sealed to a key
 of the guest's under a hybrid of ML-KEM-768 and X25519. Guests and owners
 hold the key service to its pin before they send it anything.
 
+A release rests on the key service's verdict as it stands at that moment,
+and a guest may wait in its pool for hours. So the key service keeps the
+evidence each guest opened with, asks the vendor again for each of its
+documents three quarters of an hour after it fetched it, and every minute
+judges again, with no new quote, each waiting guest whose verdict no longer
+rests on the newest documents it holds or ends within five minutes. It
+releases only on a verdict made on documents it fetched within the hour: one
+that ran out is made again on the path of the release, and a key service
+that cannot reach the vendor for an hour releases nothing until it can. A
+guest whose evidence the newer documents refuse is forgotten, and gets
+nothing. A verdict also ends with the certificate that carried its evidence,
+after a day, so a guest that still waits then opens its session again under
+its next certificate, with a fresh quote.
+
 A guest has no road of its own to its key service. Its launcher carries the
 connection:
 
@@ -393,7 +407,10 @@ changes on the host while it runs.
   ledger, recovery, a change of a tenant's authority, and deleting a stored
   credential. A replica that stops has forgotten its tenants and their
   credentials. A guest judges the key service by the vendor documents its own
-  launcher answers with, so the two share a platform for now.
+  launcher answers with, so the two share a platform for now. With no lease
+  there is nothing yet to refuse a running session whose platform the vendor
+  revokes: the key service keeps the evidence each bound guest acquired with
+  for that judgment, and a repeat of an acquire is held to it.
 - A stream that says when a TD leaves ready. A binder keeps its verdict on a
   TD that another binder took until that TD's certificate ends, and judges
   it again each hour meanwhile.

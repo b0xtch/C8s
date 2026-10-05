@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/keyservice"
@@ -48,6 +49,8 @@ type Options struct {
 	// machine it is: a replica a host built another machine than the
 	// document's signer recorded.
 	Machines []string
+	// Now is the replica's clock. Nil is the system's.
+	Now func() time.Time
 }
 
 // New boots a key service whose launch document lists pools, and serves it
@@ -99,7 +102,7 @@ func NewWith(t testing.TB, with Options, pools ...*sessionsim.Pool) *Sim {
 	t.Cleanup(cancel)
 	service, err := keyservice.New(ctx, keyservice.Config{
 		Launch: launch, Signature: string(signature), LaunchKey: pub,
-		TEE: sessiontest.TEE{TD: td}, Engine: with.Engine,
+		TEE: sessiontest.TEE{TD: td}, Engine: with.Engine, Now: with.Now,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {

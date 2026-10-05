@@ -66,7 +66,7 @@ func Run(ctx context.Context, cfg Config, listen string) error {
 		if cfg.CollateralDial != nil && cfg.Platform == "tdx" {
 			agent.AwaitCollateral(ctx, CollateralWait)
 		}
-		agent.OpenKeyService(ctx)
+		agent.KeepKeyServiceOpen(ctx)
 	}()
 
 	// The API is up while the image is fetched, so a verifier can already see

@@ -107,14 +107,23 @@ type guest struct {
 	client    *api.Client
 	sealing   *api.EncryptionKey
 	keyDigest string
+	// ttl is how long each certificate the guest presents lasts.
+	ttl time.Duration
 }
 
 // newGuest boots a guest of pool by hand: its registers hold the pool's
 // image, the launch key's seed and the launch document.
 func newGuest(t *testing.T, pool *sessionsim.Pool, ks *keyservicetest.Sim) *guest {
 	t.Helper()
-	// A real guest of the pool, for its documents and its image.
+	// A real guest of the pool, for its documents and its image. It opens a
+	// session of its own, or has tried to, before this one asks anything:
+	// what a test counts at the key service is then this guest's.
 	model := pool.Boot(t, nil, ks.Pin)
+	for deadline := time.Now().Add(10 * time.Second); model.Logged("opened a session with the key service") == 0 && model.Logged("the key service is not reached yet") == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the pool's guest never tried to open its session with the key service")
+		}
+	}
 	td := sessiontest.NewTD()
 	identity, err := runtimemeasure.LoadImageManifest(model.ManifestPath)
 	if err != nil {
@@ -132,7 +141,7 @@ func newGuest(t *testing.T, pool *sessionsim.Pool, ks *keyservicetest.Sim) *gues
 		return data
 	}
 	dir := strings.TrimSuffix(model.LaunchKeyPath, session.PubkeyFile)
-	g := &guest{t: t, td: td, launch: read(dir + session.DocumentFile), signature: strings.TrimSpace(string(read(dir + session.SignatureFile)))}
+	g := &guest{t: t, td: td, ttl: time.Hour, launch: read(dir + session.DocumentFile), signature: strings.TrimSpace(string(read(dir + session.SignatureFile)))}
 	td.SeedLaunchKey(read(model.LaunchKeyPath))
 	event := runtimemeasure.Event(session.DocumentDigest(g.launch))
 	if err := td.Extend(event[:]); err != nil {
@@ -185,7 +194,7 @@ func (g *guest) certificate() *tls.Certificate {
 	if err != nil {
 		g.t.Fatal(err)
 	}
-	opts := &ratls.CertOptions{Subject: pkix.Name{CommonName: "c8s session"}, TTL: time.Hour}
+	opts := &ratls.CertOptions{Subject: pkix.Name{CommonName: "c8s session"}, TTL: g.ttl}
 	if g.oneTime != nil {
 		ext, err := g.oneTime.Extension()
 		if err != nil {
@@ -937,5 +946,501 @@ func TestClientHoldsAKeyServiceToItsDocumentsMachines(t *testing.T) {
 	// holds the replica to its list again.
 	if err := c.PutCredential(within(t), "acme", "token", []byte("value"), o.signer); err != nil {
 		t.Fatalf("a call after the machine was read: %v", err)
+	}
+}
+
+// vendor is an engine whose verdicts rest on the vendor's documents as it
+// says it fetched them, which counts what it is asked, and which a test has
+// refuse the evidence or fail to judge it.
+type vendor struct {
+	sessiontest.Engine
+	// now is the replica's clock, and the engine's.
+	now func() time.Time
+
+	mu sync.Mutex
+	// fetched is when the oldest document under a verdict was fetched.
+	fetched   time.Time
+	documents uint64
+	asked     int
+	renewed   int
+	// down is what a renewal fails with, and what a judgment fails with once
+	// its documents are an hour old.
+	down error
+	// revoked refuses every guest.
+	revoked bool
+	// taking is how many of the next judgments each take a document in
+	// while they run.
+	taking int
+}
+
+func (e *vendor) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	e.mu.Lock()
+	e.asked++
+	if e.taking > 0 {
+		e.taking--
+		e.documents++
+	}
+	fetched, revoked := e.fetched, e.revoked
+	e.mu.Unlock()
+	res, err := e.Engine.VerifyEvidence(ctx, env, reportData)
+	switch {
+	case err != nil:
+		return nil, err
+	case revoked:
+		return nil, &session.VerificationError{Err: errors.New("the platform's key is revoked")}
+	case !e.now().Before(fetched.Add(time.Hour)):
+		// What the engine of a verifier that may send a secret does with
+		// documents past their hour: it asks the vendor, which is down.
+		return nil, session.ErrStaleDocuments
+	}
+	if res.Claims.PlatformData == nil {
+		res.Claims.PlatformData = map[string]any{}
+	}
+	res.Claims.PlatformData[session.CollateralClaim] = &session.CollateralFinding{Fetched: fetched, Expires: fetched.Add(30 * 24 * time.Hour)}
+	return res, nil
+}
+
+func (e *vendor) Renew(context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.renewed++
+	if e.down != nil {
+		return e.down
+	}
+	// Three quarters of an hour is when a document is due.
+	if now := e.now(); now.Sub(e.fetched) >= 45*time.Minute {
+		e.fetched = now
+		e.documents++
+	}
+	return nil
+}
+
+func (e *vendor) Documents() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.documents
+}
+
+func (e *vendor) set(change func(*vendor)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	change(e)
+}
+
+func (e *vendor) judged() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.asked
+}
+
+// dated is a world whose key service judges by a vendor engine, on a clock
+// the test moves.
+type dated struct {
+	*world
+	engine *vendor
+	mu     sync.Mutex
+	now    time.Time
+}
+
+func (d *dated) clock() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.now
+}
+
+func (d *dated) advance(by time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.now = d.now.Add(by)
+}
+
+// newDated is a world at this moment, whose key service fetched the
+// vendor's documents age ago.
+func newDated(t *testing.T, age time.Duration) *dated {
+	t.Helper()
+	d := &dated{world: &world{pool: sessionsim.NewPool(t), owner: newOwner(t)}, now: time.Now()}
+	d.engine = &vendor{now: d.clock, fetched: d.now.Add(-age)}
+	d.ks = keyservicetest.NewWith(t, keyservicetest.Options{Engine: d.engine, Now: d.clock}, d.pool)
+	c := client(t, d.ks.Pin)
+	if err := c.RegisterAuthority(within(t), "acme", d.owner.pub, d.owner.signer); err != nil {
+		t.Fatalf("register the tenant's authority: %v", err)
+	}
+	if err := c.PutCredential(within(t), "acme", "token", []byte("s3cret"), d.owner.signer); err != nil {
+		t.Fatalf("store a credential: %v", err)
+	}
+	return d
+}
+
+// lasting is a bind for g that the key service takes whatever its clock
+// reads in these tests.
+func (d *dated) lasting(g *guest) *session.SignedBind {
+	return g.bind(d.owner, d.ks, func(o *session.BindOptions) { o.NotAfter = time.Now().Add(6 * time.Hour) })
+}
+
+// until is when the key service's verdict on g ends.
+func (d *dated) until(t *testing.T, g *guest) time.Time {
+	t.Helper()
+	_, until, _, ok := d.ks.Service.Verdict(g.keyDigest)
+	if !ok {
+		t.Fatal("the key service holds no verdict on the guest")
+	}
+	return until
+}
+
+// opened is a guest of the world's pool with an open session, whose
+// certificates last a day. The guest the pool's documents are read from has
+// one too: a Rejudge that finds verdicts due finds that one's among them.
+func (d *dated) opened(t *testing.T) *guest {
+	t.Helper()
+	g := newGuest(t, d.pool, d.ks)
+	g.ttl = 24 * time.Hour
+	if err := g.open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	return g
+}
+
+// Rule 1 of the release rule holds at the moment of a release, and not only
+// when the guest opened its session: the verdict on its evidence rests on
+// the vendor's documents as the key service fetched them within the hour,
+// the newest it holds. A guest that waits in its pool past a revocation, or
+// while the vendor cannot be asked, is released nothing.
+func TestReleaseRestsOnDocumentsFetchedWithinTheHour(t *testing.T) {
+	t.Run("the verdict ran out and the vendor cannot be asked", func(t *testing.T) {
+		d := newDated(t, 30*time.Minute)
+		g := d.opened(t)
+		bind := d.lasting(g)
+		d.engine.set(func(e *vendor) { e.down = errors.New("no route to the vendor") })
+		// A second before the documents' hour is over the verdict stands,
+		// and a release judges nothing.
+		d.advance(30*time.Minute - time.Second)
+		if until := d.until(t, g); !until.Equal(d.engine.fetched.Add(time.Hour)) {
+			t.Fatalf("the verdict stands until %s, want an hour after the documents were fetched", until)
+		}
+		before := d.engine.judged()
+		if _, err := g.acquire(d.lasting(g), "absent"); status(err) != 403 || d.engine.judged() != before {
+			t.Fatalf("a request within the verdict's hour: %v, judged %d times", err, d.engine.judged()-before)
+		}
+		d.advance(time.Second)
+		answer, err := g.acquire(bind, "token")
+		if status(err) != 503 || answer != nil {
+			t.Fatalf("a release on documents an hour old: %+v, %v, want HTTP 503", answer, err)
+		}
+		if d.engine.judged() == before {
+			t.Fatal("the key service refused without judging the evidence again")
+		}
+		// Nothing was said of the guest: once the documents are here it is
+		// judged on them, on the path, and released to.
+		d.engine.set(func(e *vendor) { e.fetched, e.down = d.clock(), nil })
+		if answer, err := g.acquire(bind, "token"); err != nil || len(answer.Credentials) != 1 {
+			t.Fatalf("a release once the documents are fetched anew: %v", err)
+		}
+	})
+
+	t.Run("judged again off the path, the verdict stands past its first hour", func(t *testing.T) {
+		d := newDated(t, 0)
+		g := d.opened(t)
+		bind := d.lasting(g)
+		first := d.until(t, g)
+		// The documents are not due, and neither is the verdict.
+		d.advance(44 * time.Minute)
+		if judged, err := d.ks.Service.Rejudge(within(t)); err != nil || judged != 0 || !d.until(t, g).Equal(first) {
+			t.Fatalf("before anything is due: %d judged, %v", judged, err)
+		}
+		// The documents are due: the engine fetches them, and the pool's
+		// guests are judged on the new ones.
+		d.advance(time.Minute)
+		if judged, err := d.ks.Service.Rejudge(within(t)); err != nil || judged != 2 {
+			t.Fatalf("with newer documents: %d judged, %v, want both guests of the pool", judged, err)
+		}
+		if until := d.until(t, g); !until.Equal(d.clock().Add(time.Hour)) {
+			t.Fatalf("the verdict made anew stands until %s, want an hour from now", until)
+		}
+		// Past the first verdict's hour a release judges nothing on the path.
+		d.advance(40 * time.Minute)
+		before := d.engine.judged()
+		if answer, err := g.acquire(bind, "token"); err != nil || len(answer.Credentials) != 1 {
+			t.Fatalf("a release eighty-five minutes after the guest opened: %v", err)
+		}
+		if d.engine.judged() != before {
+			t.Fatal("a guest that was judged off the path was judged again on it")
+		}
+	})
+
+	t.Run("a verdict near its end is made anew though no document changed", func(t *testing.T) {
+		d := newDated(t, 0)
+		g := d.opened(t)
+		d.engine.set(func(e *vendor) { e.down = errors.New("no route to the vendor") })
+		d.advance(55*time.Minute - time.Second)
+		before := d.engine.judged()
+		if judged, _ := d.ks.Service.Rejudge(within(t)); judged != 0 || d.engine.judged() != before {
+			t.Fatalf("more than five minutes before its end: %d judged", judged)
+		}
+		d.advance(time.Second)
+		// The vendor is down, so the judgment rests on the same documents
+		// and the verdict ends when it did.
+		judged, err := d.ks.Service.Rejudge(within(t))
+		if err == nil || judged != 2 || d.engine.judged() != before+2 {
+			t.Fatalf("five minutes before its end, the vendor down: %d judged, %v", judged, err)
+		}
+		if until := d.until(t, g); !until.Equal(d.engine.fetched.Add(time.Hour)) {
+			t.Fatalf("the verdict stands until %s", until)
+		}
+		// Past its end the guest still cannot be judged: its verdict is
+		// kept, and stands for nothing, until the vendor answers.
+		d.advance(5 * time.Minute)
+		if judged, err := d.ks.Service.Rejudge(within(t)); err == nil || judged != 0 {
+			t.Fatalf("past its end, the vendor down: %d judged, %v", judged, err)
+		}
+		if _, err := g.acquire(d.lasting(g), "token"); status(err) != 503 {
+			t.Fatalf("a release past the verdict's end: %v, want HTTP 503", err)
+		}
+		d.engine.set(func(e *vendor) { e.down = nil })
+		if judged, err := d.ks.Service.Rejudge(within(t)); err != nil || judged != 2 {
+			t.Fatalf("once the vendor answers: %d judged, %v", judged, err)
+		}
+		if _, err := g.acquire(d.lasting(g), "token"); err != nil {
+			t.Fatalf("a release once the vendor answers: %v", err)
+		}
+	})
+
+	t.Run("a newer document shows before the key service has judged on it", func(t *testing.T) {
+		d := newDated(t, 0)
+		g := d.opened(t)
+		bind := d.lasting(g)
+		d.engine.set(func(e *vendor) { e.documents++ })
+		before := d.engine.judged()
+		if answer, err := g.acquire(bind, "token"); err != nil || len(answer.Credentials) != 1 {
+			t.Fatalf("a release after a newer document came: %v", err)
+		}
+		if d.engine.judged() != before+1 {
+			t.Fatalf("the evidence was judged %d times on the newer document, want once", d.engine.judged()-before)
+		}
+		// On that verdict, the next judges nothing.
+		if _, err := g.acquire(bind, "token"); err != nil || d.engine.judged() != before+1 {
+			t.Fatalf("the same release again: %v, judged %d times more", err, d.engine.judged()-before-1)
+		}
+	})
+
+	t.Run("the newer documents refuse the guest", func(t *testing.T) {
+		d := newDated(t, 0)
+		g, other := d.opened(t), d.opened(t)
+		bind := g.bind(d.owner, d.ks, nil)
+		d.engine.set(func(e *vendor) { e.documents, e.revoked = e.documents+1, true })
+		// On the path of a release.
+		if answer, err := g.acquire(bind, "token"); status(err) != 403 || answer != nil {
+			t.Fatalf("a release to a guest the newer documents refuse: %+v, %v, want HTTP 403", answer, err)
+		}
+		// And off it: the guest is forgotten.
+		if judged, err := d.ks.Service.Rejudge(within(t)); err != nil || judged != 0 {
+			t.Fatalf("Rejudge: %d judged, %v", judged, err)
+		}
+		for _, guest := range []*guest{g, other} {
+			if _, _, _, ok := d.ks.Service.Verdict(guest.keyDigest); ok {
+				t.Fatal("the key service keeps a verdict on a guest its documents refuse")
+			}
+		}
+		d.engine.set(func(e *vendor) { e.revoked = false })
+		if _, err := other.acquire(other.bind(d.owner, d.ks, nil), "token"); status(err) != 409 {
+			t.Fatalf("a release to a guest that was forgotten: %v, want HTTP 409", err)
+		}
+	})
+
+	t.Run("a verdict made while a document came in is made once more", func(t *testing.T) {
+		d := newDated(t, 0)
+		g := newGuest(t, d.pool, d.ks)
+		g.ttl = 24 * time.Hour
+		before := d.engine.judged()
+		d.engine.set(func(e *vendor) { e.taking = 1 })
+		if err := g.open(); err != nil {
+			t.Fatal(err)
+		}
+		if d.engine.judged() != before+2 {
+			t.Fatalf("the guest's evidence was judged %d times, want twice: once on documents that then changed", d.engine.judged()-before)
+		}
+		// The verdict is on the documents the key service holds now: a
+		// release judges nothing more.
+		before = d.engine.judged()
+		if _, err := g.acquire(d.lasting(g), "token"); err != nil || d.engine.judged() != before {
+			t.Fatalf("a release on that verdict: %v, judged %d times more", err, d.engine.judged()-before)
+		}
+		// An engine whose documents never settle gives no verdict to keep.
+		d.engine.set(func(e *vendor) { e.taking = 1 << 30 })
+		late := newGuest(t, d.pool, d.ks)
+		if err := late.open(); status(err) != 503 {
+			t.Fatalf("open while documents keep coming: %v, want HTTP 503", err)
+		}
+	})
+
+	t.Run("a guest that cannot be judged when it opens is told to ask again", func(t *testing.T) {
+		d := newDated(t, 2*time.Hour)
+		g := newGuest(t, d.pool, d.ks)
+		if err := g.open(); status(err) != 503 {
+			t.Fatalf("open with documents two hours old and the vendor down: %v, want HTTP 503", err)
+		}
+		if _, _, _, ok := d.ks.Service.Verdict(g.keyDigest); ok {
+			t.Fatal("the key service keeps a verdict it could not make")
+		}
+		d.engine.set(func(e *vendor) { e.fetched = d.clock() })
+		if err := g.open(); err != nil {
+			t.Fatalf("open once the documents are here: %v", err)
+		}
+	})
+}
+
+// A verdict never outlives the certificate that carried its evidence, so a
+// guest that waits for its bind opens again under its next certificate, with
+// a fresh quote. Once a bind is accepted the evidence the guest acquired
+// with is what the key service keeps.
+func TestGuestOpensAgainUnderItsNextCertificate(t *testing.T) {
+	d := newDated(t, 0)
+	g := newGuest(t, d.pool, d.ks)
+	// A certificate that ends within the hour ends the verdict with it.
+	g.ttl = 20 * time.Minute
+	if err := g.open(); err != nil {
+		t.Fatal(err)
+	}
+	first, until, bound, ok := d.ks.Service.Verdict(g.keyDigest)
+	if !ok || bound || until.After(time.Now().Add(g.ttl)) || until.Before(time.Now().Add(g.ttl-time.Minute)) {
+		t.Fatalf("the verdict stands until %s, want the end of a certificate that lasts %s", until, g.ttl)
+	}
+	// The same certificate again changes nothing, and costs no judgment.
+	before := d.engine.judged()
+	if err := g.open(); err != nil || d.engine.judged() != before {
+		t.Fatalf("open again on the same connection: %v, judged %d times", err, d.engine.judged()-before)
+	}
+	// A new connection presents the guest's next certificate.
+	g.ttl = 24 * time.Hour
+	g.client.Close()
+	if err := g.open(); err != nil {
+		t.Fatal(err)
+	}
+	second, until, _, _ := d.ks.Service.Verdict(g.keyDigest)
+	if second == first || !until.Equal(d.clock().Add(time.Hour)) {
+		t.Fatalf("after the guest opened again the verdict rests on the same certificate: %t, until %s", second == first, until)
+	}
+
+	// The guest's next certificate must still be a ready guest's: one of a
+	// guest that has measured more, as a bind makes it, is refused, and the
+	// verdict the guest has is kept.
+	measured := runtimemeasure.Event("sha256:" + strings.Repeat("ab", 32))
+	if err := g.td.Extend(measured[:]); err != nil {
+		t.Fatal(err)
+	}
+	g.client.Close()
+	if err := g.open(); status(err) != 403 {
+		t.Fatalf("open under a certificate of a guest that measured more: %v, want HTTP 403", err)
+	}
+	if kept, _, _, ok := d.ks.Service.Verdict(g.keyDigest); !ok || kept != second {
+		t.Fatal("a refused open replaced the verdict the guest had")
+	}
+
+	// A bind is accepted: from here the evidence is the one it came with.
+	bind := d.lasting(g)
+	if _, err := g.acquire(bind, "token"); err != nil {
+		t.Fatal(err)
+	}
+	g.client.Close()
+	before = d.engine.judged()
+	if err := g.open(); err != nil || d.engine.judged() != before {
+		t.Fatalf("open after the bind: %v, judged %d times", err, d.engine.judged()-before)
+	}
+	kept, _, bound, ok := d.ks.Service.Verdict(g.keyDigest)
+	if !ok || !bound || kept != second {
+		t.Fatalf("after its bind the guest's evidence changed: bound %t, the same certificate %t", bound, kept == second)
+	}
+	// Off the path the key service judges no bound guest for a release: of
+	// the pool's two guests, the one that is still nobody's. A repeat of the
+	// bound guest's acquire rests on the verdict it was released on, made
+	// again on the path once a newer document is here.
+	released := d.until(t, g)
+	d.advance(10 * time.Minute)
+	d.engine.set(func(e *vendor) { e.documents++ })
+	if judged, err := d.ks.Service.Rejudge(within(t)); err != nil || judged != 1 || !d.until(t, g).Equal(released) {
+		t.Fatalf("Rejudge with one bound guest: %d judged, %v", judged, err)
+	}
+	before = d.engine.judged()
+	if _, err := g.acquire(bind, "token"); err != nil || d.engine.judged() != before+1 {
+		t.Fatalf("the same acquire again after a newer document: %v, judged %d times", err, d.engine.judged()-before)
+	}
+	d.engine.set(func(e *vendor) { e.documents, e.revoked = e.documents+1, true })
+	if _, err := g.acquire(bind, "token"); status(err) != 403 {
+		t.Fatalf("the same acquire again once the documents refuse the guest: %v, want HTTP 403", err)
+	}
+}
+
+// A guest that waits for its bind opens its session again as its certificate
+// nears its end, so that the key service's verdict, which ends with that
+// certificate, is made anew on a fresh quote, and the guest can still be
+// bound.
+func TestWaitingGuestKeepsItsKeyServiceSessionOpen(t *testing.T) {
+	w := newWorld(t)
+	w.pool.CertTTL = 4 * time.Second
+	g := w.pool.Boot(t, nil, w.ks.Pin)
+	identity, err := runtimemeasure.LoadImageManifest(g.ManifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launchKey, err := os.ReadFile(g.LaunchKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := session.NewClient(g.URL, session.Policy{Image: identity, LaunchKey: launchKey, Authority: w.owner.pub, AllowReady: true}, sessiontest.Engine{}, w.owner.signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reader.Close)
+	var ready *session.ReadyTD
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if ready, err = reader.Ready(within(t)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the guest is not ready: %v", err)
+		}
+	}
+	key, err := session.InstanceKeyDigest(ready.InstanceKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first [32]byte
+	var firstUntil time.Time
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		var ok bool
+		if first, firstUntil, _, ok = w.ks.Service.Verdict(key); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the guest opened no session with its key service")
+		}
+	}
+	if firstUntil.After(time.Now().Add(w.pool.CertTTL)) {
+		t.Fatalf("the verdict stands until %s, past the end of the certificate that carried its evidence", firstUntil)
+	}
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		next, until, bound, ok := w.ks.Service.Verdict(key)
+		if ok && next != first {
+			if bound || !until.After(firstUntil) {
+				t.Fatalf("after the guest opened again its verdict stands until %s, and the first stood until %s", until, firstUntil)
+			}
+			// It opened again while the first verdict still stood: the
+			// guest was at no time one the key service would release
+			// nothing to.
+			if !time.Now().Before(firstUntil) {
+				t.Fatalf("the guest opened again only after its first verdict had ended at %s", firstUntil)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the guest did not open its session again under its next certificate")
+		}
+	}
+	if g.Logged("opened the session with the key service again, under a new certificate") == 0 {
+		t.Fatal("the guest does not say it opened its session again")
+	}
+	// Bound now, it takes its stored credential on the verdict of the
+	// certificate it last opened with.
+	if _, err := w.start(t, g); err != nil {
+		t.Fatalf("a guest that waited past its first certificate could not be started: %v", err)
 	}
 }

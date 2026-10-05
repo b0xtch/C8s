@@ -1,8 +1,9 @@
 // Package keyservice is one replica of the session key service
 // (docs/session-key-service.md), as far as milestone 1 needs it: it holds
 // tenants' authority keys and stored credentials in memory, verifies the
-// guests of the pools its launch document lists, and releases a stored
-// credential to a bound guest by the release rule, sealed to that guest.
+// guests of the pools its launch document lists, judges their evidence again
+// as the vendor replaces its documents, and releases a stored credential to
+// a bound guest by the release rule, sealed to that guest.
 //
 // It grows out of CDS: the store is CDS's, and the evidence checks are the
 // ones every session verifier runs. Leases, generations, replication, the
@@ -10,10 +11,12 @@
 package keyservice
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -111,13 +114,29 @@ type tenant struct {
 	credentials map[string]bool
 }
 
-// guest is the verdict on a guest's evidence, by its instance key, the
-// one-time keys that evidence bound, and the one bind the replica has
-// accepted for it.
+// guest is the verdict on a guest's evidence, by its instance key: the
+// evidence, kept to be judged again as the vendor replaces its documents,
+// until when the verdict stands, the one-time keys the evidence bound, and
+// the one bind the replica has accepted for the guest.
 type guest struct {
-	verified time.Time
-	oneTime  *session.OneTimeKeys
-	bind     string
+	evidence *session.Relayed
+	// pool is the served pool whose policy the evidence passed under.
+	pool int
+	// until is when the verdict ends, an hour at most after the replica
+	// fetched the oldest document under it: nothing is released past it.
+	// documents is the engine's count of the vendor's documents when the
+	// verdict was made, by which a newer document shows.
+	until     time.Time
+	documents uint64
+	oneTime   *session.OneTimeKeys
+	bind      string
+}
+
+// verdict is one judgment of a guest's evidence.
+type verdict struct {
+	ready     *session.ReadyTD
+	pool      int
+	documents uint64
 }
 
 // New prepares a replica: its instance key, and a serving certificate that
@@ -225,7 +244,139 @@ func (p *provider) Provision(ctx context.Context) (*tls.Certificate, time.Durati
 	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: p.key, Leaf: leaf}, p.ttl, nil
 }
 
-// Serve serves the replica's API on ln until ctx ends.
+// Verdict says what the replica holds of the guest with this instance key
+// digest: the digest of the certificate that carried the evidence it judged,
+// until when its verdict on that stands, and whether a bind has been
+// accepted for the guest. ok is false for a guest with no open session.
+func (s *Service) Verdict(instanceKey string) (certificate [sha256.Size]byte, until time.Time, bound, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.guests[instanceKey]
+	if !ok {
+		return certificate, time.Time{}, false, false
+	}
+	return sha256.Sum256(g.evidence.Certificate), g.until, g.bind != "", true
+}
+
+// documents is the engine's count of the vendor's documents it came to
+// hold. An engine that counts none judges by none.
+func (s *Service) documents() uint64 {
+	if counter, ok := s.cfg.Engine.(session.DocumentCounter); ok {
+		return counter.Documents()
+	}
+	return 0
+}
+
+// judge judges a guest's evidence against the pools at, as a verifier whose
+// verdict lets a secret go: on the vendor's documents as this replica
+// fetched them within the hour. A verdict made while the engine was still
+// taking documents in is made once more. The error is the last pool's, or
+// that of one that could not judge for want of a document.
+func (s *Service) judge(ctx context.Context, evidence *session.Relayed, pools ...int) (*verdict, error) {
+	var last, unjudged error
+	for _, at := range pools {
+		for range 2 {
+			before := s.documents()
+			ready, err := session.VerifyReadyToRelease(ctx, s.pins[at].policy, s.cfg.Engine, evidence, s.cfg.Now())
+			if err == nil && s.documents() != before {
+				continue
+			}
+			if err == nil {
+				return &verdict{ready: ready, pool: at, documents: before}, nil
+			}
+			var refused *session.VerificationError
+			if last = err; !errors.As(err, &refused) {
+				unjudged = err
+			}
+			break
+		}
+	}
+	if unjudged != nil {
+		return nil, unjudged
+	}
+	if last == nil {
+		last = errors.New("the vendor's documents kept changing under the judgment")
+	}
+	return nil, last
+}
+
+// currentLocked reports whether the verdict on g stands: within its time,
+// and on the newest documents the engine holds. The caller holds the lock.
+func (s *Service) currentLocked(g *guest) bool {
+	return s.cfg.Now().Before(g.until) && g.documents == s.documents()
+}
+
+// Rejudge keeps the verdicts on pooled guests current, off the path of any
+// start. It has the engine ask the vendor again for the documents that are
+// due, and judges again, on the evidence each guest opened with and with no
+// new quote, every guest no bind has been accepted for whose verdict no
+// longer rests on the newest documents the replica holds or ends within
+// five minutes. A guest whose evidence is refused now is forgotten. judged
+// is how many verdicts were made anew, and the error a document the vendor
+// could not be asked for.
+func (s *Service) Rejudge(ctx context.Context) (judged int, err error) {
+	if renewer, ok := s.cfg.Engine.(session.Renewer); ok {
+		err = renewer.Renew(ctx)
+	}
+	type stale struct {
+		key string
+		g   *guest
+	}
+	now := s.cfg.Now()
+	s.mu.Lock()
+	var due []stale
+	for key, g := range s.guests {
+		if g.bind == "" && (!s.currentLocked(g) || g.until.Sub(now) <= session.RenewAhead) {
+			due = append(due, stale{key, g})
+		}
+	}
+	s.mu.Unlock()
+	dropped := 0
+	for _, d := range due {
+		if ctx.Err() != nil {
+			return judged, ctx.Err()
+		}
+		check, cancel := context.WithTimeout(ctx, verifyTimeout)
+		v, failed := s.judge(check, d.g.evidence, d.g.pool)
+		cancel()
+		var refused *session.VerificationError
+		s.mu.Lock()
+		// The guest may have opened again meanwhile, or been bound.
+		if g := s.guests[d.key]; g == d.g && g.bind == "" {
+			switch {
+			case failed == nil:
+				g.until, g.documents, g.oneTime = v.ready.Until, v.documents, v.ready.OneTime
+				judged++
+			case errors.As(failed, &refused):
+				delete(s.guests, d.key)
+				dropped++
+				s.log.Warn("a pooled guest's evidence no longer passes", "instance_key", d.key, "error", failed)
+			}
+		}
+		s.mu.Unlock()
+	}
+	if judged > 0 || dropped > 0 || err != nil {
+		s.log.Info("judged pooled guests again", "judged", judged, "dropped", dropped, "due", len(due), "vendor", err)
+	}
+	return judged, err
+}
+
+// keepJudged calls Rejudge every minute until ctx ends.
+func (s *Service) keepJudged(ctx context.Context) {
+	tick := time.NewTicker(session.RefreshEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			_, _ = s.Rejudge(ctx)
+		}
+	}
+}
+
+// Serve serves the replica's API on ln until ctx ends, and keeps its
+// verdicts on pooled guests current meanwhile.
 func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           s.Handler(),
@@ -237,7 +388,13 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 		MaxHeaderBytes:    64 << 10,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelDebug),
 	}
-	stopped := make(chan struct{})
+	keeping, stop := context.WithCancel(ctx)
+	defer stop()
+	stopped, kept := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(kept)
+		s.keepJudged(keeping)
+	}()
 	go func() {
 		defer close(stopped)
 		<-ctx.Done()
@@ -246,6 +403,8 @@ func (s *Service) Serve(ctx context.Context, ln net.Listener) error {
 		_ = srv.Shutdown(shutdown)
 	}()
 	err := srv.Serve(tls.NewListener(ln, s.tls))
+	stop()
+	<-kept
 	if ctx.Err() != nil {
 		<-stopped
 		return nil
@@ -320,8 +479,13 @@ func (s *Service) guestRoute(next func(w http.ResponseWriter, r *http.Request, l
 }
 
 // open judges a guest's evidence against the pools the replica serves and
-// keeps the verdict by the guest's instance key. Rule 1 and rule 2 of the
-// release rule are settled here, off the path of a start.
+// keeps the verdict, and the evidence, by the guest's instance key. Rule 1
+// and rule 2 of the release rule are settled here, off the path of a start,
+// and are kept settled by Rejudge.
+//
+// A guest that no bind has been accepted for may open again under another
+// certificate, as it does when the one it opened with nears its end: a
+// verdict never outlives the certificate that carried its evidence.
 func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certificate, key string, body []byte) {
 	var req api.OpenRequest
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Launch) == 0 {
@@ -329,10 +493,11 @@ func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certif
 		return
 	}
 	s.mu.Lock()
-	_, known := s.guests[key]
-	full := len(s.guests) >= s.cfg.MaxGuests
+	g, known := s.guests[key]
+	same := known && (g.bind != "" || bytes.Equal(g.evidence.Certificate, leaf.Raw))
+	full := !known && len(s.guests) >= s.cfg.MaxGuests
 	s.mu.Unlock()
-	if known {
+	if same {
 		writeJSON(w, struct{}{})
 		return
 	}
@@ -342,37 +507,77 @@ func (s *Service) open(w http.ResponseWriter, r *http.Request, leaf *x509.Certif
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), verifyTimeout)
 	defer cancel()
-	relayed := &session.Relayed{
+	evidence := &session.Relayed{
 		Certificate: leaf.Raw, Phase: session.PhaseReady, Launch: req.Launch, Signature: req.Signature,
 		Events: []string{session.DocumentDigest(req.Launch)},
 	}
-	var ready *session.ReadyTD
-	var last error
-	for _, p := range s.pins {
-		// The verdict will release a secret: the root CA CRL under it is one
-		// this replica fetched itself.
-		if ready, last = session.VerifyReadyToRelease(ctx, p.policy, s.cfg.Engine, relayed, s.cfg.Now()); last == nil {
-			break
-		}
+	pools := make([]int, len(s.pins))
+	for i := range pools {
+		pools[i] = i
 	}
-	if last != nil {
-		s.log.Warn("a guest of no served pool was refused", "instance_key", key, "error", last)
+	v, err := s.judge(ctx, evidence, pools...)
+	var refused *session.VerificationError
+	switch {
+	case errors.As(err, &refused):
+		s.log.Warn("a guest of no served pool was refused", "instance_key", key, "error", err)
 		refuse(w, http.StatusForbidden, "the guest is of no pool this key service serves")
+		return
+	case err != nil:
+		// Nothing was said of the guest: it asks again.
+		s.log.Warn("a guest's evidence could not be judged", "instance_key", key, "error", err)
+		refuse(w, http.StatusServiceUnavailable, "the key service could not judge the guest's evidence: the vendor's documents are not at hand")
 		return
 	}
 	s.mu.Lock()
-	if _, known := s.guests[key]; !known {
+	if g, known := s.guests[key]; !known || g.bind == "" {
 		// The one-time keys are the ones the quote just judged binds: a
 		// release is made only against a receipt signed under the first.
-		s.guests[key] = &guest{verified: s.cfg.Now(), oneTime: ready.OneTime}
+		s.guests[key] = &guest{evidence: evidence, pool: v.pool, until: v.ready.Until, documents: v.documents, oneTime: v.ready.OneTime}
 	}
 	s.mu.Unlock()
-	s.log.Info("opened a guest's session", "instance_key", key)
+	s.log.Info("opened a guest's session", "instance_key", key, "again", known)
 	writeJSON(w, struct{}{})
 }
 
+// standing settles rules 1 and 2 for a release to the guest of key: the
+// verdict on the evidence it opened with stands now, on the vendor's
+// documents as this replica fetched them within the hour, the newest it
+// holds. A verdict that ran out, or that a newer document came after, is
+// made again here, on the kept evidence. It returns the status and reason to
+// refuse with, or zero.
+func (s *Service) standing(ctx context.Context, key string) (int, string) {
+	s.mu.Lock()
+	g, known := s.guests[key]
+	current := known && s.currentLocked(g)
+	s.mu.Unlock()
+	switch {
+	case !known:
+		return http.StatusConflict, "the guest has no open session with this key service"
+	case current:
+		return 0, ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, verifyTimeout)
+	defer cancel()
+	v, err := s.judge(ctx, g.evidence, g.pool)
+	var refused *session.VerificationError
+	switch {
+	case errors.As(err, &refused):
+		s.log.Warn("a guest's evidence no longer passes", "instance_key", key, "error", err)
+		return http.StatusForbidden, "the evidence the guest opened its session with no longer passes"
+	case err != nil:
+		s.log.Warn("a guest's evidence could not be judged again", "instance_key", key, "error", err)
+		return http.StatusServiceUnavailable, "the key service's verdict on the guest has run out, and the vendor's documents for another are not at hand"
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now, ok := s.guests[key]; ok && now == g {
+		g.until, g.documents = v.ready.Until, v.documents
+	}
+	return 0, ""
+}
+
 // acquire releases what a guest's bind allows, by the release rule.
-func (s *Service) acquire(w http.ResponseWriter, _ *http.Request, leaf *x509.Certificate, key string, body []byte) {
+func (s *Service) acquire(w http.ResponseWriter, r *http.Request, leaf *x509.Certificate, key string, body []byte) {
 	began := time.Now()
 	var req api.AcquireRequest
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -405,12 +610,16 @@ func (s *Service) acquire(w http.ResponseWriter, _ *http.Request, leaf *x509.Cer
 	}
 	digest := session.DocumentDigest(bind.Raw)
 
+	// Rules 1 and 2: the verdict on the evidence of the key this connection
+	// proved, from the guest's open, which stands now.
+	if status, reason := s.standing(r.Context(), key); status != 0 {
+		refuse(w, status, "%s", reason)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Rules 1 and 2: the verdict on the evidence of the key this connection
-	// proved, from the guest's open.
 	g, known := s.guests[key]
-	if !known {
+	if !known || !s.cfg.Now().Before(g.until) {
 		refuse(w, http.StatusConflict, "the guest has no open session with this key service")
 		return
 	}
