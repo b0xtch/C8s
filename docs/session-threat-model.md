@@ -123,9 +123,10 @@ but not confidentiality.
   among them, and the evidence the TD gave when it became ready still
   verifies. So nothing another binder relies on rests on them: a bind's
   receipt is signed by a one-time key that the guest erases before anything of
-  the tenant runs, the key service releases only against such a receipt and
-  for one bind per instance key, and the bind's quote shows the bind in
-  RTMR[3].
+  the tenant runs, a command sent with a bind is sealed to a second one-time
+  key, erased by then too, the key service releases only against such a
+  receipt and for one bind per instance key, and the bind's quote shows the
+  bind in RTMR[3].
 - **A revision the owner did not make, or one beyond the bind.** A revision of
   a session's egress or credential rules is signed by the bind's authority,
   must lie inside the bind's boundary, and is measured before it takes effect,

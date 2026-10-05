@@ -31,9 +31,10 @@ name each baseline.
 
 ## How sessions hide the rest
 
-- **Warm pools.** A TD boots before anyone asks for it, so a start is a claim
-  and a bind, two round trips to the guest, plus the binder's check. Boot time
-  still matters for how fast a pool refills after a burst.
+- **Warm pools.** A TD boots before anyone asks for it, so a start is a claim,
+  which the daemon answers from its own record, and a bind, one round trip to
+  the guest that can carry the first command, plus the binder's check. Boot
+  time still matters for how fast a pool refills after a burst.
 - **Hold keeps memory.** A release restarts the vCPUs and renews the lease;
   nothing is read back.
 - **Lazy restore.** A restored session runs before its seal has been read
@@ -89,7 +90,7 @@ Each lever must keep the rules in
 | cold boot | Firecracker boot to a ready guest | TD launch to a ready, unbound guest |
 | a boot, in parts | Firecracker's boot, in parts | the firmware's memory acceptance and its waits, loading and measuring the kernel image, the kernel's memory acceptance, bounce buffer and devices, the initrd, user space and the agent, the session with the key service that brings the vendor's documents, and the CPU time the boot burns on every vCPU |
 | warm activation | snapshot load to the first command | claim and bind to the first command |
-| a start, in parts | none | claim, ready check, bind (with the key service's answer and the sandbox's start inside it), the binder's check, and the first command |
+| a start, in parts | none | claim, ready check, bind (with the key service's answer and the sandbox's start inside it), the binder's check, and the first command, on its own or sent with the bind |
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
 | a burst of 100 starts at once | median and tail latency, and success rate | the same |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |

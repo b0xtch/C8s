@@ -57,9 +57,9 @@ guest that differs from Kata's in four ways, all kept here:
   underivable offline, so the Kata mode pinned MRTD alone.
 - **No boot on the user's path.** A pooled TD boots for nobody and becomes one
   session's only when a signed bind, measured and taken once, makes it so,
-  after a fence has closed every connection made before the claim but the
-  daemon's own. A start is a few round trips rather than a boot, and the TD
-  never returns to the pool.
+  after a fence raised as the bind arrives has closed every connection made
+  before it but the daemon's own. A start is a few round trips rather than a
+  boot, and the TD never returns to the pool.
 
 Sessions extend that guest with what agent platforms need:
 
@@ -161,14 +161,16 @@ Session TDs follow c8s's current launch-key and measurement contracts
   hybrid encryption key, ML-KEM-768 with X25519, which the instance key
   signs and to which keys are released, so what reaches the TD stays closed
   to anyone who records it now and has a quantum computer later.
-- **One-time key.** Beside its instance key, a pooled guest makes a signing
-  key for its one bind. Every report it makes before that bind carries the
-  key's digest in its report data, beside the instance key's, and its evidence
-  keeps the last such quote. The guest signs its answer to the bind with this
-  key, then erases it before it takes anything for the tenant or starts the
-  sandbox. The instance key must outlive the bind, so code that broke out of
-  the sandbox could read it; the one-time key is gone by then ([A session that
-  reads its own TD](session-threat-model.md#binding-and-identity)).
+- **One-time keys.** Beside its instance key, a pooled guest makes a signing
+  key and a hybrid KEM key, ML-KEM-768 with X25519, for its one bind. Every
+  report it makes before that bind carries their digest in its report data,
+  beside the instance key's, and its evidence keeps the last such quote. The
+  guest signs its answer to the bind with the first and erases it, then opens
+  with the second a command sealed to it if one comes with the bind, and
+  erases that key too before anything of the tenant runs. The instance key
+  must outlive the bind, so code that broke out of the sandbox could read it;
+  the one-time keys are gone by then ([A session that reads its own
+  TD](session-threat-model.md#binding-and-identity)).
 - **Bind.** On TDX the guest extends RTMR[3] with the bind's digest, on top
   of the launch key's seed: the chain a node's per-workload measurement uses
   today. SEV-SNP has no runtime register, so there the guest puts the bind's
