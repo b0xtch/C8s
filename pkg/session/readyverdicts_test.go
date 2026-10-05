@@ -260,6 +260,157 @@ func TestVerdictMadeAheadIsReusedOnlyWhileItStands(t *testing.T) {
 	})
 }
 
+// renewing is counted as an engine that also fetches the vendor's documents
+// anew when asked, and that may refuse what it is shown or fail to judge it.
+type renewing struct {
+	*counted
+	renewed atomic.Int64
+	// vendor, when set, is what a renewal fails with.
+	vendor error
+	// refuse and fail, when set, are what the next verifications return.
+	refuse, fail atomic.Bool
+}
+
+func (e *renewing) Renew(context.Context) error {
+	e.renewed.Add(1)
+	return e.vendor
+}
+
+func (e *renewing) VerifyEvidence(ctx context.Context, env teetypes.AttestationEvidence, reportData []byte) (*teetypes.VerificationResult, error) {
+	res, err := e.counted.VerifyEvidence(ctx, env, reportData)
+	switch {
+	case err != nil:
+		return nil, err
+	case e.refuse.Load():
+		return nil, &session.VerificationError{Err: errors.New("the platform's key is revoked")}
+	case e.fail.Load():
+		return nil, session.ErrStaleDocuments
+	}
+	return res, nil
+}
+
+// A binder judges again, off the path of any claim, each verdict that no
+// longer rests on the newest documents its engine holds or that nears its
+// end, on the evidence it kept: a guest that waits past the hour is still
+// found judged at its claim.
+func TestRefreshJudgesKeptEvidenceAgain(t *testing.T) {
+	s := serveReady(t, sessiontest.NewTD())
+	shown := relayedState(t, s)
+	// What a host relays with the evidence is not kept with it.
+	shown.Collateral = []byte(`{"documents":[{"url":"https://pcs.example/a","body":"Ym9keQ=="}]}`)
+	setup := func(t *testing.T) (*renewing, *session.ReadyVerdicts, *time.Time) {
+		engine := &renewing{counted: newCounted()}
+		verdicts := watching(t, s, engine)
+		clock := time.Now()
+		verdicts.SetClock(func() time.Time { return clock })
+		if err := verdicts.Judge(within(t), shown); err != nil {
+			t.Fatal(err)
+		}
+		return engine, verdicts, &clock
+	}
+
+	t.Run("nothing changed", func(t *testing.T) {
+		engine, verdicts, _ := setup(t)
+		judged, err := verdicts.Refresh(within(t))
+		if err != nil || judged != 0 || engine.asked.Load() != 1 || engine.renewed.Load() != 1 {
+			t.Fatalf("Refresh: %d judged, %v, the engine asked %d times and to renew %d times", judged, err, engine.asked.Load(), engine.renewed.Load())
+		}
+	})
+
+	t.Run("the engine came to hold another document", func(t *testing.T) {
+		engine, verdicts, _ := setup(t)
+		engine.documents.Add(1)
+		judged, err := verdicts.Refresh(within(t))
+		if err != nil || judged != 1 || engine.asked.Load() != 2 {
+			t.Fatalf("Refresh: %d judged, %v, the engine asked %d times", judged, err, engine.asked.Load())
+		}
+		if _, named := session.Stapled(engine.context); named || session.HandedDocumentsAllowed(engine.context) {
+			t.Fatal("a verdict made anew may rest on documents that were handed over")
+		}
+		claimed, err := verdicts.Claimed(within(t), shown)
+		if err != nil || !claimed.Ahead || engine.asked.Load() != 2 {
+			t.Fatalf("the claim after it: %v, the engine asked %d times", err, engine.asked.Load())
+		}
+	})
+
+	t.Run("the verdict nears its end", func(t *testing.T) {
+		engine, verdicts, clock := setup(t)
+		began := *clock
+		*clock = began.Add(session.ServingVerdictTTL - session.RenewAhead - time.Second)
+		if judged, err := verdicts.Refresh(within(t)); err != nil || judged != 0 {
+			t.Fatalf("a second before it is due: %d judged, %v", judged, err)
+		}
+		*clock = began.Add(session.ServingVerdictTTL - session.RenewAhead)
+		if judged, err := verdicts.Refresh(within(t)); err != nil || judged != 1 || engine.asked.Load() != 2 {
+			t.Fatalf("five minutes before its end: %d judged, %v", judged, err)
+		}
+		// Past the first verdict's hour, the guest is still found judged.
+		*clock = began.Add(session.ServingVerdictTTL + 30*time.Minute)
+		claimed, err := verdicts.Claimed(within(t), shown)
+		if err != nil || !claimed.Ahead || engine.asked.Load() != 2 {
+			t.Fatalf("a claim half an hour past the first verdict's end: %v, ahead %t", err, claimed != nil && claimed.Ahead)
+		}
+	})
+
+	t.Run("the evidence is refused now", func(t *testing.T) {
+		engine, verdicts, _ := setup(t)
+		engine.documents.Add(1)
+		engine.refuse.Store(true)
+		if judged, err := verdicts.Refresh(within(t)); err != nil || judged != 0 || verdicts.Kept() != 0 {
+			t.Fatalf("Refresh: %d judged, %v, %d verdicts kept on a guest that is refused", judged, err, verdicts.Kept())
+		}
+		if claimed, err := verdicts.Claimed(within(t), shown); !isVerdict(err) {
+			t.Fatalf("a claim of a guest that is refused now: %+v, %v", claimed, err)
+		}
+	})
+
+	t.Run("the vendor cannot be asked", func(t *testing.T) {
+		engine, verdicts, clock := setup(t)
+		began := *clock
+		engine.vendor = errors.New("no route to the vendor")
+		engine.fail.Store(true)
+		*clock = began.Add(session.ServingVerdictTTL - time.Minute)
+		judged, err := verdicts.Refresh(within(t))
+		if err == nil || judged != 0 || verdicts.Kept() != 1 {
+			t.Fatalf("Refresh: %d judged, %v, %d verdicts kept", judged, err, verdicts.Kept())
+		}
+		// The verdict it has stands for what is left of its hour, and a claim
+		// within it judges nothing.
+		before := engine.asked.Load()
+		claimed, err := verdicts.Claimed(within(t), shown)
+		if err != nil || !claimed.Ahead || engine.asked.Load() != before {
+			t.Fatalf("a claim within the verdict's hour: %v", err)
+		}
+		// Past the hour there is none, and none can be made.
+		if err := verdicts.Judge(within(t), shown); !errors.Is(err, session.ErrStaleDocuments) {
+			t.Fatalf("Judge with the vendor out of reach: %v", err)
+		}
+		*clock = began.Add(session.ServingVerdictTTL)
+		if claimed, err := verdicts.Claimed(within(t), shown); !errors.Is(err, session.ErrStaleDocuments) {
+			t.Fatalf("a claim past the hour: %+v, %v", claimed, err)
+		}
+	})
+
+	t.Run("the binder changed its policy meanwhile", func(t *testing.T) {
+		engine, verdicts, _ := setup(t)
+		engine.documents.Add(1)
+		engine.hold, engine.inside = make(chan struct{}), make(chan struct{}, 4)
+		done := make(chan error, 1)
+		go func() {
+			_, err := verdicts.Refresh(within(t))
+			done <- err
+		}()
+		<-engine.inside
+		if err := verdicts.SetPolicy(s.policy); err != nil {
+			t.Fatal(err)
+		}
+		close(engine.hold)
+		if err := <-done; err != nil || verdicts.Kept() != 0 {
+			t.Fatalf("Refresh: %v, %d verdicts of the policy before kept", err, verdicts.Kept())
+		}
+	})
+}
+
 // A claim that comes while its guest is being judged waits for that verdict,
 // and judges nothing a second time. A policy changed meanwhile leaves the
 // verdict unused.

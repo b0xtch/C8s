@@ -13,6 +13,10 @@ import (
 // and has not been handed: a host can show it any number.
 const maxReadyVerdicts = 1024
 
+// RefreshEvery is how often a binder that keeps verdicts refreshes them: see
+// ReadyVerdicts.KeepCurrent.
+const RefreshEvery = time.Minute
+
 // ReadyVerdicts keeps a binder's verdicts on ready guests it was shown ahead
 // of a claim, as a daemon's WatchReady shows a pool's, so that a claim finds
 // its guest judged and the binder's check is off the path of a start.
@@ -27,7 +31,11 @@ const maxReadyVerdicts = 1024
 // never shown, the claim's evidence is judged on the path.
 //
 // Every verdict is made as one that lets a secret go (VerifyReadyToRelease):
-// a binder that watches a pool seals what it sends with its binds.
+// a binder that watches a pool seals what it sends with its binds. Such a
+// verdict stands for an hour from when the binder fetched the vendor's
+// documents under it, so a binder keeps the evidence it judged and judges it
+// again as the documents are replaced, off the path of any claim: see
+// Refresh.
 type ReadyVerdicts struct {
 	engine Engine
 	now    func() time.Time
@@ -43,9 +51,12 @@ type ReadyVerdicts struct {
 // readyVerdict is one verdict, or one on its way.
 type readyVerdict struct {
 	// done is closed once the verdict is made.
-	done  chan struct{}
-	ready *ReadyTD
-	err   error
+	done chan struct{}
+	// evidence is what the guest gave and the verdict was made on, kept to
+	// be judged again: no document the guest's host relayed is among it.
+	evidence *Relayed
+	ready    *ReadyTD
+	err      error
 	// epoch and documents are the binder's policy and its engine's count of
 	// the vendor's documents when the verdict was made. settled says that
 	// count did not move while it was.
@@ -114,12 +125,15 @@ func (v *ReadyVerdicts) Judge(ctx context.Context, r *Relayed) error {
 		return nil
 	}
 	v.evictLocked()
-	verdict := &readyVerdict{done: make(chan struct{}), epoch: v.epoch, began: v.now()}
+	verdict := &readyVerdict{
+		done: make(chan struct{}), epoch: v.epoch, began: v.now(),
+		evidence: &Relayed{Certificate: r.Certificate, Phase: r.Phase, Launch: r.Launch, Signature: r.Signature, Events: r.Events},
+	}
 	v.judged[digest] = verdict
 	policy := v.policy
 	v.mu.Unlock()
 
-	v.judge(ctx, policy, r, verdict)
+	v.judge(ctx, policy, verdict.evidence, verdict)
 	v.mu.Lock()
 	// A verdict that failed is none, and neither is one made under a policy
 	// the binder has since changed: SetPolicy dropped it from the set.
@@ -227,6 +241,75 @@ func (v *ReadyVerdicts) Claimed(ctx context.Context, r *Relayed) (*JudgedReady, 
 		return nil, err
 	}
 	return &JudgedReady{ReadyTD: ready, Took: v.now().Sub(began)}, nil
+}
+
+// Refresh keeps the verdicts current, off the path of any claim. It has the
+// engine ask the vendor again for the documents that are due (Renewer), and
+// judges again, on the evidence it keeps, every verdict that no longer rests
+// on the newest documents the engine holds or that ends within five minutes.
+// A guest whose evidence is refused now is dropped. One that could not be
+// judged, for want of a document, keeps its verdict for what is left of its
+// time. judged is how many verdicts were made anew, and the error a document
+// the vendor could not be asked for.
+func (v *ReadyVerdicts) Refresh(ctx context.Context) (judged int, err error) {
+	if renewer, ok := v.engine.(Renewer); ok {
+		err = renewer.Renew(ctx)
+	}
+	type stale struct {
+		digest [sha256.Size]byte
+		kept   *readyVerdict
+	}
+	v.mu.Lock()
+	policy, epoch, now := v.policy, v.epoch, v.now()
+	var due []stale
+	for digest, kept := range v.judged {
+		// One on its way is made on what the engine holds now.
+		if kept.made() && (!v.usableLocked(kept) || kept.ready.Until.Sub(now) <= RenewAhead) {
+			due = append(due, stale{digest, kept})
+		}
+	}
+	v.mu.Unlock()
+	for _, d := range due {
+		if ctx.Err() != nil {
+			return judged, ctx.Err()
+		}
+		again := &readyVerdict{done: d.kept.done, evidence: d.kept.evidence, epoch: epoch, began: v.now()}
+		v.judge(ctx, policy, again.evidence, again)
+		var refused *VerificationError
+		v.mu.Lock()
+		// A claim may have taken the verdict meanwhile, or the policy changed.
+		if v.judged[d.digest] == d.kept && v.epoch == epoch {
+			switch {
+			case again.err == nil:
+				v.judged[d.digest] = again
+				judged++
+			case errors.As(again.err, &refused):
+				delete(v.judged, d.digest)
+			}
+		}
+		v.mu.Unlock()
+	}
+	return judged, err
+}
+
+// KeepCurrent refreshes the verdicts every RefreshEvery until ctx ends: what
+// a binder runs beside its watch of a pool. refreshed, when set, is told of
+// each refresh that judged a verdict anew or could not ask the vendor.
+func (v *ReadyVerdicts) KeepCurrent(ctx context.Context, refreshed func(judged int, took time.Duration, err error)) {
+	tick := time.NewTicker(RefreshEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		began := time.Now()
+		judged, err := v.Refresh(ctx)
+		if refreshed != nil && ctx.Err() == nil && (judged > 0 || err != nil) {
+			refreshed(judged, time.Since(began), err)
+		}
+	}
 }
 
 // Kept is how many verdicts the binder keeps, made or on their way.

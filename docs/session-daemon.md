@@ -86,6 +86,18 @@ certificate. The binder judges each then, and at a claim finds its guest by
 the certificate in the claim's answer, never by the TD's name. A TD it was
 not shown, or whose verdict no longer stands, it judges at the claim.
 
+What a binder seals with a bind, or sends over `Connect`, goes on a verdict
+that rests on the vendor's documents as the binder fetched them from the
+vendor itself within the last hour. The documents a host relays with a TD's
+evidence serve only a check that sends nothing secret, such as the one before
+a bind is signed ([Old vendor
+documents](session-threat-model.md#launch-and-measurement)). So a binder
+asks the vendor again for each document three quarters of an hour after it
+fetched it, keeps the evidence it judged, and judges it again when a newer
+document arrives or a verdict nears its end: `session.ReadyVerdicts` does
+both, off the path of any start. A binder that cannot reach the vendor for
+an hour seals and sends nothing until it can.
+
 `c8s session start` is the client for one session: it claims, judges, signs
 with the owner's authority key, binds and verifies again, and writes a
 binding directory. A command after `--` goes with the bind as the session's
@@ -382,3 +394,6 @@ changes on the host while it runs.
   credential. A replica that stops has forgotten its tenants and their
   credentials. A guest judges the key service by the vendor documents its own
   launcher answers with, so the two share a platform for now.
+- A stream that says when a TD leaves ready. A binder keeps its verdict on a
+  TD that another binder took until that TD's certificate ends, and judges
+  it again each hour meanwhile.

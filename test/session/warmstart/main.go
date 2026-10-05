@@ -24,11 +24,20 @@
 // start: a round's claim then finds its guest judged. That work is done
 // before the round and is no part of its times, so a record says whether the
 // guest was judged ahead and how long that took. --watch-ready=false judges
-// every guest at its claim.
+// every guest at its claim. The watch may run under a certificate of its
+// own (--watch-cert), which the pool names by its key and no authority has
+// signed. Every verdict here lets a secret go, so it rests on the vendor's
+// documents as this process fetched them within the hour: it asks the vendor
+// again as they come due and judges the waiting guests on what came, each
+// minute, and prints a record of kind "refresh" for each time that did work,
+// so that a reader can tell the rounds it ran beside. What it can name of
+// those documents before it has seen a guest it fetches when it starts, and
+// prints a record of kind "documents" for.
+//
 // Each round prints one JSON record on standard output, with times in
-// microseconds on this process's monotonic clock. The first round finds the
-// engine's documents unread and its connections unmade: a reader who wants
-// the steady state leaves it out.
+// microseconds on this process's monotonic clock and the wall clock's time
+// when it began. The first round finds the engine's documents unread and its
+// connections unmade: a reader who wants the steady state leaves it out.
 //
 // It is a measuring tool for a host that runs a session daemon
 // (test/session/hardware.sh shows how one is set up). It verifies everything
@@ -52,6 +61,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -66,6 +76,7 @@ import (
 
 type options struct {
 	daemon, ca, cert, key              string
+	watchCert, watchKey                string
 	pool, manifest, launchKey          string
 	authorityKey, tenant, prefix       string
 	sandboxImage, keyService, stored   string
@@ -78,12 +89,30 @@ type options struct {
 	watchReady                         bool
 }
 
+// refresh is one time this side asked the vendor for the documents that
+// were due and judged its waiting guests again, beside whatever round ran
+// then: kind "refresh". The first, of kind "documents", is made before any
+// round and fetches what can be named by then. Every time is in
+// microseconds.
+type refresh struct {
+	Kind string `json:"kind"`
+	// At is when it began, on the wall clock, and Took how long it ran.
+	At   int64 `json:"at_unix_us"`
+	Took int64 `json:"took_us"`
+	// Judged is how many guests were judged anew, and Error what the vendor
+	// could not be asked for.
+	Judged int    `json:"judged"`
+	Error  string `json:"error,omitempty"`
+}
+
 // record is one round. Every time is in microseconds.
 type record struct {
 	Kind    string `json:"kind"`
 	Round   int    `json:"round"`
 	Session string `json:"session"`
 	TD      string `json:"td"`
+	// At is when the round's claim began, on the wall clock.
+	At int64 `json:"at_unix_us"`
 	// Claim to Judge are the steps of a start, in order. Seal is the first
 	// command sealed for the guest, with the credential this side holds if
 	// it holds one, when they go with the bind. Bind is the call that
@@ -165,7 +194,9 @@ func main() {
 	flag.BoolVar(&o.prejudge, "prejudge", true, "judge the guest's serving certificate while the guest takes its bind, so that the first command's connection does not wait for it")
 	flag.BoolVar(&o.preconnect, "preconnect", true, "with --prejudge, also make the connection the session's commands take ahead of the first that needs it")
 	flag.BoolVar(&o.withBind, "command-with-bind", true, "send the first command with the bind, sealed to the guest's one-time key (not with --quote-first)")
-	flag.BoolVar(&o.watchReady, "watch-ready", true, "watch the pool's ready TDs and judge each before its claim; the pool's configuration must name --daemon-cert as one of its binders")
+	flag.BoolVar(&o.watchReady, "watch-ready", true, "watch the pool's ready TDs and judge each before its claim; the pool's configuration must name the key of --watch-cert, or of --daemon-cert without one, as one of its binders")
+	flag.StringVar(&o.watchCert, "watch-cert", "", "a certificate to watch the pool under in place of --daemon-cert, PEM: a binder's own, which no authority need have signed")
+	flag.StringVar(&o.watchKey, "watch-key", "", "the private key of --watch-cert, PEM")
 	flag.Parse()
 	if err := run(&o); err != nil {
 		fmt.Fprintln(os.Stderr, "warmstart:", err)
@@ -184,6 +215,9 @@ func run(o *options) error {
 	}
 	if o.stored != "" && o.keyService == "" {
 		return errors.New("--stored-credential needs --key-service")
+	}
+	if (o.watchCert == "") != (o.watchKey == "") {
+		return errors.New("--watch-cert and --watch-key go together")
 	}
 	if o.sealedCredential != "" && (o.stored != "" || o.quoteFirst || !o.withBind) {
 		return errors.New("--sealed-credential goes with the bind's first command: not with --stored-credential, --quote-first or --command-with-bind=false")
@@ -242,21 +276,59 @@ func run(o *options) error {
 		return err
 	}
 
+	var printing sync.Mutex
+	out := json.NewEncoder(os.Stdout)
+	emit := func(v any) error {
+		printing.Lock()
+		defer printing.Unlock()
+		return out.Encode(v)
+	}
 	engine := session.NewEngine(session.EngineOptions{CollateralCacheDir: o.collateralCache})
-	// The one document a verdict that lets a secret go takes from the vendor
-	// alone is fetched before a start needs it.
-	session.Prefetch(engine)
+	// What a verdict that lets a secret go takes from the vendor alone is
+	// fetched before a start needs it, as far as it can be named by now. It
+	// is work done before the measured path, so it is timed and recorded.
+	if renewer, ok := engine.(session.Renewer); ok {
+		began := time.Now()
+		fetching, cancel := context.WithTimeout(context.Background(), time.Minute)
+		err := renewer.Renew(fetching)
+		cancel()
+		rec := &refresh{Kind: "documents", At: began.UnixMicro(), Took: micros(began)}
+		if err != nil {
+			// A round that needs them says what it could not do.
+			rec.Error = err.Error()
+		}
+		if err := emit(rec); err != nil {
+			return err
+		}
+	}
 	readyPolicy := session.Policy{Image: identity, LaunchKey: launchKey, Authority: authorityPub, AllowReady: true, AcceptTCBStatus: accepted}
 	verdicts, err := session.NewReadyVerdicts(readyPolicy, engine)
 	if err != nil {
 		return err
 	}
 	if o.watchReady {
+		watcher := host
+		if o.watchCert != "" {
+			own, err := tls.LoadX509KeyPair(o.watchCert, o.watchKey)
+			if err != nil {
+				return fmt.Errorf("--watch-cert and --watch-key: %w", err)
+			}
+			if watcher, err = daemon.Dial(daemon.Options{Address: o.daemon, RootCAs: roots, Certificate: &own}); err != nil {
+				return err
+			}
+			defer watcher.Close()
+		}
 		watching, stop := context.WithCancel(context.Background())
 		defer stop()
-		go watch(watching, host, o.pool, verdicts)
+		go watch(watching, watcher, o.pool, verdicts)
+		go verdicts.KeepCurrent(watching, func(judged int, took time.Duration, err error) {
+			rec := &refresh{Kind: "refresh", At: time.Now().Add(-took).UnixMicro(), Took: took.Microseconds(), Judged: judged}
+			if err != nil {
+				rec.Error = err.Error()
+			}
+			_ = emit(rec)
+		})
 	}
-	out := json.NewEncoder(os.Stdout)
 	for round := range o.rounds {
 		if o.before != "" {
 			hook := exec.Command(o.before, strconv.Itoa(round))
@@ -271,7 +343,7 @@ func run(o *options) error {
 		if err != nil {
 			return fmt.Errorf("round %d: %w", round, err)
 		}
-		if err := out.Encode(rec); err != nil {
+		if err := emit(rec); err != nil {
 			return err
 		}
 	}
@@ -360,6 +432,7 @@ func one(ctx context.Context, o *options, round int, host *daemon.Client, engine
 
 	began := time.Now()
 	step := began
+	rec.At = began.UnixMicro()
 	claimed, err := host.Claim(ctx, claimID, o.pool, rec.Session, o.wait)
 	if err != nil {
 		return nil, fmt.Errorf("claim: %w", err)
