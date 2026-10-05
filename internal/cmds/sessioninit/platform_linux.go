@@ -416,9 +416,10 @@ func (k *kernel) DialHost(port uint32) (net.Conn, error) {
 }
 
 // powerOff ends the guest. A session guest never reboots: whatever comes up
-// after it is another guest, attested afresh.
+// after it is another guest, attested afresh. Nothing is written out first:
+// the root's contents die with a key of this boot, and what a session keeps
+// it has handed to its host before this.
 func powerOff() {
-	unix.Sync()
 	_ = unix.Reboot(unix.LINUX_REBOOT_CMD_POWER_OFF)
 	// Not reached while the kernel honours the call. Process 1 must not exit.
 	for {
