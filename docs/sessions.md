@@ -262,7 +262,13 @@ that is acceptable is the owner's choice, made per tenant.
 - **Start.** The daemon claims a ready TD and the owner's binder checks its
   evidence and signs a bind, or a binder that checked the pool's ready TDs
   ahead signs a bind for one, which claims it; the guest takes the bind and
-  starts the sandbox.
+  starts the sandbox. The sandbox runs the guest's own init, which stays and
+  reaps what commands leave, and runs a process of the session's only when
+  the policy names one: the image's own command, or a command sent to it as
+  any other is. The session then ends when that process does. The sandbox's
+  memory is bounded below its TD's, leaving the guest's own services a
+  reserve, so a session that fills it loses processes of its own, never the
+  guest's.
 - **Hold and release** stop and restart the TD's vCPUs, keeping its memory.
 - **Commit** records the session's files as a new layer while it runs,
   without stopping it. In **continuous mode** the guest commits the

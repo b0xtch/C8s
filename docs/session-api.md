@@ -71,7 +71,7 @@ guest's own API on its TLS port.
                +----------+                     +--> sealing --> ended
      claim lapsed, or destroyed before a bind   +--------------> ended
  any state --> ended: destroyed, refused bind, age limit, crash, host lost,
-                      lease lost
+                      lease lost, the session's process ended
 ```
 
 - **booting to ready.** The daemon launches the TD from the pool's bundle. The
@@ -121,6 +121,12 @@ guest's own API on its TLS port.
   its own.
 - **sealing to ended.** The guest writes its seal, records it at the key
   service and ends.
+- **running to ended.** A session whose policy names a process for its
+  sandbox ends when that process ends. The guest takes no new connection
+  then, and for a few seconds at most gives the answers it still owes, such
+  as the bind's, with its quote, and a command's, which the end killed. It
+  ends with the code for it, and the process's status stays in the session's
+  logs, for its owner.
 
 **A session's life**, as the daemon sees it: new, live (running or held),
 sealing, sealed, restoring, live again, and so on until destroyed. The
@@ -342,7 +348,7 @@ in the release log with its reference values
 | `session`, `tenant` | the session's name, scoped by the authority that signs it; a start names a session the key service has no record of, so a binder gives each new session a name of its own and keeps it for a retry ([A start the daemon calls not ready](session-threat-model.md#binding-and-identity)) |
 | `purpose` | `start`, `restore`, `fork` or `template`; with the `generation` a restore expects, or the `template` a fork comes from |
 | `disks` | per slot, the root hash or digest of what the guest may open there |
-| `policy` | the sandbox's images by digest; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (the key service, or the binder, sealed with the bind or put over `Connect`), with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`, which every bind carries; `any` allows every public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
+| `policy` | the sandbox's images by digest, and its process (`process`: by default none, so that only the guest's init runs in it, and stays; the image's own command; or a command sent as any command is, sealed with the bind or over `Connect`, since a bind holds no secret), whose end ends the session; who may drive the session (`access`: the keys allowed to run commands, release credentials and open forwarded streams); the credentials it declares, by name, size and where each comes from (the key service, or the binder, sealed with the bind or put over `Connect`), with the endpoints each may be used at and whether the sandbox may hold it itself (`credentials`); its egress rules, which allow by host and port, by method and path where the gateway reads the request, and in a container sandbox by the program that connects, and deny the rest (`egress`, which every bind carries; `any` allows every public destination); the most its egress and credential rules may ever allow, which revisions must stay within (`boundary`); the inference endpoints it may reach and their pins; the most it may keep once its TD ends (`seal`: none, files or processes) and how it commits while it runs (`commit`: none, `files` on a timer, or `continuous` with an epoch and the size classes of its records); and the wall when the TD is a tenant VM |
 | `keyService` | the key service the session trusts: exactly the one in the TD's launch document, which it opened its session with, or none when the session declares no credential from a key service; a TD refuses a bind naming any other, and at a bind naming none closes its session with the key service and deals with no replica after it. With it, `members`: the digests of the instance keys of its replicas, each of which the binder judged as for a release, on the vendor's documents as it fetched them itself within the last hour. From the bind on, the guest takes nothing from a replica, and sends it nothing, unless it is one of them or joined them by a membership that a majority of the replicas the guest holds signed ([Which replicas a guest trusts](session-key-service.md#which-replicas-a-guest-trusts)) |
 | `review` | the session's review policy, by its digest in the release log, or none |
 | `ownerKey` | under dual control, the owner's key manager: the key its share is wrapped to, and where to ask for it |

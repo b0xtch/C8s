@@ -79,17 +79,18 @@ choosing where the host can read it.
   reached and a code from a list. The init sends it, since it sees the agent
   end however it ends, and then powers the guest off. When the agent ends the
   guest for a reason of its own, such as its age limit, its lease lost, a
-  bind refused or a guard's refusal, each guard with a code of its own, it
-  exits with that reason's code for the init to send; when it ends
-  otherwise, the code says that it exited, with its status, or was killed,
-  with the signal and whether the kernel killed it for memory. A kernel that
-  faults reports one fixed code to the VMM instead, through the platform's
-  call for a fatal error, and never the text of its panic, which can hold
-  addresses and data. The launcher gives the code as the TD's reason for
-  ending, or says that none came. Codes are for operators, and nothing that
-  guards a session rests on them. Nothing of a guest's memory leaves: the
-  host cannot read a TD's private memory, and the guest writes no dump
-  outside it.
+  bind refused, a guard's refusal, each guard with a code of its own, or the
+  end of the process the policy named, it exits with that reason's code for
+  the init to send, and never with that process's status, which the session
+  chooses. When the agent ends otherwise, the code says that it exited, with
+  its status, or was killed, with the signal and whether the kernel killed it
+  for memory. A kernel that faults reports one fixed code to the VMM instead,
+  through the platform's call for a fatal error, and never the text of its
+  panic, which can hold addresses and data. The launcher gives the code as the
+  TD's reason for ending, or says that none came. Codes are for operators, and
+  nothing that guards a session rests on them. Nothing of a guest's memory
+  leaves: the host cannot read a TD's private memory, and the guest writes no
+  dump outside it.
 - **Support goes through the owner.** An operator who needs to see inside a
   session asks its owner, whose client can open the session's logs and share
   what it chooses. No call or key lets the platform look in alone.
