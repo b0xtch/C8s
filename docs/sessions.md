@@ -169,9 +169,13 @@ Session TDs follow c8s's current launch-key and measurement contracts
   the bind, and opens with the second any message the binder sealed to it with
   the bind, carrying the first command or the credentials the binder holds. It
   uses neither key again, and erases both at once before anything of the
-  tenant runs. The instance key must outlive the bind, so code that broke out
-  of the sandbox could read it; the one-time keys are gone by then ([A session
-  that reads its own TD](session-threat-model.md#binding-and-identity)).
+  tenant runs. Both live only in a helper process that the agent starts at
+  boot: the helper makes them, signs and opens with them for the agent, and
+  exits, and the guest's kernel zeroes every page it frees, so the agent never
+  holds either key and erasing both is the helper's exit. The instance key
+  must outlive the bind, so code that broke out of the sandbox could read it;
+  the one-time keys are gone by then ([A session that reads its own
+  TD](session-threat-model.md#binding-and-identity)).
 - **Bind.** On TDX the guest extends RTMR[3] with the bind's digest, on top
   of the launch key's seed: the chain a node's per-workload measurement uses
   today. SEV-SNP has no runtime register, so there the guest puts the bind's

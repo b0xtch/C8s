@@ -46,7 +46,7 @@ Non-goals, stated so that nobody assumes otherwise:
 | guest firmware | in MRTD (or the SEV-SNP launch measurement) | pinned, and built from source with the image, so that auditors can rebuild it |
 | guest kernel, initrd, command line, and the root file system with the agent | in RTMR[1], RTMR[2] and the dm-verity root | the image's published manifest |
 | the launch key, the bind and later runtime events | the RTMR[3] chain on TDX; HOST_DATA and report data on SEV-SNP | replayed by the verifier |
-| the agent and its gateways (egress, inference, the message box) | on the verity root | the same pins |
+| the agent, its key helper and its gateways (egress, inference, the message box) | on the verity root | the same pins |
 | the key service | attested code in its own CVMs, a quorum of replicas | each replica verifies the others; binds pin its replicas |
 | verifier code and reference values | they make the decision | reproducible builds, each in the public release log; the browser bundle pinned by hash |
 | the release log's witnesses | together they keep the log from showing two histories | at least one runs outside the operator's reach, and two of three must cosign |
@@ -356,6 +356,7 @@ but not confidentiality.
 | accepting memory only when used | driven by the guest; the host learns the session's memory high-water mark, which is metadata |
 | giving free memory back to the host | only free blocks are converted to shared, and a block comes back through acceptance, which zeroes it |
 | a spawner inside the sandbox, which starts each command | the tenant's to break: the agent hands it, with each command, only a write-only descriptor for that command's cgroup.procs file, whose writes the kernel judges by the agent's credentials but reads in the spawner's own PID namespace, so it can put only its own sandbox's processes into that one cgroup; the agent signals and moves no process by its number, ends a command by its cgroup and takes the command's end and status from the kernel through the process's pidfd, so a broken spawner can harm only its own tenant's sandbox |
+| the one-time keys held by a helper process that exits at the bind, rather than by the agent | the helper alone holds their private halves; it signs one receipt and opens one sealed message for the agent and does nothing else, keeps its memory out of swap and dumps no core; the agent runs nothing of the tenant's until it has reaped the helper, and the guest's kernel zeroes every page it frees, so the keys are gone with the helper |
 | paravirtual features | only wake-ups and hints, whose host input can slow the guest but not change what it computes, such as a kick for a halted vCPU; the kernel is built to take no other, whatever its host offers, so no paravirtual clock and no flush of a preempted vCPU's TLB left to its host |
 | host patches, such as pre-faulting or 2 MiB private pages | host code is untrusted anyway: a bug can deny service or crash TDs, but not read private memory without a flaw in the TDX module or the hardware |
 
