@@ -670,8 +670,10 @@ stops a session for about an epoch and the start of a restore.
   session, the key of the binder whose bind claimed it if one did, and the
   time. The reason of a TD whose guest ended itself is the code the guest
   gave as it ended, or a crash when it gave none
-  ([What leaves a session](session-disclosure.md#logs-consoles-and-crashes)).
-  They are level-triggered: a TD that changed twice between two events
+  ([What leaves a session](session-disclosure.md#logs-consoles-and-crashes)),
+  but the daemon ends a TD as soon as its guest answers that it refused its
+  bind, with the refusal as its reason, rather than wait for the guest's word.
+  Events are level-triggered: a TD that changed twice between two events
   shows once, as it is, so the daemon holds at most one per TD for a slow
   reader. The same stream carries a session committed or sealed (with its
   generation) or restored (with whether its processes came back), and a pool's
