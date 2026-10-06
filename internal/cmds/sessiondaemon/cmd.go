@@ -28,7 +28,7 @@ func NewCmd() *cobra.Command {
 }
 
 func newRunCmd() *cobra.Command {
-	var config string
+	var config, profile string
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run the daemon",
@@ -56,6 +56,9 @@ directory, and 'c8s session-daemon drain' ends them.`,
 				return err
 			}
 			defer ln.Close()
+			if profile != "" {
+				defer profileOnSignals(profile, log)()
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGTERM, syscall.SIGINT)
 			defer stop()
 			d := sessiond.New(cfg, runner, log)
@@ -73,6 +76,7 @@ directory, and 'c8s session-daemon drain' ends them.`,
 		},
 	}
 	cmd.Flags().StringVar(&config, "config", "", "the daemon's configuration file")
+	cmd.Flags().StringVar(&profile, "cpu-profile", "", "for a trial: write the daemon's CPU profile over each stretch from a SIGUSR1 to the SIGUSR2 that follows, to this path with .0, .1 and so on after it (go tool pprof)")
 	_ = cmd.MarkFlagRequired("config")
 	return cmd
 }
