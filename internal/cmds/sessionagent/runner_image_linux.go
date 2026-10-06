@@ -107,6 +107,9 @@ type ImageRunner struct {
 	ahead     map[string]*prestagedImage
 	stopAhead context.CancelFunc
 	aheadDone chan struct{}
+	// closing runs Close once, and closed is what it returned.
+	closing sync.Once
+	closed  error
 }
 
 // prestagedImage is an image unpacked before any sandbox was named.
@@ -1213,9 +1216,15 @@ func (r *ImageRunner) Dial(ctx context.Context, port int) (net.Conn, error) {
 	return sandboxNet.dial(ctx, port)
 }
 
-// Close ends the sandbox and releases its root filesystem. A guest never
-// needs it: it powers off with the agent.
+// Close ends the sandbox and releases its root filesystem, once: a later
+// call returns what the first did. A guest's agent closes its runner as it
+// ends, and the guest powers off after it.
 func (r *ImageRunner) Close() error {
+	r.closing.Do(func() { r.closed = r.close() })
+	return r.closed
+}
+
+func (r *ImageRunner) close() error {
 	r.mu.Lock()
 	stop, done := r.stopAhead, r.aheadDone
 	r.mu.Unlock()

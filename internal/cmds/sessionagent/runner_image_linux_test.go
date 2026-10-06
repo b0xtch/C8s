@@ -452,6 +452,43 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 	})
 }
 
+// A sandbox whose own process ends is known to have ended at once, and its
+// runner closes at once over it, with a command's process waiting in it or
+// without one: a guest's end waits on nothing of the runtime's.
+func TestImageSandboxEndIsKnownAtOnce(t *testing.T) {
+	for _, cold := range []bool{false, true} {
+		t.Run(map[bool]string{false: "a command's process waits", true: "none waits"}[cold], func(t *testing.T) {
+			c := newContainer(t, containerOptions{cold: cold, image: ocispec.ImageConfig{
+				Cmd: []string{"/bin/sh", "-c", "until [ -e /tmp/end ]; do sleep 0.01; done; exit 3"},
+			}})
+			c.start(t)
+			client := c.client(t, c.owner)
+			c.out(t, client, "true")
+			if !cold {
+				c.awaitWarm(t)
+			}
+			c.out(t, client, ": > /tmp/end")
+			began := time.Now()
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := c.runner.Wait(ctx); err == nil || !strings.Contains(err.Error(), "status 3") {
+				t.Fatalf("Wait = %v", err)
+			}
+			if took := time.Since(began); took > 500*time.Millisecond {
+				t.Errorf("the sandbox's end was known %s after the command that had its process end", took)
+			}
+			// What its guest then waits for before it ends.
+			began = time.Now()
+			if err := c.runner.Close(); err != nil {
+				t.Errorf("close runner: %v", err)
+			}
+			if took := time.Since(began); took > 500*time.Millisecond {
+				t.Errorf("the runner took %s to close over a sandbox that had ended", took)
+			}
+		})
+	}
+}
+
 // awaitWarm waits until a command's process waits in the sandbox for the
 // next command.
 func (c *container) awaitWarm(t *testing.T) {

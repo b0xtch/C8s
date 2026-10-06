@@ -82,14 +82,16 @@ func (g *processGroup) kill(p *os.Process) error {
 }
 
 // close removes the command's cgroup once the kernel has reaped its tasks.
+// A cgroup that is gone has none: a container's runtime removes the cgroups
+// below the container's when the container ends.
 func (g *processGroup) close() {
 	if g.dir == "" {
 		return
 	}
 	g.fd.Close()
 	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		events, _ := os.ReadFile(filepath.Join(g.dir, "cgroup.events"))
-		if strings.Contains(string(events), "populated 0") || time.Now().After(deadline) {
+		events, err := os.ReadFile(filepath.Join(g.dir, "cgroup.events"))
+		if err != nil || strings.Contains(string(events), "populated 0") || time.Now().After(deadline) {
 			break
 		}
 	}
