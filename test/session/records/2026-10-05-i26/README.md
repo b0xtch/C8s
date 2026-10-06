@@ -125,6 +125,12 @@ Each `env.txt` says so in its first line.
   are gathered at the end, and its `summary.txt` was made afterwards from
   its records by the same program. The first run's other two configurations
   followed it.
+- **Each daemon ran on its guests' CPUs.** The first line of each `env.txt`
+  lists the daemons with the programs that drive the rounds. That line is
+  wrong: the script started each side's daemon, and with it the daemon's
+  launchers, on the CPUs of that side's guests. The times are what the runs
+  took there. The method has since put the platform's own programs on CPUs
+  apart from the guests', and the script with it.
 - **The simulated TEE side protects nothing.** It is the method's second
   baseline: a development build under an authority made for the run.
 

@@ -94,6 +94,9 @@ cluster and what was deployed on it.
 - **`w24-m-pb`'s `clearing` record reads 0.** The kernel of that one console
   boot had not started its clock when it cleared its memory, so its log
   times nothing before that. The other seven read 2317 to 2381 ms.
+- **Each daemon ran on its guests' CPUs**, though the first line of each
+  `env.txt` lists the daemons with the programs that drive the rounds: the
+  line is wrong, as the first records say.
 - **The simulated TEE side protects nothing.**
 
 ## What these copies leave out
