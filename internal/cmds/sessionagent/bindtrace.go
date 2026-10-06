@@ -81,14 +81,18 @@ func (t *bindTrace) add(part string, d time.Duration) {
 	t.marks = append(t.marks, part+"_us", d.Microseconds())
 }
 
+// log says when the parts of the bind were done. What the bind cost is read
+// once, at the end of its call: the reading is work of its own, and none of
+// a bind's answers waits on it.
 func (t *bindTrace) log(log *slog.Logger) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	log.Info("a bind was served", append(t.marks, t.cost()...)...)
+	log.Info("a bind was served", t.marks...)
 }
 
 // ended logs what the bind's whole call cost: the bind, and what followed
-// its answer on the same call, such as the first command and the quote.
+// its answer on the same call, such as the first command and the quote. It
+// runs once the call's last answer is written.
 func (t *bindTrace) ended(log *slog.Logger) {
 	log.Info("a bind's call ended", append([]any{"took_us", time.Since(t.began).Microseconds()}, t.cost()...)...)
 }

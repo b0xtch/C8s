@@ -3,6 +3,9 @@
 package sessionagent
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -40,6 +43,25 @@ func TestBindTraceCostsWhatWasSpentSinceTheBind(t *testing.T) {
 	}
 	if ran, ok := cost[1].(int64); !ok || ran < 5000 {
 		t.Fatalf("the agent spun for 20 ms and its bind cost it %v us", cost[1])
+	}
+}
+
+// A bind's own line says when its parts were done and reads no cost. The
+// cost is read once, when the bind's call has ended, so that no answer on
+// the call waits on the reading.
+func TestBindTraceReadsItsCostAtTheCallsEnd(t *testing.T) {
+	var logged bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&logged, nil))
+	ctx, trace := withBindTrace(t.Context())
+	traced(ctx, "answered")
+	trace.log(log)
+	if line := logged.String(); !strings.Contains(line, `"answered_us"`) || strings.Contains(line, "_cpu_us") {
+		t.Fatalf("a bind's own line: %s", line)
+	}
+	logged.Reset()
+	trace.ended(log)
+	if line := logged.String(); !strings.Contains(line, `"took_us"`) || !strings.Contains(line, `"agent_cpu_us"`) || !strings.Contains(line, `"guest_idle_ms"`) {
+		t.Fatalf("the end of a bind's call: %s", line)
 	}
 }
 
