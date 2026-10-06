@@ -80,6 +80,13 @@ but not confidentiality.
 
 - **The host boots another image.** MRTD, RTMR[1] or RTMR[2] differ from the
   published pins, and every verifier refuses the evidence.
+- **A kernel the evidence does not show.** RTMR[1] and RTMR[2] show the kernel
+  a TD booted, and a session's kernel is built so that nothing loads another
+  kernel or adds code to it later: it has no loadable modules, no kexec, no
+  BPF system call, no /dev/mem or /proc/kcore, and its lockdown is forced to
+  confidentiality. Code that breaks out of its sandbox (A4) can change the
+  kernel only through a flaw in it, and the image's build refuses a kernel
+  configuration or command line that allows any of these.
 - **The host declares another machine.** RTMR[0] records the machine the host
   declared to the firmware: its vCPUs, its memory and how that is split, how
   many PCI functions it has, and the builds of its VMM and firmware. It does
