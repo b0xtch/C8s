@@ -40,6 +40,13 @@
 #                              consoles and hold each refusal to its reason
 #   C8S_SANDBOX_STORE          directory written by test/session/sandboximage;
 #                              a locked run needs it
+#   C8S_SESSION_OFFERED=0      leave out the check of what a guest takes of
+#                              KVM's paravirtual features, and the control of
+#                              it and of hardware.sh's. They need bpftrace
+#                              and a C compiler on the host
+#   C8S_KVM_OFFER              as for hardware.sh
+#   C8S_CONTROL_KERNEL         the kernel image that control boots (default:
+#                              the host's own, /boot/vmlinuz-<its release>)
 #   C8S_QUOTE_SOCKET, C8S_SESSION_CONFINE, C8S_ACCEPT_TCB, C8S_SESSION_PORT,
 #   C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                              as for hardware.sh; the quoting service and the
@@ -319,6 +326,14 @@ if ! serving "$probe_pid" "$probe_port"; then
 fi
 record PASS "a simulating session guest boots with no TEE and serves"
 printf '{"step":"session-boot","ms":%d}\n' $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
+# The agent serves only where its kernel's log says the kernel zeroes every
+# page it frees, as erasing the guest's one-time keys with their helper
+# rests on that. A development guest's console has the agent's lines on both.
+if [ "$dev" = 1 ]; then
+    check "the guest's agent read from its kernel that the kernel zeroes the memory it frees" \
+        grep -a -q -E '"msg":"the kernel zeroes the memory it frees","kernel":"mem auto-init: [^"]*heap free:on"' "$out/probe.log"
+    check "the guest's agent holds its one-time keys in a key helper" grep -a -q 'the one-time keys are held by a key helper' "$out/probe.log"
+fi
 expect 0 "the class's machine is read from its evidence" machine "$SIM" session launch-config machine --url "https://127.0.0.1:$probe_port" \
     --image-manifest "$manifest" --launch-key "$out/pool.key.pub" "${simulated[@]}"
 machine=$(tr -d '[:space:]' < "$out/machine.out")
@@ -328,6 +343,110 @@ if ! [[ $machine =~ ^[0-9a-f]{96}$ ]]; then
 fi
 check "two shapes are two machines" test "$machine" != "$ks_machine"
 stop_pid "$probe_pid"; probe_pid=""
+
+# What the guest's kernel takes of KVM's paravirtual features, as hardware.sh
+# checks of a TD: the guest is launched once more under a VMM that offers
+# every one, with every hint, and the host's own trace of that VMM says what
+# the guest was answered and what it then reached for. A guest with a
+# simulated TEE takes what a TD takes, so that the two differ by the
+# hardware and by nothing their kernel takes from its host.
+#
+# The control of both checks follows it: a kernel that is not this image's,
+# the host's own, booted under the same VMM with nothing to run, takes what
+# it is offered, and the same trace shows the MSRs it reaches for. A trace
+# that showed nothing there would show nothing of a guest either.
+offered() {
+    local dir vmm control_vmm="" trace=$out/offered.trace tracer launched calls others child
+    local control=${C8S_CONTROL_KERNEL:-/boot/vmlinuz-$(uname -r)}
+    dir=$(mktemp -d /tmp/c8s-offer.XXXXXX) || return 1
+    chmod 755 "$dir"
+    if ! cc -shared -fPIC -O2 -o "$dir/kvm-offer-all.so" "${C8S_KVM_OFFER:-$(dirname "$0")/kvmoffer/kvm-offer-all.c}" -ldl 2> "$out/offered-cc.err"; then
+        record FAIL "a VMM that offers every paravirtual feature is built" "$(tail -c 300 "$out/offered-cc.err" | tr '\n' ' ')"
+        rm -rf "${dir:?}"
+        return 1
+    fi
+    printf '#!/bin/sh\nLD_PRELOAD=%s/kvm-offer-all.so exec %s "$@"\n' "$dir" "$(command -v qemu-system-x86_64)" > "$dir/qemu"
+    chmod 755 "$dir/qemu" "$dir/kvm-offer-all.so"
+    sudo -n bpftrace -e '
+tracepoint:kvm:kvm_cpuid /args->function == 0x40000001/ { @leaf[pid, args->rax, args->rdx] = count(); }
+tracepoint:kvm:kvm_msr /args->ecx >= 0x4b564d00 && args->ecx <= 0x4b564dff/ { @msr[pid, args->ecx] = count(); }
+tracepoint:kvm:kvm_hypercall { @hypercall[pid, args->nr] = count(); }' > "$trace" 2> "$out/offered-trace.err" &
+    tracer=$!
+    for _ in $(seq 1 100); do
+        grep -q Attach "$trace" "$out/offered-trace.err" 2>/dev/null && break
+        kill -0 "$tracer" 2>/dev/null || break
+        sleep 0.1
+    done
+    sudo -n "$SIM" "${launcher[@]}" "${simulated[@]}" --qemu "$dir/qemu" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/offered-vm" \
+        --name "c8s-session-offered-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/offered.log" 2>&1 &
+    probe_pid=$!
+    launched=0
+    serving "$probe_pid" "$probe_port" && launched=1
+    vmm=$(pgrep -f "[q]emu-system.*guest=c8s-session-offered-$run" | head -1)
+    stop_pid "$probe_pid"; probe_pid=""
+    # The control has no root to mount: its kernel takes what it takes, finds
+    # nothing to run and stops, which ends its VMM.
+    if sudo -n test -r "$control"; then
+        sudo -n timeout 60 "$dir/qemu" -name "guest=c8s-offer-control-$run" -machine q35,accel=kvm -cpu host -smp 2 -m 512 \
+            -display none -monitor none -serial "file:$out/offered-control.console" -no-reboot \
+            -kernel "$control" -append "console=ttyS0 panic=-1" > "$out/offered-control.log" 2>&1 &
+        child=$!
+        for _ in $(seq 1 50); do
+            control_vmm=$(pgrep -f "[q]emu-system.*guest=c8s-offer-control-$run" | head -1)
+            [ -n "$control_vmm" ] && break
+            sleep 0.1
+        done
+        wait "$child" 2>/dev/null
+    fi
+    for child in $(pgrep -P "$tracer"); do sudo -n kill -INT "$child" 2>/dev/null; done
+    wait "$tracer" 2>/dev/null
+    rm -rf "${dir:?}"
+    if [ "$launched" != 1 ] || [ -z "$vmm" ]; then
+        record FAIL "a guest whose host offers it every paravirtual feature serves" "$(tail -c 600 "$out/offered.log" | tr '\n' ' ')"
+    else
+        record PASS "a guest whose host offers it every paravirtual feature serves"
+        # 4294967295 is every bit of a register.
+        if grep -q "^@leaf\[$vmm, 4294967295, 4294967295\]" "$trace"; then
+            record PASS "its host answered the feature leaf with every feature and every hint"
+        else
+            record FAIL "its host answered the feature leaf with every feature and every hint" "$(grep "^@leaf\[$vmm," "$trace" | tr '\n' ' ')"
+        fi
+        if grep -q "^@msr\[$vmm," "$trace"; then
+            record FAIL "the guest reached for no paravirtual MSR" "$(grep "^@msr\[$vmm," "$trace" | tr '\n' ' ')"
+        else
+            record PASS "the guest reached for no paravirtual MSR"
+        fi
+        # KVM's numbers: 5 kicks a halted vCPU, 10 sends an IPI, 11 asks for a
+        # vCPU to be run. A guest that boots sends IPIs to several vCPUs at
+        # once, which is what the hypercall is for.
+        calls=$(sed -n "s/^@hypercall\[$vmm, \([0-9]*\)\]: .*/\1/p" "$trace" | sort -n | tr '\n' ' ')
+        others=$(for nr in $calls; do case "$nr" in 5|10|11) ;; *) printf '%s ' "$nr" ;; esac; done)
+        if [ -z "$others" ] && [[ " $calls" == *" 10 "* ]]; then
+            record PASS "it sent IPIs by its host's hypercall, and its other hypercalls kicked a vCPU or asked for one to be run" "numbers $calls"
+        else
+            record FAIL "it sent IPIs by its host's hypercall, and its other hypercalls kicked a vCPU or asked for one to be run" "numbers ${calls:-none}"
+        fi
+    fi
+    if [ -z "$control_vmm" ] || ! grep -q "^@leaf\[$control_vmm, 4294967295, 4294967295\]" "$trace"; then
+        record FAIL "the control, the host's own kernel as a guest, is offered every paravirtual feature" \
+            "$control (C8S_CONTROL_KERNEL names another): $(grep "^@leaf\[${control_vmm:-none}," "$trace" | tr '\n' ' ') $(tail -c 300 "$out/offered-control.log" 2>/dev/null | tr '\n' ' ')"
+        return 1
+    fi
+    record PASS "the control, the host's own kernel as a guest, is offered every paravirtual feature"
+    if grep -q "^@msr\[$control_vmm," "$trace"; then
+        record PASS "it takes them, and the host's trace shows the MSRs it reaches for" \
+            "$(sed -n "s/^@msr\[$control_vmm, \([0-9]*\)\]: .*/\1/p" "$trace" | sort -n | while read -r msr; do printf '0x%x ' "$msr"; done)"
+    else
+        record FAIL "it takes them, and the host's trace shows the MSRs it reaches for" "none seen"
+    fi
+}
+if [ "${C8S_SESSION_OFFERED:-1}" = 0 ]; then
+    echo "== LEFT OUT: what a guest takes of the paravirtual features a host offers, and its control (C8S_SESSION_OFFERED=0)"
+elif ! command -v bpftrace > /dev/null || ! command -v cc > /dev/null; then
+    record FAIL "the host can offer a guest every paravirtual feature and trace what it takes" "it needs bpftrace and a C compiler: C8S_SESSION_OFFERED=0 leaves the check out"
+else
+    offered
+fi
 expect 0 "a pool bundle that lists its machine" bundle "$SIM" session launch-config new --out "$out/bundle" "${pool_doc[@]}" --machine "$machine"
 
 # A launcher declares the registers of the files it boots, and of no others.

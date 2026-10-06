@@ -67,6 +67,17 @@
 #                            nothing. A binder names the key service's
 #                            replica it judged in its bind, and a guest
 #                            takes no bind that names another.
+#   C8S_SESSION_OFFERED=0    leave out the check of what a guest takes of
+#                            KVM's paravirtual features from a host that
+#                            offers all of them. The check needs bpftrace
+#                            and a C compiler on the host
+#   C8S_KVM_OFFER            the source of the preload that makes a VMM offer
+#                            them all (default: kvmoffer/kvm-offer-all.c
+#                            beside this script)
+#   C8S_SESSION_WAITERS=0    leave out the check of how a vCPU that waits
+#                            for a lock is woken. It needs bpftrace, and a
+#                            host kernel whose KVM modules carry their types
+#                            (BTF)
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -361,7 +372,99 @@ if [ "$code" = 409 ] && grep -q fenced "$out/sealed-raw.out"; then
 else
     record FAIL "a guest that no bind has reached reads no sealed message" "HTTP $code: $(head -c 300 "$out/sealed-raw.out" | tr '\n' ' ')"
 fi
+# A guest's one-time keys live in a helper process and are gone when it
+# exits, because the kernel zeroes every page it frees. The agent reads the
+# kernel's own word on that from the kernel's log before it starts a helper,
+# and serves only if the word is that it does: so every guest that serves
+# here was told so. A development guest's console has the agent's lines on
+# both. A locked guest says neither where its host could read it.
+if [ "$dev" = 1 ]; then
+    check "the guest's agent read from its kernel that the kernel zeroes the memory it frees" \
+        grep -a -q -E '"msg":"the kernel zeroes the memory it frees","kernel":"mem auto-init: [^"]*heap free:on"' "$out/probe.log"
+    check "the guest's agent holds its one-time keys in a key helper" grep -a -q 'the one-time keys are held by a key helper' "$out/probe.log"
+fi
 stop_pid "$probe_pid"; probe_pid=""
+
+# What the guest's kernel takes of KVM's paravirtual features. A TD's host
+# answers the CPUID leaf that offers them, so the same guest is launched once
+# more under a VMM that offers every one, the clock, steal time and the rest
+# with every hint, and the host's own trace of that VMM says what the guest
+# was answered and what it then reached for: the MSRs those features are
+# taken through, and its hypercalls. It may send an IPI, kick a halted vCPU
+# and ask for a vCPU to be run, and nothing else. simtee.sh makes the same
+# check of a guest with a simulated TEE and holds the control of both: a
+# kernel that is not this image's, under the same VMM, is seen to take what
+# it is offered.
+offered() {
+    local dir vmm trace=$out/offered.trace tracer launched
+    dir=$(mktemp -d /tmp/c8s-offer.XXXXXX) || return 1
+    chmod 755 "$dir"
+    if ! cc -shared -fPIC -O2 -o "$dir/kvm-offer-all.so" "${C8S_KVM_OFFER:-$(dirname "$0")/kvmoffer/kvm-offer-all.c}" -ldl 2> "$out/offered-cc.err"; then
+        record FAIL "a VMM that offers every paravirtual feature is built" "$(tail -c 300 "$out/offered-cc.err" | tr '\n' ' ')"
+        rm -rf "${dir:?}"
+        return 1
+    fi
+    # The launcher starts this in the VMM's place: the VMM with the offer
+    # preloaded, as whichever user the launcher confines its VMM to.
+    printf '#!/bin/sh\nLD_PRELOAD=%s/kvm-offer-all.so exec %s "$@"\n' "$dir" "$(command -v qemu-system-x86_64)" > "$dir/qemu"
+    chmod 755 "$dir/qemu" "$dir/kvm-offer-all.so"
+    sudo -n bpftrace -e '
+tracepoint:kvm:kvm_cpuid /args->function == 0x40000001/ { @leaf[pid, args->rax, args->rdx] = count(); }
+tracepoint:kvm:kvm_msr /args->ecx >= 0x4b564d00 && args->ecx <= 0x4b564dff/ { @msr[pid, args->ecx] = count(); }
+tracepoint:kvm:kvm_hypercall { @hypercall[pid, args->nr] = count(); }' > "$trace" 2> "$out/offered-trace.err" &
+    tracer=$!
+    for _ in $(seq 1 100); do
+        grep -q Attach "$trace" "$out/offered-trace.err" 2>/dev/null && break
+        kill -0 "$tracer" 2>/dev/null || break
+        sleep 0.1
+    done
+    sudo -n "$C8S" "${launcher[@]}" --qemu "$dir/qemu" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/offered-vm" \
+        --name "c8s-session-offered-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/offered.log" 2>&1 &
+    probe_pid=$!
+    launched=0
+    serving "$probe_pid" "$probe_port" && launched=1
+    vmm=$(pgrep -f "[q]emu-system.*guest=c8s-session-offered-$run" | head -1)
+    stop_pid "$probe_pid"; probe_pid=""
+    for child in $(pgrep -P "$tracer"); do sudo -n kill -INT "$child" 2>/dev/null; done
+    wait "$tracer" 2>/dev/null
+    rm -rf "${dir:?}"
+    if [ "$launched" != 1 ] || [ -z "$vmm" ]; then
+        record FAIL "a guest whose host offers it every paravirtual feature serves" "$(tail -c 600 "$out/offered.log" | tr '\n' ' ')"
+        return 1
+    fi
+    record PASS "a guest whose host offers it every paravirtual feature serves"
+    # 4294967295 is every bit of a register.
+    if grep -q "^@leaf\[$vmm, 4294967295, 4294967295\]" "$trace"; then
+        record PASS "its host answered the feature leaf with every feature and every hint"
+    else
+        record FAIL "its host answered the feature leaf with every feature and every hint" "$(grep "^@leaf\[$vmm," "$trace" | tr '\n' ' ')"
+    fi
+    if grep -q "^@msr\[$vmm," "$trace"; then
+        record FAIL "the guest reached for no paravirtual MSR" "$(grep "^@msr\[$vmm," "$trace" | tr '\n' ' ')"
+    else
+        record PASS "the guest reached for no paravirtual MSR"
+    fi
+    # KVM's numbers: 5 kicks a halted vCPU, 10 sends an IPI, 11 asks for a
+    # vCPU to be run. A guest that boots sends IPIs to several vCPUs at once,
+    # which is what the hypercall is for; whether it kicks one or asks for
+    # one to be run goes by what its vCPUs wait for, which the check of a
+    # session's waiters below sees to.
+    local calls others
+    calls=$(sed -n "s/^@hypercall\[$vmm, \([0-9]*\)\]: .*/\1/p" "$trace" | sort -n | tr '\n' ' ')
+    others=$(for nr in $calls; do case "$nr" in 5|10|11) ;; *) printf '%s ' "$nr" ;; esac; done)
+    if [ -z "$others" ] && [[ " $calls" == *" 10 "* ]]; then
+        record PASS "it sent IPIs by its host's hypercall, and its other hypercalls kicked a vCPU or asked for one to be run" "numbers $calls"
+    else
+        record FAIL "it sent IPIs by its host's hypercall, and its other hypercalls kicked a vCPU or asked for one to be run" "numbers ${calls:-none}"
+    fi
+}
+if [ "${C8S_SESSION_OFFERED:-1}" = 0 ]; then
+    echo "== LEFT OUT: what a guest takes of the paravirtual features a host offers (C8S_SESSION_OFFERED=0)"
+elif ! command -v bpftrace > /dev/null || ! command -v cc > /dev/null; then
+    record FAIL "the host can offer a guest every paravirtual feature and trace what it takes" "it needs bpftrace and a C compiler: C8S_SESSION_OFFERED=0 leaves the check out"
+else
+    offered
+fi
 
 expect 0 "the pool's launch bundle, which pins the key service and lists the machine" bundle "$C8S" session launch-config new --out "$out/bundle" \
     --key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --machine "$machine"
@@ -782,6 +885,127 @@ expect 0 "verify s1 with a fresh quote" verify "$C8S" session verify "${s1[@]}" 
 check "the fresh quote confirms the receipt kept with the binding" [ "$(said verify receipt)" = True ]
 expect 0 "verify s1 with collateral from Intel alone" verify-own "$C8S" session verify "${s1[@]}" --own-collateral-only --collateral-cache "$out/cache-own"
 expect 0 "a command under the kept verdict" exec-kept "$C8S" session exec "${s1[@]}" -- true
+
+# Where the agent runs and what it weighs. A command on the guest's own file
+# system sees the guest's processes and cgroups, which a sandbox's does not,
+# so this is asked of a development guest without a sandbox image: every
+# thread of the agent keeps to the guest's first processor, the command has
+# all of them, the agent's cgroup outweighs the command's a hundred to one
+# on the processor they share, and the helper that held the guest's one-time
+# keys is gone.
+if [ "$dev" = 1 ] && [ -z "$store_dir" ]; then
+    expect 0 "a command reads where the agent runs and what it weighs" placed "$C8S" session exec "${s1[@]}" -- sh -c '
+for p in /proc/[0-9]*; do
+    [ "$(cat "$p/comm" 2> /dev/null)" = c8s-session-gue ] || continue
+    for t in "$p"/task/*; do grep Cpus_allowed_list "$t/status"; done
+done | sort -u | tr -d "[:space:]"; echo
+grep Cpus_allowed_list /proc/self/status | tr -d "[:space:]"; echo
+cat /sys/fs/cgroup/c8s-session/agent/cpu.weight
+grep -l "one-time-key[s]" /proc/[0-9]*/cmdline 2> /dev/null | wc -l'
+    check "every thread of the agent keeps to the guest's first processor" [ "$(sed -n 1p "$out/placed.out")" = "Cpus_allowed_list:0" ]
+    check "a command has every processor of the guest" [ "$(sed -n 2p "$out/placed.out")" = "Cpus_allowed_list:0-3" ]
+    check "the agent's cgroup outweighs a command's a hundred to one" [ "$(sed -n 3p "$out/placed.out")" = 10000 ]
+    check "no key helper runs in a guest that is bound" [ "$(sed -n 4p "$out/placed.out" | tr -d '[:space:]')" = 0 ]
+fi
+
+# A vCPU that waits for a lock halts, and the vCPU that frees the lock kicks
+# it. A lock taken with interrupts off is waited for with them off, and a
+# TD's halt tells its host which they are, as the host cannot see: told they
+# are on, the host ends the halt for an interrupt that is pending and that
+# the waiter cannot take, and the waiter halts and comes straight back for
+# as long as it waits. So s1's guest is kept to one CPU of the host's, where
+# a vCPU that holds a lock is soon descheduled with it, a command in it
+# keeps four vCPUs at the kernel's locks, and the host's trace of its VMM
+# says how each halt with interrupts off ended: at a kick that named its
+# vCPU, or at an interrupt delivered after the vCPU last went in. One that
+# ended at neither was ended for what was pending. The same trace holds the
+# guest's hypercalls: on one CPU it kicks vCPUs and asks for vCPUs to be
+# run.
+waiters() {
+    local td vmm mask cpu trace=$out/waiters.trace tracer n child
+    td=$(said start-s1 td)
+    vmm=$(pgrep -f "[q]emu-system.*guest=$td" | head -1)
+    if [ -z "$td" ] || [ -z "$vmm" ]; then
+        record FAIL "s1's VMM is found" "TD ${td:-unnamed}"
+        return 1
+    fi
+    mask=$(sudo -n taskset -p "$vmm" | sed 's/.*: //')
+    cpu=$(sudo -n taskset -cp "$vmm" | grep -oE '[0-9]+$')
+    # The halt is KVM's own routine for one. r12 of a TD's halt is its word
+    # on its interrupts: not zero when they are off.
+    sudo -n bpftrace -e '
+fentry:kvm:kvm_emulate_halt_noskip /pid == $1/ {
+    $v = (uint64)args->vcpu->vcpu_id;
+    @halting[$v] = 1;
+    if (((struct vcpu_tdx *)args->vcpu)->vp_enter_args.r12 != 0) { @off[$v] = 1; @halts["off"] = count(); }
+    else { @halts["on"] = count(); }
+}
+fentry:kvm_intel:tdx_deliver_interrupt /args->apic->vcpu->kvm->userspace_pid == $1/ {
+    @new[(uint64)args->apic->vcpu->vcpu_id] = 1;
+}
+tracepoint:kvm:kvm_hypercall /pid == $1/ {
+    @hypercall[args->nr] = count();
+    if (args->nr == 5) { @kick[(uint64)args->a1] = 1; }
+}
+tracepoint:kvm:kvm_entry /pid == $1/ {
+    $v = (uint64)args->vcpu_id;
+    if (@halting[$v]) {
+        if (@off[$v]) {
+            if (@kick[$v]) { @ended["kick"] = count(); }
+            else if (@new[$v]) { @ended["interrupt"] = count(); }
+            else { @ended["neither"] = count(); }
+        }
+        @kick[$v] = 0;
+    }
+    @halting[$v] = 0; @off[$v] = 0; @new[$v] = 0;
+}
+END { clear(@halting); clear(@off); clear(@new); clear(@kick); }' "$vmm" > "$trace" 2> "$out/waiters-trace.err" &
+    tracer=$!
+    for _ in $(seq 1 100); do
+        grep -q Attach "$trace" "$out/waiters-trace.err" 2>/dev/null && break
+        kill -0 "$tracer" 2>/dev/null || break
+        sleep 0.1
+    done
+    if ! kill -0 "$tracer" 2>/dev/null; then
+        record FAIL "the host traces the halts of s1's guest" "$(tail -c 400 "$out/waiters-trace.err" | tr '\n' ' ')"
+        return 1
+    fi
+    sudo -n taskset -a -cp "$cpu" "$vmm" > /dev/null
+    expect 0 "a command keeps four vCPUs of s1 at the kernel's locks, on one CPU of the host's" squeeze "$C8S" session exec "${s1[@]}" -- \
+        sh -c 'pids=; for n in 1 2 3 4; do (while :; do dd if=/dev/zero of=/dev/null bs=16M count=1 2> /dev/null; done) & pids="$pids $!"; done; sleep 5; kill $pids; echo squeezed'
+    sudo -n taskset -a -p "$mask" "$vmm" > /dev/null
+    for child in $(pgrep -P "$tracer"); do sudo -n kill -INT "$child" 2>/dev/null; done
+    wait "$tracer" 2>/dev/null
+    traced() { sed -n "s/^@$1\[$2\]: \([0-9]*\)$/\1/p" "$trace" | head -1; }
+    n=$(traced halts off)
+    if [ "${n:-0}" -gt 0 ]; then
+        record PASS "its vCPUs halted with interrupts off, and said so" "$n halts, and $(traced halts on) with them on"
+    else
+        record FAIL "its vCPUs halted with interrupts off, and said so" "$(grep '^@halts' "$trace" | tr '\n' ' ')"
+    fi
+    if [ "${n:-0}" -gt 0 ] && [ -z "$(traced ended neither)" ] && [ "$(traced ended kick)" -gt 0 ] 2>/dev/null; then
+        record PASS "each of those halts ended at a kick or at an interrupt that came after it" "kicks $(traced ended kick), interrupts $(traced ended interrupt)"
+    else
+        record FAIL "each of those halts ended at a kick or at an interrupt that came after it" "$(grep '^@ended' "$trace" | tr '\n' ' ')"
+    fi
+    # KVM's numbers, as above. Kept to one CPU, the guest kicks and asks:
+    # whether it also sends an IPI to several vCPUs at once is chance.
+    local calls others
+    calls=$(sed -n 's/^@hypercall\[\([0-9]*\)\]: .*/\1/p' "$trace" | sort -n | tr '\n' ' ')
+    others=$(for nr in $calls; do case "$nr" in 5|10|11) ;; *) printf '%s ' "$nr" ;; esac; done)
+    if [ -z "$others" ] && [[ " $calls" == *" 5 "* ]] && [[ " $calls" == *" 11 "* ]]; then
+        record PASS "the guest kicked vCPUs and asked for vCPUs to be run, and made no hypercall but those and the one that sends an IPI" "numbers $calls"
+    else
+        record FAIL "the guest kicked vCPUs and asked for vCPUs to be run, and made no hypercall but those and the one that sends an IPI" "numbers ${calls:-none}"
+    fi
+}
+if [ "${C8S_SESSION_WAITERS:-1}" = 0 ]; then
+    echo "== LEFT OUT: how a guest's vCPU that waits for a lock is woken (C8S_SESSION_WAITERS=0)"
+elif ! command -v bpftrace > /dev/null; then
+    record FAIL "the host can trace a guest's halts" "it needs bpftrace: C8S_SESSION_WAITERS=0 leaves the check out"
+else
+    waiters
+fi
 
 # What a live session refuses.
 expect 2 "verify refuses another image" verify-image "$C8S" session verify --binding "$out/s1" --image-manifest "$out/manifest-other.json" "${accept[@]}"
