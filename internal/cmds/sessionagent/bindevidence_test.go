@@ -209,8 +209,8 @@ func awaitQuotes(t *testing.T, tee *quotingTEE, n int) [][]byte {
 // the guest takes the evidence its sender would have asked for next: it comes
 // with the answer or with the guest's state. The sender judges it, holds it
 // to the receipt, and is the bound guest's client from then on: one
-// connection, no attestation request, and the quote for it taken ahead of the
-// one the reissued serving certificate needs.
+// connection and no attestation request. The guest quotes once for its bind
+// and issues no certificate on account of it.
 func TestBindIsAnsweredWithItsOwnEvidence(t *testing.T) {
 	p, tee, log := quoted(t)
 	// Before the bind the client asks nothing of a tenant: there is none.
@@ -242,11 +242,16 @@ func TestBindIsAnsweredWithItsOwnEvidence(t *testing.T) {
 		t.Fatalf("the client's steps: %s", taken.list())
 	}
 
-	// Two quotes: the answer's, for a nonce, and then the certificate's.
-	asked := awaitQuotes(t, tee, before+2)[before:]
+	// One quote: the answer's, for a nonce. The certificate from before the
+	// bind is served on, so none is taken for another.
+	asked := awaitQuotes(t, tee, before+1)[before:]
 	certificate := certificateQuote(t, ready.InstanceKey.(*ecdsa.PublicKey))
-	if len(asked) != 2 || slices.Equal(asked[0], certificate) || !slices.Equal(asked[1], certificate) {
-		t.Fatalf("the guest's quotes after the bind: %d, the certificate's first: %v", len(asked), slices.Equal(asked[0], certificate))
+	if len(asked) != 1 || slices.Equal(asked[0], certificate) {
+		t.Fatalf("the guest's quotes after the bind: %d, a certificate's among them: %v", len(asked), slices.ContainsFunc(asked, func(q []byte) bool { return slices.Equal(q, certificate) }))
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tee.quotes()) - before; n != 1 {
+		t.Fatalf("the guest took %d quotes on account of its bind, and one is the bind's", n)
 	}
 
 	// The evidence is an attestation by this client: a credential leaves on
@@ -258,7 +263,7 @@ func TestBindIsAnsweredWithItsOwnEvidence(t *testing.T) {
 	if err != nil || string(out.Stdout) != "s3cr3t" {
 		t.Fatalf("exec = %+v, %v", out, err)
 	}
-	if n := len(tee.quotes()); n != before+2 || taken.count(session.TimedDial) != 1 {
+	if n := len(tee.quotes()); n != before+1 || taken.count(session.TimedDial) != 1 {
 		t.Fatalf("%d quotes and %d dials after a credential and a command", n-before, taken.count(session.TimedDial))
 	}
 
@@ -343,12 +348,10 @@ func TestBindQuoteThatFailsIsTakenAgain(t *testing.T) {
 	if !log.has(withoutEvidence) {
 		t.Fatal("the agent did not say that an attempt gave no quote")
 	}
-	// The failed attempt, the certificate's quote, and the second attempt:
-	// both attempts are for the bind's nonce.
-	asked := awaitQuotes(t, tee, before+3)[before:]
-	certificate := certificateQuote(t, ready.InstanceKey.(*ecdsa.PublicKey))
-	if !slices.Equal(asked[0], asked[2]) || !slices.Equal(asked[1], certificate) {
-		t.Fatal("the guest's quotes after the bind are not the bind's, the certificate's and the bind's again")
+	// The failed attempt and the second one, both for the bind's nonce.
+	asked := awaitQuotes(t, tee, before+2)[before:]
+	if len(asked) != 2 || !slices.Equal(asked[0], asked[1]) {
+		t.Fatalf("the guest's quotes after the bind are not the bind's and the bind's again: %d", len(asked))
 	}
 }
 

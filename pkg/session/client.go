@@ -919,7 +919,7 @@ func (c *Client) FetchEvidence(ctx context.Context) (*Evidence, error) {
 		}
 	}
 	if err != nil {
-		return nil, err
+		return nil, c.anotherGuest(ctx, err)
 	}
 	if state == nil || len(state.PeerCertificates) == 0 {
 		return nil, refuse("attestation response did not arrive over a verified TLS connection")
@@ -931,6 +931,28 @@ func (c *Client) FetchEvidence(ctx context.Context) (*Evidence, error) {
 		return nil, fmt.Errorf("encode instance key: %w", err)
 	}
 	return &Evidence{Nonce: nonce, InstanceKey: der, Response: resp, leaf: state.PeerCertificates[0]}, nil
+}
+
+// anotherGuest makes a verdict of a guest's refusal of this client's token,
+// where the guest says in its public state that it took another bind than
+// the one this client holds it to: it is another guest than the binding's.
+// Its handshake cannot tell: a bound guest serves the certificate it had
+// before its bind, as every guest of its pool does. What a guest says of
+// itself there is taken only as grounds to refuse it.
+func (c *Client) anotherGuest(ctx context.Context, refused error) error {
+	var status *StatusError
+	pinned := c.required().Bind
+	if !errors.As(refused, &status) || status.Status != http.StatusUnauthorized || len(pinned) == 0 {
+		return refused
+	}
+	var state StateResponse
+	if _, err := c.send(ctx, http.MethodGet, PathState, nil, &state, false); err != nil {
+		return refused
+	}
+	if len(state.Bind) == 0 || bytes.Equal(state.Bind, pinned) {
+		return refused
+	}
+	return refuse("the guest at this address took another bind than the one it is held to, and is another guest: %w", refused)
 }
 
 // Attest fetches evidence for a fresh nonce and runs the trust gate on it. On

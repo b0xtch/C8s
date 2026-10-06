@@ -15,6 +15,7 @@ import (
 
 	agratls "github.com/confidential-dot-ai/attestation-go/ratls"
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
 	"github.com/confidential-dot-ai/c8s/internal/sessiontest"
 	"github.com/confidential-dot-ai/c8s/pkg/ratls"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -298,10 +299,15 @@ func TestKeptReceiptIsHeldToTheCertificateFromBeforeTheBind(t *testing.T) {
 }
 
 // The real guest, end to end: the certificate it serves before its bind
-// carries its one-time keys; it signs its receipt under the first, keeps
-// serving that certificate with its state, and issues its next without them.
+// carries its one-time keys; it signs its receipt under the first and keeps
+// serving that certificate, at its handshakes and with its state. Its bind is
+// no reason to issue another: the next one comes when that one's time is
+// half up, and carries no one-time keys.
 func TestGuestServesItsCertificateFromBeforeTheBind(t *testing.T) {
-	s := serveReady(t, sessiontest.NewTD())
+	// A certificate short enough for the test to see the next one.
+	const lifetime = 4 * time.Second
+	s := serveReady(t, sessiontest.NewTD(), func(cfg *sessionagent.Config) { cfg.CertTTL = lifetime })
+	issued := time.Now()
 	engine := sessiontest.Engine{}
 	before := relayedState(t, s)
 	ready, err := session.VerifyReady(within(t), s.policy, engine, before, time.Now())
@@ -342,8 +348,9 @@ func TestGuestServesItsCertificateFromBeforeTheBind(t *testing.T) {
 		t.Fatalf("the receipt, held to the certificate the guest serves from before its bind: %v", err)
 	}
 
-	// The certificate it issues once it is bound carries no one-time keys,
-	// and is none a receipt is held to.
+	// The bound guest serves the certificate from before its bind until
+	// that one is due to be replaced. The one it issues then carries no
+	// one-time keys, and is none a receipt is held to.
 	var after []byte
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
 		after = relay(t, s, http.MethodGet, session.PathState, nil, new(session.StateResponse))
@@ -353,6 +360,9 @@ func TestGuestServesItsCertificateFromBeforeTheBind(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("the bound guest never issued a certificate of its own")
 		}
+	}
+	if early := lifetime/2 - time.Since(issued); early > 0 {
+		t.Fatalf("the bound guest issued a certificate %s before the one from before its bind was due to be replaced", early)
 	}
 	leaf, err := x509.ParseCertificate(after)
 	if err != nil {

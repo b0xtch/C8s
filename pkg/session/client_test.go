@@ -61,7 +61,7 @@ type served struct {
 
 // serveReady boots a guest of a pool of its own and serves its agent. Nobody
 // has bound it.
-func serveReady(t *testing.T, td *sessiontest.TD) *served {
+func serveReady(t *testing.T, td *sessiontest.TD, with ...func(*sessionagent.Config)) *served {
 	t.Helper()
 	dir, bundle := newBundle(t, td, nil)
 	td.SeedLaunchKey(bundle.LaunchKey)
@@ -71,11 +71,15 @@ func serveReady(t *testing.T, td *sessiontest.TD) *served {
 	if err != nil {
 		t.Fatal(err)
 	}
-	agent, err := sessionagent.Stage(context.Background(), sessionagent.Config{
+	cfg := sessionagent.Config{
 		Platform: "tdx", PubkeyPath: filepath.Join(dir, session.OpkeyDir, session.PubkeyFile),
 		LaunchDir: filepath.Join(dir, session.OpkeyDir), CredentialDir: credDir,
 		TEE: sessiontest.TEE{TD: td}, Runner: runner, Logger: slog.New(s.refused), Bare: true,
-	})
+	}
+	for _, set := range with {
+		set(&cfg)
+	}
+	agent, err := sessionagent.Stage(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

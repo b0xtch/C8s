@@ -569,16 +569,6 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 			quote = <-evidence
 			a.keepBindQuote(quote)
 		}
-		// The serving certificate's quote predates the last extend; reissue
-		// it so a handshake alone shows the final register. A certificate
-		// from before passes a verifier's handshake too, so nobody waits for
-		// this one, and it follows the bind's quote: the quoting service
-		// takes one request of a guest at a time.
-		if a.certs.CertReady() {
-			if err := a.certs.SwapProvider(ctx, a.provider()); err != nil {
-				a.log.Warn("reissue serving certificate after sandbox admission", "error", err)
-			}
-		}
 		if quote == nil {
 			a.keepBindQuote(a.bindEvidenceAgain(ctx, bind, events))
 			// Whoever waits for the quote is told there is none to wait for.
@@ -1121,37 +1111,48 @@ type instanceProvider struct {
 	key *ecdsa.PrivateKey
 	tee TEE
 	ttl time.Duration
-	// oneTime are the guest's one-time keys, for a certificate from before
-	// its bind: the certificate carries them, and its quote binds them
-	// beside the instance key. Nil from the bind on.
-	oneTime *session.OneTimeKeys
+	// oneTime says, as each certificate is issued, which one-time keys it
+	// carries: the guest's until its bind, when the certificate carries them
+	// and its quote binds them beside the instance key, and none from the
+	// bind on.
+	oneTime func() *session.OneTimeKeys
 	// seen, when set, is shown the evidence a certificate is issued over,
 	// and issued the certificate.
 	seen   func(teetypes.AttestationEvidence)
 	issued func(der []byte)
 }
 
-// provider issues the guest's certificates as its state has them: under its
-// one-time keys until its bind is measured, and under the instance key alone
-// from then on.
+// provider issues the guest's certificates as its state has them when each
+// is issued: under its one-time keys until its bind is measured, and under
+// the instance key alone from then on. A bind is no reason to issue one: the
+// certificate from before it is served until its time is up.
 func (a *Agent) provider() *instanceProvider {
-	p := &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL}
+	return &instanceProvider{key: a.key, tee: a.tee, ttl: a.cfg.CertTTL, oneTime: a.unboundKeys}
+}
+
+// unboundKeys is the guest's one-time keys while it has no bind, and nil
+// from its bind on.
+func (a *Agent) unboundKeys() *session.OneTimeKeys {
 	a.measured.RLock()
 	defer a.measured.RUnlock()
-	if a.bind == nil {
-		p.oneTime = &a.oneTime.public
+	if a.bind != nil {
+		return nil
 	}
-	return p
+	return &a.oneTime.public
 }
 
 func (p *instanceProvider) Provision(ctx context.Context) (*tls.Certificate, time.Duration, error) {
-	rd, err := session.CertificateReportData(&p.key.PublicKey, p.oneTime)
+	var oneTime *session.OneTimeKeys
+	if p.oneTime != nil {
+		oneTime = p.oneTime()
+	}
+	rd, err := session.CertificateReportData(&p.key.PublicKey, oneTime)
 	if err != nil {
 		return nil, 0, err
 	}
 	var carried []pkix.Extension
-	if p.oneTime != nil {
-		ext, err := p.oneTime.Extension()
+	if oneTime != nil {
+		ext, err := oneTime.Extension()
 		if err != nil {
 			return nil, 0, err
 		}
