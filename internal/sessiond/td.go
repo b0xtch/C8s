@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/fileutil"
@@ -131,6 +133,41 @@ type td struct {
 	// asksNext the one that waits for it to end: see asked. Either is nil
 	// when there is none.
 	asking, asksNext *asked
+	// saves counts the saves of the record that were asked for. disk guards
+	// the record's file and written, the number of the last save that
+	// reached it: a save that comes to the file after a later one is
+	// dropped. Neither is the daemon's lock's to guard.
+	saves   uint64
+	disk    sync.Mutex
+	written uint64
+}
+
+// kept is a TD's record as it stood when a save of it was asked for, and
+// which save that was.
+type kept struct {
+	rec record
+	n   uint64
+}
+
+// snapshot copies the TD's record for a save. The caller holds the daemon's
+// lock, and may write the copy once it no longer does.
+func (t *td) snapshot() kept {
+	t.saves++
+	rec := t.rec
+	if t.rec.Claim != nil {
+		claim := *t.rec.Claim
+		rec.Claim = &claim
+	}
+	if t.rec.Bind != nil {
+		bind := *t.rec.Bind
+		rec.Bind = &bind
+	}
+	if t.rec.Ended != nil {
+		end := *t.rec.Ended
+		rec.Ended = &end
+	}
+	rec.Released = slices.Clone(t.rec.Released)
+	return kept{rec: rec, n: t.saves}
 }
 
 // serves notes what a ready guest said of itself, and the certificate it
@@ -162,14 +199,30 @@ func newID() (string, error) {
 func (d *Daemon) dir(id string) string { return filepath.Join(d.cfg.StateDir, "tds", id) }
 
 // save writes the TD's record. The caller holds the lock.
-func (d *Daemon) save(t *td) error {
-	data, err := json.Marshal(&t.rec)
+func (d *Daemon) save(t *td) error { return d.write(t, t.snapshot()) }
+
+// write puts a snapshot of a TD's record in its file, unless a later one is
+// there already. It takes no lock of the daemon's: a record that holds a
+// bind's answer is the slow part of a bind to encode and write, and with it
+// under the daemon's lock every bind of a burst waited for every other's.
+func (d *Daemon) write(t *td, k kept) error {
+	data, err := json.Marshal(&k.rec)
 	if err != nil {
 		return err
 	}
-	if err := fileutil.WriteAtomic(filepath.Join(d.dir(t.rec.ID), recordFile), data, 0o600); err != nil {
-		return fmt.Errorf("keep the record of %s: %w", t.rec.ID, err)
+	t.disk.Lock()
+	defer t.disk.Unlock()
+	if k.n <= t.written {
+		return nil
 	}
+	writeFile := fileutil.WriteAtomic
+	if other := d.writeFile.Load(); other != nil {
+		writeFile = *other
+	}
+	if err := writeFile(filepath.Join(d.dir(k.rec.ID), recordFile), data, 0o600); err != nil {
+		return fmt.Errorf("keep the record of %s: %w", k.rec.ID, err)
+	}
+	t.written = k.n
 	return nil
 }
 

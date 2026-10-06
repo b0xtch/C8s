@@ -252,6 +252,66 @@ func TestSessionStartsFromThePool(t *testing.T) {
 	}
 }
 
+// A record on its way to the disk holds up no other TD's bind: the daemon
+// writes it with its lock free, both the record that a bind was sent and the
+// record of its answer. The bind it belongs to waits for each.
+func TestSlowRecordHoldsUpNoOtherBind(t *testing.T) {
+	h := newHost(t, 3, nil)
+	o := newOwner(t)
+	c := h.AsOrchestrator()
+	claim := func(name string) *daemon.Claimed {
+		t.Helper()
+		claimed, err := c.Claim(ctx(t), requestID(t), sessiondtest.Pool, name, 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claimed
+	}
+	names := []string{"first", "second"}
+	slow, others := claim("slow"), []*daemon.Claimed{claim(names[0]), claim(names[1])}
+	reached, next, release := h.Daemon.HoldRecords(slow.TD)
+	defer release()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.bind(c, o, "slow", slow)
+		done <- err
+	}()
+	for i, what := range []string{"that its bind was sent", "of its answer"} {
+		select {
+		case <-reached:
+		case err := <-done:
+			t.Fatalf("a bind returned with no record %s written: %v", what, err)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("the record %s never came to the disk", what)
+		}
+		if _, err := h.bind(c, o, names[i], others[i]); err != nil {
+			t.Fatalf("a bind for another TD, while the record %s was on its way to the disk: %v", what, err)
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("a bind returned before the record %s was written: %v", what, err)
+		default:
+		}
+		next()
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("the bind whose records were slow: %v", err)
+	}
+}
+
+// Two saves of one record that reach the disk in the other order leave the
+// later one there.
+func TestLaterRecordIsNotReplacedByAnEarlierOne(t *testing.T) {
+	h := newHost(t, 1, nil)
+	claimed, err := h.AsOrchestrator().Claim(ctx(t), requestID(t), sessiondtest.Pool, "s1", 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state, err := h.Daemon.SaveOutOfOrder(claimed.TD, sessiond.StateBound); err != nil || state != sessiond.StateBound {
+		t.Fatalf("the record's file names the state %q, %v; the later save named %q", state, err, sessiond.StateBound)
+	}
+}
+
 // A repeat of a request gets the first answer and changes nothing.
 func TestRepeatedRequestsChangeNothing(t *testing.T) {
 	h := newHost(t, 1, nil)

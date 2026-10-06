@@ -603,21 +603,39 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	}
 	t.busy = true
 	address := t.rec.Address
-	var err error
+	// The record says a bind was sent before one is: it is written once the
+	// daemon's lock is free, and the bind waits for it.
+	var sent kept
 	if !replay {
-		err = d.save(t)
+		sent = t.snapshot()
 	}
 	d.mu.Unlock()
-	if err != nil {
-		d.end(t, "its record could not be kept", "")
-		return nil, nil, status.Error(codes.Internal, "the bind could not be recorded")
+	if !replay {
+		if err := d.write(t, sent); err != nil {
+			d.mu.Lock()
+			t.busy = false
+			d.endLocked(t, "its record could not be kept", "")
+			d.mu.Unlock()
+			return nil, nil, status.Error(codes.Internal, "the bind could not be recorded")
+		}
 	}
 
 	asked := time.Now()
 	relayed, err := d.relayBind(ctx, t, address, req, func() { tell(t) })
 	guest := time.Since(asked)
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	// The answer is recorded once the lock is free again, before the call
+	// returns it.
+	var answered *kept
+	defer func() {
+		d.mu.Unlock()
+		if answered == nil {
+			return
+		}
+		if err := d.write(t, *answered); err != nil {
+			d.log.Error("a TD's record could not be kept", "td", answered.rec.ID, "error", err)
+		}
+	}()
 	t.busy = false
 	var refused *refusal
 	switch {
@@ -667,9 +685,8 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	if session.Phase(evidence.GetPhase()) == session.PhaseRunning {
 		t.rec.State = StateRunning
 	}
-	if err := d.save(t); err != nil {
-		d.log.Error("a TD's record could not be kept", "td", t.rec.ID, "error", err)
-	}
+	snapshot := t.snapshot()
+	answered = &snapshot
 	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
 		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
 		"sealed", relayed.sealed, "claimed_by_bind", t.rec.Claim != nil && t.rec.Claim.ByBind)

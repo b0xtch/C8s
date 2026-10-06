@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sessionv1alpha1 "github.com/confidential-dot-ai/c8s/api/session/v1alpha1"
@@ -67,6 +68,9 @@ type Daemon struct {
 	now    func() time.Time
 	// bootTimeout is how long a TD may take to serve.
 	bootTimeout time.Duration
+	// writeFile puts a record's file in place, whole or not at all, where a
+	// test has its own way to: see write.
+	writeFile atomic.Pointer[func(path string, data []byte, mode os.FileMode) error]
 
 	mu  sync.Mutex
 	tds map[string]*td
