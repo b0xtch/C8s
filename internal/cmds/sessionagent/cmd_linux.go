@@ -144,6 +144,9 @@ func newRunCmd() *cobra.Command {
 			}
 			if processors > 0 {
 				runtime.GOMAXPROCS(processors)
+				if err := keepTo(processors); err != nil {
+					return err
+				}
 			}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
 			var err error
@@ -265,7 +268,7 @@ func newRunCmd() *cobra.Command {
 	f.StringVar(&image.StateDir, "sandbox-state-dir", defaultStateDir, "directory on the encrypted scratch volume for the sandbox image")
 	f.StringVar(&image.RunDir, "sandbox-runtime-dir", defaultRuntimeDir, "RAM-backed directory for the container runtime's state")
 	f.Int64Var(&image.PidsLimit, "sandbox-pids-max", defaultPidsMax, "task limit of the sandbox and its commands together")
-	f.IntVar(&processors, "processors", 0, "how many of the guest's processors the agent's own work runs on at once (0: all of them). The sandbox and its commands have every one either way: fewer for the agent means fewer of them woken for its work")
+	f.IntVar(&processors, "processors", 0, "how many of the guest's processors the agent keeps to, the first ones, with the runtime it starts containers with (0: all of them). The session's own code has every one either way: fewer for the agent means fewer of them woken for its work")
 	f.IntVar(&acceptReserve, "accept-reserve", 0, "megabytes of accepted free memory a guest holds while it waits for a sandbox, on a kernel that accepts memory on request (vm.accept_memory_mb); a pool guest says it is ready once it holds them")
 	f.BoolVar(&acceptRest, "accept-rest", false, "once a sandbox runs, accept the rest of the guest's memory in the background, so that the sandbox finds it accepted. Without it a sandbox accepts what it grows into, and the guest stays as small as its use")
 	f.StringSliceVar(&plainHTTP, "sandbox-plain-http", nil, "registries (host:port) reached without TLS, for a dev image's local registry; an image is verified by its digest either way")

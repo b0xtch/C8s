@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sys/unix"
 
 	"github.com/confidential-dot-ai/attestation-go/runtimemeasure"
 	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionagent"
@@ -450,6 +452,40 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 			t.Error("a command ran in a sandbox that has ended")
 		}
 	})
+}
+
+// An agent that keeps to its first processor starts its runtime there, and
+// the processes that wait in the sandbox for a command. A command of the
+// session's has every processor of the guest all the same: the waiting
+// process takes them back as it becomes the command.
+func TestCommandHasEveryProcessorOfAGuestWhoseAgentKeepsToOne(t *testing.T) {
+	n := runtime.NumCPU()
+	var allowed unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &allowed); err != nil {
+		t.Fatal(err)
+	}
+	if n < 2 || allowed.Count() != n || !allowed.IsSet(0) || !allowed.IsSet(n-1) {
+		t.Skipf("needs the machine's first %d processors, and two or more of them", n)
+	}
+	t.Cleanup(func() {
+		if err := sessionagent.KeepTo(n); err != nil {
+			t.Errorf("give the test binary its processors back: %v", err)
+		}
+	})
+	if err := sessionagent.KeepTo(1); err != nil {
+		t.Fatal(err)
+	}
+	c := newContainer(t, containerOptions{})
+	c.start(t)
+	client := c.client(t, c.owner)
+	c.awaitWarm(t)
+	want := "0-" + strconv.Itoa(n-1)
+	if got := c.out(t, client, "grep Cpus_allowed_list /proc/self/status"); !strings.HasSuffix(got, "\t"+want) {
+		t.Errorf("a command has the processors %q, and its guest has %s", got, want)
+	}
+	if c.warmUsed() != 1 {
+		t.Errorf("the command ran as a process the runtime started for it: %d ran as one that waited", c.warmUsed())
+	}
 }
 
 // A sandbox whose own process ends is known to have ended at once, and its

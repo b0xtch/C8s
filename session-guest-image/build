@@ -32,8 +32,10 @@
 #                   start accepts what it grows into.
 #   C8S_AGENT_PROCESSORS=...
 #                   how many of the guest's processors the session's agent
-#                   runs its own work on at once (its --processors). Part of
-#                   the measured service line. Default 0: all of them.
+#                   keeps to, the first ones, with the runtime it starts
+#                   containers with (its --processors). The session's own
+#                   code has every one either way. Part of the measured
+#                   service line. Default 0: all of them.
 #   C8S_NAME=...    output name (default c8s-session -> output/c8s-session/)
 #   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
 #   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s-session-guest and

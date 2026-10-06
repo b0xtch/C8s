@@ -8,6 +8,10 @@ package sessionagent
 // on the machine, for as long as it is up.
 func SetUserNamespaceLimit(path string) { userNamespaceLimit = path }
 
+// KeepTo keeps the test binary's threads to its first n processors, as an
+// agent's flag keeps an agent's.
+var KeepTo = keepTo
+
 // WarmCommands reports whether a command's process waits in the runner's
 // container for whichever command comes next, and how many commands ran as
 // one so far.

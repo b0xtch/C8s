@@ -32,7 +32,7 @@ case "$ROLE" in
         if [ "$RESERVE" -gt 0 ]; then
             SERVICE+=("--accept-reserve=$RESERVE")
         fi
-        # The processors the agent's own work runs on at once.
+        # The processors the agent and its runtime keep to.
         if [ "$PROCESSORS" -gt 0 ]; then
             SERVICE+=("--processors=$PROCESSORS")
         fi

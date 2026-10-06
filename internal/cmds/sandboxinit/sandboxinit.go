@@ -165,6 +165,8 @@ func become(control io.ReadWriter) error {
 	if _, err := io.WriteString(control, Taken+"\n"); err != nil {
 		return fmt.Errorf("tell the agent the command is taken: %w", err)
 	}
+	// The session's own code runs on every processor of its guest.
+	everyProcessor()
 	err = unix.Exec(path, p.Argv, p.Env)
 	if errors.Is(err, unix.ENOENT) {
 		// The file, or the interpreter its first line names.
