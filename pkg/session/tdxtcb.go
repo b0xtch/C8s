@@ -2,12 +2,14 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/google/go-tdx-guest/pcs"
 	pb "github.com/google/go-tdx-guest/proto/tdx"
@@ -113,6 +115,51 @@ func (f *TCBFinding) judge(accepted []string) error {
 	return nil
 }
 
+// intelDocuments keeps Intel's TCB info and QE identity as they were last
+// decoded, by their bytes. Every quote of a platform is matched against the
+// same two documents until Intel issues new ones, and decoding them is most
+// of what a match costs. What is kept is only ever read.
+var intelDocuments struct {
+	tcbInfo    keptDocuments[pcs.TdxTcbInfo]
+	qeIdentity keptDocuments[pcs.QeIdentity]
+}
+
+// keptDocuments is the few documents of one kind that were decoded last.
+type keptDocuments[T any] struct {
+	mu   sync.Mutex
+	kept map[[sha256.Size]byte]*T
+}
+
+// maxKeptDocuments bounds what is kept of one kind: a verifier meets one
+// document a platform family, and a new one only as Intel issues it.
+const maxKeptDocuments = 8
+
+// decoded is raw decoded, from what is kept of its kind if these bytes were
+// decoded before. Its caller reads it and changes nothing of it.
+func decoded[T any](documents *keptDocuments[T], raw []byte) (*T, error) {
+	key := sha256.Sum256(raw)
+	documents.mu.Lock()
+	document, ok := documents.kept[key]
+	documents.mu.Unlock()
+	if ok {
+		return document, nil
+	}
+	document = new(T)
+	if err := json.Unmarshal(raw, document); err != nil {
+		return nil, err
+	}
+	documents.mu.Lock()
+	defer documents.mu.Unlock()
+	if len(documents.kept) >= maxKeptDocuments {
+		documents.kept = nil
+	}
+	if documents.kept == nil {
+		documents.kept = map[[sha256.Size]byte]*T{}
+	}
+	documents.kept[key] = document
+	return document, nil
+}
+
 // evaluateTDXTCB matches a quote against Intel's TCB info and QE identity,
 // following Intel's algorithm for "Get TDX TCB Info". It reports the platform
 // level, the TDX module level and the quoting enclave's level separately, and
@@ -129,12 +176,12 @@ func evaluateTDXTCB(quote *pb.QuoteV4, tcbInfoJSON, qeIdentityJSON []byte) (*TCB
 	if err != nil {
 		return nil, fmt.Errorf("PCK certificate extensions: %w", err)
 	}
-	var info pcs.TdxTcbInfo
-	if err := json.Unmarshal(tcbInfoJSON, &info); err != nil {
+	info, err := decoded(&intelDocuments.tcbInfo, tcbInfoJSON)
+	if err != nil {
 		return nil, fmt.Errorf("TCB info: %w", err)
 	}
-	var identity pcs.QeIdentity
-	if err := json.Unmarshal(qeIdentityJSON, &identity); err != nil {
+	identity, err := decoded(&intelDocuments.qeIdentity, qeIdentityJSON)
+	if err != nil {
 		return nil, fmt.Errorf("QE identity: %w", err)
 	}
 	if !strings.EqualFold(exts.FMSPC, info.TcbInfo.Fmspc) {

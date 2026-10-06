@@ -13,9 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -155,7 +157,18 @@ var decimalRE = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
 // Parse strictly validates launch.yaml bytes. It authenticates nothing: guests
 // use VerifySigned, verifiers check the signature against a pinned key.
+//
+// A pool's guests all carry one document, and whoever judges them reads it
+// once for each: the last few that validated are kept by their bytes, and
+// each caller is handed a copy of its own.
 func Parse(data []byte) (*Document, error) {
+	key := sha256.Sum256(data)
+	parsedDocuments.mu.Lock()
+	kept, ok := parsedDocuments.kept[key]
+	parsedDocuments.mu.Unlock()
+	if ok {
+		return copyOf(kept), nil
+	}
 	var doc Document
 	if err := ParseCanonicalYAML(data, &doc); err != nil {
 		return nil, err
@@ -163,7 +176,71 @@ func Parse(data []byte) (*Document, error) {
 	if err := doc.Validate(); err != nil {
 		return nil, err
 	}
+	parsedDocuments.mu.Lock()
+	defer parsedDocuments.mu.Unlock()
+	if len(parsedDocuments.kept) >= maxKeptDocuments {
+		parsedDocuments.kept = nil
+	}
+	if parsedDocuments.kept == nil {
+		parsedDocuments.kept = map[[sha256.Size]byte]*Document{}
+	}
+	parsedDocuments.kept[key] = copyOf(&doc)
 	return &doc, nil
+}
+
+// parsedDocuments is the launch documents Parse read last, which nothing
+// but Parse holds: see there.
+var parsedDocuments struct {
+	mu   sync.Mutex
+	kept map[[sha256.Size]byte]*Document
+}
+
+// copyOf is a document that shares nothing with doc.
+func copyOf(doc *Document) *Document {
+	return deepCopy(reflect.ValueOf(doc)).Interface().(*Document)
+}
+
+// deepCopy copies a value of the kinds a document is made of, and whatever
+// it points to.
+func deepCopy(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Pointer:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.New(v.Type().Elem())
+		out.Elem().Set(deepCopy(v.Elem()))
+		return out
+	case reflect.Struct:
+		out := reflect.New(v.Type()).Elem()
+		out.Set(v)
+		for i := range v.NumField() {
+			if out.Field(i).CanSet() {
+				out.Field(i).Set(deepCopy(v.Field(i)))
+			}
+		}
+		return out
+	case reflect.Slice:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := range v.Len() {
+			out.Index(i).Set(deepCopy(v.Index(i)))
+		}
+		return out
+	case reflect.Map:
+		if v.IsNil() {
+			return v
+		}
+		out := reflect.MakeMapWithSize(v.Type(), v.Len())
+		for it := v.MapRange(); it.Next(); {
+			out.SetMapIndex(deepCopy(it.Key()), deepCopy(it.Value()))
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // ParseCanonicalYAML decodes one launch document into out, which is a pointer

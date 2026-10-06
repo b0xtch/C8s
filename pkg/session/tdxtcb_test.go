@@ -1,10 +1,14 @@
 package session
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/google/go-tdx-guest/pcs"
 )
 
 // The captured quote's own TCB, read from its PCK certificate and TD report:
@@ -227,5 +231,39 @@ func TestTCBEvaluation(t *testing.T) {
 				t.Fatalf("want an error mentioning %q, got %+v, %v", tc.want, got, err)
 			}
 		})
+	}
+}
+
+// Intel's documents are decoded once for the bytes they come as, and a
+// document that does not decode is kept by nobody.
+func TestIntelDocumentsAreDecodedOnce(t *testing.T) {
+	var documents keptDocuments[pcs.QeIdentity]
+	raw := []byte(`{"enclaveIdentity":{"id":"TD_QE","version":2}}`)
+	first, err := decoded(&documents, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := decoded(&documents, bytes.Clone(raw))
+	if err != nil || again != first {
+		t.Fatalf("the same bytes were decoded again: %p and %p, %v", first, again, err)
+	}
+	other, err := decoded(&documents, []byte(`{"enclaveIdentity":{"id":"TD_QE","version":3}}`))
+	if err != nil || other == first || other.EnclaveIdentity.Version != 3 {
+		t.Fatalf("other bytes: %+v, %v", other, err)
+	}
+	for range 2 {
+		if _, err := decoded(&documents, []byte(`{"enclaveIdentity":`)); err == nil {
+			t.Fatal("a document cut short was decoded")
+		}
+	}
+	// More kinds of bytes than are kept: each still decodes to its own.
+	for i := range 3 * maxKeptDocuments {
+		document, err := decoded(&documents, fmt.Appendf(nil, `{"enclaveIdentity":{"version":%d}}`, 100+i))
+		if err != nil || int(document.EnclaveIdentity.Version) != 100+i {
+			t.Fatalf("document %d: %+v, %v", i, document, err)
+		}
+	}
+	if kept, err := decoded(&documents, raw); err != nil || kept.EnclaveIdentity.Version != 2 {
+		t.Fatalf("the first document, read after many others: %+v, %v", kept, err)
 	}
 }

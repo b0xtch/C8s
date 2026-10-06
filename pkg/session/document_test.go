@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -272,5 +273,48 @@ func TestExecRequestValidate(t *testing.T) {
 	ok := session.ExecRequest{ID: id, Argv: []string{"sh", "-c", "true"}, Env: map[string]string{"A": "b"}, TimeoutSeconds: 5}
 	if err := ok.Validate(); err != nil {
 		t.Fatalf("control: %v", err)
+	}
+}
+
+// A document that was read before is read from what was kept of it, and
+// each reader gets a document of its own: what one does to its copy, the
+// next does not find, in a list, a map or behind a pointer.
+func TestParsedDocumentIsEachReadersOwn(t *testing.T) {
+	_, bundle := newBundle(t, sessiontest.NewTD(), nil)
+	first, err := session.Parse(bundle.Launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Machine == nil || len(first.Machine.RTMR0) == 0 || len(first.Image.RTMRs) == 0 {
+		t.Fatalf("the document this test needs lists a machine and registers: %+v", first)
+	}
+	want, err := session.Parse(bundle.Launch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Pool = "another"
+	first.Machine.RTMR0[0] = "changed"
+	first.Machine = nil
+	for register := range first.Image.RTMRs {
+		first.Image.RTMRs[register] = "changed"
+	}
+	first.Prestage = append(first.Prestage, "an-image")
+	for range 3 {
+		again, err := session.Parse(bundle.Launch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(again, want) {
+			t.Fatalf("a document read again holds what an earlier reader did to its own:\n%+v\n%+v", again, want)
+		}
+		again.Machine.RTMR0[0] = "changed again"
+	}
+	// A document that does not validate is kept by nobody: it is refused
+	// each time.
+	bad := bytes.Replace(bundle.Launch, []byte("pool: agents"), []byte("pool: Agents!"), 1)
+	for range 2 {
+		if _, err := session.Parse(bad); err == nil {
+			t.Fatal("a document with a pool no pool is named was read")
+		}
 	}
 }
