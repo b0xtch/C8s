@@ -115,14 +115,19 @@ func TestPullWaitsOutARegistryThatIsNotUpYet(t *testing.T) {
 	}
 }
 
-// What is not an unreachable registry is not waited out.
+// What is not an unreachable registry is not waited out: the registry is
+// asked what one pull asks of it, and no more.
 func TestPullDoesNotWaitOutARefusal(t *testing.T) {
 	registry := imagestoretest.NewRegistry(t)
-	began := time.Now()
+	ref := registry.Ref(digest.FromString("no such image"))
+	if _, err := testPuller(t).Pull(context.Background(), ref); err == nil {
+		t.Fatal("a registry without the image handed one over")
+	}
+	once := registry.Requests.Load()
 	ctx, steps := withAdmission(context.Background())
-	_, err := pullWaiting(ctx, testPuller(t), registry.Ref(digest.FromString("no such image")), quiet)
-	if err == nil || time.Since(began) > 50*time.Millisecond || len(steps.list()) != 0 {
-		t.Fatalf("a registry without the image: %v after %s, steps %+v", err, time.Since(began), steps.list())
+	_, err := pullWaiting(ctx, testPuller(t), ref, quiet)
+	if asked := registry.Requests.Load() - once; err == nil || asked != once || len(steps.list()) != 0 {
+		t.Fatalf("a registry without the image: %v, asked %d times where one pull asks %d, steps %+v", err, asked, once, steps.list())
 	}
 }
 

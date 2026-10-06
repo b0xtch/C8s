@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,20 +15,38 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/session/disclosure"
 )
 
+// logBuffer is a log a test reads while the launcher still writes to it.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // listening is a launcher that takes its guest's last word over TCP, where
 // the guest's would come over vsock, and writes its log to the buffer.
-func listening(t *testing.T, own func(net.Conn) bool) (*lastWord, string, *bytes.Buffer) {
+func listening(t *testing.T, own func(net.Conn) bool) (*lastWord, string, *logBuffer) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var logged bytes.Buffer
-	w := &lastWord{ln: ln, own: own, file: filepath.Join(t.TempDir(), "end.json"), log: slog.New(slog.NewJSONHandler(&logged, nil))}
+	logged := &logBuffer{}
+	w := &lastWord{ln: ln, own: own, file: filepath.Join(t.TempDir(), "end.json"), log: slog.New(slog.NewJSONHandler(logged, nil))}
 	done := make(chan struct{})
 	go func() { defer close(done); w.serve() }()
 	t.Cleanup(func() { _ = w.Close(); <-done })
-	return w, ln.Addr().String(), &logged
+	return w, ln.Addr().String(), logged
 }
 
 // say sends bytes to a launcher as a guest's init would its word.
