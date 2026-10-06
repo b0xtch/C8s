@@ -74,6 +74,15 @@ name each baseline.
 - **Polling** where latency matters and CPU is spare, such as the guest's
   halt polling, turned on through the measured command line. Polling spends
   CPU that a burst of starts needs, so a pool that must burst polls nothing.
+- **The platform's work on one vCPU.** The agent, with its gateways, and the
+  runtime it starts the sandbox with keep to one of the TD's vCPUs, where they
+  are weighted above the sandbox, while the sandbox's own code gets all of
+  them. A start then spreads its work over fewer vCPUs, so it wakes fewer of
+  them and waits less on a sibling its host has descheduled, which the guest
+  cannot tell from a running one. This stays the default only while the
+  gateways carry as much on one vCPU as on four, with the sandbox busy on all
+  of them; if they do not, the agent widens itself once its bind's call has
+  ended.
 - **Host-side pre-faulting** of private memory before a bind, which is safe
   because added pages stay pending until the guest accepts them.
 - **Reflinks.** The daemon keeps its store of layers and the slots' backing
@@ -98,7 +107,7 @@ Each lever must keep the rules in
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
 | a burst of 100 starts at once | median and tail latency, success rate, and the CPU each start costs: all of the host's, the guests' vCPUs given apart, and the client's beside it; of snapshot loads and of starts from a pool | the same, and the latency to each binder's kept verdict |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |
-| a request through the egress gateway | the same request through OpenShell's proxy, with TLS ended and a credential put in | the time the gateway adds, with and without a credential, and with a program to attribute |
+| a request through the egress gateway | the same request through OpenShell's proxy, with TLS ended and a credential put in, and the same transfers with no proxy | the time the gateway adds, with and without a credential, and with a program to attribute; and the throughput it carries with the agent on one vCPU and on four, the sandbox busy on all of them |
 | snapshot and restore at 1, 4 and 16 GiB | snapshot create and load, and gVisor's checkpoint and restore | seal and restore, to the first instruction |
 | a seal, in parts | none | drain, pre-dump, freeze, checkpoint, layer writes, store and commit, at the same sizes |
 | a restore, in parts | none | the claim, placing the stack by reflink, by mapping and by copy, the key service's answer, opening the layers, and the first instruction, at the same sizes |
