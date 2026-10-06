@@ -209,7 +209,9 @@ control plane and its workloads, which took 0.7 to 1.3 of one CPU over the
 five seconds before each configuration; that can only slow a side, and the
 sides took turns. They also ran before the method pinned the host's halt
 polling, so their records do not name it; it stood throughout at the host's
-default, 200,000 ns.
+default, 200,000 ns. And they ran before the method kept the platform's own
+programs apart from the guests: each side's daemon, and so its launchers, ran
+on that side's guests' cores.
 
 From the claim, if any, and the bind to the first command's answer, in
 milliseconds: the median of 20 rounds, with the 90th percentile in brackets.
