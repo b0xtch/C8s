@@ -140,7 +140,12 @@ memory-acceptance floor; work inside within the published floors.
   manifest where the TDX module would measure them, and quotes in the vendor's
   format under a development root of the same algorithms, signed in the guest,
   on a platform that is always UpToDate, so that every check costs what it
-  costs on TDX. The difference is then what the hardware and the vendor's
+  costs on TDX. Its kernel takes of its host's paravirtual features only those
+  a TD's takes, the few that [the threat
+  model](session-threat-model.md#optimizations-that-must-not-weaken-the-model)
+  allows whatever its host offers, so that TDX is not charged with what the
+  guest refuses its host. The difference is then what the hardware and the
+  vendor's
   quoting add: memory acceptance, the TDX module's exits, bounce buffers for
   device I/O and the quoting service. Only a development build of a verifier
   or key service can accept that root, and then in place of the vendor's,
@@ -220,7 +225,16 @@ sides took turns. They also ran before the method pinned the host's halt
 polling, so their records do not name it; it stood throughout at the host's
 default, 200,000 ns. And they ran before the method kept the platform's own
 programs apart from the guests: each side's daemon, and so its launchers, ran
-on that side's guests' cores.
+on that side's guests' cores. Last, they ran before the method gave the
+simulated guest only a TD's paravirtual features. Traced on later images whose
+kernel takes what theirs took, the TD wrote no paravirtual MSR and made only
+the hypercall that sends an IPI, while the simulated guest also took
+asynchronous page faults, PV EOI and steal time, whose preempted flag let it
+leave a preempted vCPU's TLB flush to its host, yield to a preempted vCPU it
+had sent an IPI, and stop spinning on a lock whose holder's vCPU was
+preempted. Neither took a clock of its host's. Most of these act only on a
+vCPU its host has preempted, and we expect a lone start to have few; these
+runs cannot say how much they saved the simulated side.
 
 From the claim, if any, and the bind to the first command's answer, in
 milliseconds: the median of 20 rounds, with the 90th percentile in brackets.
@@ -251,7 +265,8 @@ serial console, a floor, so the target for warm activation holds there. With
 the quote judged first, the session answers 0.1 to 0.3 ms after that load:
 level with it, but short of the target. The hardware and the vendor's quoting
 add 1.2 to 1.5 ms to a start, and 2.9 to 3.1 ms when the quote is judged
-first and its wait is on the path.
+first and its wait is on the path; these figures also count whatever the
+simulated guest's paravirtual features saved it.
 
 A snapshot's load is the fastest start Firecracker itself offers. A platform
 can also keep plain VMs booted ahead in a pool, as sessions keep TDs, and a
