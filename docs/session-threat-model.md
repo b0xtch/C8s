@@ -355,6 +355,7 @@ but not confidentiality.
 | sending review signals as they happen | not allowed: they leave on the policy's schedule, padded to one size |
 | accepting memory only when used | driven by the guest; the host learns the session's memory high-water mark, which is metadata |
 | giving free memory back to the host | only free blocks are converted to shared, and a block comes back through acceptance, which zeroes it |
+| paravirtual features | only wake-ups and hints, whose host input can slow the guest but not change what it computes, such as a kick for a halted vCPU; the kernel is built to take no other, whatever its host offers, so no paravirtual clock and no flush of a preempted vCPU's TLB left to its host |
 | host patches, such as pre-faulting or 2 MiB private pages | host code is untrusted anyway: a bug can deny service or crash TDs, but not read private memory without a flaw in the TDX module or the hardware |
 
 ## Hardware and side-channel residuals

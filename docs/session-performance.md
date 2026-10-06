@@ -71,8 +71,9 @@ name each baseline.
   cheaper and leave less to attack.
 - **The tenant VM.** Many small, mostly idle sessions of one owner share one
   TD behind gVisor, which costs far less memory per session than a TD each.
-- **Polling** where latency matters, such as the guest's halt polling, turned
-  on through the measured command line.
+- **Polling** where latency matters and CPU is spare, such as the guest's
+  halt polling, turned on through the measured command line. Polling spends
+  CPU that a burst of starts needs, so a pool that must burst polls nothing.
 - **Host-side pre-faulting** of private memory before a bind, which is safe
   because added pages stay pending until the guest accepts them.
 - **Reflinks.** The daemon keeps its store of layers and the slots' backing
@@ -95,7 +96,7 @@ Each lever must keep the rules in
 | warm activation | snapshot load to the first command; from a pool of VMs booted ahead, the claim to the first command | claim, if any, and bind to the first command |
 | a start, in parts | none | the claim, unless the bind makes it; the binder's check of the ready evidence, or finding the verdict it reached before the claim; signing and sealing; the bind, with the sandbox's start and any answer from the key service inside it; the receipt's check; and the first command, on its own or sent with the bind |
 | first authenticated command | the same, over the platform's channel | the same, including the client's verification |
-| a burst of 100 starts at once | median and tail latency, success rate, and the host's CPU each start costs, of snapshot loads and of starts from a pool | the same |
+| a burst of 100 starts at once | median and tail latency, success rate, and the CPU each start costs: all of the host's, the guests' vCPUs given apart, and the client's beside it; of snapshot loads and of starts from a pool | the same, and the latency to each binder's kept verdict |
 | pause and resume | `PATCH /vm` paused, then resumed | hold, then release, to the first effect |
 | a request through the egress gateway | the same request through OpenShell's proxy, with TLS ended and a credential put in | the time the gateway adds, with and without a credential, and with a program to attribute |
 | snapshot and restore at 1, 4 and 16 GiB | snapshot create and load, and gVisor's checkpoint and restore | seal and restore, to the first instruction |
