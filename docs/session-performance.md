@@ -92,6 +92,15 @@ name each baseline.
   waits for another vCPU to run a function asks its host, every 100
   microseconds it waits, to run that one. Neither reads anything from its host
   to decide.
+- **Processors that sleep through boot.** A TD's other processors wait in its
+  firmware from their first instruction until the kernel wakes them, and their
+  host does not see them spin. Where the host offers the kick, they halt as
+  they wait instead, and whoever gives them work kicks them: the firmware for
+  its own work and the kernel for its wake-up. The kernel tells the firmware
+  that it will kick before it accepts the memory for its page structures, so
+  they sleep through that too. Where the host offers no kick, they spin, with
+  a pause in each turn. The firmware reads nothing from its host but that
+  offer.
 - **Host-side pre-faulting** of private memory before a bind, which is safe
   because added pages stay pending until the guest accepts them.
 - **Reflinks.** The daemon keeps its store of layers and the slots' backing
