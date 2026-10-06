@@ -151,7 +151,11 @@ memory-acceptance floor; work inside within the published floors.
   within one run. Nothing else runs on the host during a run: no TD or VM but
   the sides' own, and a side that waits keeps its guests idle, with no boot or
   ending in flight, on cores apart from those of the side being measured, as
-  the record lists. Where the host cannot hold every side's guests at once,
+  the record lists. The guests' VMMs keep to cores that nothing else of the
+  run uses, and the platform's own programs, the daemon and its launchers,
+  the quoting service and the programs that start the guests, run on cores
+  apart from them, the same for every side, as the record lists too. Where
+  the host cannot hold every side's guests at once,
   as with pools for a burst of 100, the sides take turns instead, each side's
   guests up only in its own turns, and a turn begins only once the host has
   taken apart the guests of the turn before, their memory freed and a TD's
@@ -241,8 +245,8 @@ first and its wait is on the path.
 A snapshot's load is the fastest start Firecracker itself offers. A platform
 can also keep plain VMs booted ahead in a pool, as sessions keep TDs, and a
 VM that already runs answers a command in 1.3 to 1.8 ms here, so a start from
-such a pool would by these numbers come sooner than a session's. It is
-measured with the burst of 100, as a baseline of its own.
+such a pool would by these numbers come sooner than a session's. The burst
+of 100 below measures it, as a baseline of its own.
 
 The first configuration in parts, the medians of runs 3 and 4:
 
@@ -300,3 +304,94 @@ side's judgment of a ready guest 2.7 to 3.1 ms and did not move its start,
 6.7 to 8.7 ms across the three; and Firecracker's first command was the
 guest's own `true` rather than a session's work, which gave 12.8 to 13.3 ms
 over vsock.
+
+### A burst of 100 starts, 2026-10-06
+
+One run on the same host as the runs above, with newer session images and the
+host's halt polling at 0: eleven bursts a side of 100 starts at one instant,
+the first of each side left out. Three sides took turns burst by burst, each
+side's guests up for its own turns alone, since the host cannot hold them all
+at once (below): a pool of 100 ready TDs of 4 vCPUs and 16 GiB, each start a
+bind that claims its TD and carries a credential and the first command sealed,
+the first configuration above; Firecracker v1.17.0 loading one snapshot of its
+leanest guest of the same size 100 times, each into a VMM of its own; and 100
+such Firecracker guests booted ahead and idle, as a platform with
+confidentiality off can keep a pool. The first command is `node -v` on every
+side, in the same image, and a session's start succeeds only when it answers
+and the binder keeps its verdict on the bind's quote. The guests kept to 18 of
+the host's 24 cores, and the TDs' daemon and its launchers ran there with
+them, which the method now keeps apart; the programs that started the bursts
+ran on cores of their own. The run departs from the method as runs 3 and 4 do,
+with TDX on in the firmware for every side and a Kubernetes control plane and
+its workloads on the host, 1.1 of one CPU before the run, and its record says
+so first. The records are in
+[2026-10-06-i32](../test/session/records/2026-10-06-i32/README.md).
+
+Before each burst its side's guests were ready and idle by their own counters:
+the TDs judged by the binder as each became ready, after it fetched the
+vendor's documents, with the image unpacked in each; and each of Firecracker's
+guests had read its file system whole, as the TDs' unpacking reads theirs, and
+each booted guest had its agent's connection made. None of that is in the
+times below, which are in milliseconds, the median with the 95th and 99th
+percentiles in brackets.
+
+| A burst of 100 | TD | Firecracker, snapshot loads | Firecracker, booted ahead |
+|---|---|---|---|
+| starts that succeeded | 1,000 of 1,000 | 1,000 of 1,000 | 1,000 of 1,000 |
+| the burst's instant to the first command's answer | 238.5 (279.1, 290.1) | 115.9 (136.2, 141.2) | 39.3 (48.4, 51.3) |
+| each start to its first command's answer | 231.9 (274.6, 285.4) | 99.5 (128.8, 136.8) | 39.0 (48.1, 51.0) |
+| the burst's instant to the binder's kept verdict | 142.8 (229.0, 241.3) | | |
+| a burst's last answer: the median of ten, the least and the most | 269.2, 249.5 to 298.2 | 135.9, 126.5 to 149.6 | 49.5, 48.5 to 53.0 |
+| a burst's last kept verdict: the same | 240.9, 221.3 to 271.3 | | |
+
+Every start on every side succeeded. A single start from a warm pool answers
+sooner than a snapshot's load, as above, but a hundred at once answer later:
+from the burst's instant, a TD's first command answers 2.1 times as late as a
+snapshot load's at the median, and 6.1 times as late as a booted guest's. So
+in a burst the target for warm activation does not hold, and a pool of booted
+guests, the stronger baseline, answers sooner still. The binder's verdict is
+not what holds a TD start back: it came before the first command's answer at
+the median and at the 99th percentile, the bind's quote arriving 2.5 ms after
+the bind's answer at the median and 60.7 ms at the 99th.
+
+What a start cost its host, in milliseconds of CPU: the whole by the host
+kernel's count over each burst, less what the host gave over as long with the
+guests idle and less what the programs that started the bursts took, and its
+parts by the scheduler's count of each thread over the same span.
+
+| CPU a start | TD | Firecracker, snapshot loads | Firecracker, booted ahead |
+|---|---|---|---|
+| all of the host's | 95.98 | 37.17 | 15.37 |
+| the VMMs' vCPU threads | 90.81 | 33.76 | 15.67 |
+| their other threads | 0.54 | 3.05 | 0.19 |
+| the kernel's own threads | 0.03 | 0.19 | 0.06 |
+| the quoting service | 1.68 | | |
+| the daemon and its launchers | 1.62 and 0.25 | | |
+| the programs that started the bursts, beside these | 3.55 | 0.52 | 0.06 |
+
+The whole and the sum of its parts differ by 1.05, 0.18 and -0.55 ms a start,
+which is whatever else ran and the error of the tick by which the kernel keeps
+the whole, largest on the shortest bursts. A TD burst lasts about as long as
+its CPU over its cores: 100 starts at 96 ms are 9.6 CPU-seconds, which the
+guests' 18 cores, 36 threads, give in 267 ms, and its last answer came 269.2
+ms after its instant at the median. Nearly all of a TD start's CPU is its own
+vCPUs', and the kernel's tick found them in the guest for 84.7 ms of it and in
+the host's kernel for 7.1, against 13.1 and 2.5 for a booted Firecracker
+guest. Each TD start's vCPU threads also waited 528 ms in all for a processor,
+against 101 for a snapshot's load and 45 for a booted guest. A TD start took
+1,675 exits, 420 of them halts and 434 interrupts, against a booted guest's
+1,020, with 129 and 85; a snapshot's load took 7,768, most of them for its
+6,290 page faults on the snapshot's memory. The daemon's time over a bind was
+111.8 ms at the median, of which the guest's answer took 86.0, on cores it
+shared with the guests.
+
+The sides took turns because their guests do not fit on the host together: 100
+ready TDs took 84,866 MiB, 75,132 MiB of it their private pages, about 751 MiB
+a TD; 100 booted Firecracker guests took 53,133 MiB, 531 MiB each; and a burst
+of snapshot loads 5,452 MiB, each load counted whole though they share their
+snapshot's pages. That is 143,451 MiB together, against the 114,273 MiB the
+host had available. Idle, a ready TD's VMM ran 1.5 ms a second and took 139
+exits, and a booted Firecracker guest's 0.4 ms and 49.
+
+Reaching a booted pool means cutting what a TD start costs its host, nearly
+all of it in the guest, and the next runs trace where it goes.
