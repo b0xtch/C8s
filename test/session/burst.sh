@@ -71,6 +71,9 @@
 #                            memory (default 8192): a pool that would not is
 #                            not started, and the run says how many fit
 #   C8S_TIMING_REST          seconds of rest before each burst (default 5)
+#   C8S_BURST_QUIET_LIMIT    for a trial: seconds a side's guests have, after
+#                            their rest, to be idle by their own counters
+#                            before their burst fails (default 180)
 #   C8S_TIMING_PIN_POWER=1   for the run, set every CPU's governor to
 #                            performance, turn off idle states deeper than
 #                            C1E and turn turbo on, and set KVM's halt
@@ -553,7 +556,7 @@ cat > "$out/sample" <<HOOK
 #!/usr/bin/env bash
 case "\$1" in td) text='guest=td-' ;; *) text='$fc/firecracker ' ;; esac
 [ "\$2" = before ] && set -- "\$1" quiet "\$3"
-exec sudo -n python3 "$vmm_stat" "\$1" "\$2" "\$3" "\$text" >> "$records"
+exec sudo -n python3 "$vmm_stat" "\$1" "\$2" "\$3" "\$text" ${C8S_BURST_QUIET_LIMIT:-180} >> "$records"
 HOOK
 for side in td load pool; do
     for when in before after; do
@@ -675,6 +678,8 @@ for (( n = 0; n < rounds; n++ )); do
         pool_full
         sleep "$rest"
         free_after=$(available_mib) pinned_after=$(pinned_mib)
+        printf '{"kind":"td-pool","round":%d,"tds":%d,"filled_s":%d,"available_before_mib":%d,"available_mib":%d,"unevictable_before_mib":%d,"unevictable_mib":%d,"reserve_mib":%d}\n' \
+            "$n" "$depth" "$filled" "$free_before" "$free_after" "$pinned_before" "$pinned_after" "$reserve_mib" >> "$records"
         echo "burst $n: the pool of $depth ready TDs filled in $filled s, two booting at a time, and held $(( $(tdx_keys) - keys_before )) key IDs; the host's unevictable memory, which holds the TDs' private pages, went from $pinned_before MiB to $pinned_after MiB, $(( (pinned_after - pinned_before) / depth )) MiB a ready TD, and its available memory from $free_before MiB to $free_after MiB, $(( (free_before - free_after) / depth )) MiB a ready TD" >> "$out/env.txt"
         watch_pid=""
         if [ -n "${C8S_BURST_WATCH:-}" ]; then
@@ -836,6 +841,13 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
     print(f"--- what a start cost its host: {name} ({starts} starts, each VMM's threads from the burst's go to its last answer)")
     print(f"vCPU threads ran {ms('vcpu', 'ran_us'):8.2f} ms a start and waited for a CPU {ms('vcpu', 'waited_us'):8.2f} ms; sampled by the kernel's tick: in the guest {ms('vcpu', 'guest_us'):.2f}, in the host's kernel {ms('vcpu', 'system_us'):.2f}")
     print(f"other threads ran {ms('other', 'ran_us'):8.2f} ms a start and waited {ms('other', 'waited_us'):8.2f} ms")
+    held = [before for before, _, _ in pairs if before["vmms"] and "resident_kb" in before]
+    if held:
+        guests = sum(b["vmms"] for b in held)
+        line = f"before a burst each guest's VMM held {sum(b['resident_kb'] for b in held) / guests / 1024:.0f} MiB resident"
+        if key == "td":
+            line += ", which leaves out a TD's private pages: the pool's lines of the record count those"
+        print(line + f"; the host then had {statistics.median(b['host_memavailable_kb'] for b in held) / 1024:.0f} MiB available and {statistics.median(b['host_unevictable_kb'] for b in held) / 1024:.0f} MiB unevictable")
     # The same guests idle, over the second before the burst.
     idle = [(pair["idle"], pair["before"]) for b in rows if b.get("kind") == kind and b["round"] > 0
             for pair in [taken.get((key, b["round"]), {})] if "idle" in pair and "before" in pair and pair["before"]["vmms"]]
@@ -854,6 +866,26 @@ for name, key in (("TDs", "td"), ("Firecracker's booted guests", "pool")):
     waits = [r for r in rows if r.get("kind") == "vmm-quiet" and r["side"] == key and r["vmms"]]
     if waits:
         print(f"{name} were idle by their own counters {statistics.median(r['waited_s'] for r in waits):.0f} s after their rest, at the median of {len(waits)} bursts (at most {max(r['waited_s'] for r in waits):.0f} s): no guest's VMM ran over 10 ms or resolved over 16 page faults in each of two seconds")
+# Whether the sides' guests would have stood on the host together, which the
+# method prefers to turns: what each took of it, against what it had. A TD's
+# private pages are unevictable memory of the host's and no part of its
+# VMM's resident set, which holds the rest of it.
+pools = [r for r in rows if r.get("kind") == "td-pool"]
+held = lambda key, when: [pair[when]["resident_kb"] / 1024 for (side, n), pair in taken.items()
+                          if side == key and when in pair and pair[when]["vmms"] and "resident_kb" in pair[when]]
+if pools and held("td", "before"):
+    mid = statistics.median
+    private = mid([r["unevictable_mib"] - r["unevictable_before_mib"] for r in pools])
+    tds = max(private + mid(held("td", "before")), mid([r["available_before_mib"] - r["available_mib"] for r in pools]))
+    parts, together = [f"{pools[0]['tds']} ready TDs took {tds:.0f} MiB of the host's memory, {private:.0f} of it their private pages"], tds
+    for key, when, what in (("pool", "before", "Firecracker's booted guests"), ("load", "after", "a burst of its snapshot loads, each counted whole though they share their snapshot's pages")):
+        if held(key, when):
+            parts.append(f"{what} {mid(held(key, when)):.0f} MiB")
+            together += mid(held(key, when))
+    had, spare = max(r["available_before_mib"] for r in pools), pools[0]["reserve_mib"]
+    print("the sides took turns, each side's guests up for its own turn alone: " + ", ".join(parts) + f": {together:.0f} MiB together, "
+          f"and the host had {had:.0f} MiB available, of which {spare} are left to what else it runs: "
+          + ("they would have stood on it together" if together + spare <= had else "they do not stand on it together"))
 outputs = sorted({s.get("first_output", "") for s in rows if s.get("kind") in ("session", "fc-load-session", "fc-pool-session")})
 print("the first command wrote: " + ", ".join(repr(o) for o in outputs))
 # A start whose command wrote something else did other work than the rest.
