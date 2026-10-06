@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 # Build the TDX firmware a session guest boots (TDVF), from edk2 at the commit
-# pinned below. MRTD is this file's measurement, so what goes into it is
-# pinned here: the source, the platform description and the build options.
+# pinned below with the patches beside this file. MRTD is the firmware's
+# measurement, so what goes into it is pinned here: the source, the patches,
+# the platform description and the build options.
 #
 #   session-guest-image/firmware/build [output file]
+#   session-guest-image/firmware/build --inputs
 #
 # The default output is build/session-firmware/OVMF.tdx.fd in this checkout.
+# Beside the output goes <output>.inputs, a digest of this file and of the
+# patches: --inputs prints that digest and builds nothing, for a caller that
+# keeps a firmware it built to tell whether it is still this one.
 #
 #   C8S_FIRMWARE_WORK=...  where edk2 is fetched and built (default: the
 #                          output file's directory)
 #   EDK2_DIR=...           build in this edk2 checkout, which must be at the
-#                          pinned commit, and fetch nothing
+#                          pinned commit with no change of its own, and fetch
+#                          nothing. The patches are applied to it for the
+#                          build and taken out again after
 #
 # A release build: a debug build asserts, and prints every step to a debug
 # port its host can attach. No UEFI shell: nothing boots it.
@@ -39,6 +46,17 @@ SUBMODULES=(
 
 FW_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "$FW_DIR/../.." && pwd)
+# This build's own changes to edk2, applied in name order. Each one changes
+# the firmware, and so MRTD.
+PATCHES=()
+for patch in "$FW_DIR"/patches/*.patch; do
+    [ -f "$patch" ] && PATCHES+=("$patch")
+done
+inputs() { cat "${BASH_SOURCE[0]}" ${PATCHES[@]+"${PATCHES[@]}"} | sha256sum | cut -d' ' -f1; }
+if [ "${1:-}" = --inputs ]; then
+    inputs
+    exit 0
+fi
 OUT=${1:-$REPO_DIR/build/session-firmware/OVMF.tdx.fd}
 case "$OUT" in /*) ;; *) OUT=$PWD/$OUT ;; esac
 WORK=${C8S_FIRMWARE_WORK:-$(dirname "$OUT")}
@@ -60,10 +78,25 @@ else
 fi
 have=$(git -C "$SRC" rev-parse HEAD)
 [ "$have" = "$EDK2_COMMIT" ] || fail "$SRC is at $have, and this build pins $EDK2_COMMIT ($EDK2_TAG)"
-[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || fail "$SRC has local changes"
 if [ -z "${EDK2_DIR:-}" ]; then
+    # The clone is this build's own: what a build that was cut short left of
+    # its patches goes, the files they add among it.
+    git -C "$SRC" reset -q --hard "$EDK2_COMMIT"
+    git -C "$SRC" clean -q -fd -- OvmfPkg MdePkg MdeModulePkg UefiCpuPkg
     git -C "$SRC" submodule update -q --init --depth 1 "${SUBMODULES[@]}"
 fi
+[ -z "$(git -C "$SRC" status --porcelain --untracked-files=no)" ] || fail "$SRC has local changes"
+unpatch() {
+    local i
+    for (( i = ${#PATCHES[@]} - 1; i >= 0; i-- )); do
+        git -C "$SRC" apply -R --whitespace=nowarn "${PATCHES[i]}" 2> /dev/null || true
+    done
+}
+# Somebody else's checkout is left as it was found, however the build ends.
+[ -n "${EDK2_DIR:-}" ] && trap unpatch EXIT
+for patch in ${PATCHES[@]+"${PATCHES[@]}"}; do
+    git -C "$SRC" apply --whitespace=nowarn "$patch" || fail "$(basename "$patch") does not apply to edk2 at $EDK2_COMMIT"
+done
 
 cd "$SRC"
 if [ ! -x BaseTools/Source/C/bin/GenFw ]; then
@@ -83,5 +116,6 @@ if ! build -a X64 -t GCC -b RELEASE -p "$PLATFORM" -n "$(nproc)" "${OPTIONS[@]}"
     fail "the firmware did not build: see $WORK/firmware-build.log"
 fi
 install -m 0644 Build/IntelTdx/RELEASE_GCC/FV/OVMF.fd "$OUT"
+inputs > "$OUT.inputs"
 echo "session-guest-image/firmware/build: $(sha256sum "$OUT" | cut -d' ' -f1)  $OUT"
-echo "session-guest-image/firmware/build: edk2 $EDK2_COMMIT, $(gcc --version | head -1), $(nasm -v)"
+echo "session-guest-image/firmware/build: edk2 $EDK2_COMMIT with ${#PATCHES[@]} patches, $(gcc --version | head -1), $(nasm -v)"

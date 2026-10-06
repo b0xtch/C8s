@@ -78,6 +78,14 @@
 #                            for a lock is woken. It needs bpftrace, and a
 #                            host kernel whose KVM modules carry their types
 #                            (BTF)
+#   C8S_SESSION_OLD_IMAGE    a session image of this kind built before the
+#                            firmware's waiting processors slept and before
+#                            the kernel woke them. Its guest is booted on this
+#                            image's firmware, and this image's on its
+#                            firmware. A development run needs one whose
+#                            agent says how many processors its kernel
+#                            brought up. Unset leaves both boots out
+#   C8S_SESSION_PAIRED=0     leave those two boots out
 #   C8S_SESSION_PORT, C8S_KEY_SERVICE_PORT, C8S_SESSION_CIDR
 #                            the daemon's port (7443), the key service's
 #                            loopback port (18543), the guests' block
@@ -246,6 +254,47 @@ serving() {
     done
     return 1
 }
+# vcpus_ran <guest's name> <file>: once the file is there, how long the
+# guest's vCPU threads have run since its VMM started, in milliseconds: the
+# one that ran most, which is its first processor's, and the others together.
+vcpus_ran() {
+    python3 - "$1" "$2" <<'RAN'
+import os, sys, time
+name, stop = sys.argv[1], sys.argv[2]
+def vmm():
+    for entry in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                line = f.read()
+        except OSError:
+            continue
+        if b"qemu-system" in line and f"guest={name},".encode() in line:
+            return entry
+deadline = time.time() + 300
+pid = vmm()
+while pid is None or not os.path.exists(stop):
+    if time.time() > deadline:
+        sys.exit(f"no VMM of {name} came, or nobody said when to look")
+    time.sleep(0.01)
+    pid = pid or vmm()
+ran = []
+for tid in os.listdir(f"/proc/{pid}/task"):
+    try:
+        with open(f"/proc/{pid}/task/{tid}/stat") as f:
+            guest = int(f.read().rsplit(")", 1)[1].split()[40])
+        # The scheduler's own count for the thread, in nanoseconds.
+        with open(f"/proc/{pid}/task/{tid}/schedstat") as f:
+            took = int(f.read().split()[0]) // 1000000
+    except (OSError, ValueError, IndexError):
+        continue
+    # A vCPU's thread is one that has run a guest.
+    if guest > 0:
+        ran.append(took)
+if not ran:
+    sys.exit(f"the VMM of {name} has no thread that ran a guest")
+print(max(ran), sum(ran) - max(ran), len(ran))
+RAN
+}
 # cores_apart: each VMM this run's guests have now, the pool's and the key
 # service's, has a core-scheduling cookie of its own on every thread, so no
 # core's two threads run two guests at once.
@@ -381,11 +430,35 @@ expect 0 "a launch bundle that lists no machine" bundle-probe "$C8S" session lau
 sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
     --name "c8s-session-probe-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/probe.log" 2>&1 &
 probe_pid=$!
+# What the guest's processors have run by the time it serves: see below.
+rm -f "$out/probe-served"
+vcpus_ran "c8s-session-probe-$run" "$out/probe-served" > "$out/probe-ran.out" 2> "$out/probe-ran.err" &
+ran_pid=$!
 if ! serving "$probe_pid" "$probe_port"; then
     record FAIL "a guest whose document lists no machine serves" "$(tail -c 600 "$out/probe.log" | tr '\n' ' ')"
+    kill "$ran_pid" 2> /dev/null
     finish
 fi
 record PASS "a guest whose document lists no machine serves"
+# A guest's processors other than the first wait for work at a mailbox: in
+# the firmware until it hands the machine over, and then until the kernel
+# starts them. They wait asleep, so by the time the guest serves they have
+# run, together, less than the first processor alone: what they worked for
+# the firmware, which has them accept memory with it, and for the system as
+# it started. Where they wait spinning, each of them has run about as long
+# as the first.
+: > "$out/probe-served"
+wait "$ran_pid" 2> /dev/null
+read -r first_ms others_ms vcpus < "$out/probe-ran.out" || first_ms="" others_ms="" vcpus=""
+if [ -n "$first_ms" ] && [ "$others_ms" -lt "$first_ms" ]; then
+    record PASS "the guest's waiting processors slept while it booted" "when it served its first processor had run $first_ms ms and its other $((vcpus - 1)) together $others_ms ms"
+else
+    record FAIL "the guest's waiting processors slept while it booted" "when it served its first processor had run ${first_ms:-?} ms and its others together ${others_ms:-?} ms: $(tr '\n' ' ' < "$out/probe-ran.err")"
+fi
+if [ "$dev" = 1 ]; then
+    check "the guest's kernel brought up all four of its processors" \
+        grep -a -q '"msg":"the guest.s processors","brought_up":4,' "$out/probe.log"
+fi
 expect 0 "its machine is read from its evidence" machine "$C8S" session launch-config machine --url "https://127.0.0.1:$probe_port" \
     --image-manifest "$manifest" --launch-key "$out/pool.key.pub" "${accept[@]}"
 machine=$(tr -d '[:space:]' < "$out/machine.out")
@@ -506,6 +579,74 @@ elif ! command -v bpftrace > /dev/null || ! command -v cc > /dev/null; then
     record FAIL "the host can offer a guest every paravirtual feature and trace what it takes" "it needs bpftrace and a C compiler: C8S_SESSION_OFFERED=0 leaves the check out"
 else
     offered
+fi
+
+# The firmware has a waiting processor sleep only where somebody will wake
+# it, and the kernel wakes whichever it commands. Neither needs the other,
+# and no pair of them may hang. C8S_SESSION_OLD_IMAGE names an image of this
+# kind built before either learnt that, with a firmware whose waiting
+# processors spin and a kernel that wakes nobody. Its guest booted on this
+# image's firmware, and this image's guest booted on its firmware, must each
+# serve: a kernel that could not start its processors would wait for them
+# for ever. Each boots by the images' own path, from its disk.
+paired() {
+    local old=${C8S_SESSION_OLD_IMAGE:-} dir file
+    if [ -z "$old" ]; then
+        echo "== LEFT OUT: a kernel that wakes no waiting processor on this firmware, and this kernel on a firmware whose waiting processors spin (C8S_SESSION_OLD_IMAGE names an image built before both)"
+        return
+    fi
+    if cmp -s "$old/OVMF.tdx.fd" "$IMG/OVMF.tdx.fd"; then
+        record FAIL "the image to pair with is one from before this firmware" "$old has this image's firmware"
+        return
+    fi
+    # pair <directory> <its files' image> <its firmware's image> <step>
+    pair() {
+        dir=$out/$1
+        mkdir -p "$dir"
+        for file in "$2"/*; do
+            ln -sf "$file" "$dir/$(basename "$file")"
+        done
+        rm -f "$dir/OVMF.tdx.fd" "$dir/manifest.json"
+        cp "$3/OVMF.tdx.fd" "$dir/OVMF.tdx.fd"
+        # The pair's reference values are its firmware's MRTD with the other
+        # registers of its files' image: a guest serves only on a launch
+        # document for the measurements it booted with.
+        if ! python3 - "$2/manifest.json" "$3/manifest.json" > "$dir/manifest.json" 2> "$out/$1.err" <<'MIX' ||
+import json, sys
+image, firmware = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+image["tdx"]["mrtd"], image["tdx"]["firmware"] = firmware["tdx"]["mrtd"], firmware["tdx"]["firmware"]
+json.dump(image, sys.stdout)
+MIX
+            ! "$C8S" session launch-config new --out "$out/bundle-$1" --key "$out/pool.key" --key-service "$pin" \
+                --image-manifest "$dir/manifest.json" --pool agents --class s-4x16 > "$out/bundle-$1.out" 2>> "$out/$1.err"; then
+            record FAIL "$4" "no launch bundle for the pair: $(tail -c 300 "$out/$1.err" | tr '\n' ' ')"
+            return
+        fi
+        sudo -n "$C8S" "${launcher[@]}" --image-dir "$dir" --launch-dir "$out/bundle-$1/opkeydata" --work-dir "$dir-vm" \
+            --name "c8s-session-$1-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/$1.log" 2>&1 &
+        probe_pid=$!
+        if serving "$probe_pid" "$probe_port"; then
+            record PASS "$4"
+        else
+            record FAIL "$4" "$(tail -c 600 "$out/$1.log" | tr '\n' ' ')"
+        fi
+        stop_pid "$probe_pid"; probe_pid=""
+    }
+    pair unwoken "$old" "$IMG" "a kernel that wakes no waiting processor starts all of its own on this firmware, and serves"
+    pair unslept "$IMG" "$old" "this image's kernel starts all its processors on a firmware whose waiting processors spin, and serves"
+    # A kernel that could not start a processor would go on without it, and
+    # still serve: a development guest's agent says how many it has.
+    if [ "$dev" = 1 ]; then
+        check "the kernel that wakes nobody brought up all four on this firmware" \
+            grep -a -q '"msg":"the guest.s processors","brought_up":4,' "$out/unwoken.log"
+        check "this image's kernel brought up all four on the firmware that spins" \
+            grep -a -q '"msg":"the guest.s processors","brought_up":4,' "$out/unslept.log"
+    fi
+}
+if [ "${C8S_SESSION_PAIRED:-1}" = 0 ]; then
+    echo "== LEFT OUT: this firmware under a kernel that wakes nobody, and this kernel on a firmware that spins (C8S_SESSION_PAIRED=0)"
+else
+    paired
 fi
 
 expect 0 "the pool's launch bundle, which pins the key service and lists the machine" bundle "$C8S" session launch-config new --out "$out/bundle" \

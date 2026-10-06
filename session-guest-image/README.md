@@ -105,7 +105,7 @@ is no boot loader between them.
 
 | Step | What it is | Where it is measured |
 |---|---|---|
-| Firmware | TDVF, built by `firmware/build` from edk2 at a pinned commit: a release build without the UEFI shell | MRTD |
+| Firmware | TDVF, built by `firmware/build` from edk2 at a pinned commit with the patches in `firmware/patches/`: a release build without the UEFI shell | MRTD |
 | Kernel image | the UKI, installed as the boot partition's fallback application (`Bootloader=uki`) | RTMR[1], and its kernel, initrd and command line in RTMR[2] |
 | Kernel | the builder's hardened kernel with `kernel/session.config` and the patches in `kernel/patches/` | part of the UKI |
 | Init | `c8s-session-init`, the one file of the initramfs | part of the UKI |
@@ -122,7 +122,7 @@ also refuses a command line with a word on `lsm`, `lockdown` or
 `init_on_free`, both as the profile gives it and as the built UKI carries
 it: the kernel's build settles all three.
 
-The kernel carries six source patches, applied in name order by the
+The kernel carries seven source patches, applied in name order by the
 builder's `--kernel-patch`. Each is named by hash in the manifest
 (`kernel_patches_sha256`).
 
@@ -134,6 +134,21 @@ builder's `--kernel-patch`. Each is named by hash in the manifest
 | `0004` | A guest's host answers the CPUID leaf that offers KVM's paravirtual features, and in a TD the TDX module has no part in the answer. The kernel now takes three of them, whatever is offered and whatever it runs on: the hypercall that sends an IPI, the one that kicks a halted vCPU and the one that asks the host to run a vCPU. Each asks the host for a wake-up or a turn and hands it nothing the guest computes with. It takes no clock of the host's, no steal time, no EOI or page fault the host completes, no TLB flush left to the host, and no hint. A guest with a simulated TEE takes the same. |
 | `0005` | A processor that asks another to run a function and waits for it spins until the other has. In a guest the other may be a vCPU its host has descheduled, and a TD's host sees no spin to act on, so the waiter spun to the end of its own turn on the processor the other was waiting for. A waiter that has had no answer for 100 microseconds now names the vCPU it waits for to the host, with the third hypercall of `0004`, and again each time it has waited as long. It reads nothing of the host's to decide. |
 | `0006` | A TD's halt tells its host whether its interrupts are off, which the host cannot see. One routine served the idle loop, which is to be woken by an interrupt, and the plain halt, and said they were on. A waiter for a lock that is taken with interrupts off halts with them off, for the vCPU that frees the lock to kick it: told they were on, the host ended that halt for a pending interrupt the waiter could not take, and the waiter never slept. The plain halt now says what the interrupts are. |
+| `0007` | A TD's processors other than the first wait in the firmware until the kernel sets a command for them in a mailbox. This image's firmware has them wait asleep where somebody will wake them (see the firmware's patch below). The kernel says at the mailbox that it wakes them, as soon as it finds the mailbox, and kicks a processor after each command it sets for it, with the second hypercall of `0004`. On a firmware whose waiting processors spin, both do nothing. The word stays for as long as the kernel runs, so a kernel that could start another kernel would have to take it back first: this one is built without kexec, which `build` checks. |
+
+The firmware carries one source patch (`firmware/patches/`), applied by
+`firmware/build`, which changes MRTD.
+
+| Patch | What it changes |
+|---|---|
+| `0001` | A TD's processors other than the first wait at a mailbox: in the firmware's own loop, then in a relocated one until an OS starts them, and again whenever the OS hands one back. They spun, since nothing could wake them from a halt, and a vCPU that spins costs its host a processor for as long as it waits. Under KVM the hypercall that kicks a halted vCPU can wake them, so they now halt wherever whoever sets what they wait for kicks them after: at the firmware's own mailbox from the start, at the relocated one until boot services end, and after that only under an OS that has written `KVMKICKS` at the start of the mailbox's area for the OS. As boot services end the first processor clears the word that said the firmware runs and then kicks the others, which it reaches by the APIC IDs below the TD's `MAX_VCPUS`: a processor with another ID spins wherever the firmware is the one to wake it. Under any other OS, and under a host that offers no kick, they spin as before, now with a PAUSE. The firmware takes nothing else of KVM's, and reads nothing a halt or a kick returns. |
+
+The firmware and the kernel do not need each other. This kernel on a
+firmware without the patch finds its processors spinning, and its kicks wake
+nobody. A kernel without `0007` on this firmware finds them spinning too,
+since it never writes the word that lets them sleep. `test/session/hardware.sh`
+boots both pairs from an image built before either change
+(`C8S_SESSION_OLD_IMAGE`), each by the images' own path.
 
 The bounce buffer that every virtio transfer goes through starts at 32 MiB
 and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=16384`). The kernel's

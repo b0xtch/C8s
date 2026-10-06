@@ -1,0 +1,190 @@
+Subject: [PATCH] x86/acpi: kick an AP that waits at the wakeup mailbox, and say so
+
+A TD's processors other than the first wait in the firmware until the
+kernel sets a command for them in a mailbox the two share. They wait
+spinning: their APICs are off and no INIT reaches a TD's vCPU, so nothing
+could wake them from a halt. A vCPU that spins costs its host a processor
+for as long as it waits, from the firmware's start until the kernel brings
+the processor up, and again for as long as the processor is offline.
+
+A firmware can have them sleep, halted with interrupts off, where the host
+wakes a halted vCPU for a kick: the hypercall this kernel makes for a
+lock's waiter. Such a firmware needs the OS to kick an AP after it sets a
+command for it, so it has an AP sleep only once the OS has said that it
+kicks, with a value at the start of the mailbox's area for the OS.
+
+This kernel writes that value as soon as it can read the MADT, which is
+before it sets up its own memory: a TD accepts the memory for that first,
+which can take most of a second, and the APs would spin through it. It
+kicks the AP after each command: the wake-up, and the test that shows a
+processor taken offline is back in the firmware.
+Under a firmware that knows no such value the write lands in bytes the
+ACPI specification leaves to the OS, and the kick wakes nobody. Under a
+host that offers no kick the kernel does neither.
+
+A kick asks the host to run a vCPU and hands the guest nothing. The host
+can delay it or leave it out, as it can keep any vCPU from running, and
+the kernel waits for the AP's answer in the mailbox as before.
+
+The value stays for as long as the kernel runs. A kernel that could hand
+its processors to another kernel, which might kick nobody, would have to
+clear it first: this image's kernel is built without kexec, and its build
+is checked for that.
+
+Linux-Version: 6.18.49
+---
+--- a/arch/x86/include/asm/acpi.h
++++ b/arch/x86/include/asm/acpi.h
+@@ -82,6 +82,8 @@
+ 
+ int __init acpi_parse_mp_wake(union acpi_subtable_headers *header,
+ 			      const unsigned long end);
++int __init acpi_parse_mp_wake_early(union acpi_subtable_headers *header,
++				    const unsigned long end);
+ 
+ void asm_acpi_mp_play_dead(u64 reset_vector, u64 pgd_pa);
+ 
+--- a/arch/x86/kernel/acpi/boot.c
++++ b/arch/x86/kernel/acpi/boot.c
+@@ -1631,6 +1631,17 @@
+ 	 */
+ 	early_acpi_process_madt();
+ 
++#ifdef CONFIG_ACPI_MADT_WAKEUP
++	/*
++	 * Tell a firmware whose waiting APs can sleep that this kernel kicks
++	 * them, before the kernel sets up its memory: in a TD that takes
++	 * long, and the APs would spin through it.
++	 */
++	if (!acpi_disabled)
++		acpi_table_parse_madt(ACPI_MADT_TYPE_MULTIPROC_WAKEUP,
++				      acpi_parse_mp_wake_early, 1);
++#endif
++
+ 	/*
+ 	 * Hardware-reduced ACPI mode initialization:
+ 	 */
+--- a/arch/x86/kernel/acpi/madt_wakeup.c
++++ b/arch/x86/kernel/acpi/madt_wakeup.c
+@@ -4,9 +4,11 @@
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/kexec.h>
++#include <linux/kvm_para.h>
+ #include <linux/memblock.h>
+ #include <linux/pgtable.h>
+ #include <linux/sched/hotplug.h>
++#include <linux/unaligned.h>
+ #include <asm/apic.h>
+ #include <asm/barrier.h>
+ #include <asm/init.h>
+@@ -24,6 +26,46 @@
+ static u64 acpi_mp_pgd __ro_after_init;
+ static u64 acpi_mp_reset_vector_paddr __ro_after_init;
+ 
++/*
++ * A firmware may have an AP that waits at the mailbox sleep, halted, where
++ * the AP's host wakes a halted vCPU for a kick and the OS kicks the AP after
++ * it sets a command. This kernel kicks, and says so with this value at the
++ * start of the mailbox's area for the OS. An AP that has not read it there,
++ * or whose firmware knows no such word, spins as it always did, and a kick
++ * then asks its host for nothing. The host can delay a kick or leave it out,
++ * as it can keep a vCPU from running: the AP is woken late or not at all,
++ * and reads the same mailbox when it is.
++ */
++#define ACPI_MP_WAKE_OS_KICKS	0x534b43494b4d564bULL	/* "KVMKICKS" */
++
++static bool acpi_mp_kicks(void)
++{
++	return kvm_para_available() && kvm_para_has_feature(KVM_FEATURE_PV_UNHALT);
++}
++
++/* Wake the AP that a command was just set for, in case it sleeps. */
++static void acpi_mp_kick(u32 apicid)
++{
++	if (acpi_mp_kicks())
++		kvm_hypercall2(KVM_HC_KICK_CPU, 0, apicid);
++}
++
++/* Before any command: the APs may sleep from here on. */
++static void __init acpi_mp_say_it_kicks(void)
++{
++	struct acpi_madt_multiproc_wakeup_mailbox *mailbox;
++
++	if (!acpi_mp_wake_mailbox_paddr || !acpi_mp_kicks())
++		return;
++
++	mailbox = early_memremap(acpi_mp_wake_mailbox_paddr, sizeof(*mailbox));
++	if (!mailbox)
++		return;
++
++	put_unaligned_le64(ACPI_MP_WAKE_OS_KICKS, mailbox->reserved_os);
++	early_memunmap(mailbox, sizeof(*mailbox));
++}
++
+ static void acpi_mp_stop_this_cpu(void)
+ {
+ 	asm_acpi_mp_play_dead(acpi_mp_reset_vector_paddr, acpi_mp_pgd);
+@@ -49,6 +91,7 @@
+ 	acpi_mp_wake_mailbox->apic_id = apicid;
+ 	smp_store_release(&acpi_mp_wake_mailbox->command,
+ 			  ACPI_MP_WAKE_COMMAND_TEST);
++	acpi_mp_kick(apicid);
+ 
+ 	/* Don't wait longer than a second. */
+ 	timeout = USEC_PER_SEC;
+@@ -158,13 +201,14 @@
+ 	acpi_mp_wake_mailbox->wakeup_vector = start_ip;
+ 	smp_store_release(&acpi_mp_wake_mailbox->command,
+ 			  ACPI_MP_WAKE_COMMAND_WAKEUP);
++	acpi_mp_kick(apicid);
+ 
+ 	/*
+ 	 * Wait for the CPU to wake up.
+ 	 *
+ 	 * The CPU being woken up is essentially in a spin loop waiting to be
+-	 * woken up. It should not take long for it wake up and acknowledge by
+-	 * zeroing out ->command.
++	 * woken up, or asleep and just kicked. It should not take long for it
++	 * wake up and acknowledge by zeroing out ->command.
+ 	 *
+ 	 * ACPI specification doesn't provide any guidance on how long kernel
+ 	 * has to wait for a wake up acknowledgment. It also doesn't provide
+@@ -205,6 +249,29 @@
+ 	mp_wake->mailbox_address = 0;
+ }
+ 
++/*
++ * As soon as the MADT can be read: the mailbox's address, to say there that
++ * this kernel kicks. The entry is parsed in full, and set up, later.
++ */
++int __init acpi_parse_mp_wake_early(union acpi_subtable_headers *header,
++				    const unsigned long end)
++{
++	struct acpi_madt_multiproc_wakeup *mp_wake;
++
++	mp_wake = (struct acpi_madt_multiproc_wakeup *)header;
++	if (!mp_wake)
++		return -EINVAL;
++	if (end - (unsigned long)mp_wake < ACPI_MADT_MP_WAKEUP_SIZE_V0)
++		return -EINVAL;
++	if (mp_wake->header.length < ACPI_MADT_MP_WAKEUP_SIZE_V0)
++		return -EINVAL;
++
++	acpi_mp_wake_mailbox_paddr = mp_wake->mailbox_address;
++	acpi_mp_say_it_kicks();
++
++	return 0;
++}
++
+ int __init acpi_parse_mp_wake(union acpi_subtable_headers *header,
+ 			      const unsigned long end)
+ {
+@@ -228,6 +295,7 @@
+ 	acpi_table_print_madt_entry(&header->common);
+ 
+ 	acpi_mp_wake_mailbox_paddr = mp_wake->mailbox_address;
++	acpi_mp_say_it_kicks();
+ 
+ 	if (mp_wake->version >= ACPI_MADT_MP_WAKEUP_VERSION_V1 &&
+ 	    mp_wake->header.length >= ACPI_MADT_MP_WAKEUP_SIZE_V1) {

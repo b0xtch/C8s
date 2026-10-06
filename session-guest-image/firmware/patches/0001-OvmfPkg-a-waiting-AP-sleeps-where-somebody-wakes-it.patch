@@ -1,0 +1,627 @@
+Subject: [PATCH] OvmfPkg: a TD's waiting APs sleep where somebody will wake them
+
+A TD's processors other than the first wait at a mailbox: in the firmware's
+own loop until its DXE phase moves them, and then in a relocated loop until
+an OS sets a command for them, and again whenever the OS hands one back.
+They wait spinning, the relocated loop without a PAUSE, since nothing could
+wake them from a halt: their APICs are off and a TD's vCPU takes no INIT. A
+vCPU that spins costs its host a processor for as long as it waits.
+
+Under KVM something can wake them: the hypercall that kicks a halted vCPU,
+named by its APIC ID, works whatever state that APIC is in. So an AP now
+halts, with the flag that says its interrupts are off, wherever whoever
+sets what it waits for kicks it after:
+
+- At the firmware's own mailbox, from the start. Its BSP kicks after each
+  command and each release of the APs. The one thing an AP waits for there
+  that another AP brings about is the count of those that have arrived: the
+  AP that makes it whole kicks the others, since the BSP may have counted
+  itself, and kicked, before that AP came.
+- At the relocated mailbox while the firmware still runs. No command comes
+  then. As boot services end the BSP clears a word of the mailbox and then
+  kicks, in that order, so an AP that read the word as set and has not
+  halted yet is kicked too.
+- At the relocated mailbox under an OS, only once the OS has written
+  "KVMKICKS" at the start of the mailbox's area for the OS, which says that
+  it kicks an AP after it sets a command for it. Under an OS that never
+  writes it the APs spin as before, now with a PAUSE. An OS that writes it
+  and can hand the APs to another OS clears it first.
+
+An AP asks its host's KVM leaf whether a kick is offered and spins where it
+is not, and the firmware takes nothing else of KVM's. The BSP kicks the APIC
+IDs below the TD's MAX_VCPUS, so an AP with another ID spins wherever the
+BSP is the one to wake it. A kick that comes before the halt ends that halt
+at once, so none is missed between an AP's look at the mailbox and its
+halt, and a kick that comes for nothing costs a second look. What the halt
+and the kick return is not read.
+
+The one wait this leaves spinning is an AP's for the BSP's page tables, in
+the reset vector, which is over in microseconds: it gets a PAUSE.
+
+edk2: edk2-stable202608
+---
+--- a/OvmfPkg/Include/IndustryStandard/IntelTdx.h
++++ b/OvmfPkg/Include/IndustryStandard/IntelTdx.h
+@@ -45,7 +45,13 @@
+   UINT64    WakeUpArgs2;
+   UINT64    WakeUpArgs3;
+   UINT64    WakeUpArgs4;
+-  UINT8     Pad1[0xe0];
++  //
++  // Not zero in the relocated mailbox for as long as the firmware runs: no
++  // OS sets a command there yet, and the BSP kicks the APs as it hands the
++  // machine over (see TdxCommondefs.inc).
++  //
++  UINT64    FirmwareRuns;
++  UINT8     Pad1[0xd8];
+   UINT64    NumCpusArriving;
+   UINT8     Pad2[0xf8];
+   UINT64    NumCpusExiting;
+--- a/OvmfPkg/Include/Library/TdxMailboxLib.h
++++ b/OvmfPkg/Include/Library/TdxMailboxLib.h
+@@ -71,3 +71,14 @@
+ MpSerializeEnd (
+   VOID
+   );
++
++/**
++  This function will be called by BSP to wake the APs that sleep at a mailbox,
++  after it has changed what they wait for. Under a host that does not wake a
++  halted vCPU for a kick no AP sleeps, and this does nothing.
++**/
++VOID
++EFIAPI
++MpKickAps (
++  VOID
++  );
+--- a/OvmfPkg/Include/TdxCommondefs.inc
++++ b/OvmfPkg/Include/TdxCommondefs.inc
+@@ -17,6 +17,7 @@
+ AcceptPageArgsPhysicalEnd                 equ       808h
+ AcceptPageArgsTopStackAddress             equ       810h
+ AcceptPageArgsApStackSize                 equ       818h
++FirmwareRunsOffset                        equ       820h
+ CpuArrivalOffset                          equ       900h
+ CpusExitingOffset                         equ       0a00h
+ TalliesOffset                             equ       0a08h
+@@ -48,3 +49,132 @@
+ 
+ %define TDCALL_TDINFO                          0x1
+ %define TDCALL_TDACCEPTPAGE                    0x6
++
++;
++; A waiting AP sleeps where whoever sets what it waits for kicks it after.
++; A kick is KVM's hypercall that makes a halted vCPU runnable: it names the
++; vCPU by its APIC ID and works whatever state that APIC is in.
++;
++; The BSP kicks after each change to the mailbox the firmware starts with,
++; so an AP sleeps at that one from the start. One thing an AP waits for
++; there another AP can bring about: the count of those that have arrived,
++; which the last to arrive makes whole. That AP kicks the others, as the BSP
++; would. At the relocated mailbox only
++; an OS sets commands. Until the firmware hands the machine to one, no
++; command comes, and an AP sleeps there: the BSP clears FirmwareRuns and
++; then kicks the APs as boot services end. From then on an AP sleeps only
++; once the OS has written MP_WAKEUP_OS_KICKS at the start of the mailbox's
++; area for the OS, which says that it kicks an AP after it sets a command.
++; An OS that never writes it finds the APs spinning, as it always did. An
++; OS that writes it and can hand the APs to another OS clears it first.
++;
++; The BSP kicks the APIC IDs below the TD's MAX_VCPUS: an AP with another
++; ID spins wherever the BSP is the one to wake it. Under a host that offers
++; no kick an AP spins everywhere. Every spin has a PAUSE.
++;
++; A kick is a reason to look at the mailbox again and nothing else: what the
++; halt and the kick return is not read.
++;
++%define TDVMCALL_CPUID                         10
++%define TDVMCALL_HLT                           12
++%define KVM_CPUID_SIGNATURE                    0x40000000
++%define KVM_CPUID_FEATURES                     0x40000001
++%define KVM_FEATURE_PV_UNHALT                  7
++%define KVM_HC_KICK_CPU                        5
++%define MP_WAKEUP_OS_KICKS                     0x534b43494b4d564b  ; "KVMKICKS"
++
++;
++; ap_asks_cpuid <leaf>: the host's answer for a CPUID leaf, EAX to EDX in
++; R12D to R15D. ZF is clear if the call failed. Uses RAX, RCX and R10 to
++; R15, and shows the host no other register.
++;
++%macro ap_asks_cpuid 1
++    xor     eax, eax
++    mov     ecx, 0xfc00
++    xor     r10d, r10d
++    mov     r11d, TDVMCALL_CPUID
++    mov     r12d, %1
++    xor     r13d, r13d
++    xor     r14d, r14d
++    xor     r15d, r15d
++    tdcall
++    or      rax, r10
++%endmacro
++
++;
++; ap_may_sleep: R13 is 1 if this AP's host wakes a halted vCPU for a kick,
++; and 0 if not. Uses RAX, RCX and R10 to R15.
++;
++%macro ap_may_sleep 0
++    ap_asks_cpuid KVM_CPUID_SIGNATURE
++    jnz     %%spins
++    cmp     r13d, 0x4b4d564b                ; "KVMK"
++    jne     %%spins
++    cmp     r14d, 0x564b4d56                ; "VMKV"
++    jne     %%spins
++    cmp     r15d, 0x0000004d                ; "M"
++    jne     %%spins
++    ap_asks_cpuid KVM_CPUID_FEATURES
++    jnz     %%spins
++    bt      r12d, KVM_FEATURE_PV_UNHALT
++    jnc     %%spins
++    mov     r13d, 1
++    jmp     %%asked
++%%spins:
++    xor     r13d, r13d
++%%asked:
++%endmacro
++
++;
++; ap_sleeps: halt, and say that interrupts are off, which the host ends for
++; a kick alone. A kick that came since this AP last halted ends the halt at
++; once, so none is missed between a look at the mailbox and the halt. Uses
++; RAX, RCX and R10 to R12.
++;
++%macro ap_sleeps 0
++    xor     eax, eax
++    mov     ecx, 0x1c00
++    xor     r10d, r10d
++    mov     r11d, TDVMCALL_HLT
++    mov     r12d, 1
++    tdcall
++%endmacro
++
++;
++; ap_kicks_all: kick every APIC ID below the TD's MAX_VCPUS, which R8 holds
++; in its upper half, where R14 is 1: the host wakes a halted vCPU for a
++; kick. Uses RAX, RCX, R10 to R12 and R15.
++;
++%macro ap_kicks_all 0
++    test    r14d, r14d
++    jz      %%kicked
++    xor     r15d, r15d
++%%next:
++    mov     rax, r8
++    shr     rax, 32
++    cmp     r15d, eax
++    jae     %%kicked
++    xor     eax, eax
++    mov     ecx, 0x1c00
++    mov     r10d, KVM_HC_KICK_CPU
++    xor     r11d, r11d
++    mov     r12d, r15d
++    tdcall
++    inc     r15d
++    jmp     %%next
++%%kicked:
++%endmacro
++
++;
++; ap_waits: wait to look again at what this AP waits for: asleep where R13
++; is 1, and for a pause where it is not. Uses RAX, RCX and R10 to R12.
++;
++%macro ap_waits 0
++    test    r13d, r13d
++    jz      %%pauses
++    ap_sleeps
++    jmp     %%waited
++%%pauses:
++    pause
++%%waited:
++%endmacro
+--- a/OvmfPkg/IntelTdx/Sec/X64/IntelTdxAPs.nasm
++++ b/OvmfPkg/IntelTdx/Sec/X64/IntelTdxAPs.nasm
+@@ -17,6 +17,22 @@
+     ; R9  [31:0]  VCPU_INDEX
+     ;
+ ParkAp:
++    ;
++    ; R14 says from here on whether this AP's host wakes a halted vCPU for a
++    ; kick, and R13 whether this AP sleeps as it waits. The BSP kicks the
++    ; APIC IDs below MAX_VCPUS, so an AP whose ID is none of them spins.
++    ;
++    ap_may_sleep
++    mov       ebx, r13d
++    ap_asks_cpuid 0xb
++    mov       r14d, ebx
++    mov       r13d, 0
++    jnz       do_wait_loop
++    mov       rax, r8
++    shr       rax, 32
++    cmp       r15d, eax
++    jae       do_wait_loop
++    mov       r13d, r14d
+ 
+ do_wait_loop:
+     ;
+@@ -26,16 +42,26 @@
+     lock xadd dword [rsp + CpuArrivalOffset], eax
+     inc       eax
+ 
++    ;
++    ; The AP whose arrival makes the count whole wakes those that sleep on
++    ; it: the BSP kicked when it counted itself, which may have been before.
++    ;
++    cmp       eax, r8d
++    jne       .check_arrival_cnt
++    ap_kicks_all
++    jmp       .check_command
++
+ .check_arrival_cnt:
+     cmp       eax, r8d
+     je        .check_command
++    ap_waits
+     mov       eax, dword[rsp + CpuArrivalOffset]
+     jmp       .check_arrival_cnt
+ 
+ .check_command:
+     mov     eax, dword[rsp + CommandOffset]
+     cmp     eax, MpProtectedModeWakeupCommandNoop
+-    je      .check_command
++    je      .wait_command
+ 
+     cmp     eax, MpProtectedModeWakeupCommandWakeup
+     je      .do_wakeup
+@@ -44,6 +70,9 @@
+     je      .do_accept_pages
+ 
+     ; Don't support this command, so ignore
++
++.wait_command:
++    ap_waits
+     jmp     .check_command
+ 
+ .do_accept_pages:
+@@ -101,6 +130,7 @@
+ .check_exiting_cnt:
+     cmp     eax, 0
+     je      do_wait_loop
++    ap_waits
+     mov     eax, dword[rsp + CpusExitingOffset]
+     jmp     .check_exiting_cnt
+ 
+--- a/OvmfPkg/Library/TdxMailboxLib/TdxMailbox.c
++++ b/OvmfPkg/Library/TdxMailboxLib/TdxMailbox.c
+@@ -18,6 +18,38 @@
+ #include <Library/TdxMailboxLib.h>
+ 
+ /**
++  Kick the vCPUs whose APIC ID is below Limit, where the TD's host wakes a
++  halted vCPU for a kick. Under a host that does not, it does nothing.
++
++  @param[in] Limit            The first APIC ID that is not kicked
++**/
++VOID
++EFIAPI
++TdxMailboxKick (
++  IN UINT32  Limit
++  );
++
++/**
++  This function will be called by BSP to wake the APs that sleep at a mailbox,
++  after it has changed what they wait for (see TdxCommondefs.inc). An AP
++  whose APIC ID this does not reach does not sleep where the BSP wakes it.
++**/
++VOID
++EFIAPI
++MpKickAps (
++  VOID
++  )
++{
++  UINT64          Status;
++  TD_RETURN_DATA  TdReturnData;
++
++  Status = TdCall (TDCALL_TDINFO, 0, 0, 0, &TdReturnData);
++  if (Status == TDX_EXIT_REASON_SUCCESS) {
++    TdxMailboxKick (TdReturnData.TdInfo.MaxVcpus);
++  }
++}
++
++/**
+   This function will be called by BSP to get the CPU number.
+ 
+   @retval   CPU number
+@@ -87,6 +119,7 @@
+   AsmCpuid (0x01, NULL, NULL, NULL, NULL);
+   MailBox->Command = Command;
+   AsmCpuid (0x01, NULL, NULL, NULL, NULL);
++  MpKickAps ();
+   return;
+ }
+ 
+@@ -113,6 +146,7 @@
+   DEBUG ((DEBUG_VERBOSE, "Releasing APs\n"));
+   MailBox->NumCpusExiting = NumOfCpus;
+   InterlockedIncrement ((UINT32 *)&MailBox->NumCpusArriving);
++  MpKickAps ();
+ }
+ 
+ /**
+@@ -136,4 +170,5 @@
+   MailBox->Command         = MpProtectedModeWakeupCommandNoop;
+   MailBox->NumCpusArriving = 0;
+   InterlockedDecrement ((UINT32 *)&MailBox->NumCpusExiting);
++  MpKickAps ();
+ }
+--- a/OvmfPkg/Library/TdxMailboxLib/TdxMailboxLib.inf
++++ b/OvmfPkg/Library/TdxMailboxLib/TdxMailboxLib.inf
+@@ -24,6 +24,7 @@
+ 
+ [Sources.X64]
+   TdxMailbox.c
++  X64/TdxMailboxKick.nasm
+ 
+ [Packages]
+   MdePkg/MdePkg.dec
+--- a/OvmfPkg/Library/TdxMailboxLib/TdxMailboxNull.c
++++ b/OvmfPkg/Library/TdxMailboxLib/TdxMailboxNull.c
+@@ -83,3 +83,16 @@
+ {
+   ASSERT (FALSE);
+ }
++
++/**
++  This function will be called by BSP to wake the APs that sleep at a mailbox,
++  after it has changed what they wait for.
++**/
++VOID
++EFIAPI
++MpKickAps (
++  VOID
++  )
++{
++  ASSERT (FALSE);
++}
+--- /dev/null
++++ b/OvmfPkg/Library/TdxMailboxLib/X64/TdxMailboxKick.nasm
+@@ -0,0 +1,64 @@
++;------------------------------------------------------------------------------
++; @file
++; The BSP's kick of the APs that sleep at the mailbox
++;
++; SPDX-License-Identifier: BSD-2-Clause-Patent
++;
++;------------------------------------------------------------------------------
++
++%include "TdxCommondefs.inc"
++
++DEFAULT REL
++SECTION .text
++
++BITS 64
++
++%macro  tdcall  0
++  db  0x66, 0x0f, 0x01, 0xcc
++%endmacro
++
++;------------------------------------------------------------------------------
++;  VOID
++;  EFIAPI
++;  TdxMailboxKick (
++;    IN UINT32  Limit   // Rcx
++;    );
++;
++;  Kicks every APIC ID below Limit, the caller's own among them, which costs
++;  the caller one halt that returns at once. The host is shown R10 to R12
++;  of a kick, and R10 to R15 of the two CPUID leaves that say whether it
++;  takes one.
++;------------------------------------------------------------------------------
++global ASM_PFX(TdxMailboxKick)
++ASM_PFX(TdxMailboxKick):
++    push    rbx
++    push    r12
++    push    r13
++    push    r14
++    push    r15
++
++    mov     ebx, ecx
++    ap_may_sleep
++    test    r13d, r13d
++    jz      .done
++
++    xor     r13d, r13d
++.next:
++    cmp     r13d, ebx
++    jae     .done
++    xor     eax, eax
++    mov     ecx, 0x1c00
++    mov     r10d, KVM_HC_KICK_CPU
++    xor     r11d, r11d
++    mov     r12d, r13d
++    tdcall
++    inc     r13d
++    jmp     .next
++
++.done:
++    pop     r15
++    pop     r14
++    pop     r13
++    pop     r12
++    pop     rbx
++    ret
+--- a/OvmfPkg/ResetVector/Ia32/IntelTdx.nasm.inc
++++ b/OvmfPkg/ResetVector/Ia32/IntelTdx.nasm.inc
+@@ -103,8 +103,9 @@
+     ;
+ TdxApWait:
+     cmp     byte[TDX_WORK_AREA_PGTBL_READY], 0
+-    je      TdxApWait
+-    jmp     ExitInitTdxWorkarea
++    jne     ExitInitTdxWorkarea
++    pause
++    jmp     TdxApWait
+ 
+ TdxBspEntry:
+     ;
+--- a/OvmfPkg/TdxDxe/TdxAcpiTable.c
++++ b/OvmfPkg/TdxDxe/TdxAcpiTable.c
+@@ -23,6 +23,7 @@
+ #include <Protocol/AcpiTable.h>
+ #include <Library/UefiBootServicesTableLib.h>
+ #include <Library/UefiLib.h>
++#include <Guid/EventGroup.h>
+ #include <Library/TdxMailboxLib.h>
+ #include <Protocol/Cpu.h>
+ #include <Uefi.h>
+@@ -139,10 +140,16 @@
+   RelocatedMailBox->Command      = MpProtectedModeWakeupCommandNoop;
+   RelocatedMailBox->ApicId       = MP_CPU_PROTECTED_MODE_MAILBOX_APICID_INVALID;
+   RelocatedMailBox->WakeUpVector = 0;
++  //
++  // Until boot services end, an AP sleeps at this mailbox, and
++  // HandOverMailBox wakes it. The mailbox's area for the OS is zero, as the
++  // whole page is: an OS that kicks says so there.
++  //
++  RelocatedMailBox->FirmwareRuns = 1;
+ 
+   //
+   // Wakup APs and have been move to the finalized run loop
+-  // They will spin until guest OS wakes them
++  // They will wait there until guest OS wakes them
+   //
+   MpSerializeStart ();
+ 
+@@ -166,6 +173,31 @@
+ }
+ 
+ /**
++  Hand the relocated mailbox over to the OS as boot services end. From here
++  on an OS sets its commands, and an AP sleeps at it only under an OS that
++  has said it kicks: the APs are woken to find that out.
++
++  @param[in]  Event     Event whose notification function is being invoked
++  @param[in]  Context   The relocated mailbox
++**/
++STATIC
++VOID
++EFIAPI
++HandOverMailBox (
++  IN EFI_EVENT  Event,
++  IN VOID       *Context
++  )
++{
++  //
++  // The word first, then the kicks: an AP that read the word as set and
++  // has not halted yet is kicked after, and its halt returns at once.
++  //
++  ((volatile MP_WAKEUP_MAILBOX *)Context)->FirmwareRuns = 0;
++  MemoryFence ();
++  MpKickAps ();
++}
++
++/**
+   Alter the MADT when ACPI Table from QEMU is available.
+ 
+   @param[in]  Event     Event whose notification function is being invoked
+@@ -192,6 +224,7 @@
+   EFI_PHYSICAL_ADDRESS                                 RelocateResetVector;
+   EFI_ACPI_6_6_MULTIPROCESSOR_WAKEUP_STRUCTURE         *MadtMpWk;
+   EFI_ACPI_1_0_MULTIPLE_APIC_DESCRIPTION_TABLE_HEADER  *MadtHeader;
++  EFI_EVENT                                            HandOverEvent;
+ 
+   Index        = 0;
+   NewMadtTable = NULL;
+@@ -208,6 +241,23 @@
+     ASSERT (FALSE);
+     DEBUG ((DEBUG_ERROR, "Failed to relocate Td mailbox\n"));
+     return;
++  }
++
++  //
++  // The APs sleep at the relocated mailbox until boot services end. With
++  // nobody to wake them then, they are woken now and spin.
++  //
++  Status = gBS->CreateEventEx (
++                  EVT_NOTIFY_SIGNAL,
++                  TPL_CALLBACK,
++                  HandOverMailBox,
++                  (VOID *)(UINTN)RelocateMailboxAddress,
++                  &gEfiEventExitBootServicesGuid,
++                  &HandOverEvent
++                  );
++  if (EFI_ERROR (Status)) {
++    DEBUG ((DEBUG_ERROR, "No event for the end of boot services: the APs spin. %r\n", Status));
++    HandOverMailBox (NULL, (VOID *)(UINTN)RelocateMailboxAddress);
+   }
+ 
+   do {
+--- a/OvmfPkg/TdxDxe/TdxDxe.inf
++++ b/OvmfPkg/TdxDxe/TdxDxe.inf
+@@ -45,6 +45,7 @@
+ 
+ [Guids]
+   gUefiOvmfPkgPlatformInfoGuid                      ## CONSUMES
++  gEfiEventExitBootServicesGuid                     ## CONSUMES ## Event
+ 
+ [Protocols]
+   gQemuAcpiTableNotifyProtocolGuid                 ## CONSUMES
+--- a/OvmfPkg/TdxDxe/X64/ApRunLoop.nasm
++++ b/OvmfPkg/TdxDxe/X64/ApRunLoop.nasm
+@@ -92,22 +92,56 @@
+     jnz         Panic
+     mov         r8, r15
+     mov         qword[rel mailbox_address], rbx
++    ; From here on RSI says whether the kick the BSP sends as boot services
++    ; end reaches this AP, which it does where the AP's APIC ID is below the
++    ; TD's MAX_VCPUS, and R13 whether this AP's host can wake it from a halt.
++    mov         rdi, r8
++    mov         rax, TDCALL_TDINFO
++    tdcall
++    shr         r8, 32
++    xor         esi, esi
++    cmp         edi, r8d
++    setb        sil
++    mov         r8, rdi
++    ap_may_sleep
++    and         esi, r13d
+ 
+ MailBoxLoop:
+-    ; Spin until command set
++    ; Wait until command set
+     cmp        dword [rbx + CommandOffset], MULTIPROCESSOR_WAKEUP_MAILBOX_COMMAND_NOOP
+-    je         MailBoxLoop
++    je         MailBoxWait
+     ; Determine if this is a broadcast or directly for my apic-id, if not, ignore
+     cmp        dword [rbx + ApicidOffset], MailboxApicidBroadcast
+     je         MailBoxProcessCommand
+     cmp        dword [rbx + ApicidOffset], r8d
+-    jne        MailBoxLoop
++    jne        MailBoxWait
+ MailBoxProcessCommand:
+     cmp        dword [rbx + CommandOffset], MULTIPROCESSOR_WAKEUP_MAILBOX_COMMAND_WAKEUP
+     je         MailBoxWakeUp
+     cmp        dword [rbx + CommandOffset], MULTIPROCESSOR_WAKEUP_MAILBOX_COMMAND_TEST
+     je         MailBoxTest
+     ; Don't support this command, so ignore
++MailBoxWait:
++    ; Asleep only where somebody will wake this AP. While the firmware runs
++    ; that is the BSP, as it hands the machine over, where its kick reaches
++    ; this AP. After that it is an OS that has said it kicks an AP after it
++    ; sets a command, where the host can wake this AP. Otherwise spin.
++    cmp        qword [rbx + FirmwareRunsOffset], 0
++    je         MailBoxUnderOs
++    test       esi, esi
++    jnz        MailBoxSleep
++    jmp        MailBoxSpin
++MailBoxUnderOs:
++    test       r13d, r13d
++    jz         MailBoxSpin
++    mov        rax, MP_WAKEUP_OS_KICKS
++    cmp        qword [rbx + OSArgsOffset], rax
++    jne        MailBoxSpin
++MailBoxSleep:
++    ap_sleeps
++    jmp        MailBoxLoop
++MailBoxSpin:
++    pause
+     jmp        MailBoxLoop
+ MailBoxWakeUp:
+     mov        rax, [rbx + WakeupVectorOffset]

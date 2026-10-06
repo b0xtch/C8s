@@ -54,7 +54,8 @@
 #                   repo's checkout).
 #   C8S_TDX_FIRMWARE=...
 #                   boot this TDX firmware file. Unset, firmware/build builds
-#                   it from source, once, into build/session-firmware/.
+#                   it from source into build/session-firmware/, once, and
+#                   again when its source or its patches have changed.
 #
 # Extra args are passed through to `confos build`.
 set -euo pipefail
@@ -154,7 +155,10 @@ FIRMWARE=()
 if [ "$C8S_PLATFORM" = tdx ]; then
     if [ -z "${C8S_TDX_FIRMWARE:-}" ]; then
         C8S_TDX_FIRMWARE="$REPO_DIR/build/session-firmware/OVMF.tdx.fd"
-        [ -f "$C8S_TDX_FIRMWARE" ] || "$PGI_DIR/firmware/build" "$C8S_TDX_FIRMWARE"
+        # Built once, and again when its source or its patches have changed.
+        if [ ! -f "$C8S_TDX_FIRMWARE" ] || [ "$(cat "$C8S_TDX_FIRMWARE.inputs" 2> /dev/null)" != "$("$PGI_DIR/firmware/build" --inputs)" ]; then
+            "$PGI_DIR/firmware/build" "$C8S_TDX_FIRMWARE"
+        fi
     fi
     [ -f "$C8S_TDX_FIRMWARE" ] || { echo "session-guest-image/build: C8S_TDX_FIRMWARE=$C8S_TDX_FIRMWARE is not a file" >&2; exit 1; }
     FIRMWARE=(--tdx-firmware "$C8S_TDX_FIRMWARE")
@@ -263,7 +267,9 @@ fi
 # RTMR[1] and RTMR[2] show the kernel a TD booted, and nothing may load
 # another kernel or add code to this one later, or read its memory: no
 # loadable modules, no kexec, no BPF system call, no /dev/mem and no
-# /proc/kcore.
+# /proc/kcore. Without kexec the kernel also never hands its processors to a
+# kernel that might not wake them: it tells the firmware that it wakes the
+# ones it commands (patch 0007), and they sleep on that word while it runs.
 for option in CONFIG_MODULES CONFIG_KEXEC CONFIG_KEXEC_FILE CONFIG_BPF_SYSCALL CONFIG_DEVMEM CONFIG_PROC_KCORE; do
     if grep -q "^$option=" "$SNAPSHOT"; then
         echo "session-guest-image/build: the kernel that was built has $option ($SNAPSHOT): code could be added to a session's kernel after its measurement, or its memory read" >&2

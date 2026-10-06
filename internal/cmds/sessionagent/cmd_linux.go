@@ -170,6 +170,9 @@ func newRunCmd() *cobra.Command {
 			if processors < 0 {
 				return errors.New("--processors is a number of processors, or 0 for all of the guest's")
 			}
+			// The processors the kernel brought up are the ones this
+			// process may run on as it starts.
+			cfg.Logger.Info("the guest's processors", "brought_up", runtime.NumCPU(), "agent_keeps_to", processors)
 			if processors > 0 {
 				runtime.GOMAXPROCS(processors)
 				if err := keepTo(processors); err != nil {
