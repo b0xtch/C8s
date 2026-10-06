@@ -119,7 +119,8 @@ func (r *ProcessRunner) Exec(ctx context.Context, req *session.ExecRequest) (*se
 	cmd.WaitDelay = waitDelay
 
 	start := time.Now()
-	startErr := cmd.Start()
+	// The agent may keep to fewer processors than a command is to have.
+	startErr := startWide(cmd)
 	var waitErr error
 	if startErr == nil {
 		group.started(cmd.Process)

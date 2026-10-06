@@ -144,10 +144,18 @@ func (g *processGroup) close() {
 	}
 }
 
+// agentWeight is the agent's weight on a processor against its siblings in
+// the service's cgroup, the sandbox and the commands, which keep the
+// kernel's 100. The session's code has every processor of the guest, the
+// agent's among them, and code that keeps its busy threads to the agent's
+// then takes a hundredth of it where it would take half.
+const agentWeight = "10000"
+
 // DelegatedCgroup prepares this service's own cgroup for per-command children.
 // cgroup v2 forbids processes in a cgroup that has controller-enabled children,
-// so the agent first moves itself into a leaf. It returns "" when the service
-// was not started with a delegated cgroup v2 subtree.
+// so the agent first moves itself into a leaf, which it weighs above the
+// children to come. It returns "" when the service was not started with a
+// delegated cgroup v2 subtree.
 func DelegatedCgroup() (string, error) {
 	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -165,8 +173,23 @@ func DelegatedCgroup() (string, error) {
 	if err := os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("0"), 0); err != nil {
 		return "", fmt.Errorf("move agent into its leaf cgroup: %w", err)
 	}
+	if err := weigh(base, leaf); err != nil {
+		return "", err
+	}
 	// Best effort: without the pids controller a command is still contained
 	// and killed whole, only its task count is unbounded.
 	_ = os.WriteFile(filepath.Join(base, "cgroup.subtree_control"), []byte("+pids"), 0)
 	return base, nil
+}
+
+// weigh gives the cgroup at leaf the agent's weight among the children of
+// base, whose processor time the kernel then shares out by weight.
+func weigh(base, leaf string) error {
+	if err := os.WriteFile(filepath.Join(base, "cgroup.subtree_control"), []byte("+cpu"), 0); err != nil {
+		return fmt.Errorf("share the service's processor time by weight: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(leaf, "cpu.weight"), []byte(agentWeight), 0); err != nil {
+		return fmt.Errorf("weigh the agent above its sandbox: %w", err)
+	}
+	return nil
 }

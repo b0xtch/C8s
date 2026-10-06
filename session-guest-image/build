@@ -35,7 +35,7 @@
 #                   keeps to, the first ones, with the runtime it starts
 #                   containers with (its --processors). The session's own
 #                   code has every one either way. Part of the measured
-#                   service line. Default 0: all of them.
+#                   service line. Default 1; 0 is all of them.
 #   C8S_NAME=...    output name (default c8s-session -> output/c8s-session/)
 #   C8S_MEMORY=...  default memory recorded in the manifest (default 1G)
 #   C8S_BINARY=...  stage this prebuilt linux/amd64 c8s-session-guest and
@@ -70,13 +70,16 @@ CONFOS_DIR=${CONFOS_DIR:-"$REPO_DIR/../confidential-os-builder"}
 case "${C8S_ACCEPT_RESERVE_MB:-0}" in
 ''|*[!0-9]*) echo "session-guest-image/build: C8S_ACCEPT_RESERVE_MB must be a number of megabytes, got '${C8S_ACCEPT_RESERVE_MB}'" >&2; exit 1 ;;
 esac
-case "${C8S_AGENT_PROCESSORS:-0}" in
-''|*[!0-9]*) echo "session-guest-image/build: C8S_AGENT_PROCESSORS must be a number of processors, got '${C8S_AGENT_PROCESSORS}'" >&2; exit 1 ;;
-esac
 case "${C8S_ROLE:-session}" in
-session) DEFAULT_NAME=c8s-session ;;
+# A session's agent keeps to one of its guest's processors unless it is told
+# otherwise: a start then wakes fewer of them. The key service has no
+# sandbox to leave the others to.
+session) DEFAULT_NAME=c8s-session C8S_AGENT_PROCESSORS=${C8S_AGENT_PROCESSORS-1} ;;
 key-service) DEFAULT_NAME=c8s-key-service ;;
 *)  echo "session-guest-image/build: C8S_ROLE must be session or key-service, got '${C8S_ROLE}'" >&2; exit 1 ;;
+esac
+case "${C8S_AGENT_PROCESSORS:-0}" in
+''|*[!0-9]*) echo "session-guest-image/build: C8S_AGENT_PROCESSORS must be a number of processors, got '${C8S_AGENT_PROCESSORS}'" >&2; exit 1 ;;
 esac
 if [ "${C8S_ROLE:-session}" != session ] && [ "${C8S_ACCEPT_RESERVE_MB:-0}${C8S_AGENT_PROCESSORS:-0}" != 00 ]; then
     echo "session-guest-image/build: C8S_ACCEPT_RESERVE_MB and C8S_AGENT_PROCESSORS are the session agent's: the key service starts no sandbox" >&2

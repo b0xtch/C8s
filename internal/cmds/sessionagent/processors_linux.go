@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
 	"strconv"
 
 	"golang.org/x/sys/unix"
@@ -44,4 +46,36 @@ func keepTo(n int) error {
 			return nil
 		}
 	}
+}
+
+// startWide starts cmd with every processor the agent was started with. A
+// process has what the thread that started it has, and an agent kept to
+// fewer has no such thread, so the calling one takes them for the start.
+func startWide(cmd *exec.Cmd) error {
+	// A locked thread is none the runtime starts another from.
+	runtime.LockOSThread()
+	var was unix.CPUSet
+	if err := unix.SchedGetaffinity(0, &was); err != nil {
+		runtime.UnlockOSThread()
+		return fmt.Errorf("read the agent's processors: %w", err)
+	}
+	if was.Count() >= runtime.NumCPU() {
+		runtime.UnlockOSThread()
+		return cmd.Start()
+	}
+	var all unix.CPUSet
+	for cpu := range len(all) * 64 {
+		all.Set(cpu)
+	}
+	// The kernel takes of the set what the guest has.
+	if err := unix.SchedSetaffinity(0, &all); err != nil {
+		runtime.UnlockOSThread()
+		return fmt.Errorf("take the guest's processors for a command: %w", err)
+	}
+	err := cmd.Start()
+	// A thread that cannot go back stays locked, and so ends with its caller.
+	if unix.SchedSetaffinity(0, &was) == nil {
+		runtime.UnlockOSThread()
+	}
+	return err
 }

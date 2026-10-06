@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -77,6 +79,38 @@ func TestProcessGroupLeavesACgroupThatDoesNotEmpty(t *testing.T) {
 	g.close()
 	if took := time.Since(began); took < closeWait || took > closeWait+time.Second {
 		t.Errorf("closing a group whose cgroup never emptied took %s, and the bound is %s", took, closeWait)
+	}
+}
+
+// The agent's cgroup is weighed above what runs beside it: a cgroup made
+// beside it, as the sandbox's is, keeps the kernel's own weight.
+func TestAgentOutweighsWhatRunsBesideIt(t *testing.T) {
+	parent, err := os.MkdirTemp(cgroupRoot, "c8s-test-weight-")
+	if err != nil {
+		t.Skipf("no cgroup of the test's own: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(parent) })
+	if has, _ := os.ReadFile(filepath.Join(parent, "cgroup.controllers")); !slices.Contains(strings.Fields(string(has)), "cpu") {
+		t.Skip("the test's cgroup has no cpu controller to hand on")
+	}
+	leaf, beside := filepath.Join(parent, "agent"), filepath.Join(parent, "sandbox")
+	for _, dir := range []string{leaf, beside} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(dir) })
+	}
+	if err := weigh(parent, leaf); err != nil {
+		t.Fatal(err)
+	}
+	for dir, want := range map[string]string{leaf: agentWeight, beside: "100"} {
+		got, err := os.ReadFile(filepath.Join(dir, "cpu.weight"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if weight := strings.TrimSpace(string(got)); weight != want {
+			t.Errorf("%s weighs %s, and should weigh %s", filepath.Base(dir), weight, want)
+		}
 	}
 }
 
