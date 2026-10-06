@@ -42,10 +42,13 @@ import (
 // it but descriptors: no command passes through it.
 func spawn() int {
 	self := fmt.Sprintf("/proc/self/fd/%d", ProgramFD)
-	// Held by a start from its fork until the process's number is written
-	// to its cgroup's file, and by the reaper for each wait: no process is
-	// reaped, and so none gives its number up, in between.
+	// started are the processes whose numbers are in their cgroups' files,
+	// and the only ones the reaper waits for. A process keeps its number
+	// until it is reaped, so one that is being started keeps its own until
+	// the kernel has read it there, and no reaping waits on a start: the
+	// agent learns of a command's end only once this spawner has reaped it.
 	var mu sync.Mutex
+	started := map[int]struct{}{}
 	say := func(text string, descriptors ...int) {
 		var rights []byte
 		if len(descriptors) > 0 {
@@ -58,21 +61,33 @@ func spawn() int {
 		}
 	}
 
-	ended := make(chan os.Signal, 1)
+	// One signal may stand for many ends, and a process that ended before it
+	// was listed is found when its start asks for another look.
+	ended, look := make(chan os.Signal, 1), make(chan struct{}, 1)
 	signal.Notify(ended, unix.SIGCHLD)
 	go func() {
-		for range ended {
-			for {
-				mu.Lock()
-				pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
-				mu.Unlock()
-				if errors.Is(err, unix.EINTR) {
-					continue
-				}
-				if pid <= 0 || err != nil {
+		for {
+			select {
+			case <-ended:
+			case <-look:
+			}
+			// A number is taken off the list under the lock that a start
+			// takes to put one on: one that is given up and comes back as
+			// a new process's is listed after it was struck, and stays.
+			mu.Lock()
+			for pid := range started {
+				for {
+					got, err := unix.Wait4(pid, nil, unix.WNOHANG, nil)
+					if errors.Is(err, unix.EINTR) {
+						continue
+					}
+					if got == pid || err != nil {
+						delete(started, pid)
+					}
 					break
 				}
 			}
+			mu.Unlock()
 		}
 	}()
 
@@ -90,7 +105,6 @@ func spawn() int {
 		if len(passed) != SpawnRequest {
 			say(fmt.Sprintf("%s %d a request carries %d descriptors, and this one %d", SpawnFailed, n, SpawnRequest, len(passed)))
 		} else {
-			mu.Lock()
 			var process int
 			pid, err := syscall.ForkExec(self, []string{self}, &syscall.ProcAttr{
 				Dir: "/", Env: []string{"PATH=" + defaultPath},
@@ -100,15 +114,21 @@ func spawn() int {
 				Sys:   &syscall.SysProcAttr{Setsid: true, PidFD: &process},
 			})
 			if err == nil {
-				// Its number is its own for as long as this lock is held:
-				// only the reaper above gives a number up, under the lock.
+				// Its number is its own until it is reaped, and it is not
+				// reaped before it is listed below.
 				if err = writeAll(passed[4], strconv.Itoa(pid)); err != nil {
 					err = fmt.Errorf("put the process in its cgroup: %w", err)
 					_ = unix.Kill(pid, unix.SIGKILL)
 					_ = unix.Close(process)
 				}
+				mu.Lock()
+				started[pid] = struct{}{}
+				mu.Unlock()
+				select {
+				case look <- struct{}{}:
+				default:
+				}
 			}
-			mu.Unlock()
 			if err != nil {
 				say(fmt.Sprintf("%s %d %v", SpawnFailed, n, err))
 			} else {

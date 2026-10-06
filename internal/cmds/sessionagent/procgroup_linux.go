@@ -29,6 +29,8 @@ const (
 type processGroup struct {
 	dir string
 	fd  *os.File
+	// tries is how many times close tried to remove the cgroup.
+	tries int
 }
 
 func newProcessGroup(parent, id string) (*processGroup, error) {
@@ -136,6 +138,7 @@ func (g *processGroup) close() {
 	g.fd.Close()
 	pause := time.Millisecond
 	for deadline := time.Now().Add(closeWait); ; time.Sleep(pause) {
+		g.tries++
 		if err := os.Remove(g.dir); err == nil || errors.Is(err, os.ErrNotExist) || time.Now().After(deadline) {
 			return
 		}

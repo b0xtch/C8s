@@ -338,32 +338,54 @@ const endWait = 200 * time.Millisecond
 // awaitEnd waits until the process a descriptor names has ended, and then
 // asks the kernel how. ok is false for a process nobody reaped in time: how
 // it ended is then not known.
+//
+// The kernel says how a process ended once its parent has reaped it, and
+// hangs up the descriptor then: the wait for that is one poll, which ends
+// when it happens, and for no longer than endWait.
 func awaitEnd(process *os.File) (end spawnEnd, ok bool) {
 	fd := int(process.Fd())
-	readable := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	for {
-		n, err := unix.Poll(readable, -1)
-		if errors.Is(err, unix.EINTR) {
-			continue
-		}
-		if err != nil || n == 0 {
-			return end, false
-		}
-		break
+	// Ended: the descriptor is readable.
+	if !polled(fd, unix.POLLIN, -1) {
+		return end, false
 	}
-	for pause, waited := 50*time.Microsecond, time.Duration(0); ; pause, waited = 2*pause, waited+pause {
-		info := unix.PidfdInfo{Mask: unix.PIDFD_INFO_EXIT}
-		if err := unix.IoctlPidfdInfo(fd, &info); err == nil && info.Mask&unix.PIDFD_INFO_EXIT != 0 {
-			status := unix.WaitStatus(info.Exit_code)
-			if status.Signaled() {
-				return spawnEnd{signal: int(status.Signal())}, true
-			}
-			return spawnEnd{status: status.ExitStatus()}, true
+	// Reaped: it hangs up, which a poll reports whatever it asks for.
+	if !polled(fd, 0, endWait) {
+		return end, false
+	}
+	info := unix.PidfdInfo{Mask: unix.PIDFD_INFO_EXIT}
+	if err := unix.IoctlPidfdInfo(fd, &info); err != nil || info.Mask&unix.PIDFD_INFO_EXIT == 0 {
+		return end, false
+	}
+	status := unix.WaitStatus(info.Exit_code)
+	if status.Signaled() {
+		return spawnEnd{signal: int(status.Signal())}, true
+	}
+	return spawnEnd{status: status.ExitStatus()}, true
+}
+
+// polled waits for events on a descriptor, or for it to hang up, for no
+// less than wait, or for ever with a wait below zero. It reports whether one
+// came.
+func polled(fd int, events int16, wait time.Duration) bool {
+	deadline := time.Now().Add(wait)
+	for {
+		left := -1
+		if wait >= 0 {
+			// The kernel takes whole milliseconds: rounded up, so that the
+			// wait is never shorter than it was asked to be.
+			left = int((max(time.Until(deadline), 0) + time.Millisecond - 1) / time.Millisecond)
 		}
-		if waited >= endWait {
-			return end, false
+		fds := []unix.PollFd{{Fd: int32(fd), Events: events}}
+		n, err := unix.Poll(fds, left)
+		switch {
+		case errors.Is(err, unix.EINTR):
+		case err != nil:
+			return false
+		case n > 0:
+			return true
+		case wait >= 0 && !time.Now().Before(deadline):
+			return false
 		}
-		time.Sleep(pause)
 	}
 }
 

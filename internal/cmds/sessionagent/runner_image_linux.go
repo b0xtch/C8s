@@ -155,8 +155,10 @@ type madeSandbox struct {
 	warmTaken chan struct{}
 	stopWarm  context.CancelFunc
 	warmDone  chan struct{}
-	// warmUsed counts the commands that ran as a process started ahead.
+	// warmUsed counts the commands that ran as a process started ahead, and
+	// commands all that the sandbox was asked to run.
 	warmUsed atomic.Int64
+	commands atomic.Int64
 	// spawner starts the container's command processes once it is up, in
 	// the runtime's place: see spawner. It is nil before that, in a
 	// container whose commands the runtime starts as they come, and once a
@@ -890,6 +892,12 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 	// way the command begins as the sandbox's init: out of its tenant's
 	// reach until it becomes the command, and with every processor of the
 	// guest from then on.
+	// The parts of a sandbox's first command are logged, as times and no
+	// more: it is the one a session's start waits for.
+	var trace *execTrace
+	if w.made.commands.Add(1) == 1 {
+		trace = &execTrace{began: time.Now()}
+	}
 	warm := w.made.takeWarm()
 	waited := warm != nil
 	for attempt := 0; ; attempt++ {
@@ -898,8 +906,10 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 			if warm, err = r.startWarm(w.made, w.process, "for-"+req.ID); err != nil {
 				return nil, err
 			}
+			trace.mark(execMade)
 		}
-		if resp, started := r.execWarm(ctx, warm, w.process, req); started {
+		trace.waited(waited && attempt == 0)
+		if resp, started := r.execWarm(ctx, warm, w.process, req, trace); started {
 			if waited && attempt == 0 {
 				w.made.warmUsed.Add(1)
 			}
@@ -1099,6 +1109,57 @@ func (r *ImageRunner) endWarm(warm *warmCommand) {
 	_ = os.RemoveAll(warm.dir)
 }
 
+// The parts of running one command, in their order: a process started for
+// it, where none waited; the process told its command; the process become
+// the command; the process gone; its cgroup killed; its cgroup removed.
+const (
+	execMade = iota
+	execTold
+	execBecame
+	execEnded
+	execKilled
+	execCleared
+	execParts
+)
+
+// execTrace is when the parts of running one command were done, each since
+// the command came, for the agent's own log. It holds times and counts, and
+// nothing of the command. A nil trace records nothing.
+type execTrace struct {
+	began time.Time
+	// ahead says the command took a process that waited for it.
+	ahead bool
+	at    [execParts]time.Duration
+}
+
+func (t *execTrace) mark(part int) { t.markAt(part, time.Now()) }
+
+func (t *execTrace) markAt(part int, at time.Time) {
+	if t != nil {
+		t.at[part] = at.Sub(t.began)
+	}
+}
+
+func (t *execTrace) waited(ahead bool) {
+	if t != nil {
+		t.ahead = ahead
+	}
+}
+
+func (t *execTrace) log(log *slog.Logger, tries int) {
+	if t == nil {
+		return
+	}
+	us := func(part int) int64 { return t.at[part].Microseconds() }
+	// As a count, which a record of numbers keeps: 1 for a process that waited.
+	waiting := 0
+	if t.ahead {
+		waiting = 1
+	}
+	log.Info("the sandbox's first command ran", "took_waiting_process", waiting, "made_us", us(execMade), "told_us", us(execTold),
+		"became_us", us(execBecame), "ended_us", us(execEnded), "killed_us", us(execKilled), "cleared_us", us(execCleared), "cgroup_tries", tries)
+}
+
 // takeWarm returns a command's process that waits for its command, or nil
 // when none does: the next one is still being started, or the container
 // starts none ahead.
@@ -1123,8 +1184,14 @@ func (m *madeSandbox) takeWarm() *warmCommand {
 // a command the runtime starts. started is false when the process ended
 // before it took the command: nothing ran, and the caller starts the command
 // another way.
-func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *specs.Process, req *session.ExecRequest) (_ *session.ExecResponse, started bool) {
-	defer r.endWarm(warm)
+func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *specs.Process, req *session.ExecRequest, trace *execTrace) (_ *session.ExecResponse, started bool) {
+	defer func() {
+		r.endWarm(warm)
+		if started {
+			trace.mark(execCleared)
+			trace.log(r.cfg.Logger, warm.group.tries)
+		}
+	}()
 	start := time.Now()
 	p := execProcess(main, req)
 	message, err := json.Marshal(sandboxinit.Process{Argv: p.Args, Env: p.Env, Cwd: p.Cwd})
@@ -1138,14 +1205,16 @@ func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *spe
 	if err := unix.Shutdown(int(warm.control.Fd()), unix.SHUT_WR); err != nil {
 		return nil, false
 	}
+	trace.mark(execTold)
 	type answer struct {
 		taken  bool
 		reason string
+		at     time.Time
 	}
 	said := make(chan answer, 1)
 	go func() {
 		taken, reason := sandboxinit.ReadAnswer(warm.control)
-		said <- answer{taken, reason}
+		said <- answer{taken, reason, time.Now()}
 	}()
 	go func() {
 		_, _ = warm.stdin.Write(req.Stdin)
@@ -1157,12 +1226,15 @@ func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *spe
 		_ = warm.group.kill(warm.command())
 		<-warm.done
 	}
+	trace.mark(execEnded)
 	// Stragglers that outlived the command must not outlive its result.
 	_ = warm.group.kill(warm.command())
+	trace.mark(execKilled)
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	var init answer
 	select {
 	case init = <-said:
+		trace.markAt(execBecame, init.at)
 	case <-time.After(waitDelay):
 	}
 	if !init.taken && init.reason == "" && !timedOut && ctx.Err() == nil {
