@@ -202,7 +202,9 @@ well, so these runs may flatter the TD by whatever that costs them; a run with
 TDX off in the firmware will say how much. And the host also ran a Kubernetes
 control plane and its workloads, which took 0.7 to 1.3 of one CPU over the
 five seconds before each configuration; that can only slow a side, and the
-sides took turns.
+sides took turns. They also ran before the method pinned the host's halt
+polling, so their records do not name it; it stood throughout at the host's
+default, 200,000 ns.
 
 From the claim, if any, and the bind to the first command's answer, in
 milliseconds: the median of 20 rounds, with the 90th percentile in brackets.
