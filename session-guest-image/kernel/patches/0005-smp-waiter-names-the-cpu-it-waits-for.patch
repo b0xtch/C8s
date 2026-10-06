@@ -1,0 +1,149 @@
+Subject: [PATCH] smp: a CPU that waits for another's answer names it to the host
+
+A CPU that sends another a function to run and waits for it spins until the
+other has run it. In a guest the other may be a vCPU its host has
+descheduled. A host that sees the spin, by the PAUSE exits it causes, runs
+the vCPU that is waited for. A TD gives its host no such exits, so the
+waiter spins to the end of its own slice, on the processor the other vCPU
+is waiting for, and with many vCPUs on few processors most of a guest
+kernel's time goes there.
+
+A KVM guest's waiter now asks its host to run the CPU it waits for, with the
+hypercall KVM has for that, once it has spun for a while with no answer, and
+again each time it has spun as long. It reads nothing from its host to
+decide: no steal time, no preempted flag. A host that ignores the request,
+or answers it wrongly, leaves the waiter waiting, as before.
+
+Linux-Version: 6.18.49
+---
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -351,7 +351,47 @@
+ 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
+ }
+ #endif
++
++#ifndef arch_csd_wait_yields
++static inline bool arch_csd_wait_yields(void) { return false; }
++static inline void arch_csd_wait_yield(int cpu) { }
++#endif
++
++/*
++ * How long a waiter spins before it says which CPU it waits for, each time.
++ * An answer from a CPU that runs, or that only has to wake, comes sooner.
++ */
++#define CSD_WAIT_YIELD_NS	(100 * NSEC_PER_USEC)
++
++/*
++ * Wait for @cpu to have run @csd's function. A guest's CPU that waits here
++ * may wait for a vCPU its host has descheduled. A host that sees the spin
++ * runs that vCPU. One that cannot see it, as a TD's cannot, lets the waiter
++ * spin to the end of its own slice, with the processor the other vCPU is
++ * waiting for. So where the architecture has a way to say it, a waiter that
++ * has spun for a while with no answer tells its host which CPU it waits
++ * for, and again each time it has spun as long.
++ */
++static __always_inline void csd_lock_wait_cpu(call_single_data_t *csd, int cpu)
++{
++	unsigned int spins = 0;
++	u64 since;
+ 
++	if (!arch_csd_wait_yields()) {
++		csd_lock_wait(csd);
++		return;
++	}
++	since = sched_clock();
++	while (READ_ONCE(csd->node.u_flags) & CSD_FLAG_LOCK) {
++		cpu_relax();
++		if (!(++spins & 63) && sched_clock() - since > CSD_WAIT_YIELD_NS) {
++			arch_csd_wait_yield(cpu);
++			since = sched_clock();
++		}
++	}
++	smp_acquire__after_ctrl_dep();
++}
++
+ static __always_inline void csd_lock(call_single_data_t *csd)
+ {
+ 	csd_lock_wait(csd);
+@@ -684,7 +724,7 @@
+ 	err = generic_exec_single(cpu, csd);
+ 
+ 	if (wait)
+-		csd_lock_wait(csd);
++		csd_lock_wait_cpu(csd, cpu);
+ 
+ 	put_cpu();
+ 
+@@ -874,7 +914,7 @@
+ 			call_single_data_t *csd;
+ 
+ 			csd = per_cpu_ptr(cfd->csd, cpu);
+-			csd_lock_wait(csd);
++			csd_lock_wait_cpu(csd, cpu);
+ 		}
+ 	}
+ }
+--- a/arch/x86/include/asm/smp.h
++++ b/arch/x86/include/asm/smp.h
+@@ -124,6 +124,17 @@
+ void native_send_call_func_ipi(const struct cpumask *mask);
+ void native_send_call_func_single_ipi(int cpu);
+ 
++#ifdef CONFIG_KVM_GUEST
++/*
++ * A KVM guest's CPU that waits for another CPU's answer asks its host to
++ * run that CPU, where the host takes the hint: see csd_lock_wait_cpu().
++ */
++bool kvm_csd_wait_yields(void);
++void kvm_csd_wait_yield(int cpu);
++#define arch_csd_wait_yields kvm_csd_wait_yields
++#define arch_csd_wait_yield kvm_csd_wait_yield
++#endif
++
+ asmlinkage __visible void smp_reboot_interrupt(void);
+ __visible void smp_reschedule_interrupt(struct pt_regs *regs);
+ __visible void smp_call_function_interrupt(struct pt_regs *regs);
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -632,6 +632,23 @@
+ 	pr_info("setup PV IPIs\n");
+ }
+ 
++static bool kvm_csd_yields __ro_after_init;
++
++bool kvm_csd_wait_yields(void)
++{
++	return kvm_csd_yields;
++}
++
++/*
++ * Ask the host to run the vCPU this one waits for. Nothing comes back that
++ * the guest goes on to use: a host that does not take the hint, or takes it
++ * wrongly, leaves the waiter where it was, waiting.
++ */
++void kvm_csd_wait_yield(int cpu)
++{
++	kvm_hypercall1(KVM_HC_SCHED_YIELD, per_cpu(x86_cpu_to_apicid, cpu));
++}
++
+ static void kvm_smp_send_call_func_ipi(const struct cpumask *mask)
+ {
+ 	int cpu;
+@@ -846,6 +863,16 @@
+ 		smp_ops.send_call_func_ipi = kvm_smp_send_call_func_ipi;
+ 		pr_info("setup PV sched yield\n");
+ 	}
++	/*
++	 * The same hypercall, asked for by a waiter's own clock and with no
++	 * steal time read: a CPU that has waited a while for another's answer
++	 * names it to the host.
++	 */
++	if (kvm_para_has_feature(KVM_FEATURE_PV_SCHED_YIELD) &&
++	    num_possible_cpus() != 1) {
++		kvm_csd_yields = true;
++		pr_info("a CPU that waits for another's answer yields to it\n");
++	}
+ 	if (cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "x86/kvm:online",
+ 				      kvm_cpu_online, kvm_cpu_down_prepare) < 0)
+ 		pr_err("failed to install cpu hotplug callbacks\n");

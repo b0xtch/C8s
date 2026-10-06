@@ -1,0 +1,54 @@
+Subject: [PATCH] x86/tdx: a halt with interrupts off says so to the host
+
+A TD cannot be seen to have interrupts off, so its halt tells the host
+whether they are, and the host leaves a vCPU that halted with them off
+halted until it is kicked. One routine served both the idle loop, which
+halts with interrupts off and is to be woken by one, and the plain halt,
+which leaves interrupts as they are. It told the host they were on, as the
+idle loop needs.
+
+A waiter for a spinlock takes the plain halt with interrupts off when the
+lock is one taken with them off, and waits for the lock's releaser to kick
+it. Told that interrupts were on, the host ended that halt for any pending
+interrupt, which the waiter could not take: with a tick due every
+millisecond the waiter then halted and came straight back for as long as it
+waited, an exit each time. The plain halt now has a routine of its own that
+says what the interrupts are. The idle loop's is as it was.
+
+Linux-Version: 6.18.49
+---
+--- a/arch/x86/coco/tdx/tdx.c
++++ b/arch/x86/coco/tdx/tdx.c
+@@ -468,6 +468,23 @@
+ 	raw_local_irq_enable();
+ }
+ 
++/*
++ * The plain halt, which leaves interrupts as they are: the host is told
++ * which. tdx_halt() above is the idle loop's too, which halts with
++ * interrupts off and is to be woken by one, so it says they are on. A
++ * caller of the plain halt with interrupts off means it: a waiter for a
++ * lock halts so, for the lock's releaser to kick it (kvm_wait()). Told that
++ * interrupts were on, the host ended that halt for any interrupt that was
++ * pending, which the waiter could not take, and with a tick due every
++ * millisecond the waiter halted and came straight back for as long as it
++ * waited.
++ */
++static void __cpuidle tdx_halt_as_is(void)
++{
++	if (__halt(raw_irqs_disabled()))
++		WARN_ONCE(1, "HLT instruction emulation failed\n");
++}
++
+ static int read_msr(struct pt_regs *regs, struct ve_info *ve)
+ {
+ 	struct tdx_module_args args = {
+@@ -1179,7 +1196,7 @@
+ 	 * in addition to having a reliable halt logic execution.
+ 	 */
+ 	pv_ops.irq.safe_halt = tdx_safe_halt;
+-	pv_ops.irq.halt = tdx_halt;
++	pv_ops.irq.halt = tdx_halt_as_is;
+ 
+ 	/*
+ 	 * TDX intercepts the RDMSR to read the X2APIC ID in the parallel

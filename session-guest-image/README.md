@@ -114,7 +114,7 @@ is no boot loader between them.
 A boot loader would be one more measured program, would read a configuration
 file that nothing measures, and waits for a key nobody can press.
 
-The kernel carries three source patches, applied in name order by the
+The kernel carries six source patches, applied in name order by the
 builder's `--kernel-patch`. Each is named by hash in the manifest
 (`kernel_patches_sha256`).
 
@@ -123,6 +123,9 @@ builder's `--kernel-patch`. Each is named by hash in the manifest
 | `0001` | A confidential guest accepts its memory as it uses it. Before its watermarks are set, the kernel accepted a block for every page allocation, and so a guest held memory it had never touched. It now accepts only what an allocation needs. |
 | `0002` | `vm.accept_memory_mb`: the agent can accept memory ahead of a sandbox at a time of its choosing, where otherwise the first task to touch it pays. |
 | `0003` | Memory the firmware already accepted is used, in every zone, before more is accepted. |
+| `0004` | A guest's host answers the CPUID leaf that offers KVM's paravirtual features, and in a TD the TDX module has no part in the answer. The kernel now takes three of them, whatever is offered and whatever it runs on: the hypercall that sends an IPI, the one that kicks a halted vCPU and the one that asks the host to run a vCPU. Each asks the host for a wake-up or a turn and hands it nothing the guest computes with. It takes no clock of the host's, no steal time, no EOI or page fault the host completes, no TLB flush left to the host, and no hint. A guest with a simulated TEE takes the same. |
+| `0005` | A processor that asks another to run a function and waits for it spins until the other has. In a guest the other may be a vCPU its host has descheduled, and a TD's host sees no spin to act on, so the waiter spun to the end of its own turn on the processor the other was waiting for. A waiter that has had no answer for 100 microseconds now names the vCPU it waits for to the host, with the third hypercall of `0004`, and again each time it has waited as long. It reads nothing of the host's to decide. |
+| `0006` | A TD's halt tells its host whether its interrupts are off, which the host cannot see. One routine served the idle loop, which is to be woken by an interrupt, and the plain halt, and said they were on. A waiter for a lock that is taken with interrupts off halts with them off, for the vCPU that frees the lock to kick it: told they were on, the host ended that halt for a pending interrupt the waiter could not take, and the waiter never slept. The plain halt now says what the interrupts are. |
 
 The bounce buffer that every virtio transfer goes through starts at 32 MiB
 and grows on demand (`CONFIG_SWIOTLB_DYNAMIC`, `swiotlb=16384`). The kernel's

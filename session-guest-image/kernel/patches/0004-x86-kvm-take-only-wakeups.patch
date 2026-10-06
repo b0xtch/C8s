@@ -1,0 +1,60 @@
+Subject: [PATCH] x86/kvm: take only wake-ups from what a host offers
+
+A KVM guest reads which paravirtual features its host offers from a CPUID
+leaf of the hypervisor's own range, and takes each one the answer names: a
+clock the host keeps, steal time and the preempted flag that goes with it,
+an EOI or a page fault the host completes, a TLB flush the guest skips for
+a vCPU the host reports preempted. Each of those lets the host decide
+something the guest then computes with, and the last lets it leave a stale
+translation in place. In a TD the TDX module has no part in that leaf: the
+guest's #VE handler asks the host, and the host answers what it likes.
+
+This kernel now takes three of them and nothing else, whatever its host
+offers and whatever it runs on: the hypercall that sends an IPI, the one
+that kicks a halted vCPU and the one that asks the host to run a vCPU.
+Each asks the host to wake or run a vCPU, which it can delay or refuse, as
+it can any interrupt, and none hands it anything the guest goes on to use.
+With steal time not taken, the kernel's own use of the third, which goes
+by the host's word that a vCPU is preempted, stays off. It takes no hint
+either. Every reader of a feature or a hint goes through the two functions
+changed here, kvmclock's and the idle driver's among them.
+
+A guest that is no TD takes the same, so that it differs from a TD by its
+hardware and by nothing its kernel takes from its host.
+
+Linux-Version: 6.18.49
+---
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -895,14 +895,29 @@
+ }
+ EXPORT_SYMBOL_GPL(kvm_para_available);
+ 
++/*
++ * A guest's host answers the leaf that offers these features. Of what a
++ * host offers there, this kernel takes only what can delay it and cannot
++ * change what it computes: the hypercall that sends an IPI, the one that
++ * kicks a halted vCPU, and the one that asks the host to run a vCPU. A
++ * clock the host keeps, steal time, an EOI or a page fault the host
++ * completes, a TLB flush left to the host for a vCPU it reports preempted:
++ * it takes none of them, whatever is offered, and no hint. Every reader of
++ * a feature or a hint comes here.
++ */
++#define KVM_FEATURES_TAKEN	(BIT(KVM_FEATURE_PV_SEND_IPI) | \
++				 BIT(KVM_FEATURE_PV_UNHALT) | \
++				 BIT(KVM_FEATURE_PV_SCHED_YIELD))
++
+ unsigned int kvm_arch_para_features(void)
+ {
+-	return cpuid_eax(kvm_cpuid_base() | KVM_CPUID_FEATURES);
++	return cpuid_eax(kvm_cpuid_base() | KVM_CPUID_FEATURES) &
++	       KVM_FEATURES_TAKEN;
+ }
+ 
+ unsigned int kvm_arch_para_hints(void)
+ {
+-	return cpuid_edx(kvm_cpuid_base() | KVM_CPUID_FEATURES);
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_para_hints);
+ 
