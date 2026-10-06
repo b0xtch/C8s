@@ -670,10 +670,13 @@ stops a session for about an epoch and the start of a restore.
   its limit with `RESOURCE_EXHAUSTED`. A host may also let only so many binds
   through to its guests at once. The rest wait, having reached no guest, and
   take their turns round the callers with binds waiting, each caller's oldest
-  first. A bind that claims its TD claims it only when its turn comes, a TD
-  claimed before its bind stays claimed while the bind waits, and the daemon
-  drops a bind whose caller gives up, or whose `notAfter` passes, before its
-  turn, so it claims nothing and ends no guest.
+  first. A turn lasts until the guest has sent its receipt and its quote over
+  the bind's nonce, or given the quote up, and never waits on the command
+  sealed with the bind, so one caller's commands neither hold another's binds
+  back nor show in how long they wait. A bind that claims its TD claims it
+  only when its turn comes, a TD claimed before its bind stays claimed while
+  the bind waits, and the daemon drops a bind whose caller gives up, or whose
+  `notAfter` passes, before its turn, so it claims nothing and ends no guest.
 - **Events** from `Watch`, for orchestrators only: each TD as it is now,
   oldest first, and then each as it changes, with its pool, host, state
   (ready, claimed, bound, held, released, sealing or ended, with its reason),

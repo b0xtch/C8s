@@ -190,9 +190,10 @@ memory-acceptance floor; work inside within the published floors.
   taken apart the guests of the turn before, their memory freed and a TD's
   key ID free again, which the record times. Where a platform lets only so
   many of a burst's starts through at once and holds the rest, every side's
-  starter does the same, at the same numbers, one of which lets the whole
-  burst through, and the record gives each; the clock still runs from the
-  burst's instant. A guest counts as idle only once
+  starter does the same, with turns that do not wait on the command, at the
+  same numbers, one of which lets the whole burst through, and the record
+  gives each; the clock still runs from the burst's instant. A guest counts as
+  idle only once
   its own counters show it, its CPU and exits down to an idle guest's rate,
   and never because a fixed rest has passed.
 - **Like for like.** Both sides reach their first command the same way, and
