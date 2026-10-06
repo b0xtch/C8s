@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/confidential-dot-ai/c8s/internal/coresched"
 )
 
 // allowedCPUs lists the CPUs the calling thread may run on.
@@ -60,7 +62,7 @@ func TestStartOnKeepsTheProcessOffTheCPUs(t *testing.T) {
 		var out bytes.Buffer
 		cmd := exec.Command("sh", "-c", "grep Cpus_allowed_list: /proc/self/status; echo --; sh -c 'grep Cpus_allowed_list: /proc/self/status'")
 		cmd.Stdout = &out
-		off, err := startOn(cmd, nil, avoid)
+		off, _, err := startOn(cmd, nil, avoid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -102,7 +104,7 @@ func TestStartOnKeepsTheProcessToItsCPUs(t *testing.T) {
 		var out bytes.Buffer
 		cmd := exec.Command("sh", "-c", "grep Cpus_allowed_list: /proc/self/status; echo --; sh -c 'grep Cpus_allowed_list: /proc/self/status'")
 		cmd.Stdout = &out
-		off, err := startOn(cmd, keep, avoid)
+		off, _, err := startOn(cmd, keep, avoid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -129,7 +131,7 @@ func TestStartOnKeepsTheProcessToItsCPUs(t *testing.T) {
 	}
 	// CPUs the machine does not have are no place to start anything.
 	cmd := exec.Command("true")
-	if _, err := startOn(cmd, []int{maxCPUs - 1}, nil); err == nil {
+	if _, _, err := startOn(cmd, []int{maxCPUs - 1}, nil); err == nil {
 		_ = cmd.Wait()
 		t.Fatal("a process was started on a CPU no machine has")
 	}
@@ -277,4 +279,41 @@ func TestRunKeepsTheVMMOffTheFirstCPUOfEachPackage(t *testing.T) {
 			t.Fatal("the VMM was started")
 		}
 	})
+}
+
+// A VMM is started apart from every other program on the host's cores: with
+// a core-scheduling cookie that is its own and no other VMM's, where the
+// host's cores have two threads each.
+func TestStartOnStartsEachProcessApart(t *testing.T) {
+	start := func() (*exec.Cmd, bool) {
+		t.Helper()
+		cmd := exec.Command("sleep", "300")
+		t.Cleanup(func() {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+				_ = cmd.Wait()
+			}
+		})
+		_, apart, err := startOn(cmd, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cmd, apart
+	}
+	one, apart := start()
+	if !apart {
+		t.Skip("this machine's cores have one hardware thread each: there is nothing to keep apart")
+	}
+	two, _ := start()
+	first, err := coresched.Cookie(one.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := coresched.Cookie(two.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == 0 || second == 0 || first == second {
+		t.Fatalf("two processes started apart have cookies %#x and %#x", first, second)
+	}
 }

@@ -246,6 +246,48 @@ serving() {
     done
     return 1
 }
+# cores_apart: each VMM this run's guests have now, the pool's and the key
+# service's, has a core-scheduling cookie of its own on every thread, so no
+# core's two threads run two guests at once.
+cores_apart() {
+    local said step="no core's two threads run two guests at once"
+    if [ "$(cat /sys/devices/system/cpu/smt/active 2>/dev/null)" != 1 ]; then
+        record PASS "$step" "this host runs one thread a core"
+        return
+    fi
+    if said=$(sudo -n python3 - "td-" "c8s-key-service-$run," <<'APART' 2>&1
+import ctypes, glob, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+cookies = {}
+for entry in filter(str.isdigit, os.listdir("/proc")):
+    try:
+        with open(f"/proc/{entry}/cmdline", "rb") as f:
+            line = f.read()
+    except OSError:
+        continue
+    if b"qemu-system" not in line or not any(f"guest={name}".encode() in line for name in sys.argv[1:]):
+        continue
+    mine = set()
+    for task in glob.glob(f"/proc/{entry}/task/[0-9]*"):
+        value = ctypes.c_ulonglong()
+        # PR_SCHED_CORE with PR_SCHED_CORE_GET: the thread's cookie, 0 for none.
+        if libc.prctl(62, 0, int(os.path.basename(task)), 0, ctypes.addressof(value)) != 0:
+            sys.exit(f"the kernel told no cookie of process {entry}: {os.strerror(ctypes.get_errno())}")
+        mine.add(value.value)
+    cookies[entry] = mine
+shared = [pid for pid, mine in cookies.items()
+          if len(mine) != 1 or 0 in mine or sum(1 for other in cookies.values() if other == mine) != 1]
+if len(cookies) < 3 or shared:
+    sys.exit(f"{len(cookies)} VMMs, and without a cookie of their own on every thread: {' '.join(shared) or 'none'}")
+print(f"{len(cookies)} VMMs, a cookie each on {sum(len(glob.glob(f'/proc/{pid}/task/[0-9]*')) for pid in cookies)} threads")
+APART
+    ); then
+        record PASS "$step" "$said"
+    else
+        record FAIL "$step" "$said"
+    fi
+}
 # ends_unserved <step> <log> <port> <network> <launcher arguments...>: a guest
 # launched so, with that network, must end by itself, and before it serves.
 ends_unserved() {
@@ -592,6 +634,7 @@ if [ "$ok" != 1 ]; then
     finish
 fi
 record PASS "the pool is filled"
+cores_apart
 printf '{"step":"pool-fill","tds":2,"ms":%d}\n' $(( ($(date +%s%N) - began) / 1000000 )) >> "$out/records.jsonl"
 check "the daemon opened nothing to its guests" sh -c "! sudo -n nft list table inet c8s_sessions | grep -q 'tcp dport'"
 

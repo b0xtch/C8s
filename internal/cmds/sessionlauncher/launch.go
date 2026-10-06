@@ -275,7 +275,13 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	}
 	started := time.Now()
 	var off []int
-	if off, err = startOn(cmd, keep, avoid); err == nil {
+	var apart bool
+	if off, apart, err = startOn(cmd, keep, avoid); err == nil {
+		if apart {
+			log.Info("the VMM shares no core with another program at any one time")
+		} else {
+			log.Info("the VMM is kept apart from nothing: this host's cores have one thread each")
+		}
 		if len(keep) > 0 {
 			log.Info("the VMM keeps to CPUs of its own", "cpus", cfg.VMMCPUs)
 		}
