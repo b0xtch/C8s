@@ -110,14 +110,27 @@ if ! diff -q <(common "$PGI_DIR/kernel/session.config") <(common "$PGI_DIR/kerne
     exit 1
 fi
 
-# The guest's one-time keys are gone when the helper that holds them exits,
-# because the kernel zeroes every page it frees. The fragment asks for that,
-# the build is checked for it below, and the measured command line has no
-# word on it. The agent serves only where the kernel's own log says it does.
-if sed -n 's/^KernelCommandLine=//p' "$PGI_DIR/c8s-session/mkosi.conf" | tr ' ' '\n' | grep -q -E '^init_on_free(=|$)'; then
-    echo "session-guest-image/build: the kernel's command line has a word on init_on_free: this image's kernel zeroes what it frees by its build" >&2
-    exit 1
-fi
+# What the kernel's build settles, its command line has no word on. The
+# guest's one-time keys are gone when the helper that holds them exits,
+# because the kernel zeroes every page it frees: the fragment asks for that,
+# and the agent serves only where the kernel's own log says it does. And
+# nothing loads another kernel or adds code to this one later: its lockdown
+# is forced by its build, among the security modules its build lists.
+# command_line <words> <where they stand>: refuse a word on any of these.
+command_line() {
+    local word
+    for word in $1; do
+        case "${word%%=*}" in
+        init_on_free)
+            echo "session-guest-image/build: the kernel's command line $2 has a word on init_on_free: this image's kernel zeroes what it frees by its build" >&2
+            exit 1 ;;
+        lsm|lockdown)
+            echo "session-guest-image/build: the kernel's command line $2 names ${word%%=*}: this image's kernel is locked down by its build, and no word changes its security modules" >&2
+            exit 1 ;;
+        esac
+    done
+}
+command_line "$(sed -n 's/^KernelCommandLine=//p' "$PGI_DIR/c8s-session/mkosi.conf")" "in c8s-session/mkosi.conf"
 
 # Kernel source patches, applied in name order. Each one changes the kernel,
 # and so the measurement, and is named by hash in the image's manifest.
@@ -247,6 +260,29 @@ if ! grep -q -x 'CONFIG_INIT_ON_FREE_DEFAULT_ON=y' "$SNAPSHOT"; then
     echo "session-guest-image/build: the kernel that was built does not zero what it frees (no CONFIG_INIT_ON_FREE_DEFAULT_ON=y in $SNAPSHOT): the one-time keys would outlive their helper" >&2
     exit 1
 fi
+# RTMR[1] and RTMR[2] show the kernel a TD booted, and nothing may load
+# another kernel or add code to this one later, or read its memory: no
+# loadable modules, no kexec, no BPF system call, no /dev/mem and no
+# /proc/kcore.
+for option in CONFIG_MODULES CONFIG_KEXEC CONFIG_KEXEC_FILE CONFIG_BPF_SYSCALL CONFIG_DEVMEM CONFIG_PROC_KCORE; do
+    if grep -q "^$option=" "$SNAPSHOT"; then
+        echo "session-guest-image/build: the kernel that was built has $option ($SNAPSHOT): code could be added to a session's kernel after its measurement, or its memory read" >&2
+        exit 1
+    fi
+done
+# Its lockdown is forced to confidentiality, as one of its security modules.
+if ! grep -q -x 'CONFIG_LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY=y' "$SNAPSHOT" \
+    || ! sed -n 's/^CONFIG_LSM="\(.*\)"$/,\1,/p' "$SNAPSHOT" | grep -q ',lockdown,'; then
+    echo "session-guest-image/build: the kernel that was built is not locked down to confidentiality by its build (CONFIG_LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY and lockdown in CONFIG_LSM, in $SNAPSHOT)" >&2
+    exit 1
+fi
+# The command line as the unified kernel image carries it, which is the one
+# that is measured: whatever the builder or a profile added to the words
+# above is held to the same.
+built=$(objcopy -O binary --only-section=.cmdline "output/$C8S_NAME/uki.efi" /dev/stdout | tr -d '\0') \
+    || { echo "session-guest-image/build: the command line of output/$C8S_NAME/uki.efi could not be read (objcopy)" >&2; exit 1; }
+[ -n "$built" ] || { echo "session-guest-image/build: output/$C8S_NAME/uki.efi carries no command line" >&2; exit 1; }
+command_line "$built" "as output/$C8S_NAME/uki.efi carries it"
 # The builder clears its staging area. The binary prints the same bytes again.
 for schema in disclosure bind; do
     "$C8S_BINARY" schema "$schema" > "output/$C8S_NAME/$schema-schema.json"

@@ -114,6 +114,14 @@ is no boot loader between them.
 A boot loader would be one more measured program, would read a configuration
 file that nothing measures, and waits for a key nobody can press.
 
+Nothing loads another kernel or adds code to this one after it is measured,
+and nothing reads its memory. `build` refuses a kernel that was built with
+loadable modules, kexec, the BPF system call, `/dev/mem` or `/proc/kcore`, or
+without lockdown forced to confidentiality among its security modules. It
+also refuses a command line with a word on `lsm`, `lockdown` or
+`init_on_free`, both as the profile gives it and as the built UKI carries
+it: the kernel's build settles all three.
+
 The kernel carries six source patches, applied in name order by the
 builder's `--kernel-patch`. Each is named by hash in the manifest
 (`kernel_patches_sha256`).
