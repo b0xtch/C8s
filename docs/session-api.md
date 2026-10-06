@@ -667,7 +667,13 @@ stops a session for about an epoch and the start of a restore.
   ever added. The bind keeps its own schema version, `c8s-bind/v1`.
 - **Limits**, per orchestrator: pools, live TDs, held TDs, open `Watch`
   streams, seal bytes and queued envelope bytes per session, each refused past
-  its limit with `RESOURCE_EXHAUSTED`.
+  its limit with `RESOURCE_EXHAUSTED`. A host may also let only so many binds
+  through to its guests at once. The rest wait, having reached no guest, and
+  take their turns round the callers with binds waiting, each caller's oldest
+  first. A bind that claims its TD claims it only when its turn comes, a TD
+  claimed before its bind stays claimed while the bind waits, and the daemon
+  drops a bind whose caller gives up, or whose `notAfter` passes, before its
+  turn, so it claims nothing and ends no guest.
 - **Events** from `Watch`, for orchestrators only: each TD as it is now,
   oldest first, and then each as it changes, with its pool, host, state
   (ready, claimed, bound, held, released, sealing or ended, with its reason),

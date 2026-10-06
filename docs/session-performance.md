@@ -171,18 +171,28 @@ memory-acceptance floor; work inside within the published floors.
 - **The same settings.** Power settings (governor, C-states, turbo) and the
   host's halt polling, which every guest on it shares, are pinned and
   recorded, versions are named, and the sides interleave round by round
-  within one run. Nothing else runs on the host during a run: no TD or VM but
+  within one run. How the host schedules the guests' vCPU threads is the same
+  for every side and recorded too: their scheduling class, the cores a guest
+  may use while it waits in a pool, while it starts and after, and whether one
+  core's two threads may run two guests at once.
+  Nothing else runs on the host during a run: no TD or VM but
   the sides' own, and a side that waits keeps its guests idle, with no boot or
   ending in flight, on cores apart from those of the side being measured, as
   the record lists. The guests' VMMs keep to cores that nothing else of the
   run uses, and the platform's own programs, the daemon and its launchers,
   the quoting service and the programs that start the guests, run on cores
-  apart from them, the same for every side, as the record lists too. Where
-  the host cannot hold every side's guests at once,
+  apart from them, the same for every side, as the record lists too. The
+  programs that start a burst stand for a platform's front ends, which can
+  scale out, so they get cores enough not to bound it, or the record says they
+  bounded it. Where the host cannot hold every side's guests at once,
   as with pools for a burst of 100, the sides take turns instead, each side's
   guests up only in its own turns, and a turn begins only once the host has
   taken apart the guests of the turn before, their memory freed and a TD's
-  key ID free again, which the record times. A guest counts as idle only once
+  key ID free again, which the record times. Where a platform lets only so
+  many of a burst's starts through at once and holds the rest, every side's
+  starter does the same, at the same numbers, one of which lets the whole
+  burst through, and the record gives each; the clock still runs from the
+  burst's instant. A guest counts as idle only once
   its own counters show it, its CPU and exits down to an idle guest's rate,
   and never because a fixed rest has passed.
 - **Like for like.** Both sides reach their first command the same way, and
