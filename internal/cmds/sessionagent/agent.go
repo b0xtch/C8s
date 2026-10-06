@@ -1044,8 +1044,13 @@ func (a *Agent) fail(err error) error {
 // Fatal delivers an error after which the guest must end.
 func (a *Agent) Fatal() <-chan error { return a.fatal }
 
-// WarmUp provisions the serving certificate before the first handshake.
-func (a *Agent) WarmUp(ctx context.Context) error { return a.certs.WarmUp(ctx) }
+// WarmUp provisions the serving certificate before the first handshake, and
+// has the documents of a bind met once before the guest's one bind meets
+// them.
+func (a *Agent) WarmUp(ctx context.Context) error {
+	session.RehearseDocuments(&BindAnswer{})
+	return a.certs.WarmUp(ctx)
+}
 
 // stateLocked returns the phase and the events the register holds. The caller
 // holds measured.
