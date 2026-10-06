@@ -1,7 +1,6 @@
 package sessiond_test
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -35,8 +34,12 @@ func TestBindsQuoteComesOnTheBindsOwnCall(t *testing.T) {
 	if call.Answer.Receipt == nil || len(call.Answer.Evidence) != 0 {
 		t.Fatalf("the answer of a guest whose quoting service is slow: receipt %v, %d bytes of quote", call.Answer.Receipt != nil, len(call.Answer.Evidence))
 	}
-	if !bytes.Equal(call.Answer.Collateral, documents) {
-		t.Fatalf("the answer came with %q of the vendor's documents", call.Answer.Collateral)
+	// The answer carries what the bind changed, and nothing its binder holds
+	// already: not the guest's certificate, its launch document or the bind,
+	// and none of the vendor's documents, though the daemon keeps some.
+	if a := call.Answer; len(a.Collateral)+len(a.Certificate)+len(a.Launch)+len(a.Bind)+len(a.ReadyCertificate) != 0 || a.Phase == "" {
+		t.Fatalf("the answer came with %d bytes of the vendor's documents, %d of a certificate, %d of a launch document and %d of a bind, in phase %q",
+			len(a.Collateral), len(a.Certificate), len(a.Launch), len(a.Bind), a.Phase)
 	}
 	binding := session.Binding{LaunchKey: h.LaunchKey, Launch: s.ready.Launch, Bind: s.bind}
 	policy := binding.Policy(h.Identity)
@@ -60,12 +63,16 @@ func TestBindsQuoteComesOnTheBindsOwnCall(t *testing.T) {
 	if quoted, err = call.Quote(ctx(t)); err != nil {
 		t.Fatalf("the quote on the bind's call: %v", err)
 	}
-	// It carries the vendor's documents as the answer did: the guest's state
-	// holds none, and its binder judges the quote against them.
-	if quoted.BindQuote != session.BindQuoteTaken || !bytes.Equal(quoted.Collateral, documents) {
-		t.Fatalf("the evidence that came with the quote: quote said to be %q, with %q of the vendor's documents", quoted.BindQuote, quoted.Collateral)
+	// It is the quote with the events and the phase it covers, and again
+	// nothing its binder holds: the binder judges it under the launch
+	// document it verified the guest by, against the vendor's documents as it
+	// fetched them itself.
+	if quoted.BindQuote != session.BindQuoteTaken || len(quoted.Events) == 0 ||
+		len(quoted.Collateral)+len(quoted.Certificate)+len(quoted.Launch)+len(quoted.Bind)+len(quoted.ReadyCertificate) != 0 {
+		t.Fatalf("the evidence that came with the quote: quote said to be %q, %d events, %d bytes of the vendor's documents, %d of a certificate, %d of a launch document, %d of a bind",
+			quoted.BindQuote, len(quoted.Events), len(quoted.Collateral), len(quoted.Certificate), len(quoted.Launch), len(quoted.Bind))
 	}
-	att, err := session.VerifyBound(ctx(t), policy, h.Engine, s.ready.InstanceKey, s.bind, quoted)
+	att, err := session.VerifyBound(ctx(t), policy, h.Engine, s.ready, s.bind, quoted)
 	if err != nil {
 		t.Fatalf("the quote that came on the call: %v", err)
 	}

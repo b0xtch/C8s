@@ -767,14 +767,14 @@ func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td stri
 		return receipt.Confirmed(att)
 	}
 	if len(answer.Evidence) > 0 {
-		att, err := session.VerifyBound(ctx, bound, engine, ready.InstanceKey, bind, answer)
+		att, err := session.VerifyBound(ctx, bound, engine, ready, bind, answer)
 		if err != nil {
 			if exitCode(err) == ExitRefused {
 				return nil, err
 			}
 			// No verdict for want of a document. What needs none still
 			// decides whether the session goes on.
-			held, holdErr := session.HoldBound(ctx, bound, engine, ready.InstanceKey, bind, answer)
+			held, holdErr := session.HoldBound(ctx, bound, engine, ready, bind, answer)
 			if holdErr != nil {
 				return nil, fmt.Errorf("the quote could not be judged (%w), and does not hold without the vendor's documents: %w", err, holdErr)
 			}
@@ -787,7 +787,7 @@ func judgeBound(ctx context.Context, s *startFlags, host *daemon.Client, td stri
 		if err := confirm(att); err != nil {
 			return nil, err
 		}
-		leaf, err := x509.ParseCertificate(answer.Certificate)
+		leaf, err := x509.ParseCertificate(ready.Certificate)
 		if err != nil {
 			leaf = nil
 		}

@@ -84,9 +84,6 @@ type readyVerdict struct {
 // JudgedReady is a ready guest as ReadyVerdicts.Claimed or Take found it.
 type JudgedReady struct {
 	*ReadyTD
-	// Certificate is the guest's serving certificate, DER, from the evidence
-	// the verdict was made on.
-	Certificate []byte
 	// Ahead says the verdict was made before the claim, on evidence the
 	// guest gave while it was ready. Took is how long making it took, then
 	// or now.
@@ -263,14 +260,14 @@ func (v *ReadyVerdicts) Claimed(ctx context.Context, r *Relayed) (*JudgedReady, 
 	}
 	v.mu.Unlock()
 	if usable {
-		return &JudgedReady{ReadyTD: kept.ready, Certificate: kept.evidence.Certificate, Ahead: true, Took: kept.took}, nil
+		return &JudgedReady{ReadyTD: kept.ready, Ahead: true, Took: kept.took}, nil
 	}
 	began := v.now()
 	ready, err := VerifyReadyToRelease(ctx, policy, v.engine, r, began)
 	if err != nil {
 		return nil, err
 	}
-	return &JudgedReady{ReadyTD: ready, Certificate: r.Certificate, Took: v.now().Sub(began)}, nil
+	return &JudgedReady{ReadyTD: ready, Took: v.now().Sub(began)}, nil
 }
 
 // Take hands the binder a ready guest it has judged, to sign a bind for:
@@ -295,7 +292,7 @@ func (v *ReadyVerdicts) Take() (*JudgedReady, error) {
 		return nil, ErrNoneJudged
 	}
 	delete(v.judged, at)
-	return &JudgedReady{ReadyTD: first.ready, Certificate: first.evidence.Certificate, Ahead: true, Took: first.took}, nil
+	return &JudgedReady{ReadyTD: first.ready, Ahead: true, Took: first.took}, nil
 }
 
 // waitsLocked reports whether a verdict is one Take hands out: made, still

@@ -1120,7 +1120,7 @@ func one(ctx context.Context, o *options, round int, name string, with *together
 				return j
 			}
 		}
-		if j.att, j.err = session.VerifyBound(ctx, bound, engine, ready.InstanceKey, bind, relayed); j.err != nil {
+		if j.att, j.err = session.VerifyBound(ctx, bound, engine, ready, bind, relayed); j.err != nil {
 			j.err = fmt.Errorf("the bound guest: %w", j.err)
 			return j
 		}
@@ -1129,7 +1129,7 @@ func one(ctx context.Context, o *options, round int, name string, with *together
 				return j
 			}
 		}
-		if j.leaf, j.err = x509.ParseCertificate(relayed.Certificate); j.err != nil {
+		if j.leaf, j.err = x509.ParseCertificate(ready.Certificate); j.err != nil {
 			j.err = fmt.Errorf("the bound guest's certificate: %w", j.err)
 			return j
 		}

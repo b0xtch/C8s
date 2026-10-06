@@ -3,7 +3,6 @@ package session
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -130,7 +129,7 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 	if oneTime == nil {
 		return nil, refuse("the guest's evidence binds no one-time keys: a receipt for its bind could not be told from one its session signed")
 	}
-	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey, OneTime: oneTime}
+	ready := &ReadyTD{Document: doc, Launch: state.Launch, Signature: state.Signature, InstanceKey: leaf.PublicKey, Certificate: leaf.Raw, OneTime: oneTime}
 	// A document that was handed over may hide a newer one. That is enough
 	// for a bind, which is not secret, and for nothing sealed with it.
 	until := stands(now, leaf, res)
@@ -148,26 +147,41 @@ func verifyReady(ctx context.Context, policy Policy, engine Engine, leaf *x509.C
 }
 
 // VerifyBound judges a guest's relayed answer to a bind: evidence that must
-// be fresh for the bind's nonce and bound to instanceKey, the key VerifyReady
-// found. policy is the policy for the bound guest and pins the bind.
-func VerifyBound(ctx context.Context, policy Policy, engine Engine, instanceKey crypto.PublicKey, bind *SignedBind, r *Relayed) (*Attestation, error) {
+// be fresh for the bind's nonce and bound to the instance key of ready, the
+// verdict VerifyReady reached on the guest before its bind. policy is the
+// policy for the bound guest and pins the bind.
+//
+// An answer to a bind carries what the bind changed: the events, the phase
+// and the quote. The launch document the guest measured and the bind are
+// the binder's own, from ready and from bind, and a relay that hands them
+// over as well is held to those.
+func VerifyBound(ctx context.Context, policy Policy, engine Engine, ready *ReadyTD, bind *SignedBind, r *Relayed) (*Attestation, error) {
 	if !bytes.Equal(policy.Bind, bind.Raw) {
 		return nil, errors.New("the policy for the bound guest must pin the bind that was sent")
 	}
+	if ready == nil || len(ready.Launch) == 0 {
+		return nil, errors.New("a bound guest is judged with the verdict on it from before its bind")
+	}
 	if len(r.Evidence) == 0 {
 		return nil, refuse("the answer to the bind carries no evidence")
+	}
+	if len(r.Launch) > 0 && !bytes.Equal(r.Launch, ready.Launch) {
+		return nil, refuse("the answer to the bind carries launch document %s, and the guest was verified under %s", DocumentDigest(r.Launch), DocumentDigest(ready.Launch))
+	}
+	if len(r.Bind) > 0 && !bytes.Equal(r.Bind, bind.Raw) {
+		return nil, refuse("the answer to the bind carries another bind than the one that was sent")
 	}
 	var evidence teetypes.AttestationEvidence
 	if err := json.Unmarshal(r.Evidence, &evidence); err != nil {
 		return nil, refuse("the relayed evidence does not parse: %v", err)
 	}
 	resp := &AttestResponse{
-		Evidence: evidence, Launch: r.Launch, Signature: r.Signature, Events: r.Events, Phase: r.Phase,
-		Bind: r.Bind, BindSignature: r.BindSignature,
+		Evidence: evidence, Launch: ready.Launch, Signature: ready.Signature, Events: r.Events, Phase: r.Phase,
+		Bind: bind.Raw, BindSignature: bind.Signature,
 	}
 	// A binder goes on to send the guest secrets on this verdict, so it rests
 	// on the vendor's documents as the binder fetched them itself.
-	return VerifyAttestation(ctx, policy, engine, instanceKey, bind.Doc.EvidenceNonce(), resp)
+	return VerifyAttestation(ctx, policy, engine, ready.InstanceKey, bind.Doc.EvidenceNonce(), resp)
 }
 
 // ErrNoBindQuote is a guest that says it gave up on the quote over its
@@ -179,7 +193,7 @@ var ErrNoBindQuote = errors.New("the guest gave up on the quote over its bind's 
 // that needs none of the vendor's documents: its signature chains to the
 // vendor's root, its report data binds the bind's nonce and instanceKey, and
 // its register replays from the events it carries, under the pinned image
-// and bind. It is for a binder whose engine could not judge the quote for
+// and bind, and under the launch document of ready. It is for a binder whose engine could not judge the quote for
 // want of a document: VerifyBound failed, and with no refusal. A quote that
 // passes leaves the session running until the document comes, held to its
 // receipt with BindReceipt.Confirmed. One that fails ends the session.
@@ -187,8 +201,8 @@ var ErrNoBindQuote = errors.New("the guest gave up on the quote over its bind's 
 // The attestation is held and stays unjudged: it says nothing of where the
 // platform's TCB stands, no verdict is kept on it, and nothing is released
 // on it.
-func HoldBound(ctx context.Context, policy Policy, engine Engine, instanceKey crypto.PublicKey, bind *SignedBind, r *Relayed) (*Attestation, error) {
-	att, err := VerifyBound(offline(ctx), policy, engine, instanceKey, bind, r)
+func HoldBound(ctx context.Context, policy Policy, engine Engine, ready *ReadyTD, bind *SignedBind, r *Relayed) (*Attestation, error) {
+	att, err := VerifyBound(offline(ctx), policy, engine, ready, bind, r)
 	if err != nil {
 		return nil, err
 	}

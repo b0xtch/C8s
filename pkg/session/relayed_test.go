@@ -120,7 +120,7 @@ func TestRelayedEvidenceIsJudgedLikeTheGuestsOwn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("VerifyBoundReceipt: %v", err)
 	}
-	att, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer)
+	att, err := session.VerifyBound(within(t), bound, engine, ready, bind, answer)
 	if err != nil {
 		t.Fatalf("VerifyBound: %v", err)
 	}
@@ -214,25 +214,36 @@ func TestRelayedEvidenceIsRefused(t *testing.T) {
 		relayed := *answer
 		relayed.Events = append([]string(nil), answer.Events...)
 		tc(&relayed)
-		if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, &relayed); !isVerdict(err) {
+		if _, err := session.VerifyBound(within(t), bound, engine, ready, bind, &relayed); !isVerdict(err) {
 			t.Errorf("%s passed as the guest's answer to the bind: %v", name, err)
 		}
 	}
+	// What a daemon relays of an answer is what the bind changed. Without
+	// the launch document, the bind and the certificate, which its binder
+	// holds, the answer verifies as it does with them, and with no verdict
+	// from before the bind it is not judged at all.
+	changed := &session.Relayed{Phase: answer.Phase, Events: answer.Events, Evidence: answer.Evidence, BindQuote: answer.BindQuote}
+	if att, err := session.VerifyBound(within(t), bound, engine, ready, bind, changed); err != nil || att.Session != "sbx-1" {
+		t.Errorf("the answer with only what the bind changed: %v", err)
+	}
+	if _, err := session.VerifyBound(within(t), bound, engine, nil, bind, changed); err == nil || isVerdict(err) {
+		t.Errorf("an answer judged with no verdict from before the bind: %v", err)
+	}
 	// The answer is fresh for this bind's nonce and bound to this guest's
 	// key, and for no other.
-	if _, err := session.VerifyBound(within(t), bound, engine, otherReady.InstanceKey, bind, answer); !isVerdict(err) {
+	if _, err := session.VerifyBound(within(t), bound, engine, otherReady, bind, answer); !isVerdict(err) {
 		t.Errorf("the answer passed for another guest's key: %v", err)
 	}
 	stale := bindFor(t, s, ready)
 	stalePolicy := (&session.Binding{LaunchKey: s.bundle.LaunchKey, Launch: ready.Launch, Bind: stale}).Policy(s.policy.Image)
-	if _, err := session.VerifyBound(within(t), stalePolicy, engine, ready.InstanceKey, stale, answer); !isVerdict(err) {
+	if _, err := session.VerifyBound(within(t), stalePolicy, engine, ready, stale, answer); !isVerdict(err) {
 		t.Errorf("the answer to one bind passed for another: %v", err)
 	}
-	if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, stale, answer); err == nil || isVerdict(err) {
+	if _, err := session.VerifyBound(within(t), bound, engine, ready, stale, answer); err == nil || isVerdict(err) {
 		t.Errorf("a policy that pins another bind than the one sent: %v", err)
 	}
 	var refused *session.VerificationError
-	if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer); errors.As(err, &refused) {
+	if _, err := session.VerifyBound(within(t), bound, engine, ready, bind, answer); errors.As(err, &refused) {
 		t.Fatalf("the guest's own answer was refused: %v", err)
 	}
 }
@@ -273,10 +284,10 @@ func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
 	}
 
 	away := &awayEngine{}
-	if _, err := session.VerifyBound(within(t), bound, away, ready.InstanceKey, bind, answer); err == nil || isVerdict(err) {
+	if _, err := session.VerifyBound(within(t), bound, away, ready, bind, answer); err == nil || isVerdict(err) {
 		t.Fatalf("a quote judged with no document at hand: %v, want an outage and no verdict", err)
 	}
-	held, err := session.HoldBound(within(t), bound, away, ready.InstanceKey, bind, answer)
+	held, err := session.HoldBound(within(t), bound, away, ready, bind, answer)
 	if err != nil {
 		t.Fatalf("HoldBound: %v", err)
 	}
@@ -305,7 +316,7 @@ func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
 		t.Fatal("the client keeps a verdict")
 	}
 	// The same quote, judged once the document is there, is no longer held.
-	judged, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer)
+	judged, err := session.VerifyBound(within(t), bound, engine, ready, bind, answer)
 	if err != nil || judged.Held {
 		t.Fatalf("the quote judged with its documents: held %v, %v", judged != nil && judged.Held, err)
 	}
@@ -325,7 +336,7 @@ func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
 		relayed := *answer
 		relayed.Events = append([]string(nil), answer.Events...)
 		tc(&relayed)
-		if _, err := session.HoldBound(within(t), bound, away, ready.InstanceKey, bind, &relayed); !isVerdict(err) {
+		if _, err := session.HoldBound(within(t), bound, away, ready, bind, &relayed); !isVerdict(err) {
 			t.Errorf("%s was held as the guest's answer to the bind: %v", name, err)
 		}
 	}
@@ -334,7 +345,7 @@ func TestBoundQuoteIsHeldWhileADocumentIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.HoldBound(within(t), bound, away, otherReady.InstanceKey, bind, answer); !isVerdict(err) {
+	if _, err := session.HoldBound(within(t), bound, away, otherReady, bind, answer); !isVerdict(err) {
 		t.Errorf("a quote was held under another guest's instance key: %v", err)
 	}
 }
@@ -477,7 +488,7 @@ func TestOnlyTheCheckBeforeABindTakesRelayedDocuments(t *testing.T) {
 	answer.Collateral = handedIn(t, 3)
 	bound := s.policy
 	bound.Launch, bound.Bind, bound.AllowReady = ready.Launch, bind.Raw, false
-	if _, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer); err != nil {
+	if _, err := session.VerifyBound(within(t), bound, engine, ready, bind, answer); err != nil {
 		t.Fatal(err)
 	}
 	want := []judgment{{named: true, docs: 3, handed: true}, {}, {}}

@@ -159,14 +159,14 @@ func (h *host) judge(c *daemon.Client, td string, ready *session.ReadyTD, bind *
 			return nil, err
 		}
 	}
-	att, err := session.VerifyBound(ctx(h.t), policy, h.Engine, ready.InstanceKey, bind, answer)
+	att, err := session.VerifyBound(ctx(h.t), policy, h.Engine, ready, bind, answer)
 	if err != nil {
 		return nil, err
 	}
 	if err := receipt.Confirmed(att); err != nil {
 		return nil, err
 	}
-	leaf, err := x509.ParseCertificate(answer.Certificate)
+	leaf, err := x509.ParseCertificate(ready.Certificate)
 	if err != nil {
 		return nil, err
 	}
@@ -770,7 +770,7 @@ func TestBinderRefusesWhatItDidNotPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, s2.answer); !errors.As(err, &refused) {
+	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready, s.bind, s2.answer); !errors.As(err, &refused) {
 		t.Fatalf("another guest's answer passed as this one's: %v", err)
 	}
 	// What a bound guest serves to anyone is the quote it took over its
@@ -780,7 +780,7 @@ func TestBinderRefusesWhatItDidNotPin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	att, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, public)
+	att, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready, s.bind, public)
 	if err != nil {
 		t.Fatalf("the quote a bound guest serves to anyone: %v", err)
 	}
@@ -790,7 +790,7 @@ func TestBinderRefusesWhatItDidNotPin(t *testing.T) {
 	if err := s2.receipt.Confirmed(att); !errors.As(err, &refused) {
 		t.Fatalf("one guest's quote confirmed another's receipt: %v", err)
 	}
-	if _, err := session.VerifyBound(ctx(t), s2.policy, h.Engine, s2.ready.InstanceKey, s2.bind, public); !errors.As(err, &refused) {
+	if _, err := session.VerifyBound(ctx(t), s2.policy, h.Engine, s2.ready, s2.bind, public); !errors.As(err, &refused) {
 		t.Fatalf("one guest's served quote passed as another's answer: %v", err)
 	}
 	if _, err := session.VerifyBoundReceipt(s.policy, s.ready, s.bind, &session.Relayed{}); !errors.As(err, &refused) {
@@ -799,11 +799,11 @@ func TestBinderRefusesWhatItDidNotPin(t *testing.T) {
 	// A quote with nothing but the state around it answers no bind.
 	bare := *public
 	bare.Evidence = nil
-	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, &bare); !errors.As(err, &refused) {
+	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready, s.bind, &bare); !errors.As(err, &refused) {
 		t.Fatalf("evidence with no quote passed as the answer to a bind: %v", err)
 	}
 	// The answer that was verified is still the one that verifies.
-	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready.InstanceKey, s.bind, s.answer); err != nil {
+	if _, err := session.VerifyBound(ctx(t), s.policy, h.Engine, s.ready, s.bind, s.answer); err != nil {
 		t.Fatalf("the guest's own answer: %v", err)
 	}
 }

@@ -1297,6 +1297,9 @@ type ReadyTD struct {
 	// InstanceKey is the key the connection terminated at: the one a bind for
 	// this guest must name.
 	InstanceKey crypto.PublicKey
+	// Certificate is the guest's serving certificate, DER, that the verdict
+	// was made on. A guest serves it on after its bind, until its time is up.
+	Certificate []byte
 	// OneTime are the keys the guest made for its one bind, as the quote in
 	// its certificate binds them: its receipt for the bind is signed under
 	// the first, and what is sent with the bind is sealed to the second.

@@ -655,24 +655,18 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	if t.rec.State == StateEnded {
 		return nil, nil, status.Errorf(codes.FailedPrecondition, "the TD ended: %s", t.rec.Ended.Reason)
 	}
-	evidence := relayed.evidence
-	// The vendor's documents as the guest last handed them over: the binder's
-	// verifier may want them, and the guest is not asked again for them.
-	if len(evidence.GetCollateral()) == 0 {
-		evidence.Collateral = t.collateral
-	}
+	// Of the guest's evidence the answer carries what the bind changed.
+	evidence := changed(relayed.evidence)
 	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, SealedStatus: relayed.sealed}
 	if t.rec.Claim != nil && t.rec.Claim.ByBind {
 		// Whoever sent the bind learns which TD it claimed.
 		answer.Td, answer.Host = t.rec.ID, d.cfg.Host
 	}
-	// What follows carries the same documents of the vendor's as the first
-	// answer does.
-	collateral := t.collateral
+	// And so does what follows.
 	later := func() (*followed, error) {
 		next, err := relayed.later()
-		if err == nil && next.evidence != nil && len(next.evidence.GetCollateral()) == 0 {
-			next.evidence.Collateral = collateral
+		if err == nil && next.evidence != nil {
+			next.evidence = changed(next.evidence)
 		}
 		return next, err
 	}
@@ -692,6 +686,19 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 		"sealed", relayed.sealed, "claimed_by_bind", t.rec.Claim != nil && t.rec.Claim.ByBind)
 	d.notify()
 	return answer, later, nil
+}
+
+// changed is what a bind changed of its guest's evidence, which is all that
+// a bind's answer carries of it: the events the guest extended, its phase,
+// and where the quote over the bind's nonce stands, with the quote once the
+// guest has it. What the guest's evidence held before the bind, whoever
+// signed the bind judged before sending it, and the bind is the sender's
+// own. GetEvidence serves all of it to anyone.
+func changed(e *sessionv1alpha1.Evidence) *sessionv1alpha1.Evidence {
+	if e == nil {
+		return nil
+	}
+	return &sessionv1alpha1.Evidence{Events: e.GetEvents(), Phase: e.GetPhase(), BindQuote: e.GetBindQuote(), Quote: e.GetQuote()}
 }
 
 // relayBind posts the bind until the guest answers it for good. What the

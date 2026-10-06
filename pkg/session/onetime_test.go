@@ -340,7 +340,7 @@ func TestGuestServesItsCertificateFromBeforeTheBind(t *testing.T) {
 	if !bytes.Equal(state.ReadyCertificate, before.Certificate) {
 		t.Fatal("the bound guest does not serve the certificate it had when its bind came")
 	}
-	att, err := session.VerifyBound(within(t), bound, engine, ready.InstanceKey, bind, answer)
+	att, err := session.VerifyBound(within(t), bound, engine, ready, bind, answer)
 	if err != nil {
 		t.Fatalf("VerifyBound: %v", err)
 	}
