@@ -3,7 +3,6 @@
 package sessionagent
 
 import (
-	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -42,8 +41,6 @@ const (
 	// awaitRunningEvery is how often a starting sandbox is looked at. A
 	// look reads three small files of the kernel's.
 	awaitRunningEvery = 200 * time.Microsecond
-	// crunFailed is crun's own exit status: the command it was given never ran.
-	crunFailed = 255
 )
 
 // ImageRunnerConfig places the sandbox container in the guest. Every value
@@ -884,70 +881,32 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 	defer cancel()
 
 	// A process that was started for whichever command comes next, if one
-	// waits. Otherwise the runtime starts this command's.
-	if warm := w.made.takeWarm(); warm != nil {
+	// waits. Otherwise the runtime starts one for this command now. Either
+	// way the command begins as the sandbox's init: out of its tenant's
+	// reach until it becomes the command, and with every processor of the
+	// guest from then on.
+	warm := w.made.takeWarm()
+	waited := warm != nil
+	for attempt := 0; ; attempt++ {
+		if warm == nil {
+			var err error
+			if warm, err = r.startWarm(w.process, "for-"+req.ID); err != nil {
+				return nil, err
+			}
+		}
 		if resp, started := r.execWarm(ctx, warm, w.process, req); started {
-			w.made.warmUsed.Add(1)
+			if waited && attempt == 0 {
+				w.made.warmUsed.Add(1)
+			}
 			return resp, nil
 		}
-		// It ended before it took the command, which started nothing.
-	}
-
-	dir := filepath.Join(r.cfg.RunDir, "exec-"+req.ID)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(dir)
-	process, err := json.Marshal(execProcess(w.process, req))
-	if err != nil {
-		return nil, err
-	}
-	processPath, logPath := filepath.Join(dir, "process.json"), filepath.Join(dir, "crun.log")
-	if err := os.WriteFile(processPath, process, 0o600); err != nil {
-		return nil, err
-	}
-	group, err := newProcessGroup(r.cgroupDir(), req.ID)
-	if err != nil {
-		return nil, err
-	}
-	defer group.close()
-
-	cmd := r.crun(ctx, "--log", "file:"+logPath, "exec", "--process", processPath, "--cgroup", filepath.Base(group.dir), sandboxID)
-	cmd.Stdin = bytes.NewReader(req.Stdin)
-	stdout, stderr := &cappedBuffer{limit: session.MaxExecOutput}, &cappedBuffer{limit: session.MaxExecOutput}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	cmd.SysProcAttr = group.sysProcAttr(-1, -1)
-	cmd.Cancel = func() error { return group.kill(cmd.Process) }
-	cmd.WaitDelay = waitDelay
-
-	start := time.Now()
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start crun: %w", err)
-	}
-	group.started(cmd.Process)
-	waitErr := cmd.Wait()
-	// Stragglers that outlived the command must not outlive its result.
-	_ = group.kill(cmd.Process)
-	if cmd.ProcessState == nil {
-		return nil, fmt.Errorf("wait for command: %w", waitErr)
-	}
-	resp := &session.ExecResponse{
-		ExitCode: exitStatus(cmd.ProcessState),
-		Stdout:   stdout.bytes(), Stderr: stderr.bytes(),
-		StdoutTruncated: stdout.truncated(), StderrTruncated: stderr.truncated(),
-		DurationMillis: time.Since(start).Milliseconds(),
-		TimedOut:       errors.Is(ctx.Err(), context.DeadlineExceeded),
-	}
-	// crun logs only its own failures, so a logged failure means the command
-	// never started. As with a bare command that is a result, with the status
-	// a shell would give, and crun has already said why on stderr.
-	if reason := readTrimmed(logPath); resp.ExitCode == crunFailed && reason != "" {
-		resp.ExitCode = exitNotExecutable
-		if strings.Contains(reason, "No such file or directory") {
-			resp.ExitCode = exitNotFound
+		// It ended before it took the command, which started nothing: one
+		// more is started for the command, and no third.
+		if attempt > 0 || ctx.Err() != nil {
+			return nil, errors.New("the sandbox started no process for the command")
 		}
+		warm = nil
 	}
-	return resp, nil
 }
 
 // warmCommand is a command's process started ahead of its command: the
@@ -978,7 +937,7 @@ type warmCommand struct {
 func (r *ImageRunner) keepWarm(ctx context.Context, made *madeSandbox, image *specs.Process) {
 	defer close(made.warmDone)
 	for n := 0; ; n++ {
-		warm, err := r.startWarm(image, n)
+		warm, err := r.startWarm(image, fmt.Sprintf("ahead-%d", n))
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -1028,8 +987,7 @@ func ended(done <-chan struct{}) bool {
 // startWarm starts the sandbox init in the sandbox's container, as a command
 // is started: by the runtime, in a cgroup of its own below the container's,
 // as the image's user and under its limits.
-func (r *ImageRunner) startWarm(image *specs.Process, n int) (_ *warmCommand, err error) {
-	id := fmt.Sprintf("ahead-%d", n)
+func (r *ImageRunner) startWarm(image *specs.Process, id string) (_ *warmCommand, err error) {
 	warm := &warmCommand{dir: filepath.Join(r.cfg.RunDir, "exec-"+id), done: make(chan struct{})}
 	if err := os.MkdirAll(warm.dir, 0o700); err != nil {
 		return nil, err

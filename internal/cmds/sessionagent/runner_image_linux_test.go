@@ -456,8 +456,9 @@ func TestImageSandboxAttestReleaseExec(t *testing.T) {
 
 // An agent that keeps to its first processor starts its runtime there, and
 // the processes that wait in the sandbox for a command. A command of the
-// session's has every processor of the guest all the same: the waiting
-// process takes them back as it becomes the command.
+// session's has every processor of the guest all the same, whether a
+// process waited for it or the runtime started one for it: either begins as
+// the sandbox's init, which takes them back as it becomes the command.
 func TestCommandHasEveryProcessorOfAGuestWhoseAgentKeepsToOne(t *testing.T) {
 	n := runtime.NumCPU()
 	var allowed unix.CPUSet
@@ -475,16 +476,22 @@ func TestCommandHasEveryProcessorOfAGuestWhoseAgentKeepsToOne(t *testing.T) {
 	if err := sessionagent.KeepTo(1); err != nil {
 		t.Fatal(err)
 	}
-	c := newContainer(t, containerOptions{})
-	c.start(t)
-	client := c.client(t, c.owner)
-	c.awaitWarm(t)
 	want := "0-" + strconv.Itoa(n-1)
-	if got := c.out(t, client, "grep Cpus_allowed_list /proc/self/status"); !strings.HasSuffix(got, "\t"+want) {
-		t.Errorf("a command has the processors %q, and its guest has %s", got, want)
-	}
-	if c.warmUsed() != 1 {
-		t.Errorf("the command ran as a process the runtime started for it: %d ran as one that waited", c.warmUsed())
+	for _, cold := range []bool{false, true} {
+		t.Run(map[bool]string{false: "a process waited for the command", true: "the runtime started one for it"}[cold], func(t *testing.T) {
+			c := newContainer(t, containerOptions{cold: cold})
+			c.start(t)
+			client := c.client(t, c.owner)
+			if !cold {
+				c.awaitWarm(t)
+			}
+			if got := c.out(t, client, "grep Cpus_allowed_list /proc/self/status"); !strings.HasSuffix(got, "\t"+want) {
+				t.Errorf("a command has the processors %q, and its guest has %s", got, want)
+			}
+			if used := c.warmUsed(); (used == 1) == cold {
+				t.Errorf("%d commands ran as a process that had waited", used)
+			}
+		})
 	}
 }
 
