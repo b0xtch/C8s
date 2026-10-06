@@ -332,10 +332,13 @@ func openState(p platform) error {
 		// is the larger part of making and mounting it. The inode tables are
 		// written as they are first used: every block reads as noise until
 		// it is written under this key, so zeroing them first says nothing.
+		// The kernel would still zero them all in the background after the
+		// mount, for a later check of the file system that this one never
+		// has: noinit_itable has it leave them, and an idle guest's disk be.
 		if err := p.RunIn(newRoot, []string{"/usr/sbin/mke2fs", "-q", "-t", "ext4", "-O", "^has_journal,^resize_inode", "-E", "lazy_itable_init=1,nodiscard", node}); err != nil {
 			return fmt.Errorf("make the file system: %w", err)
 		}
-		if err := p.Mount(node, stateDir, "ext4", msNoSuid|msNoDev, ""); err != nil {
+		if err := p.Mount(node, stateDir, "ext4", msNoSuid|msNoDev, "noinit_itable"); err != nil {
 			return fmt.Errorf("mount: %w", err)
 		}
 		p.Log("state: encrypted under a key of this boot, on %s", b.Name)

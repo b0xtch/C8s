@@ -45,7 +45,8 @@ func TestPrepareRootOnTDX(t *testing.T) {
 	if len(f.ran) != 1 || f.ran[0][0] != newRoot || f.ran[0][1] != "/usr/sbin/mke2fs" || f.ran[0][len(f.ran[0])-1] != "/dev/dm-1" {
 		t.Fatalf("helpers run: %v", f.ran)
 	}
-	if m := f.mounted(stateDir); m == nil || m.source != "/dev/dm-1" || m.fstype != "ext4" {
+	// Mounted so that the kernel zeroes none of its inode tables behind it.
+	if m := f.mounted(stateDir); m == nil || m.source != "/dev/dm-1" || m.fstype != "ext4" || m.data != "noinit_itable" {
 		t.Fatalf("state mount %+v", m)
 	}
 
