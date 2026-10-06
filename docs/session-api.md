@@ -214,7 +214,7 @@ message Bound {
   string host = 6;
 }
 message Evidence {
-  bytes certificate = 1;               // RA-TLS; report data binds the instance key and, until a bind, the one-time keys
+  bytes certificate = 1;               // RA-TLS; report data binds the instance key and, in one issued before a bind, the one-time keys
   bytes launch_document = 2;
   bytes launch_signature = 3;
   repeated string events = 4;          // the digests the guest extended, in order
@@ -528,7 +528,11 @@ A bound guest goes on serving the last certificate it issued before its bind
 (`ready_certificate`), whose quote binds the one-time keys, so that a verifier
 that comes later can hold a kept receipt to the key that signed it: that
 certificate must name the instance key the guest serves now and show RTMR[3]
-at its value before the bind, and is judged as of its issue.
+at its value before the bind, and is judged as of its issue. Its bind is no
+reason to issue another certificate: a start quotes only for its bind, and a
+binder's first handshake after its bind finds the certificate it judged. A
+verifier that wants RTMR[3] as the bind left it reads the bind's quote, or
+asks for a quote over its own nonce through `Connect`.
 
 A binder that calls `Bind` itself may send with it, sealed, the session's
 first command, the credentials it holds that the bind says come from it, or
