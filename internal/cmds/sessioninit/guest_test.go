@@ -203,6 +203,27 @@ func TestISOVolumeLabel(t *testing.T) {
 	}
 }
 
+// streams is a stream between a guest and its launcher, over TCP where
+// theirs is over vsock.
+func streams(t *testing.T) (guest *net.TCPConn, launcher net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	dialed, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher, err = ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialed.Close(); _ = launcher.Close() })
+	return dialed.(*net.TCPConn), launcher
+}
+
 // said runs a booted guest to its end as process 1 does, with a launcher
 // that takes its last word, and returns the word the launcher was sent.
 func said(t *testing.T, change func(*fakeGuest)) (*fakeGuest, *disclosure.End) {
@@ -210,10 +231,11 @@ func said(t *testing.T, change func(*fakeGuest)) (*fakeGuest, *disclosure.End) {
 	f := bootedGuest()
 	f.files[guestend.HostConfigFile] = []byte(`{"end_port": 20007, "collateral_port": 20003}`)
 	received := make(chan *disclosure.End, 1)
-	f.launcher = func(uint32) (net.Conn, error) {
-		guest, launcher := net.Pipe()
+	f.launcher = func(uint32) (guestend.Stream, error) {
+		guest, launcher := streams(t)
 		go func() {
 			end, _ := guestend.Receive(launcher, time.Second)
+			_ = launcher.Close()
 			received <- end
 		}()
 		return guest, nil
@@ -293,9 +315,8 @@ func TestGuestEndsWithoutAWordItCannotSay(t *testing.T) {
 		"the host's file is gone": func(f *fakeGuest) { delete(f.files, guestend.HostConfigFile) },
 		"no launcher listens":     func(f *fakeGuest) { f.launcher = nil },
 		"the launcher takes none": func(f *fakeGuest) {
-			f.launcher = func(uint32) (net.Conn, error) {
-				guest, launcher := net.Pipe()
-				t.Cleanup(func() { launcher.Close() })
+			f.launcher = func(uint32) (guestend.Stream, error) {
+				guest, _ := streams(t)
 				return guest, nil
 			}
 		},

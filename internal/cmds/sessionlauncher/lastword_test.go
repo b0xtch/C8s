@@ -58,6 +58,25 @@ func wordKept(t *testing.T, w *lastWord) *disclosure.End {
 	return nil
 }
 
+// A launcher closes its end of a guest's stream once it has kept the word,
+// and a guest waits for that before it powers off: the word is in its file
+// by the time the guest's send returns.
+func TestLauncherAnswersOnceItHasKeptTheWord(t *testing.T) {
+	for range 20 {
+		w, addr, _ := listening(t, func(net.Conn) bool { return true })
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := guestend.Send(conn.(*net.TCPConn), disclosure.End{Phase: "running", Code: disclosure.EndProcess}, 5*time.Second); err != nil {
+			t.Fatalf("send: %v", err)
+		}
+		if _, err := os.Stat(w.file); err != nil {
+			t.Fatalf("the launcher had answered its guest and kept no word: %v", err)
+		}
+	}
+}
+
 // A launcher keeps the word its guest says as it ends: in its log, and in
 // the file whoever started it named. It keeps the first: a guest has one.
 func TestLauncherKeepsItsGuestsLastWord(t *testing.T) {

@@ -498,13 +498,23 @@ to the schema, logs it, and writes it to the file the daemon named
 (`--end-file`). The daemon gives it as the reason of the TD's end: `the guest
 ended: process_ended in phase running`. A guest that says nothing, because its
 kernel faulted or its VMM was ended under it, leaves `the guest ended`.
-Neither side waits on the other for more than two seconds, and a guest that
-reaches no launcher ends all the same.
+
+The init writes its word and ends its writing on the stream. The launcher
+reads to that end, keeps the word, and closes its own end, and the init
+powers the guest off once it has: a guest that powered off on its own write
+could take the word with it, still on its way out. Neither side waits on the
+other for more than two seconds, and a guest that reaches no launcher ends
+all the same. A word that arrived whole is kept though its stream then
+failed.
+
+A TD that the daemon ends has the daemon's reason, and its guest is given no
+time for a word: `destroyed`, `drained`, or `the guest refused its bind`,
+which the daemon acts on as soon as the guest's answer to the bind says so.
 
 | Code | The guest ended because |
 |---|---|
 | `process_ended` | the process the session's policy names as its own ended. What that process exited with is the session's, and stays in its logs |
-| `service_exited` | the agent exited for a reason that has no code of its own yet, such as a bind it took and could not act on. The word carries the status |
+| `service_exited` | the agent exited for a reason that has no code of its own yet. The word carries the status |
 | `service_killed` | the agent was killed. The word carries the signal, and whether the kernel sent it for memory, by the kill count of the agent's own cgroup |
 | `boot_failed` | a step of the guest's boot failed after its launch files were staged. A failure before that has no port to tell |
 

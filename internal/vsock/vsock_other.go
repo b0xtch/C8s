@@ -16,6 +16,9 @@ type Conn struct{ net.Conn }
 // Peer is the context id of the far end.
 func (*Conn) Peer() uint32 { return 0 }
 
+// CloseWrite ends this end's writing.
+func (*Conn) CloseWrite() error { return errNeedsLinux }
+
 // Dial connects to a port of the context id.
 func Dial(uint32, uint32) (*Conn, error) { return nil, errNeedsLinux }
 

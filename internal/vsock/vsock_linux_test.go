@@ -65,6 +65,33 @@ func TestStreamCarriesBothWays(t *testing.T) {
 	}
 }
 
+// An end that stopped writing still reads: the far end reads what was
+// written and then its end, and answers.
+func TestEndThatStoppedWritingStillReads(t *testing.T) {
+	dialed, accepted := pair(t)
+	if _, err := dialed.Write([]byte("a word")); err != nil {
+		t.Fatal(err)
+	}
+	if err := dialed.CloseWrite(); err != nil {
+		t.Fatalf("the stream cannot end its writing: %v", err)
+	}
+	_ = accepted.SetDeadline(time.Now().Add(5 * time.Second))
+	if got, err := io.ReadAll(accepted); err != nil || string(got) != "a word" {
+		t.Fatalf("the far end read %q, %v", got, err)
+	}
+	if _, err := accepted.Write([]byte("taken")); err != nil {
+		t.Fatalf("the far end's answer: %v", err)
+	}
+	_ = accepted.Close()
+	_ = dialed.SetDeadline(time.Now().Add(5 * time.Second))
+	if got, err := io.ReadAll(dialed); err != nil || string(got) != "taken" {
+		t.Fatalf("the end that stopped writing read %q, %v", got, err)
+	}
+	if _, err := dialed.Write([]byte("more")); err == nil {
+		t.Error("an end that stopped writing wrote")
+	}
+}
+
 func TestDeadlineEndsARead(t *testing.T) {
 	dialed, _ := pair(t)
 	if err := dialed.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {

@@ -52,6 +52,20 @@ func (c *Conn) failure(op string, err error) error {
 	return &net.OpError{Op: op, Net: "vsock", Source: c.local, Addr: c.remote, Err: err}
 }
 
+// CloseWrite ends this end's writing. The far end reads what was written and
+// then the end of it, and this end still reads what the far end answers.
+func (c *Conn) CloseWrite() error {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return c.failure("shutdown", err)
+	}
+	var failed error
+	if err := raw.Control(func(fd uintptr) { failed = unix.Shutdown(int(fd), unix.SHUT_WR) }); err != nil {
+		return c.failure("shutdown", err)
+	}
+	return c.failure("shutdown", failed)
+}
+
 // LocalAddr is this end of the stream.
 func (c *Conn) LocalAddr() net.Addr { return c.local }
 

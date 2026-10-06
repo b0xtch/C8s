@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"strconv"
 	"strings"
 
@@ -60,7 +59,7 @@ type guestPlatform interface {
 	// process 1 the init is also the parent of every orphan in the guest.
 	Wait() (pid int, how ending, err error)
 	// DialHost connects to a vsock port of the guest's host.
-	DialHost(port uint32) (net.Conn, error)
+	DialHost(port uint32) (guestend.Stream, error)
 }
 
 // ending is how a process ended: the status it exited with, or the signal

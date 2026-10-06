@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io/fs"
-	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/internal/devmapper"
+	"github.com/confidential-dot-ai/c8s/internal/guestend"
 )
 
 // memDisk is a disk held in memory.
@@ -84,7 +84,7 @@ type fakeGuest struct {
 	// killed names the signal that ended a process, by its id, in place of
 	// a status. launcher answers a dial of the host, and dialed lists them.
 	killed   map[int]int
-	launcher func(port uint32) (net.Conn, error)
+	launcher func(port uint32) (guestend.Stream, error)
 	dialed   []uint32
 }
 
@@ -267,7 +267,7 @@ func (f *fakeGuest) Wait() (int, ending, error) {
 	return next[0], ending{status: next[1]}, nil
 }
 
-func (f *fakeGuest) DialHost(port uint32) (net.Conn, error) {
+func (f *fakeGuest) DialHost(port uint32) (guestend.Stream, error) {
 	f.dialed = append(f.dialed, port)
 	if f.launcher == nil {
 		return nil, errors.New("no launcher listens")

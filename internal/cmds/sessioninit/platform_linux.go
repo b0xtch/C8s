@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/confidential-dot-ai/c8s/internal/devmapper"
+	"github.com/confidential-dot-ai/c8s/internal/guestend"
 	"github.com/confidential-dot-ai/c8s/internal/vsock"
 )
 
@@ -411,7 +411,7 @@ func (k *kernel) Wait() (int, ending, error) {
 	}
 }
 
-func (k *kernel) DialHost(port uint32) (net.Conn, error) {
+func (k *kernel) DialHost(port uint32) (guestend.Stream, error) {
 	return vsock.Dial(vsock.HostCID, port)
 }
 
