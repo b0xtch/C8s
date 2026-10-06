@@ -76,12 +76,10 @@ const (
 	SpawnArg = "spawn"
 	// The words of a spawner's packets to the agent, each followed by the
 	// number of the request it answers, counted from 0: a process was
-	// started for it, with a descriptor for the process; none was, with the
-	// reason; the process it started has ended, with its exit status and the
-	// signal that ended it, of which one is 0.
+	// started for it, with a descriptor for the process; or none was, with
+	// the reason.
 	Spawned     = "started"
 	SpawnFailed = "failed"
-	SpawnEnded  = "ended"
 	// SpawnRequest is how many descriptors come with a request: the control
 	// socket of the process to start, its standard three, and the file that
 	// puts a process in the cgroup made for this one.

@@ -44,10 +44,10 @@ const spawnWait = 2 * time.Second
 // cgroup itself, through a file the agent hands it that can do nothing else,
 // and the agent takes the process for the command's only once it has read
 // that the process runs the init's own file in that cgroup and the
-// descriptor still names it. It kills by that cgroup. What a spawner says of
-// a process's end is the command's exit status and nothing else. Code that
-// kills its sandbox's spawner loses the commands the spawner had started,
-// and later ones start the slow way.
+// descriptor still names it. It kills by that cgroup, and learns how a
+// process ended from the kernel, through the same descriptor: a spawner
+// says nothing of an end, and a command it started goes on without it. Code
+// that kills its sandbox's spawner has later commands start the slow way.
 type spawner struct {
 	conn  *net.UnixConn
 	group *processGroup
@@ -59,7 +59,6 @@ type spawner struct {
 	// asked counts the requests sent, which is how the spawner numbers them.
 	asked   int
 	answers map[int]chan spawnAnswer
-	ends    map[int]chan spawnEnd
 	// gone is closed when the spawner's socket has failed or been closed:
 	// nothing more comes from it.
 	gone     chan struct{}
@@ -73,8 +72,8 @@ type spawnAnswer struct {
 	reason  string
 }
 
-// spawnEnd is how a process the spawner started ended: its exit status, or
-// the signal that ended it.
+// spawnEnd is how a process the spawner started ended, as the kernel says:
+// its exit status, or the signal that ended it.
 type spawnEnd struct{ status, signal int }
 
 // code is the exit status a shell would give.
@@ -92,7 +91,10 @@ func (r *ImageRunner) startSpawner(image *specs.Process) (_ *spawner, err error)
 	const id = "spawner"
 	s := &spawner{
 		dir: filepath.Join(r.cfg.RunDir, "exec-"+id), exited: make(chan struct{}),
-		answers: map[int]chan spawnAnswer{}, ends: map[int]chan spawnEnd{}, gone: make(chan struct{}),
+		answers: map[int]chan spawnAnswer{}, gone: make(chan struct{}),
+	}
+	if !kernelSaysEnds() {
+		return nil, errors.New("this kernel does not say through a process's descriptor how the process ended")
 	}
 	if err := os.MkdirAll(s.dir, 0o700); err != nil {
 		return nil, err
@@ -202,15 +204,6 @@ func (s *spawner) read() {
 			default:
 				answer <- spawnAnswer{reason: strings.Join(words[2:], " ")}
 			}
-		case sandboxinit.SpawnEnded:
-			if end := s.ends[of]; end != nil && len(words) == 4 {
-				status, errStatus := strconv.Atoi(words[2])
-				signal, errSignal := strconv.Atoi(words[3])
-				if errStatus == nil && errSignal == nil {
-					delete(s.ends, of)
-					end <- spawnEnd{status: status, signal: signal}
-				}
-			}
 		}
 		s.mu.Unlock()
 		closeAll(passed)
@@ -245,10 +238,9 @@ func closeAll(files []*os.File) {
 
 // start asks the spawner for one process with these descriptors as its
 // control socket and its standard three, put in the cgroup whose file of
-// processes group is. It returns a descriptor for the process and where the
-// process's end will be said.
-func (s *spawner) start(control, stdin, stdout, stderr, group *os.File) (*os.File, <-chan spawnEnd, error) {
-	answer, end := make(chan spawnAnswer, 1), make(chan spawnEnd, 1)
+// processes group is. It returns a descriptor for the process.
+func (s *spawner) start(control, stdin, stdout, stderr, group *os.File) (*os.File, error) {
+	answer := make(chan spawnAnswer, 1)
 	rights := unix.UnixRights(int(control.Fd()), int(stdin.Fd()), int(stdout.Fd()), int(stderr.Fd()), int(group.Fd()))
 	s.mu.Lock()
 	n := s.asked
@@ -257,33 +249,31 @@ func (s *spawner) start(control, stdin, stdout, stderr, group *os.File) (*os.Fil
 		// The spawner counts what it receives: a request that did not
 		// leave has no number.
 		s.asked++
-		s.answers[n], s.ends[n] = answer, end
+		s.answers[n] = answer
 	}
 	s.mu.Unlock()
 	if err != nil {
 		s.fail()
-		return nil, nil, fmt.Errorf("ask the sandbox's spawner: %w", err)
+		return nil, fmt.Errorf("ask the sandbox's spawner: %w", err)
 	}
 	forget := func() {
 		s.mu.Lock()
 		delete(s.answers, n)
-		delete(s.ends, n)
 		s.mu.Unlock()
 	}
 	select {
 	case said := <-answer:
 		if said.process == nil {
-			forget()
-			return nil, nil, fmt.Errorf("the sandbox's spawner started no process: %s", said.reason)
+			return nil, fmt.Errorf("the sandbox's spawner started no process: %s", said.reason)
 		}
-		return said.process, end, nil
+		return said.process, nil
 	case <-s.gone:
 		forget()
-		return nil, nil, errors.New("the sandbox's spawner is gone")
+		return nil, errors.New("the sandbox's spawner is gone")
 	case <-time.After(spawnWait):
 		forget()
 		s.fail()
-		return nil, nil, fmt.Errorf("the sandbox's spawner had not answered after %s", spawnWait)
+		return nil, fmt.Errorf("the sandbox's spawner had not answered after %s", spawnWait)
 	}
 }
 
@@ -312,23 +302,69 @@ func (s *spawner) end() {
 	_ = os.RemoveAll(s.dir)
 }
 
-// pidOf reads which process a descriptor for one names, as this process's
-// own namespace numbers it.
-func pidOf(process *os.File) (int, error) {
-	info, err := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(int(process.Fd())))
-	if err != nil {
-		return 0, err
+// kernelSaysEnds reports whether this kernel says, through a descriptor for
+// a process, which cgroup the process is in and how it ended once it has:
+// Linux 6.15 and later.
+func kernelSaysEnds() bool {
+	var name unix.Utsname
+	if err := unix.Uname(&name); err != nil {
+		return false
 	}
-	for line := range strings.Lines(string(info)) {
-		if value, ok := strings.CutPrefix(line, "Pid:"); ok {
-			pid, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil || pid <= 0 {
-				return 0, fmt.Errorf("the process is gone, or not one this guest can see (%s)", strings.TrimSpace(value))
-			}
-			return pid, nil
+	var major, minor int
+	if n, _ := fmt.Sscanf(unix.ByteSliceToString(name.Release[:]), "%d.%d", &major, &minor); n != 2 {
+		return false
+	}
+	return major > 6 || major == 6 && minor >= 15
+}
+
+// asked asks the kernel about the process a descriptor names: its number as
+// this process's namespace has it, and its cgroup.
+func asked(process *os.File) (*unix.PidfdInfo, error) {
+	info := &unix.PidfdInfo{Mask: unix.PIDFD_INFO_PID | unix.PIDFD_INFO_CGROUPID}
+	if err := unix.IoctlPidfdInfo(int(process.Fd()), info); err != nil {
+		return nil, fmt.Errorf("the descriptor names no living process: %w", err)
+	}
+	if info.Mask&unix.PIDFD_INFO_PID == 0 || info.Mask&unix.PIDFD_INFO_CGROUPID == 0 || info.Pid == 0 {
+		return nil, errors.New("the kernel does not say which process the descriptor names, or where it is")
+	}
+	return info, nil
+}
+
+// endWait bounds how long the kernel is asked how a process ended once it
+// has: the answer is there when the process's parent has reaped it, which a
+// spawner does at once, and the sandbox's first process for one it left.
+const endWait = 200 * time.Millisecond
+
+// awaitEnd waits until the process a descriptor names has ended, and then
+// asks the kernel how. ok is false for a process nobody reaped in time: how
+// it ended is then not known.
+func awaitEnd(process *os.File) (end spawnEnd, ok bool) {
+	fd := int(process.Fd())
+	readable := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(readable, -1)
+		if errors.Is(err, unix.EINTR) {
+			continue
 		}
+		if err != nil || n == 0 {
+			return end, false
+		}
+		break
 	}
-	return 0, errors.New("the descriptor names no process")
+	for pause, waited := 50*time.Microsecond, time.Duration(0); ; pause, waited = 2*pause, waited+pause {
+		info := unix.PidfdInfo{Mask: unix.PIDFD_INFO_EXIT}
+		if err := unix.IoctlPidfdInfo(fd, &info); err == nil && info.Mask&unix.PIDFD_INFO_EXIT != 0 {
+			status := unix.WaitStatus(info.Exit_code)
+			if status.Signaled() {
+				return spawnEnd{signal: int(status.Signal())}, true
+			}
+			return spawnEnd{status: status.ExitStatus()}, true
+		}
+		if waited >= endWait {
+			return end, false
+		}
+		time.Sleep(pause)
+	}
 }
 
 // spawnWarm has the sandbox's spawner start a command's process: the init,
@@ -378,20 +414,20 @@ func (r *ImageRunner) spawnWarm(s *spawner, id string) (_ *warmCommand, err erro
 	if err != nil {
 		return nil, fmt.Errorf("the command's cgroup: %w", err)
 	}
-	process, ended, err := s.start(theirs[0], theirs[1], theirs[2], theirs[3], procs)
+	process, err := s.start(theirs[0], theirs[1], theirs[2], theirs[3], procs)
 	_ = procs.Close()
 	if err != nil {
 		return nil, err
 	}
-	defer process.Close()
 	if err := r.confirm(process, warm.group); err != nil {
-		if _, gone := pidOf(process); gone == nil {
+		if _, gone := asked(process); gone == nil {
 			// It lives, and is not what a spawner starts: nothing more is
 			// asked of a spawner that names such a process. Nor is the
 			// process the agent's to end: an init that was started for this
 			// command ends when its control socket closes, below.
 			s.fail()
 		}
+		_ = process.Close()
 		return nil, fmt.Errorf("the process the sandbox's spawner started: %w", err)
 	}
 	copied := make(chan struct{})
@@ -405,11 +441,13 @@ func (r *ImageRunner) spawnWarm(s *spawner, id string) (_ *warmCommand, err erro
 	}()
 	go func() {
 		defer close(warm.done)
-		select {
-		case end := <-ended:
+		defer process.Close()
+		// The kernel says when it has ended and how, whatever has become
+		// of its spawner. One that nobody reaped is ended by its cgroup,
+		// and counts as killed.
+		if end, ok := awaitEnd(process); ok {
 			warm.exit = end.code()
-		case <-s.gone:
-			// Nobody is left to say how it ends: it is ended.
+		} else {
 			_ = warm.group.kill(nil)
 			warm.exit = 128 + int(unix.SIGKILL)
 		}
@@ -426,30 +464,33 @@ func (r *ImageRunner) spawnWarm(s *spawner, id string) (_ *warmCommand, err erro
 }
 
 // confirm takes a process the spawner started for a command's, and none of
-// it on the spawner's word. The process is the one its descriptor names. It
-// runs the init's own file. It is in the command's cgroup, where a process
-// that was given to another command is not. Each of these is read by the
-// process's number, which passes to another process once its own has ended,
-// so the descriptor is asked again after them: it named a living process by
-// that number before and after, and so what was read was read of it.
+// it on the spawner's word. The kernel says, through the descriptor, which
+// process it names and that the process is in the command's cgroup, where a
+// process that was given to another command is not. That it runs the init's
+// own file is read by its number, which passes to another process once its
+// own has ended, so the descriptor is asked again after that: it named a
+// living process by that number before and after, and so what was read was
+// read of it.
 func (r *ImageRunner) confirm(process *os.File, group *processGroup) error {
-	pid, err := pidOf(process)
+	before, err := asked(process)
 	if err != nil {
 		return err
+	}
+	var cgroup unix.Stat_t
+	if err := unix.Stat(group.dir, &cgroup); err != nil {
+		return fmt.Errorf("the command's cgroup: %w", err)
+	}
+	if before.Cgroupid != cgroup.Ino {
+		return errors.New("it is not in the command's cgroup")
 	}
 	program, err := os.Stat(r.cfg.SandboxInit)
 	if err != nil {
 		return err
 	}
-	proc := filepath.Join("/proc", strconv.Itoa(pid))
-	if exe, err := os.Stat(filepath.Join(proc, "exe")); err != nil || !os.SameFile(exe, program) {
+	if exe, err := os.Stat(filepath.Join("/proc", strconv.FormatUint(uint64(before.Pid), 10), "exe")); err != nil || !os.SameFile(exe, program) {
 		return errors.New("it is not the sandbox's init")
 	}
-	in, _ := strings.CutPrefix(group.dir, cgroupRoot)
-	if cgroup, err := os.ReadFile(filepath.Join(proc, "cgroup")); err != nil || strings.TrimSpace(string(cgroup)) != "0::"+in {
-		return errors.New("it is not in the command's cgroup")
-	}
-	if still, err := pidOf(process); err != nil || still != pid {
+	if after, err := asked(process); err != nil || after.Pid != before.Pid {
 		return errors.New("it ended before it was the command's")
 	}
 	return nil

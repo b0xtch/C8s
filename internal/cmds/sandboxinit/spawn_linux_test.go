@@ -138,31 +138,68 @@ func said(t *testing.T, agent int) ([]string, int) {
 	return strings.Fields(string(packet[:size])), passed
 }
 
-// pidOf reads which process a descriptor for one names.
+// pidOf asks the kernel which process a descriptor for one names.
 func pidOf(t *testing.T, process int) int {
 	t.Helper()
-	info, err := os.ReadFile("/proc/self/fdinfo/" + strconv.Itoa(process))
-	if err != nil {
-		t.Fatal(err)
+	info := unix.PidfdInfo{Mask: unix.PIDFD_INFO_PID}
+	if err := unix.IoctlPidfdInfo(process, &info); err != nil || info.Pid == 0 {
+		t.Fatalf("the descriptor names no process: %v", err)
 	}
-	for line := range strings.Lines(string(info)) {
-		if value, ok := strings.CutPrefix(line, "Pid:"); ok {
-			pid, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				t.Fatal(err)
+	return int(info.Pid)
+}
+
+// endOf waits for the process a descriptor names to end and to be reaped,
+// as only its spawner can reap it, and returns the exit status and the
+// signal the kernel says it ended with. The spawner says neither.
+func endOf(t *testing.T, process int) (status, signal int) {
+	t.Helper()
+	readable := []unix.PollFd{{Fd: int32(process), Events: unix.POLLIN}}
+	for {
+		n, err := unix.Poll(readable, 10_000)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || n == 0 {
+			t.Fatalf("the process did not end: %v", err)
+		}
+		break
+	}
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		info := unix.PidfdInfo{Mask: unix.PIDFD_INFO_EXIT}
+		if err := unix.IoctlPidfdInfo(process, &info); err == nil && info.Mask&unix.PIDFD_INFO_EXIT != 0 {
+			how := unix.WaitStatus(info.Exit_code)
+			if how.Signaled() {
+				return 0, int(how.Signal())
 			}
-			return pid
+			return how.ExitStatus(), 0
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the process ended and its spawner never reaped it")
 		}
 	}
-	t.Fatalf("no process in %s", info)
-	return 0
+}
+
+// reapable skips a test on a kernel that does not say through a process's
+// descriptor how the process ended: Linux before 6.15.
+func reapable(t *testing.T) {
+	t.Helper()
+	var name unix.Utsname
+	var major, minor int
+	if err := unix.Uname(&name); err != nil {
+		t.Skip(err)
+	}
+	if n, _ := fmt.Sscanf(unix.ByteSliceToString(name.Release[:]), "%d.%d", &major, &minor); n != 2 || major < 6 || major == 6 && minor < 15 {
+		t.Skipf("Linux %s does not say how a process ended through its descriptor", unix.ByteSliceToString(name.Release[:]))
+	}
 }
 
 // A spawner starts this program again for each request, with the request's
-// descriptors where a runtime would put them, hands the agent a descriptor
-// for the process, and says how the process ended. The process is an init
-// like any other: it becomes the command it is told.
+// descriptors where a runtime would put them, and hands the agent a
+// descriptor for the process. It reaps the process when it ends, which is
+// when the kernel says through that descriptor how it ended. The process is
+// an init like any other: it becomes the command it is told.
 func TestSpawnerStartsAnInitForEachRequest(t *testing.T) {
+	reapable(t)
 	_, agent := spawner(t)
 	for n := range 3 {
 		a := ask(t, agent, sandboxinit.SpawnRequest)
@@ -171,7 +208,6 @@ func TestSpawnerStartsAnInitForEachRequest(t *testing.T) {
 			t.Fatalf("request %d was answered %q with descriptor %d", n, words, process)
 		}
 		pid := pidOf(t, process)
-		_ = unix.Close(process)
 		if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err != nil || !strings.HasSuffix(exe, ".test") {
 			t.Fatalf("the process a spawner named runs %q, %v", exe, err)
 		}
@@ -194,15 +230,16 @@ func TestSpawnerStartsAnInitForEachRequest(t *testing.T) {
 		}
 		out, _ := io.ReadAll(a.stdout)
 		errs, _ := io.ReadAll(a.stderr)
-		words, _ = said(t, agent)
+		status, signal := endOf(t, process)
+		_ = unix.Close(process)
 		if n == 2 {
-			if got := strings.Join(words, " "); got != fmt.Sprintf("%s 2 0 9", sandboxinit.SpawnEnded) {
-				t.Fatalf("a process that was killed: %q", got)
+			if status != 0 || signal != 9 {
+				t.Fatalf("a process that was killed ended with status %d, signal %d", status, signal)
 			}
 			continue
 		}
-		if got := strings.Join(words, " "); got != fmt.Sprintf("%s %d %d 0", sandboxinit.SpawnEnded, n, 3+n) {
-			t.Fatalf("process %d ended as %q", n, got)
+		if status != 3+n || signal != 0 {
+			t.Fatalf("process %d ended with status %d, signal %d", n, status, signal)
 		}
 		// Its standard three, and the descriptor ls reads the directory by:
 		// nothing of the spawner's, and no way back to the agent.
@@ -219,6 +256,7 @@ func TestSpawnerStartsAnInitForEachRequest(t *testing.T) {
 // spawner says why, ends the process, says nothing of that end, and serves
 // the next request.
 func TestSpawnerEndsAProcessItCannotPutInItsCgroup(t *testing.T) {
+	reapable(t)
 	_, agent := spawner(t)
 	unwritable, err := os.Open(os.DevNull)
 	if err != nil {
@@ -244,11 +282,13 @@ func TestSpawnerEndsAProcessItCannotPutInItsCgroup(t *testing.T) {
 	if len(words) != 2 || words[0] != sandboxinit.Spawned || words[1] != "1" || process < 0 {
 		t.Fatalf("the request after it was answered %q", words)
 	}
-	_ = unix.Close(process)
+	// It waits for a command that never comes, ends when the agent's end of
+	// its socket closes, and is reaped as any other.
 	b.control.Close()
-	if words, _ := said(t, agent); len(words) != 4 || words[0] != sandboxinit.SpawnEnded || words[1] != "1" {
-		t.Fatalf("the next thing the spawner said was %q", words)
+	if status, signal := endOf(t, process); status != sandboxinit.FailureStatus || signal != 0 {
+		t.Fatalf("an init whose agent went away ended with status %d, signal %d", status, signal)
 	}
+	_ = unix.Close(process)
 }
 
 // A request that carries another number of descriptors starts nothing, and
@@ -265,12 +305,7 @@ func TestSpawnerRefusesARequestItCannotStart(t *testing.T) {
 		t.Fatalf("the request after it was answered %q", words)
 	}
 	_ = unix.Close(process)
-	// The process it started waits for a command that never comes, and ends
-	// when the agent's end of its socket closes.
 	a.control.Close()
-	if words, _ := said(t, agent); len(words) != 4 || words[0] != sandboxinit.SpawnEnded || words[1] != "1" {
-		t.Fatalf("a process whose agent went away ended as %q", words)
-	}
 	_ = unix.Close(agent)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()

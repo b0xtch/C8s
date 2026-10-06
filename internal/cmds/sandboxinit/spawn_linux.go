@@ -33,18 +33,19 @@ import (
 // keeps it until this spawner has reaped it, and lets the write put only
 // this sandbox's processes there, and only in that one cgroup. The spawner
 // answers with a packet: Spawned and the request's number, with a descriptor
-// for the new process, by which the agent knows it; or SpawnFailed, the
-// number and why. When a process it started ends it sends SpawnEnded, the
-// number, the exit status and the signal. It returns when the agent closes
-// the socket.
+// for the new process, by which the agent knows it and learns of its end; or
+// SpawnFailed, the number and why. It reaps what it started and says nothing
+// of how any of it ended: the kernel tells the agent that, through the
+// descriptor. It returns when the agent closes the socket.
 //
 // It says nothing of its own to the agent but these, and reads nothing from
 // it but descriptors: no command passes through it.
 func spawn() int {
 	self := fmt.Sprintf("/proc/self/fd/%d", ProgramFD)
+	// Held by a start from its fork until the process's number is written
+	// to its cgroup's file, and by the reaper for each wait: no process is
+	// reaped, and so none gives its number up, in between.
 	var mu sync.Mutex
-	// The request each living child was started for, by the child's number.
-	started := map[int]int{}
 	say := func(text string, descriptors ...int) {
 		var rights []byte
 		if len(descriptors) > 0 {
@@ -61,38 +62,17 @@ func spawn() int {
 	signal.Notify(ended, unix.SIGCHLD)
 	go func() {
 		for range ended {
-			// Under the lock a start holds until it has the process's number
-			// down: an end is never said before its start. Each process is
-			// asked after by its own number while that number is still down,
-			// so a number the kernel gives out again names no earlier process.
-			mu.Lock()
-			for pid, n := range started {
-				var status unix.WaitStatus
-				reaped, err := unix.Wait4(pid, &status, unix.WNOHANG, nil)
-				for errors.Is(err, unix.EINTR) {
-					reaped, err = unix.Wait4(pid, &status, unix.WNOHANG, nil)
-				}
-				if err != nil {
-					// No child of this process: nothing can be said of it.
-					delete(started, pid)
+			for {
+				mu.Lock()
+				pid, err := unix.Wait4(-1, nil, unix.WNOHANG, nil)
+				mu.Unlock()
+				if errors.Is(err, unix.EINTR) {
 					continue
 				}
-				if reaped != pid {
-					continue
+				if pid <= 0 || err != nil {
+					break
 				}
-				delete(started, pid)
-				if n == unsaid {
-					continue
-				}
-				exit, by := 0, 0
-				if status.Signaled() {
-					by = int(status.Signal())
-				} else {
-					exit = status.ExitStatus()
-				}
-				say(fmt.Sprintf("%s %d %d %d", SpawnEnded, n, exit, by))
 			}
-			mu.Unlock()
 		}
 	}()
 
@@ -121,22 +101,20 @@ func spawn() int {
 			})
 			if err == nil {
 				// Its number is its own for as long as this lock is held:
-				// only the reaper below gives a number up, under the lock.
+				// only the reaper above gives a number up, under the lock.
 				if err = writeAll(passed[4], strconv.Itoa(pid)); err != nil {
 					err = fmt.Errorf("put the process in its cgroup: %w", err)
 					_ = unix.Kill(pid, unix.SIGKILL)
 					_ = unix.Close(process)
-					started[pid] = unsaid
 				}
 			}
+			mu.Unlock()
 			if err != nil {
 				say(fmt.Sprintf("%s %d %v", SpawnFailed, n, err))
 			} else {
-				started[pid] = n
 				say(fmt.Sprintf("%s %d", Spawned, n), process)
 				_ = unix.Close(process)
 			}
-			mu.Unlock()
 		}
 		for _, fd := range passed {
 			_ = unix.Close(fd)
@@ -153,10 +131,6 @@ func writeAll(fd int, text string) error {
 		}
 	}
 }
-
-// unsaid is the request of a process whose start was said to have failed:
-// it is reaped, and nothing more is said of it.
-const unsaid = -1
 
 // passedIn is every descriptor in one packet's control data.
 func passedIn(control []byte) []int {

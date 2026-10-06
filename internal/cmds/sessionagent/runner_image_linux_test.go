@@ -837,11 +837,14 @@ func TestSandboxOutlivesItsSpawner(t *testing.T) {
 	c.start(t)
 	client := c.client(t, c.owner)
 	c.awaitWarm(t)
-	// The command that ends the spawner is one the spawner started, and
-	// nobody is left to say how it ended: whatever it is answered with,
-	// the spawner is gone after it.
-	_, _ = client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c",
-		`for p in /proc/[0-9]*; do if [ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 spawn " ]; then kill -9 ${p#/proc/}; fi; done`}})
+	// The command that ends the spawner is one the spawner started. It goes
+	// on without it, and how it ends is the kernel's to say: the sandbox's
+	// first process reaps what the spawner left.
+	resp, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c",
+		`for p in /proc/[0-9]*; do if [ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 spawn " ]; then kill -9 ${p#/proc/}; fi; done; echo outlived; exit 6`}})
+	if err != nil || resp.ExitCode != 6 || strings.TrimSpace(string(resp.Stdout)) != "outlived" {
+		t.Fatalf("the command that ended its spawner: %+v, %v", resp, err)
+	}
 	for i := range 4 {
 		resp, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", fmt.Sprintf("echo after-%d; exit %d", i, i)}})
 		if err != nil || resp.ExitCode != i || strings.TrimSpace(string(resp.Stdout)) != fmt.Sprintf("after-%d", i) {

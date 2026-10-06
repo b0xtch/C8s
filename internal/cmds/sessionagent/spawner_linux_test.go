@@ -3,7 +3,6 @@
 package sessionagent
 
 import (
-	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -40,7 +39,7 @@ func spoken(t *testing.T) (*spawner, int) {
 	}
 	s := &spawner{
 		conn: conn.(*net.UnixConn), exited: make(chan struct{}),
-		answers: map[int]chan spawnAnswer{}, ends: map[int]chan spawnEnd{}, gone: make(chan struct{}),
+		answers: map[int]chan spawnAnswer{}, gone: make(chan struct{}),
 	}
 	go s.read()
 	theirs := os.NewFile(uintptr(pair[1]), "spawner")
@@ -113,23 +112,31 @@ func child(t *testing.T) (*exec.Cmd, int) {
 	return cmd, process
 }
 
-// A request carries its descriptors, the spawner's answer brings a
+// knowsEnds skips a test on a kernel that does not say through a process's
+// descriptor how the process ended.
+func knowsEnds(t *testing.T) {
+	t.Helper()
+	if !kernelSaysEnds() {
+		t.Skip("this kernel does not say how a process ended through its descriptor")
+	}
+}
+
+// A request carries its descriptors, and the spawner's answer brings a
 // descriptor for the process it started, which names that process and no
-// other, and the process's end reaches whoever started it, as the exit
-// status a shell would give.
-func TestSpawnerStartsAndSaysHowItEnded(t *testing.T) {
+// other.
+func TestSpawnerStartsAProcessAndNamesIt(t *testing.T) {
+	knowsEnds(t)
 	s, theirs := spoken(t)
 	cmd, process := child(t)
 	type started struct {
 		process *os.File
-		ended   <-chan spawnEnd
 		err     error
 	}
 	done := make(chan started, 1)
 	files := descriptors(t)
 	go func() {
-		process, ended, err := s.start(files[0], files[1], files[2], files[3], files[4])
-		done <- started{process, ended, err}
+		process, err := s.start(files[0], files[1], files[2], files[3], files[4])
+		done <- started{process, err}
 	}()
 	if got := requested(t, theirs); got != sandboxinit.SpawnRequest {
 		t.Fatalf("a request carried %d descriptors", got)
@@ -143,19 +150,69 @@ func TestSpawnerStartsAndSaysHowItEnded(t *testing.T) {
 		t.Fatalf("start: %v", got.err)
 	}
 	defer got.process.Close()
-	if pid, err := pidOf(got.process); err != nil || pid != cmd.Process.Pid {
-		t.Fatalf("the descriptor names process %d (%v), and the spawner started %d", pid, err, cmd.Process.Pid)
+	if info, err := asked(got.process); err != nil || int(info.Pid) != cmd.Process.Pid {
+		t.Fatalf("the descriptor names %+v (%v), and the spawner started %d", info, err, cmd.Process.Pid)
 	}
-	if err := unix.Sendmsg(theirs, []byte(sandboxinit.SpawnEnded+" 0 7 0"), nil, nil, 0); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case end := <-got.ended:
-		if end.code() != 7 {
-			t.Errorf("a process that exited with 7 has the status %d", end.code())
+}
+
+// How a process ended is the kernel's to say, through a descriptor for it
+// and once its parent has reaped it: its exit status, or the signal that
+// ended it. Of one that ended and that nobody reaps, it is not known.
+func TestEndOfAProcessIsTheKernelsWord(t *testing.T) {
+	knowsEnds(t)
+	start := func(script string) (*exec.Cmd, *os.File) {
+		t.Helper()
+		var process int
+		cmd := exec.Command("sh", "-c", script)
+		cmd.SysProcAttr = &syscall.SysProcAttr{PidFD: &process}
+		if err := cmd.Start(); err != nil {
+			t.Skipf("no shell to start here: %v", err)
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("the process's end reached nobody")
+		named := os.NewFile(uintptr(process), "process")
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			named.Close()
+		})
+		return cmd, named
+	}
+	for script, want := range map[string]spawnEnd{"exit 7": {status: 7}, "exit 0": {}, "kill -9 $$": {signal: 9}} {
+		cmd, process := start(script)
+		reaped := make(chan struct{})
+		go func() {
+			_ = cmd.Wait()
+			close(reaped)
+		}()
+		end, ok := awaitEnd(process)
+		if !ok || end != want {
+			t.Errorf("%q ended as %+v, known %v; want %+v", script, end, ok, want)
+		}
+		<-reaped
+	}
+	// One that is still running is waited for.
+	cmd, process := start("sleep 30")
+	waited := make(chan spawnEnd, 1)
+	go func() {
+		end, _ := awaitEnd(process)
+		waited <- end
+	}()
+	select {
+	case end := <-waited:
+		t.Fatalf("a process that runs was said to have ended: %+v", end)
+	case <-time.After(100 * time.Millisecond):
+	}
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
+	if end := <-waited; end.signal != 9 {
+		t.Errorf("a process that was killed ended as %+v", end)
+	}
+	// One that has ended and is not reaped: the wait is bounded.
+	_, process = start("exit 3")
+	began := time.Now()
+	if end, ok := awaitEnd(process); ok {
+		t.Errorf("a process nobody reaped is said to have ended as %+v", end)
+	} else if took := time.Since(began); took < endWait || took > endWait+5*time.Second {
+		t.Errorf("the kernel was asked for %s about a process nobody reaped, and the bound is %s", took, endWait)
 	}
 	if (spawnEnd{signal: 9}).code() != 137 || (spawnEnd{status: 3}).code() != 3 {
 		t.Error("a signal's status is 128 and the signal, and an exit's is its own")
@@ -175,7 +232,7 @@ func TestSpawnerThatStartsNothing(t *testing.T) {
 		done := make(chan error, 1)
 		files := descriptors(t)
 		go func() {
-			process, _, err := s.start(files[0], files[1], files[2], files[3], files[4])
+			process, err := s.start(files[0], files[1], files[2], files[3], files[4])
 			if process != nil {
 				process.Close()
 			}
@@ -190,7 +247,7 @@ func TestSpawnerThatStartsNothing(t *testing.T) {
 		}
 	}
 	// Words of no request, and an end nobody asked about, with a descriptor.
-	for _, said := range []string{sandboxinit.Spawned + " 41", sandboxinit.SpawnEnded + " 41 0 0", "started", "started soon", "ended 0 x y"} {
+	for _, said := range []string{sandboxinit.Spawned + " 41", sandboxinit.SpawnFailed + " 41 late", "started", "started soon", "ended 0 0 0"} {
 		if err := unix.Sendmsg(theirs, []byte(said), unix.UnixRights(process), nil, 0); err != nil {
 			t.Fatal(err)
 		}
@@ -199,7 +256,7 @@ func TestSpawnerThatStartsNothing(t *testing.T) {
 		t.Fatal("a spawner's stray words ended it")
 	}
 	s.mu.Lock()
-	waiting := len(s.answers) + len(s.ends)
+	waiting := len(s.answers)
 	s.mu.Unlock()
 	if waiting != 0 {
 		t.Errorf("%d waits were left for requests that were answered with no process", waiting)
@@ -213,7 +270,7 @@ func TestSpawnerThatIsGone(t *testing.T) {
 	done := make(chan error, 1)
 	files := descriptors(t)
 	go func() {
-		_, _, err := s.start(files[0], files[1], files[2], files[3], files[4])
+		_, err := s.start(files[0], files[1], files[2], files[3], files[4])
 		done <- err
 	}()
 	requested(t, theirs)
@@ -230,7 +287,7 @@ func TestSpawnerThatIsGone(t *testing.T) {
 	if s.alive() {
 		t.Fatal("a spawner whose socket closed is taken for alive")
 	}
-	if _, _, err := s.start(files[0], files[1], files[2], files[3], files[4]); err == nil {
+	if _, err := s.start(files[0], files[1], files[2], files[3], files[4]); err == nil {
 		t.Fatal("a spawner that is gone was asked for a process, and gave one")
 	} else if time.Since(began) > spawnWait {
 		t.Fatalf("it took %s to say so: %v", time.Since(began), err)
@@ -238,24 +295,26 @@ func TestSpawnerThatIsGone(t *testing.T) {
 }
 
 // A descriptor that names no process is none the agent acts on.
-func TestPidOfADescriptorThatIsNoProcess(t *testing.T) {
+func TestDescriptorThatNamesNoProcess(t *testing.T) {
+	knowsEnds(t)
 	f, err := os.Open(os.DevNull)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if pid, err := pidOf(f); err == nil {
-		t.Fatalf("a file was taken for process %d", pid)
+	if info, err := asked(f); err == nil {
+		t.Fatalf("a file was taken for process %d", info.Pid)
 	}
 	cmd, process := child(t)
 	named := os.NewFile(uintptr(process), "process")
 	defer named.Close()
+	if info, err := asked(named); err != nil || int(info.Pid) != cmd.Process.Pid {
+		t.Fatalf("a living process is named %+v, %v", info, err)
+	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
-	if pid, err := pidOf(named); err == nil {
-		t.Fatalf("a process that is gone was taken for process %d", pid)
-	} else if errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("the descriptor's own entry was not read: %v", err)
+	if info, err := asked(named); err == nil {
+		t.Fatalf("a process that is gone was taken for process %d", info.Pid)
 	}
 }
 
