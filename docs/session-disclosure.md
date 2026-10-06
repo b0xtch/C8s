@@ -52,7 +52,7 @@ choosing where the host can read it.
 
 | From | What leaves in plaintext | Bounded by |
 |---|---|---|
-| the TD as a VM | that it runs, its class, its memory high-water mark, and when it ends | the hardware; this is metadata |
+| the TD as a VM | that it runs, its class, its memory high-water mark, when its vCPUs run, halt and wake one another, which vCPU a waiting one asks the host to run, and when it ends | the hardware and the kernel's [paravirtual features](session-threat-model.md#optimizations-that-must-not-weaken-the-model); this is metadata |
 | the network | sizes, times and endpoints of ciphertext, a message sealed into a bind and its sealed answer among them | metadata ([non-goals](session-threat-model.md#goals)) |
 | answers to the daemon | phases; a bind taken, or a refusal code; whether the bind's quote is taken, still being tried or given up; whether a message sealed with the bind was taken, and its answer, sealed; a commit's or a seal's generation, and its layers' ids and sizes; each epoch's generation and its record's size class; whether a restore brought processes back | the schema |
 | a guest's end | why it ended, as a code, with the phase it had reached; from a kernel that faulted, one fixed code | the schema; the image, for the kernel's code |

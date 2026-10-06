@@ -83,6 +83,15 @@ name each baseline.
   gateways carry as much on one vCPU as on four, with the sandbox busy on all
   of them; if they do not, the agent widens itself once its bind's call has
   ended.
+- **Waits that give up.** A TD's vCPU cannot tell a sibling its host has
+  descheduled from one that runs, and its host does not see it spin, so a vCPU
+  waiting on another can spin through the rest of its own slice. One that
+  waits for a spinlock halts instead after a bounded spin, until the lock's
+  releaser kicks it, and its halt tells the host that interrupts are off, so
+  that an interrupt it cannot take does not wake it again and again; one that
+  waits for another vCPU to run a function asks its host, every 100
+  microseconds it waits, to run that one. Neither reads anything from its host
+  to decide.
 - **Host-side pre-faulting** of private memory before a bind, which is safe
   because added pages stay pending until the guest accepts them.
 - **Reflinks.** The daemon keeps its store of layers and the slots' backing
