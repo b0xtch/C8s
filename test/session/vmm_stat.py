@@ -11,9 +11,14 @@ guest) and system; the memory the processes hold resident, which is a plain
 guest's memory and none of a TD's private pages; and what KVM counts for its
 VM, such as exits by kind, page faults it resolved and pages it has mapped.
 With them goes what the host has available and holds unevictable, where it
-counts the private pages of TDs. test/session/burst.sh takes
-it when a burst's last first command has answered, and before the burst:
-the difference, by the sessions, is what a start costs on a side.
+counts the private pages of TDs; all the CPU the host has given so far, by
+the kernel's count at the root of its control groups, and what this program
+has taken of it; and what the programs that work for the guests have run, by
+kind: the kernel's own threads, the quoting service, the session daemon and
+the launchers.
+test/session/burst.sh takes it when a burst's last first command has
+answered, and before the burst: the difference, by the sessions, is what a
+start costs on a side.
 
 With "quiet" for <when> it is the one before the burst, and waits for the
 side's guests to be idle by these counters first: it takes them every second
@@ -75,6 +80,8 @@ def taken(side, when, burst, text):
     kvm = dict.fromkeys(COUNTERS, 0)
     vmms = resident_kb = 0
     each = {}
+    groups = dict.fromkeys(GROUPS, 0)
+    at, given = time.time_ns() // 1000, host_cpu()
     # This program is started with the text too, and so is what started it.
     own = started_by()
     for entry in filter(str.isdigit, os.listdir("/proc")):
@@ -83,7 +90,12 @@ def taken(side, when, burst, text):
                 line = f.read().replace(b"\0", b" ").decode(errors="replace")
         except OSError:
             continue
-        if text not in line or int(entry) in own:
+        if int(entry) in own:
+            continue
+        if text not in line:
+            group = grouped(entry, line)
+            if group:
+                groups[group] += sum(ran for _, ran, *_ in threads(entry)) // 1000
             continue
         vmms += 1
         mine = [0, 0]
@@ -113,7 +125,46 @@ def taken(side, when, burst, text):
                     mine[1] += count
         each[entry] = mine
     return {"kind": "vmm-stat", "side": side, "when": when, "round": burst, "vmms": vmms, **kinds, "kvm": kvm,
-            "resident_kb": resident_kb, **host_memory()}, each
+            "resident_kb": resident_kb, **host_memory(), "t_us": at, "host_cpu_us": given,
+            "own_cpu_us": time.process_time_ns() // 1000, "groups_ran_us": groups}, each
+
+
+# The kinds of program that work for a side's guests, beside their VMMs.
+GROUPS = ("kernel", "quoting", "daemon", "launchers")
+
+
+def grouped(pid, line):
+    """The kind of a process that is no VMM of the side, or nothing."""
+    if not line:
+        # A thread of the kernel's has no command line, and kthreadd started it.
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                parent = f.read().rsplit(")", 1)[1].split()[1]
+        except (OSError, IndexError):
+            return None
+        return "kernel" if parent == "2" or pid == "2" else None
+    program = os.path.basename(line.split(" ", 1)[0])
+    if program in ("qgs", "aesm_service"):
+        return "quoting"
+    if " session-daemon run" in line:
+        return "daemon"
+    if " session-launcher run" in line:
+        return "launchers"
+    return None
+
+
+def host_cpu():
+    """All the CPU the host has given so far, in us, or nothing where the
+    kernel does not say."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name == "usage_usec":
+                    return int(value)
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def started_by():

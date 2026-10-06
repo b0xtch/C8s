@@ -106,6 +106,7 @@ import (
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 	"github.com/confidential-dot-ai/c8s/pkg/session/daemon"
 	"github.com/confidential-dot-ai/c8s/pkg/session/keyservice"
+	"github.com/confidential-dot-ai/c8s/test/session/hostcpu"
 )
 
 type options struct {
@@ -163,7 +164,10 @@ type judged struct {
 type together struct {
 	began    time.Time
 	answered func()
-	release  <-chan struct{}
+	// judged is given once the quote over the session's bind is judged, one
+	// way or the other.
+	judged  func()
+	release <-chan struct{}
 }
 
 // volley is one burst of starts: kind "burst". Every time is in
@@ -176,11 +180,20 @@ type volley struct {
 	// Sessions were let go at once, and Started of them started: each had
 	// its first command's answer, and its quote then agreed with its
 	// receipt. First and Wall are when the first and the last of those had
-	// their answer.
+	// their answer, and Verdict when the last had its quote judged and its
+	// verdict kept.
 	Sessions int   `json:"sessions"`
 	Started  int   `json:"started"`
 	First    int64 `json:"first_us,omitempty"`
 	Wall     int64 `json:"wall_us,omitempty"`
+	Verdict  int64 `json:"verdict_us,omitempty"`
+	// Span is from that instant until every session had its answer and its
+	// quote judged. HostCPU is all the CPU the host gave over it, whoever
+	// took it, by its kernel's count, and OwnCPU the part this program took:
+	// the binders' work, which is no part of what the host's guests cost.
+	Span    int64 `json:"span_us,omitempty"`
+	HostCPU int64 `json:"host_cpu_us,omitempty"`
+	OwnCPU  int64 `json:"own_cpu_us,omitempty"`
 	// Ready is how many ready TDs this side held a verdict on at that
 	// instant: with fewer than Sessions, the rest started as more booted.
 	Ready int `json:"ready"`
@@ -591,30 +604,44 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 		at  time.Duration
 	}
 	outcomes := make([]outcome, o.burst)
-	answered := make(chan int, o.burst)
+	answered, judged := make(chan int, o.burst), make(chan int, o.burst)
 	release := make(chan struct{})
 	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
 	defer cancel()
 	var all sync.WaitGroup
+	given, counted := hostcpu.Now()
 	began := time.Now()
 	for i := range outcomes {
 		all.Add(1)
 		go func() {
 			defer all.Done()
 			said := false
+			var judgedOnce sync.Once
 			with := &together{began: began, release: release, answered: func() {
 				said = true
 				outcomes[i].at = time.Since(began)
 				answered <- i
-			}}
+			}, judged: func() { judgedOnce.Do(func() { judged <- i }) }}
 			outcomes[i].rec, outcomes[i].err = start(ctx, fmt.Sprintf("%s-%d-%d", o.prefix, round, i), with)
 			if !said {
 				answered <- i
 			}
+			// One that failed before its quote was looked at.
+			with.judged()
 		}()
 	}
+	// A burst is over when every session has its answer and its verdict.
 	for range outcomes {
 		<-answered
+	}
+	for range outcomes {
+		<-judged
+	}
+	span := time.Since(began)
+	if now, ok := hostcpu.Now(); ok && counted {
+		given = now.Since(given)
+	} else {
+		given = hostcpu.Reading{}
 	}
 	if o.afterAnswers != "" {
 		// Every guest still runs: none is confirmed or ended before this.
@@ -628,7 +655,7 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 	}
 	close(release)
 	all.Wait()
-	said := &volley{Kind: "burst", Round: round, At: began.UnixMicro(), Sessions: o.burst, Ready: o.ready}
+	said := &volley{Kind: "burst", Round: round, At: began.UnixMicro(), Sessions: o.burst, Ready: o.ready, Span: span.Microseconds(), HostCPU: given.Host, OwnCPU: given.Own}
 	for _, each := range outcomes {
 		// A session whose quote disagreed after its answer did not start.
 		if each.err != nil {
@@ -643,6 +670,7 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 			said.First = at
 		}
 		said.Wall = max(said.Wall, at)
+		said.Verdict = max(said.Verdict, each.rec.Offset+each.rec.Confirmed)
 		if err := emit(each.rec); err != nil {
 			return err
 		}
@@ -1053,7 +1081,12 @@ func one(ctx context.Context, o *options, round int, name string, with *together
 		err  error
 	}
 	quoted := func() (j judgment) {
-		defer func() { rec.Quote, rec.Confirmed = micros(answered), micros(began) }()
+		defer func() {
+			rec.Quote, rec.Confirmed = micros(answered), micros(began)
+			if with != nil {
+				with.judged()
+			}
+		}()
 		relayed := answer
 		if len(relayed.Evidence) == 0 {
 			if relayed, j.err = call.Quote(ctx); errors.Is(j.err, daemon.ErrQuoteNotSent) {

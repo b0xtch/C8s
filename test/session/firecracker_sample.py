@@ -88,7 +88,9 @@ import tempfile
 import threading
 import time
 
-VCPUS, MEM_MIB = 4, 16384
+# The session class's size. A trial of test/session/burst.sh may give the
+# guest other vCPUs.
+VCPUS, MEM_MIB = int(os.environ.get("C8S_FIRECRACKER_VCPUS", "4")), 16384
 # The port the guest's agent listens on, and the guest's address on vsock.
 AGENT_PORT, GUEST_CID = 5000, 3
 BOOT_ARGS = "console=ttyS0 reboot=k panic=1 quiet"

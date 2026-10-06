@@ -61,6 +61,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/confidential-dot-ai/c8s/test/session/hostcpu"
 )
 
 // agentPort is where the guest's agent listens on vsock, as the snapshot's
@@ -107,14 +109,20 @@ type started struct {
 // volley is the burst: kind "fc-load", or "fc-pool". Its times run from the
 // instant every start was let go.
 type volley struct {
-	Kind     string   `json:"kind"`
-	Round    int      `json:"round"`
-	At       int64    `json:"at_unix_us"`
-	Sessions int      `json:"sessions"`
-	Started  int      `json:"started"`
-	First    int64    `json:"first_us,omitempty"`
-	Wall     int64    `json:"wall_us,omitempty"`
-	Command  []string `json:"first_command"`
+	Kind     string `json:"kind"`
+	Round    int    `json:"round"`
+	At       int64  `json:"at_unix_us"`
+	Sessions int    `json:"sessions"`
+	Started  int    `json:"started"`
+	First    int64  `json:"first_us,omitempty"`
+	Wall     int64  `json:"wall_us,omitempty"`
+	// Span is from that instant until every start had answered or failed.
+	// HostCPU is all the CPU the host gave over it, whoever took it, by its
+	// kernel's count, and OwnCPU the part this program took.
+	Span    int64    `json:"span_us,omitempty"`
+	HostCPU int64    `json:"host_cpu_us,omitempty"`
+	OwnCPU  int64    `json:"own_cpu_us,omitempty"`
+	Command []string `json:"first_command"`
 	// PoolBoot is how long the pool's guests took to boot, all of them, so
 	// many at a time, and Idle how long they then sat before the burst.
 	// Neither is part of a start.
@@ -236,6 +244,7 @@ func run(o *options) error {
 	if err := hook(o.before, o.round); err != nil {
 		return fmt.Errorf("-before-burst: %w", err)
 	}
+	given, counted := hostcpu.Now()
 	began := time.Now()
 	for _, v := range vmms {
 		v.burst = began
@@ -243,6 +252,11 @@ func run(o *options) error {
 	said.At = began.UnixMicro()
 	close(release)
 	all.Wait()
+	said.Span = time.Since(began).Microseconds()
+	if now, ok := hostcpu.Now(); ok && counted {
+		given = now.Since(given)
+		said.HostCPU, said.OwnCPU = given.Host, given.Own
+	}
 	if err := hook(o.after, o.round); err != nil {
 		return fmt.Errorf("-after-answers: %w", err)
 	}

@@ -70,6 +70,9 @@
 #   C8S_BURST_RESERVE_MIB    what the pool must leave of the host's available
 #                            memory (default 8192): a pool that would not is
 #                            not started, and the run says how many fit
+#   C8S_BURST_VCPUS          for a trial: the vCPUs of every guest, a TD's
+#                            and Firecracker's (default 4, the session
+#                            class's). A run that sets another says so
 #   C8S_TIMING_REST          seconds of rest before each burst (default 5)
 #   C8S_BURST_QUIET_LIMIT    for a trial: seconds a side's guests have, after
 #                            their rest, to be idle by their own counters
@@ -134,6 +137,8 @@ depth=${C8S_BURST_POOL:-$sessions}
 rounds=${C8S_BURST_ROUNDS:-4}
 first_command=${C8S_BURST_COMMAND:-node -v}
 rest=${C8S_TIMING_REST:-5}
+vcpus=${C8S_BURST_VCPUS:-4}
+case "$vcpus" in ''|*[!0-9]*|0) echo "C8S_BURST_VCPUS is a number of vCPUs" >&2; exit 2 ;; esac
 # The bytes of the credential warmstart seals with each bind.
 credential_bytes=48
 # What a pool is taken to need of the host's memory before it is started:
@@ -324,7 +329,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-shape=(--vcpus 4 --memory 16G --low-memory 512M --scratch 4G --image-store "$store")
+shape=(--vcpus "$vcpus" --memory 16G --low-memory 512M --scratch 4G --image-store "$store")
 ks_shape=(--vcpus 2 --memory 4G --low-memory 512M --scratch 2G)
 # serving <pid> <port>: wait until the guest of that launcher serves.
 serving() {
@@ -366,7 +371,7 @@ quiet "$C8S" session key-service launch-config new --out "$out/ks" --key "$out/k
 quiet "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1:$ks_port" --out "$pin" "${accept[@]}" || die "the pin"
 
 # The sandbox image is unpacked in every pooled TD before anybody binds it.
-pool_doc=(--key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --prestage "$ref")
+pool_doc=(--key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class "s-${vcpus}x16" --prestage "$ref")
 quiet "$C8S" session launch-config new --out "$out/bundle-probe" "${pool_doc[@]}" || die "the pool's first bundle"
 on "$cpus_td" sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
     --name "c8s-session-probe-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/probe.log" 2>&1 &
@@ -392,8 +397,8 @@ install -m 0755 "$fc_agent" "$fc/fcagent"
 sudo -n "$imageroot" -store "$store" -image "$ref" -out "$fc/image" > "$out/image.env" 2>> "$out/setup.err" || die "the image's tree for the baseline"
 sudo -n install -m 0644 "$out/image.env" "$fc/image.env"
 # shellcheck disable=SC2086
-(on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean "$credential_bytes" $first_command) >> "$records" || die "the lean Firecracker guest"
-(on "$cpus_fc" sudo -n python3 "$fc_sample" "$fc" lean-snapshot) >> "$records" || die "the Firecracker snapshot"
+(on "$cpus_fc" sudo -n env C8S_FIRECRACKER_VCPUS="$vcpus" python3 "$fc_sample" "$fc" lean "$credential_bytes" $first_command) >> "$records" || die "the lean Firecracker guest"
+(on "$cpus_fc" sudo -n env C8S_FIRECRACKER_VCPUS="$vcpus" python3 "$fc_sample" "$fc" lean-snapshot) >> "$records" || die "the Firecracker snapshot"
 
 {
     echo "listen: 127.0.0.1:$port"
@@ -407,7 +412,7 @@ sudo -n install -m 0644 "$out/image.env" "$fc/image.env"
     [ -n "$confine" ] && echo "  confine: \"$confine\""
     [ "$dev" = 1 ] && echo "  console: true"
     echo "classes:"
-    echo "  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}"
+    echo "  s-${vcpus}x16: {vcpus: $vcpus, memory: 16G, lowMemory: 512M, scratch: 4G}"
     echo "pools:"
     echo "  - imageDir: $IMG"
     echo "    launchDir: $out/bundle/opkeydata"
@@ -609,6 +614,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     printf 'baselines: Firecracker loading one snapshot of its leanest guest %s times at once, and Firecracker starting as many sessions at once in such guests booted ahead and idle, each to the first command over vsock to an agent that is its guest'"'"'s init on the same image'"'"'s tree, taking turns with the TDs burst by burst in an order that rotates, each side'"'"'s guests there for its own turn alone, which begins with them idle and the host rested; ' "$sessions"
     [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each TD burst (%s); ' "$C8S_BURST_WATCH"
+    [ "$vcpus" = 4 ] || printf 'a departure: every guest has %s vCPUs where the session class has 4; ' "$vcpus"
     printf 'no second baseline: its guests hold all of their memory from boot; '
     printf 'CPUs: TDs and their daemon %s, Firecracker %s, key service %s, the programs that start the bursts %s; ' "$cpus_td" "$cpus_fc" "$cpus_ks" "$cpus_drive"
     printf 'no claim: each bind claims its TD; before the measured path, on each side: its pool filled, rested %s s and then waited until every guest was idle by KVM'"'"'s own counters for it, the TDs'"'"' with the vendor'"'"'s documents fetched by the binder, each ready TD judged when it became ready and the image unpacked in each, and as that unpacking'"'"'s counterpart each of Firecracker'"'"'s guests having read its file system whole, the one its snapshot was made of (which had also run one command) and each one booted for its pool, which was left the same way with a connection to its agent made; a start that failed or lost its guest counts against its side'"'"'s success rate, and none is left out\n' "$rest"
@@ -628,7 +634,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     echo "session image $(basename "$IMG") disk sha256 $(field "$m" outputs.disk_image.sha256) kernel image sha256 $(field "$m" outputs.uki.sha256) firmware sha256 $(field "$m" tdx.firmware.sha256) mrtd $(field "$m" tdx.mrtd) rtmr1 $(field "$m" tdx.rtmr1) rtmr2 $(field "$m" tdx.rtmr2) machine $machine"
     echo "key service image $(basename "$KSIMG") disk sha256 $(field "$km" outputs.disk_image.sha256) kernel image sha256 $(field "$km" outputs.uki.sha256) mrtd $(field "$km" tdx.mrtd) rtmr2 $(field "$km" tdx.rtmr2) machine $ks_machine"
     echo "guest kernel $(field "$m" inputs.kernel.linux_version), guests on taps c8st<n> in $cidr"
-    echo "session class 4 vCPUs, 16 GiB; key service 2 vCPUs, 4 GiB; Firecracker guest 4 vCPUs, 16 GiB"
+    echo "session class $vcpus vCPUs, 16 GiB; key service 2 vCPUs, 4 GiB; Firecracker guest $vcpus vCPUs, 16 GiB"
     echo "sandbox image $ref, in a store of $(stat -c %s "$store") bytes sha256 $(sha256sum "$store" | cut -c1-64); its tree as the baseline's guest has it: $(sudo -n du -sm "$fc/image" | cut -f1) MiB"
     echo "work directory on $(df --output=fstype,source "$out" | tail -1)"
     echo "load $(cat /proc/loadavg)"
@@ -775,12 +781,17 @@ def side(name, bursts, sessions, parts):
         show("  " + label, [s[key] / 1000 for s in mine if s.get(key)])
     show("a burst's first answer", [b["first_us"] / 1000 for b in steady if b.get("first_us")])
     show("a burst's last answer (wall clock)", [b["wall_us"] / 1000 for b in steady if b.get("wall_us")])
+    # A session has started once its binder keeps its verdict from the quote
+    # over the bind: a burst's quotes share the host's one quoting service.
+    show("the binder's verdict kept, from the burst's instant", [(s["offset_us"] + s["confirmed_us"]) / 1000 for s in mine if s.get("confirmed_us")])
+    show("a burst's last kept verdict (wall clock)", [b["verdict_us"] / 1000 for b in steady if b.get("verdict_us")])
     if times:
         print(f"by the public board's formula, on these times as this host's own client took them: {score(times, started / asked):.2f}")
     for b in bursts:
         when = "the first burst, caches cold" if b["round"] == 0 else f"burst {b['round']}"
         of = [s["first_cmd_us"] / 1000 for s in sessions if s["round"] == b["round"]]
         print(f"{when}: {b['started']} of {b['sessions']} started" + (f", median {statistics.median(of):.1f} ms, last answer at {b.get('wall_us', 0) / 1000:.1f} ms" if of else "")
+              + (f", last kept verdict at {b['verdict_us'] / 1000:.1f} ms" if b.get("verdict_us") else "")
               + (f", on {b['ready']} ready TDs" if b.get("ready", b["sessions"]) != b["sessions"] else "")
               + ("".join(f"; failed: {e}" for e in b.get("errors", []))))
 side("TDs", [r for r in rows if r.get("kind") == "burst"], [r for r in rows if r.get("kind") == "session"],
@@ -841,6 +852,31 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
     print(f"--- what a start cost its host: {name} ({starts} starts, each VMM's threads from the burst's go to its last answer)")
     print(f"vCPU threads ran {ms('vcpu', 'ran_us'):8.2f} ms a start and waited for a CPU {ms('vcpu', 'waited_us'):8.2f} ms; sampled by the kernel's tick: in the guest {ms('vcpu', 'guest_us'):.2f}, in the host's kernel {ms('vcpu', 'system_us'):.2f}")
     print(f"other threads ran {ms('other', 'ran_us'):8.2f} ms a start and waited {ms('other', 'waited_us'):8.2f} ms")
+    # All the CPU the host gave a start: its kernel's own count over each
+    # burst, less what the program that started the burst took of it and
+    # less what the host gave over as long with these guests idle, which is
+    # counted over the second before the burst without the sampler's own.
+    whole = [(b, pair) for b in rows if b.get("kind") == kind and b["round"] > 0 and b.get("host_cpu_us") and b.get("started")
+             for pair in [taken.get((key, b["round"]), {})] if all(pair.get(w, {}).get("host_cpu_us") for w in ("idle", "before", "after"))]
+    if whole:
+        host = drivers = 0.0
+        ran = dict.fromkeys(("vcpu", "other", "kernel", "quoting", "daemon", "launchers"), 0.0)
+        for b, pair in whole:
+            idle, before, after = pair["idle"], pair["before"], pair["after"]
+            rested, watched = max(before["t_us"] - idle["t_us"], 1), after["t_us"] - before["t_us"]
+            resting = (before["host_cpu_us"] - idle["host_cpu_us"] - (before["own_cpu_us"] - idle["own_cpu_us"])) / rested
+            host += b["host_cpu_us"] - b["own_cpu_us"] - resting * b["span_us"]
+            drivers += b["own_cpu_us"]
+            for group in ran:
+                at = (lambda r: r[group]["ran_us"]) if group in ("vcpu", "other") else (lambda r: r["groups_ran_us"][group])
+                ran[group] += at(after) - at(before) - (at(before) - at(idle)) / rested * watched
+        of = sum(b["started"] for b, _ in whole)
+        each = lambda took: took / of / 1000
+        print(f"the host gave a start {each(host):.2f} ms of CPU in all ({len(whole)} bursts, {of} starts; its kernel's count over each burst, which it keeps by its tick, less the starting program's own and less "
+              f"what it gave over as long with these guests idle). Of that, by the scheduler's own count of each thread: the VMMs' vCPU threads {each(ran['vcpu']):.2f}, their other threads {each(ran['other']):.2f}, "
+              f"the kernel's own threads {each(ran['kernel']):.2f}, the quoting service {each(ran['quoting']):.2f}, the daemon {each(ran['daemon']):.2f}, the launchers {each(ran['launchers']):.2f}; "
+              f"the two counts differ by {each(host - sum(ran.values())):+.2f}, which is whatever else ran and what a tick's sample is off by")
+        print(f"the program that started the bursts took {each(drivers):.2f} ms a start more, on processors of its own")
     held = [before for before, _, _ in pairs if before["vmms"] and "resident_kb" in before]
     if held:
         guests = sum(b["vmms"] for b in held)
