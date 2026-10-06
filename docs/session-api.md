@@ -677,6 +677,8 @@ stops a session for about an epoch and the start of a restore.
   only when its turn comes, a TD claimed before its bind stays claimed while
   the bind waits, and the daemon drops a bind whose caller gives up, or whose
   `notAfter` passes, before its turn, so it claims nothing and ends no guest.
+  A caller may have as many binds waiting as its host can hold TDs, and one
+  more is refused at once with `RESOURCE_EXHAUSTED`, having claimed nothing.
 - **Events** from `Watch`, for orchestrators only: each TD as it is now,
   oldest first, and then each as it changes, with its pool, host, state
   (ready, claimed, bound, held, released, sealing or ended, with its reason),
