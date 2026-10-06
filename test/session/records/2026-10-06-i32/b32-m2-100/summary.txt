@@ -1,0 +1,106 @@
+--- TDs
+10 bursts of 100 after the first: 1000 of 1000 sessions started, a success rate of 1.0000
+start to the first command's answer        n=1000  median    231.9  p95    274.6  p99    285.4  min     21.3  max    293.7  ms
+  the same from the burst's instant        n=1000  median    238.5  p95    279.1  p99    290.1  min     21.6  max    298.2  ms
+  a session's own start after that instant n=1000  median      3.9  p95     14.8  p99     17.0  min      0.2  max     19.6  ms
+  sign                                     n=1000  median      0.2  p95      9.2  p99     15.2  min      0.1  max     18.3  ms
+  seal                                     n=1000  median      0.4  p95      3.9  p99     11.7  min      0.2  max     16.7  ms
+  bind                                     n=1000  median    125.7  p95    213.5  p99    228.7  min      7.6  max    255.1  ms
+  the receipt's check                      n=1000  median      0.1  p95      0.3  p99      1.4  min      0.1  max      5.5  ms
+  the first command after the start        n=1000  median     76.1  p95    166.4  p99    197.3  min      0.1  max    245.2  ms
+  the bind's quote, after its answer       n=1000  median      2.5  p95     28.0  p99     60.7  min      1.2  max     94.8  ms
+  the quote judged, from the start         n=1000  median    137.6  p95    224.2  p99    237.9  min     13.8  max    262.9  ms
+a burst's first answer                     n=  10  median     37.2  p95    113.8  p99    113.8  min     21.6  max    113.8  ms
+a burst's last answer (wall clock)         n=  10  median    269.2  p95    298.2  p99    298.2  min    249.5  max    298.2  ms
+the binder's verdict kept, from the burst's instant n=1000  median    142.8  p95    229.0  p99    241.3  min     15.7  max    271.3  ms
+a burst's last kept verdict (wall clock)   n=  10  median    240.9  p95    271.3  p99    271.3  min    221.3  max    271.3  ms
+by the public board's formula, on these times as this host's own client took them: 97.54
+the first burst, caches cold: 100 of 100 started, median 219.0 ms, last answer at 265.5 ms, last kept verdict at 246.0 ms
+burst 1: 100 of 100 started, median 252.3 ms, last answer at 289.0 ms, last kept verdict at 241.3 ms
+burst 2: 100 of 100 started, median 226.2 ms, last answer at 266.2 ms, last kept verdict at 258.3 ms
+burst 3: 100 of 100 started, median 241.2 ms, last answer at 279.1 ms, last kept verdict at 236.4 ms
+burst 4: 100 of 100 started, median 206.3 ms, last answer at 249.5 ms, last kept verdict at 228.7 ms
+burst 5: 100 of 100 started, median 261.5 ms, last answer at 298.2 ms, last kept verdict at 271.3 ms
+burst 6: 100 of 100 started, median 247.5 ms, last answer at 288.7 ms, last kept verdict at 258.8 ms
+burst 7: 100 of 100 started, median 231.8 ms, last answer at 268.8 ms, last kept verdict at 232.9 ms
+burst 8: 100 of 100 started, median 231.0 ms, last answer at 269.5 ms, last kept verdict at 241.1 ms
+burst 9: 100 of 100 started, median 221.1 ms, last answer at 260.1 ms, last kept verdict at 221.3 ms
+burst 10: 100 of 100 started, median 226.8 ms, last answer at 259.8 ms, last kept verdict at 240.8 ms
+--- Firecracker, each start a snapshot's load
+10 bursts of 100 after the first: 1000 of 1000 sessions started, a success rate of 1.0000
+start to the first command's answer        n=1000  median     99.5  p95    128.8  p99    136.8  min     40.9  max    141.7  ms
+  the same from the burst's instant        n=1000  median    115.9  p95    136.2  p99    141.2  min     43.8  max    149.6  ms
+  a session's own start after that instant n=1000  median     12.8  p95     40.4  p99     48.4  min      0.1  max     62.6  ms
+  the VMM's API socket                     n=1000  median      1.5  p95     34.9  p99     54.4  min      0.3  max     77.7  ms
+  the snapshot loaded and resumed          n=1000  median     35.1  p95     65.5  p99     87.5  min      5.1  max    102.0  ms
+  the agent's accept                       n=1000  median     40.0  p95     70.2  p99     97.6  min      9.1  max    103.7  ms
+a burst's first answer                     n=  10  median     71.2  p95     81.6  p99     81.6  min     43.8  max     81.6  ms
+a burst's last answer (wall clock)         n=  10  median    135.9  p95    149.6  p99    149.6  min    126.5  max    149.6  ms
+by the public board's formula, on these times as this host's own client took them: 98.90
+the first burst, caches cold: 100 of 100 started, median 101.7 ms, last answer at 131.8 ms
+burst 1: 100 of 100 started, median 92.0 ms, last answer at 137.0 ms
+burst 2: 100 of 100 started, median 84.1 ms, last answer at 130.9 ms
+burst 3: 100 of 100 started, median 104.5 ms, last answer at 143.3 ms
+burst 4: 100 of 100 started, median 95.8 ms, last answer at 136.9 ms
+burst 5: 100 of 100 started, median 111.4 ms, last answer at 137.6 ms
+burst 6: 100 of 100 started, median 99.6 ms, last answer at 126.5 ms
+burst 7: 100 of 100 started, median 89.2 ms, last answer at 134.6 ms
+burst 8: 100 of 100 started, median 104.0 ms, last answer at 129.1 ms
+burst 9: 100 of 100 started, median 91.7 ms, last answer at 134.9 ms
+burst 10: 100 of 100 started, median 123.6 ms, last answer at 149.6 ms
+--- Firecracker, each start a guest booted ahead
+10 bursts of 100 after the first: 1000 of 1000 sessions started, a success rate of 1.0000
+start to the first command's answer        n=1000  median     39.0  p95     48.1  p99     51.0  min     15.9  max     52.6  ms
+  the same from the burst's instant        n=1000  median     39.3  p95     48.4  p99     51.3  min     16.2  max     53.0  ms
+  a session's own start after that instant n=1000  median      0.3  p95      0.4  p99      0.5  min      0.0  max      0.5  ms
+a burst's first answer                     n=  10  median     18.0  p95     19.6  p99     19.6  min     16.2  max     19.6  ms
+a burst's last answer (wall clock)         n=  10  median     49.5  p95     53.0  p99     53.0  min     48.5  max     53.0  ms
+by the public board's formula, on these times as this host's own client took them: 99.58
+the first burst, caches cold: 100 of 100 started, median 39.8 ms, last answer at 47.1 ms
+burst 1: 100 of 100 started, median 40.1 ms, last answer at 49.3 ms
+burst 2: 100 of 100 started, median 39.8 ms, last answer at 48.5 ms
+burst 3: 100 of 100 started, median 39.5 ms, last answer at 48.9 ms
+burst 4: 100 of 100 started, median 37.4 ms, last answer at 53.0 ms
+burst 5: 100 of 100 started, median 37.9 ms, last answer at 52.9 ms
+burst 6: 100 of 100 started, median 38.6 ms, last answer at 49.7 ms
+burst 7: 100 of 100 started, median 38.9 ms, last answer at 52.2 ms
+burst 8: 100 of 100 started, median 39.3 ms, last answer at 51.3 ms
+burst 9: 100 of 100 started, median 38.3 ms, last answer at 48.8 ms
+burst 10: 100 of 100 started, median 39.1 ms, last answer at 49.1 ms
+Firecracker's pool booted, eight at a time n=  11  median   8409.0  p95   8478.0  p99   8478.0  min   8381.0  max   8478.0  ms (before its burst: no part of a start)
+Firecracker's guest: the agent as init on the image's own tree, 171307008 bytes, booted with: reboot=k panic=1 pci=off nomodule 8250.nr_uarts=0 i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd swiotlb=noforce init=/.c8s/fcagent; its first command is node -v
+Firecracker's snapshot: made in 19999 ms, of that guest 250 ms after its VMM started and once it had read its file system whole
+the daemon's time over a bind              n=1000  median    111.8  p95    193.8  p99    219.7  min      5.1  max    254.4  ms
+  of which the guest's answer              n=1000  median     86.0  p95    178.2  p99    206.4  min      3.7  max    249.3  ms
+TD launch to ready                         n=1100  median   3562.0  p95   3682.0  p99   3722.0  min   3441.0  max   3782.0  ms (two boot at a time, beside whatever else ran)
+  VMM start to documents asked             n=1100  median   2243.0  p95   2289.0  p99   2323.0  min   2193.0  max   3389.0  ms
+  documents asked to ready                 n=1100  median   1298.0  p95   1413.0  p99   1458.0  min    222.0  max   1517.0  ms
+--- what a start cost its host: TDs (1000 starts, each VMM's threads from the burst's go to its last answer)
+vCPU threads ran    91.58 ms a start and waited for a CPU   527.72 ms; sampled by the kernel's tick: in the guest 84.72, in the host's kernel 7.09
+other threads ran     0.32 ms a start and waited    20.81 ms
+the host gave a start 95.98 ms of CPU in all (10 bursts, 1000 starts; its kernel's count over each burst, which it keeps by its tick, less the starting program's own and less what it gave over as long with these guests idle). Of that, by the scheduler's own count of each thread: the VMMs' vCPU threads 90.81, their other threads 0.54, the kernel's own threads 0.03, the quoting service 1.68, the daemon 1.62, the launchers 0.25; the two counts differ by +1.05, which is whatever else ran and what a tick's sample is off by
+the program that started the bursts took 3.55 ms a start more, on processors of its own
+before a burst each guest's VMM held 96 MiB resident, which leaves out a TD's private pages: the pool's lines of the record count those; the host then had 28865 MiB available and 75702 MiB unevictable
+idle, in the second before the burst, each guest's VMM ran 1.52 ms and took 139 exits; a burst's last answer came 269 ms after its go
+KVM: 1675 exits a start (halt 420, I/O 0, MMIO 0, interrupts 434, others 821), 0 page faults resolved, pages mapped anew: 0 of 4 KiB and 0 of 2 MiB
+KVM: halted vCPUs spun 0.00 ms a start for a wakeup (0 of 0 spins met one) and then slept 5059.34 ms; the host's halt_poll_ns is 0
+--- what a start cost its host: Firecracker, a snapshot's load (1000 starts, each VMM's threads from the burst's go to its last answer)
+vCPU threads ran    33.76 ms a start and waited for a CPU   100.72 ms; sampled by the kernel's tick: in the guest 9.10, in the host's kernel 1.92
+other threads ran     3.05 ms a start and waited    14.74 ms
+the host gave a start 37.17 ms of CPU in all (10 bursts, 1000 starts; its kernel's count over each burst, which it keeps by its tick, less the starting program's own and less what it gave over as long with these guests idle). Of that, by the scheduler's own count of each thread: the VMMs' vCPU threads 33.76, their other threads 3.05, the kernel's own threads 0.19, the quoting service 0.00, the daemon 0.00, the launchers 0.00; the two counts differ by +0.18, which is whatever else ran and what a tick's sample is off by
+the program that started the bursts took 0.52 ms a start more, on processors of its own
+KVM: 7768 exits a start (halt 177, I/O 0, MMIO 24, interrupts 163, others 7405), 6290 page faults resolved, pages mapped anew: 5711 of 4 KiB and 0 of 2 MiB
+KVM: halted vCPUs spun 0.00 ms a start for a wakeup (0 of 0 spins met one) and then slept 406.37 ms; the host's halt_poll_ns is 0
+--- what a start cost its host: Firecracker, booted ahead (1000 starts, each VMM's threads from the burst's go to its last answer)
+vCPU threads ran    15.72 ms a start and waited for a CPU    45.24 ms; sampled by the kernel's tick: in the guest 13.13, in the host's kernel 2.46
+other threads ran     0.19 ms a start and waited     2.70 ms
+the host gave a start 15.37 ms of CPU in all (10 bursts, 1000 starts; its kernel's count over each burst, which it keeps by its tick, less the starting program's own and less what it gave over as long with these guests idle). Of that, by the scheduler's own count of each thread: the VMMs' vCPU threads 15.67, their other threads 0.19, the kernel's own threads 0.06, the quoting service 0.00, the daemon 0.00, the launchers 0.00; the two counts differ by -0.55, which is whatever else ran and what a tick's sample is off by
+the program that started the bursts took 0.06 ms a start more, on processors of its own
+before a burst each guest's VMM held 531 MiB resident; the host then had 60921 MiB available and 574 MiB unevictable
+idle, in the second before the burst, each guest's VMM ran 0.38 ms and took 49 exits; a burst's last answer came 49 ms after its go
+KVM: 1020 exits a start (halt 129, I/O 0, MMIO 15, interrupts 85, others 791), 572 page faults resolved, pages mapped anew: 572 of 4 KiB and 0 of 2 MiB
+KVM: halted vCPUs spun 0.00 ms a start for a wakeup (0 of 0 spins met one) and then slept 2715.29 ms; the host's halt_poll_ns is 0
+TDs were idle by their own counters 2 s after their rest, at the median of 11 bursts (at most 2 s): no guest's VMM ran over 10 ms or resolved over 16 page faults in each of two seconds
+Firecracker's booted guests were idle by their own counters 2 s after their rest, at the median of 11 bursts (at most 2 s): no guest's VMM ran over 10 ms or resolved over 16 page faults in each of two seconds
+the sides took turns, each side's guests up for its own turn alone: 100 ready TDs took 84866 MiB of the host's memory, 75132 of it their private pages, Firecracker's booted guests 53133 MiB, a burst of its snapshot loads, each counted whole though they share their snapshot's pages 5452 MiB: 143451 MiB together, and the host had 114273 MiB available, of which 8192 are left to what else it runs: they do not stand on it together
+the first command wrote: 'v24.21.0'

@@ -1,0 +1,18 @@
+listen: 127.0.0.1:7443
+host: test-host
+stateDir: /work/run/b32-m2-100/state
+capacity: 100
+tls: {cert: /work/run/b32-m2-100/pki/server.pem, key: /work/run/b32-m2-100/pki/server.key, clientCA: /work/run/b32-m2-100/pki/ca.pem}
+network: {mode: tap, guestCIDR: 10.213.0.0/22}
+vmm:
+  quoteSocket: /var/run/tdx-qgs/qgs.socket
+  confine: "64055"
+classes:
+  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}
+pools:
+  - imageDir: /work/images-i32/c8s-session
+    launchDir: /work/run/b32-m2-100/bundle/opkeydata
+    depth: 100
+    imageStore: /work/store-node/images.store
+    binders:
+      - "sha256:842fbeb650573e81a71faf48d8100af64f1278eb254b8989b99593ac0bffe45f"
