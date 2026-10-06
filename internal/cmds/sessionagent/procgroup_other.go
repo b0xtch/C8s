@@ -5,6 +5,7 @@ package sessionagent
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"syscall"
 )
 
@@ -31,6 +32,14 @@ func (g *processGroup) kill(p *os.Process) error {
 		return err
 	}
 	return nil
+}
+
+// wait waits for a command that was started in the group, and ends what
+// outlived it.
+func (g *processGroup) wait(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	_ = g.kill(cmd.Process)
+	return err
 }
 
 func (g *processGroup) close() {}

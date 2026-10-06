@@ -123,10 +123,9 @@ func (r *ProcessRunner) Exec(ctx context.Context, req *session.ExecRequest) (*se
 	var waitErr error
 	if startErr == nil {
 		group.started(cmd.Process)
-		waitErr = cmd.Wait()
+		// Stragglers that outlived the command do not outlive its result.
+		waitErr = group.wait(cmd)
 	}
-	// Stragglers that outlived the command must not outlive its result.
-	_ = group.kill(cmd.Process)
 	resp := &session.ExecResponse{
 		Stdout: stdout.bytes(), Stderr: stderr.bytes(),
 		StdoutTruncated: stdout.truncated(), StderrTruncated: stderr.truncated(),

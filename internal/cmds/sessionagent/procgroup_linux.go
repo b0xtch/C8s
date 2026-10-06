@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -65,37 +68,80 @@ func (g *processGroup) started(p *os.Process) {
 	_ = os.WriteFile(fmt.Sprintf("/proc/%d/oom_score_adj", p.Pid), []byte(execOOMScoreAdj), 0)
 }
 
+// kill ends the command and everything it spawned. With a cgroup it is ended
+// by the cgroup alone, which names its processes by no number: once a
+// command has been waited for, its number can name another process, and in
+// the agent's namespace that could be one of the agent's own. Without one,
+// p leads the process group that is killed, and must not have been waited
+// for yet: see wait.
 func (g *processGroup) kill(p *os.Process) error {
-	var errs []error
 	if g.dir != "" {
-		if err := os.WriteFile(filepath.Join(g.dir, "cgroup.kill"), []byte("1"), 0); err != nil {
-			errs = append(errs, err)
+		// The kernel's own file, written and never made: a cgroup that is
+		// gone has none, and holds nothing to end.
+		f, err := os.OpenFile(filepath.Join(g.dir, "cgroup.kill"), os.O_WRONLY, 0)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
 		}
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.WriteString("1")
+		return err
 	}
 	if p != nil {
 		// Negative pid: the whole process group the command leads.
 		if err := syscall.Kill(-p.Pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-			errs = append(errs, err)
+			return err
 		}
 	}
-	return errors.Join(errs...)
+	return nil
 }
 
-// close removes the command's cgroup once the kernel has reaped its tasks.
-// A cgroup that is gone has none: a container's runtime removes the cgroups
-// below the container's when the container ends.
+// wait waits for a command that was started in the group, and ends what
+// outlived it: stragglers must not outlive a command's result. Without a
+// cgroup they are the command's process group, which is killed once the
+// command has ended and before it is waited for: until then the command
+// keeps its number, and so its group's, from every other process.
+func (g *processGroup) wait(cmd *exec.Cmd) error {
+	if g.dir == "" {
+		var info unix.Siginfo
+		for {
+			if err := unix.Waitid(unix.P_PID, cmd.Process.Pid, &info, unix.WEXITED|unix.WNOWAIT, nil); !errors.Is(err, unix.EINTR) {
+				break
+			}
+		}
+		_ = g.kill(cmd.Process)
+		return cmd.Wait()
+	}
+	err := cmd.Wait()
+	_ = g.kill(nil)
+	return err
+}
+
+// closeWait bounds how long close tries to empty a command's cgroup.
+const closeWait = 2 * time.Second
+
+// close removes the command's cgroup, which the kernel allows once it holds
+// no process. A cgroup that is gone holds none: a container's runtime
+// removes the cgroups below the container's when the container ends. One
+// that still holds a process is killed again and tried again, for a bounded
+// time: whoever was handed the cgroup's file of processes can put more in
+// after a kill, until the cgroup is removed. A cgroup that does not empty
+// in that time is left to end with its sandbox, and nothing waits on it.
 func (g *processGroup) close() {
 	if g.dir == "" {
 		return
 	}
 	g.fd.Close()
-	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		events, err := os.ReadFile(filepath.Join(g.dir, "cgroup.events"))
-		if err != nil || strings.Contains(string(events), "populated 0") || time.Now().After(deadline) {
-			break
+	pause := time.Millisecond
+	for deadline := time.Now().Add(closeWait); ; time.Sleep(pause) {
+		if err := os.Remove(g.dir); err == nil || errors.Is(err, os.ErrNotExist) || time.Now().After(deadline) {
+			return
 		}
+		_ = g.kill(nil)
+		pause = min(2*pause, 10*time.Millisecond)
 	}
-	_ = os.Remove(g.dir)
 }
 
 // DelegatedCgroup prepares this service's own cgroup for per-command children.
