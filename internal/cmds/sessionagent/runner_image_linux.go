@@ -157,6 +157,11 @@ type madeSandbox struct {
 	warmDone  chan struct{}
 	// warmUsed counts the commands that ran as a process started ahead.
 	warmUsed atomic.Int64
+	// spawner starts the container's command processes once it is up, in
+	// the runtime's place: see spawner. It is nil before that, in a
+	// container whose commands the runtime starts as they come, and once a
+	// spawner has stopped answering.
+	spawner atomic.Pointer[spawner]
 }
 
 // NewImageRunner returns the runner of a guest image that carries crun.
@@ -890,7 +895,7 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 	for attempt := 0; ; attempt++ {
 		if warm == nil {
 			var err error
-			if warm, err = r.startWarm(w.process, "for-"+req.ID); err != nil {
+			if warm, err = r.startWarm(w.made, w.process, "for-"+req.ID); err != nil {
 				return nil, err
 			}
 		}
@@ -919,7 +924,10 @@ func (r *ImageRunner) Exec(ctx context.Context, req *session.ExecRequest) (*sess
 // undumpable until its exec, so that code cannot attach to it or open its
 // socket to the agent, and the agent reads a bounded answer from it.
 type warmCommand struct {
+	// cmd is the runtime that started the process, and nil for a process
+	// the sandbox's spawner started, whose exit status is then exit.
 	cmd   *exec.Cmd
+	exit  int
 	group *processGroup
 	// dir holds the runtime's description of the process and its log.
 	dir     string
@@ -933,11 +941,22 @@ type warmCommand struct {
 }
 
 // keepWarm keeps one command's process waiting in made's container for as
-// long as the container lives, and starts the next when one is taken.
+// long as the container lives, and starts the next when one is taken. It
+// has the runtime start the container's spawner first, which starts those
+// processes from then on, and ends the spawner with the container.
 func (r *ImageRunner) keepWarm(ctx context.Context, made *madeSandbox, image *specs.Process) {
 	defer close(made.warmDone)
+	if s, err := r.startSpawner(image); err != nil {
+		r.cfg.Logger.Warn("the sandbox has no spawner, and the runtime starts each of its commands' processes", "error", err)
+	} else {
+		made.spawner.Store(s)
+		defer func() {
+			made.spawner.Store(nil)
+			s.end()
+		}()
+	}
 	for n := 0; ; n++ {
-		warm, err := r.startWarm(image, fmt.Sprintf("ahead-%d", n))
+		warm, err := r.startWarm(made, image, fmt.Sprintf("ahead-%d", n))
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -985,9 +1004,19 @@ func ended(done <-chan struct{}) bool {
 }
 
 // startWarm starts the sandbox init in the sandbox's container, as a command
-// is started: by the runtime, in a cgroup of its own below the container's,
-// as the image's user and under its limits.
-func (r *ImageRunner) startWarm(image *specs.Process, id string) (_ *warmCommand, err error) {
+// is started: in a cgroup of its own below the container's, as the image's
+// user and under its limits. The container's spawner starts it where one
+// answers, and the runtime otherwise.
+func (r *ImageRunner) startWarm(made *madeSandbox, image *specs.Process, id string) (_ *warmCommand, err error) {
+	if s := made.spawner.Load(); s != nil {
+		warm, err := r.spawnWarm(s, id)
+		if err == nil {
+			return warm, nil
+		}
+		if !s.alive() && made.spawner.CompareAndSwap(s, nil) {
+			r.cfg.Logger.Warn("the sandbox's spawner is gone, and the runtime starts each of its commands' processes from here on", "error", err)
+		}
+	}
 	warm := &warmCommand{dir: filepath.Join(r.cfg.RunDir, "exec-"+id), done: make(chan struct{})}
 	if err := os.MkdirAll(warm.dir, 0o700); err != nil {
 		return nil, err
@@ -1060,7 +1089,7 @@ func (r *ImageRunner) startWarm(image *specs.Process, id string) (_ *warmCommand
 func (r *ImageRunner) endWarm(warm *warmCommand) {
 	_ = warm.control.Close()
 	_ = warm.stdin.Close()
-	_ = warm.group.kill(warm.cmd.Process)
+	_ = warm.group.kill(warm.command())
 	select {
 	case <-warm.done:
 	case <-time.After(stopTimeout):
@@ -1125,11 +1154,11 @@ func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *spe
 	select {
 	case <-warm.done:
 	case <-ctx.Done():
-		_ = warm.group.kill(warm.cmd.Process)
+		_ = warm.group.kill(warm.command())
 		<-warm.done
 	}
 	// Stragglers that outlived the command must not outlive its result.
-	_ = warm.group.kill(warm.cmd.Process)
+	_ = warm.group.kill(warm.command())
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 	var init answer
 	select {
@@ -1140,7 +1169,7 @@ func (r *ImageRunner) execWarm(ctx context.Context, warm *warmCommand, main *spe
 		return nil, false
 	}
 	resp := &session.ExecResponse{
-		ExitCode: exitStatus(warm.cmd.ProcessState),
+		ExitCode: warm.exitCode(),
 		Stdout:   warm.stdout.bytes(), Stderr: warm.stderr.bytes(),
 		StdoutTruncated: warm.stdout.truncated(), StderrTruncated: warm.stderr.truncated(),
 		DurationMillis: time.Since(start).Milliseconds(),

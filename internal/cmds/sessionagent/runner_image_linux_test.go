@@ -669,10 +669,11 @@ func TestCommandsRunAsProcessesStartedAhead(t *testing.T) {
 	if got := c.out(t, client, "ps | grep -c '[s]leep 300' || true"); got != "0" {
 		t.Errorf("%s sleepers outlived the command", got)
 	}
-	// Of the cgroups below the sandbox's, only the waiting process's is left.
+	// Of the cgroups below the sandbox's, only the waiting process's and the
+	// spawner's are left.
 	c.awaitWarm(t)
 	left, err := filepath.Glob(filepath.Join(c.cgroup, "sandbox", "exec-*"))
-	if err != nil || len(left) != 1 || !strings.Contains(filepath.Base(left[0]), "ahead") {
+	if err != nil || len(left) != 2 || !strings.Contains(filepath.Base(left[0]), "ahead") || filepath.Base(left[1]) != "exec-spawner" {
 		t.Errorf("command cgroups left behind: %v, %v", left, err)
 	}
 
@@ -718,8 +719,11 @@ func TestWaitingProcessIsOutOfTheTenantsReach(t *testing.T) {
 	// time to be started.
 	probe := `sleep 0.5
 for p in /proc/[0-9]*; do
-	[ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 " ] || continue
-	echo "found ${p#/proc/}"
+	case "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" in
+	"/proc/self/fd/3 ") echo "found ${p#/proc/}" ;;
+	"/proc/self/fd/3 spawn ") echo "found-spawner ${p#/proc/}" ;;
+	*) continue ;;
+	esac
 	cat $p/environ > /dev/null 2>&1; echo "environment $?"
 	cat $p/maps > /dev/null 2>&1; echo "memory-map $?"
 	head -c 1 $p/exe > /dev/null 2>&1; echo "program $?"
@@ -735,10 +739,15 @@ done`
 	if !strings.Contains(report, "found ") {
 		t.Fatalf("no waiting process was found in the sandbox: %q", report)
 	}
+	// The sandbox's spawner holds a socket to the agent as well, for as
+	// long as the sandbox lives.
+	if !strings.Contains(report, "found-spawner ") {
+		t.Fatalf("no spawner was found in the sandbox: %q", report)
+	}
 	for _, line := range strings.Split(strings.TrimSpace(report), "\n") {
 		what, status, _ := strings.Cut(line, " ")
-		if what != "found" && status == "0" {
-			t.Errorf("a command opened the %s of the process that waits beside it: %q", what, report)
+		if !strings.HasPrefix(what, "found") && status == "0" {
+			t.Errorf("a command opened the %s of a process that waits beside it: %q", what, report)
 		}
 	}
 	// The same command can open its own, so the probe tells a refusal
@@ -760,6 +769,91 @@ done`
 		}
 	}
 	c.awaitWarm(t)
+}
+
+// countedRuntime is the runtime behind a script that notes each call's
+// arguments, and a count of the calls so far that have a word among them.
+func countedRuntime(t *testing.T) (path string, calls func(word string) int) {
+	t.Helper()
+	crun, _ := containerFixtures(t)
+	dir := t.TempDir()
+	noted := filepath.Join(dir, "calls")
+	path = filepath.Join(dir, "runtime")
+	script := fmt.Sprintf("#!/bin/sh\necho \"$*\" >> %s\nexec %s \"$@\"\n", noted, crun)
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path, func(word string) int {
+		data, err := os.ReadFile(noted)
+		if err != nil {
+			return 0
+		}
+		return strings.Count(string(data), " "+word+" ")
+	}
+}
+
+// Once a sandbox is made the runtime starts one more process in it, the
+// sandbox's spawner, and none for any command: each command's process is one
+// the spawner started, in a cgroup of its own, with input, output and a
+// status of its own.
+func TestSpawnerStartsTheProcessOfEachCommand(t *testing.T) {
+	runtime, calls := countedRuntime(t)
+	c := newContainer(t, containerOptions{runtime: runtime})
+	c.start(t)
+	client := c.client(t, c.owner)
+	cgroups := map[string]bool{}
+	for i := range 5 {
+		c.awaitWarm(t)
+		resp, err := client.Exec(ctxT(t), session.ExecRequest{
+			Argv:  []string{"/bin/sh", "-c", fmt.Sprintf(`cat; echo "err %d" >&2; grep -o 'exec-.*' /proc/self/cgroup; exit %d`, i, i+2)},
+			Stdin: fmt.Appendf(nil, "in %d\n", i),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		said := strings.Fields(string(resp.Stdout))
+		if resp.ExitCode != i+2 || len(said) != 3 || said[0]+" "+said[1] != fmt.Sprintf("in %d", i) || string(resp.Stderr) != fmt.Sprintf("err %d\n", i) {
+			t.Fatalf("command %d: %+v", i, resp)
+		}
+		if cgroups[said[2]] || said[2] == "exec-spawner" {
+			t.Errorf("command %d ran in the cgroup %s, which is another's", i, said[2])
+		}
+		cgroups[said[2]] = true
+	}
+	if used := c.warmUsed(); used != 5 {
+		t.Errorf("%d of 5 commands ran as a process that had waited", used)
+	}
+	if started := calls("exec"); started != 1 {
+		t.Errorf("the runtime started %d processes in a sandbox that was made, and the spawner is one", started)
+	}
+}
+
+// A sandbox outlives its spawner. Code of the tenant's can end the spawner,
+// which runs as its user: the commands that follow still run, started by
+// the runtime as every command's process was before a sandbox had one.
+func TestSandboxOutlivesItsSpawner(t *testing.T) {
+	runtime, calls := countedRuntime(t)
+	c := newContainer(t, containerOptions{runtime: runtime})
+	c.start(t)
+	client := c.client(t, c.owner)
+	c.awaitWarm(t)
+	// The command that ends the spawner is one the spawner started, and
+	// nobody is left to say how it ended: whatever it is answered with,
+	// the spawner is gone after it.
+	_, _ = client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c",
+		`for p in /proc/[0-9]*; do if [ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 spawn " ]; then kill -9 ${p#/proc/}; fi; done`}})
+	for i := range 4 {
+		resp, err := client.Exec(ctxT(t), session.ExecRequest{Argv: []string{"/bin/sh", "-c", fmt.Sprintf("echo after-%d; exit %d", i, i)}})
+		if err != nil || resp.ExitCode != i || strings.TrimSpace(string(resp.Stdout)) != fmt.Sprintf("after-%d", i) {
+			t.Fatalf("command %d after the spawner was killed: %+v, %v", i, resp, err)
+		}
+	}
+	if got := c.out(t, client, `for p in /proc/[0-9]*; do [ "$(tr '\0' ' ' < $p/cmdline 2>/dev/null)" = "/proc/self/fd/3 spawn " ] && echo there; done; true`); got != "" {
+		t.Errorf("a spawner is in the sandbox again: %q", got)
+	}
+	if started := calls("exec"); started < 3 {
+		t.Errorf("the runtime started %d processes in the sandbox, its spawner among them, and commands ran after the spawner was gone", started)
+	}
 }
 
 // A runner that starts no process ahead runs every command by the runtime,

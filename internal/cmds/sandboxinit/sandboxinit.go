@@ -32,6 +32,11 @@
 // (see the agent's warmCommand). A process that ends without a word, before
 // it took its message, has started nothing, and its command is started
 // another way.
+//
+// Started with SpawnArg as its one argument, this program is the sandbox's
+// spawner instead: it stays, and starts a copy of itself for a command each
+// time the agent asks, so that the runtime starts one process in a sandbox
+// for all of its commands and none for each. See spawn.
 package sandboxinit
 
 import (
@@ -67,6 +72,22 @@ const (
 	// defaultPath is searched for a command named without a directory when
 	// the process's environment sets no PATH.
 	defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	// SpawnArg is the argument that starts this program as a spawner.
+	SpawnArg = "spawn"
+	// The words of a spawner's packets to the agent, each followed by the
+	// number of the request it answers, counted from 0: a process was
+	// started for it, with a descriptor for the process; none was, with the
+	// reason; the process it started has ended, with its exit status and the
+	// signal that ended it, of which one is 0.
+	Spawned     = "started"
+	SpawnFailed = "failed"
+	SpawnEnded  = "ended"
+	// SpawnRequest is how many descriptors come with a request: the control
+	// socket of the process to start, its standard three, and the file that
+	// puts a process in the cgroup made for this one.
+	SpawnRequest = 5
+	// MaxSpawnPacket bounds a packet of either side.
+	MaxSpawnPacket = 512
 )
 
 // Process is what the sandbox's first process becomes, or that it stays.
@@ -99,6 +120,9 @@ func Main() int {
 	// code cannot attach to, and whose descriptors and memory it cannot
 	// open. The process it becomes is an ordinary one again.
 	undumpable()
+	if len(os.Args) == 2 && os.Args[1] == SpawnArg {
+		return spawn()
+	}
 	control := os.NewFile(ControlFD, "control")
 	if control == nil {
 		return FailureStatus

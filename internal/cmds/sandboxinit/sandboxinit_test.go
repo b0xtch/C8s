@@ -4,6 +4,7 @@ package sandboxinit_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -25,7 +26,9 @@ const asInit = "C8S_SANDBOXINIT_TEST_AS_INIT"
 var beforeInit func()
 
 func TestMain(m *testing.M) {
-	if os.Getenv(asInit) == "1" {
+	// A spawner starts this binary by its preserved descriptor, with no
+	// variable of the test's: that is the init too.
+	if os.Getenv(asInit) == "1" || os.Args[0] == fmt.Sprintf("/proc/self/fd/%d", sandboxinit.ProgramFD) {
 		if beforeInit != nil {
 			beforeInit()
 		}
