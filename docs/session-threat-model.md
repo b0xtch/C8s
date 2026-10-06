@@ -355,6 +355,7 @@ but not confidentiality.
 | sending review signals as they happen | not allowed: they leave on the policy's schedule, padded to one size |
 | accepting memory only when used | driven by the guest; the host learns the session's memory high-water mark, which is metadata |
 | giving free memory back to the host | only free blocks are converted to shared, and a block comes back through acceptance, which zeroes it |
+| a spawner inside the sandbox, which starts each command | the tenant's to break: the agent hands it, with each command, only a write-only descriptor for that command's cgroup.procs file, whose writes the kernel judges by the agent's credentials but reads in the spawner's own PID namespace, so it can put only its own sandbox's processes into that one cgroup; the agent signals and moves no process by its number, ends a command by its cgroup and takes the command's end and status from the kernel through the process's pidfd, so a broken spawner can harm only its own tenant's sandbox |
 | paravirtual features | only wake-ups and hints, whose host input can slow the guest but not change what it computes, such as a kick for a halted vCPU; the kernel is built to take no other, whatever its host offers, so no paravirtual clock and no flush of a preempted vCPU's TLB left to its host |
 | host patches, such as pre-faulting or 2 MiB private pages | host code is untrusted anyway: a bug can deny service or crash TDs, but not read private memory without a flaw in the TDX module or the hardware |
 
