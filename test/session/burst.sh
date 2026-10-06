@@ -52,10 +52,12 @@
 #                            time, and their times say so
 #   C8S_BURST_ROUNDS         bursts a side (default 4: the first finds every
 #                            cache cold and is left out of a summary)
-#   C8S_BURST_WATCH          a command line run beside each TD burst, begun
-#                            two seconds before the burst is let go, with
-#                            the burst's number as its last word: a profiler,
-#                            for a trial. A run that has one says so
+#   C8S_BURST_WATCH          a command line run beside each burst, begun
+#                            two seconds before a TD burst is let go and
+#                            before Firecracker's program starts, with the
+#                            burst's number and its side as its last two
+#                            words: a profiler, for a trial. A run that has
+#                            one says so
 #   C8S_BURST_LEAVE_FAILED=1 for a trial: leave the TD of a session whose
 #                            start failed running until the burst's logs are
 #                            kept, and say then whether its guest answers
@@ -89,15 +91,22 @@
 #                            pins the power sets 0 and any other takes the
 #                            host's as it is. Either way the record names it
 #   C8S_BURST_CPUS           four CPU lists, as taskset takes them, separated
-#                            by spaces: the TDs' with their daemon,
-#                            Firecracker's VMMs, the key service's, and the
+#                            by spaces: the TDs' VMMs', Firecracker's VMMs',
+#                            the platform's own programs' (the TDs' daemon
+#                            and its launchers, the key service, and for the
+#                            run the host's quoting service), and the
 #                            programs' that start the bursts. Without it the
-#                            TDs and Firecracker's VMMs, which are never
+#                            TDs' and Firecracker's VMMs, which are never
 #                            there together, both get the host's cores from
-#                            the third on but four, the key service the
-#                            next and the programs the last three, each core
-#                            with its sibling threads (it needs 24 cores for
-#                            that)
+#                            the third on but four, the platform's programs
+#                            the next two and the programs that start the
+#                            bursts the last two, each core with its sibling
+#                            threads (it needs 24 cores for that)
+#   C8S_BURST_QUOTING        0 leaves the host's quoting service on the CPUs
+#                            the host has it on, which the record then names
+#                            as a departure. Otherwise it keeps to the
+#                            platform's CPUs for the run and is put back
+#                            when the run ends
 #   C8S_FIRECRACKER          directory written by firecracker-setup.sh (required)
 #   C8S_FIRECRACKER_SAMPLE   the sampling program (default: beside this script)
 #   C8S_FIRECRACKER_AGENT    the baseline's guest agent, built for the guest
@@ -185,26 +194,46 @@ if sudo -n nft list table inet c8s_sessions > /dev/null 2>&1; then
     exit 2
 fi
 
-# Where each part of the run keeps to: the TDs with their daemon,
-# Firecracker's VMMs, the key service, and the programs that start the
-# bursts. The two sides' guests are never there together, and by default
-# keep to the same CPUs.
+# Where each part of the run keeps to: the TDs' VMMs, Firecracker's VMMs,
+# the platform's own programs, and the programs that start the bursts. The
+# guests' VMMs share their CPUs with nothing else of the run, on either
+# side. The two sides' guests are never there together, and by default keep
+# to the same CPUs.
 if [ -n "${C8S_BURST_CPUS:-}" ]; then
-    read -r cpus_td cpus_fc cpus_ks cpus_drive <<< "$C8S_BURST_CPUS"
-    [ -n "${cpus_drive:-}" ] || { echo "C8S_BURST_CPUS is four CPU lists: the TDs', Firecracker's, the key service's, the drivers'" >&2; exit 2; }
+    read -r cpus_td cpus_fc cpus_platform cpus_drive <<< "$C8S_BURST_CPUS"
+    [ -n "${cpus_drive:-}" ] || { echo "C8S_BURST_CPUS is four CPU lists: the TDs' VMMs', Firecracker's VMMs', the platform's programs', the drivers'" >&2; exit 2; }
 else
     # By cores, each with its sibling threads: the first two are left to the
-    # host, the last three drive, the one before them is the key service's,
-    # and the guests of whichever side has its turn get the rest.
-    read -r cpus_td cpus_fc cpus_ks cpus_drive < <(python3 -c '
+    # host, the last two drive, the two before them are the platform's, and
+    # the guests of whichever side has its turn get the rest.
+    read -r cpus_td cpus_fc cpus_platform cpus_drive < <(python3 -c '
 import glob
 cores = sorted({open(p).read().strip() for p in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/core_cpus_list")},
                key=lambda c: int(c.replace("-", ",").split(",")[0]))
 cut = lambda a, b: ",".join(cores[a:b])
 n = len(cores)
-print(cut(2, n - 4), cut(2, n - 4), cut(n - 4, n - 3), cut(n - 3, n) if n >= 24 else "")')
+print(cut(2, n - 4), cut(2, n - 4), cut(n - 4, n - 2), cut(n - 2, n) if n >= 24 else "")')
     [ -n "${cpus_drive:-}" ] || { echo "this host has fewer than 24 cores: name the CPUs each part keeps to with C8S_BURST_CPUS" >&2; exit 2; }
 fi
+# kernel_order <CPU list>: the same CPUs as the kernel lists them, which is
+# how the daemon is told where its guests' VMMs keep to.
+kernel_order() {
+    python3 -c '
+import sys
+cpus = set()
+for part in sys.argv[1].split(","):
+    low, _, high = part.partition("-")
+    cpus.update(range(int(low), int(high or low) + 1))
+cpus, out = sorted(cpus), []
+while cpus:
+    end = 0
+    while end + 1 < len(cpus) and cpus[end + 1] == cpus[end] + 1:
+        end += 1
+    out.append(str(cpus[0]) if end == 0 else f"{cpus[0]}-{cpus[end]}")
+    cpus = cpus[end + 1:]
+print(",".join(out))' "$1"
+}
+vmm_cpus=$(kernel_order "$cpus_td") || { echo "C8S_BURST_CPUS: the TDs' VMMs' list $cpus_td is no CPU list" >&2; exit 2; }
 # on <CPU list> <command...>: the command in this shell's place, on those
 # CPUs. It is called in the background or in a subshell: the process it
 # leaves is the command's own, which a signal then reaches.
@@ -298,13 +327,34 @@ for who in server orchestrator; do
 done
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 
-ks_pid="" daemon_pid="" probe_pid="" warm_pid="" governor="" turbo="" idle_off=() halt_poll_was=""
+ks_pid="" daemon_pid="" probe_pid="" warm_pid="" governor="" turbo="" idle_off=() halt_poll_was="" quoting_was=()
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
     wait "$1" 2>/dev/null
 }
+# The host's quoting service is the platform's too: for the run it keeps to
+# the platform's CPUs, and it is put back where the host had it.
+quoting_pids() { pgrep -x qgs; pgrep -x aesm_service; }
+keep_quoting() {
+    local pid was
+    for pid in $(quoting_pids); do
+        was=$(taskset -cp "$pid" 2>/dev/null | sed 's/.*: //') || continue
+        [ -n "$was" ] || continue
+        sudo -n taskset -a -cp "$cpus_platform" "$pid" > /dev/null 2>&1 || return 1
+        quoting_was+=("$pid $was")
+    done
+    [ "${#quoting_was[@]}" -gt 0 ]
+}
+restore_quoting() {
+    local each
+    for each in "${quoting_was[@]}"; do
+        sudo -n taskset -a -cp "${each#* }" "${each%% *}" > /dev/null 2>&1
+    done
+    quoting_was=()
+}
 restore_power() {
+    restore_quoting
     if [ -n "$halt_poll_was" ]; then
         echo "$halt_poll_was" | sudo -n tee "$halt_poll_file" > /dev/null
         halt_poll_was=""
@@ -342,7 +392,7 @@ serving() {
     return 1
 }
 launch_ks() { # launch_ks <bundle> <work directory> <log>
-    on "$cpus_ks" sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$1/opkeydata" --work-dir "$2" \
+    on "$cpus_platform" sudo -n "$C8S" "${launcher[@]}" --image-dir "$KSIMG" --launch-dir "$1/opkeydata" --work-dir "$2" \
         --name "c8s-key-service-$run" "${ks_shape[@]}" --network none --port "127.0.0.1:$ks_port:8443" > "$3" 2>&1 &
     ks_pid=$!
 }
@@ -373,7 +423,7 @@ quiet "$C8S" session key-service pin --bundle "$out/ks" --url "https://127.0.0.1
 # The sandbox image is unpacked in every pooled TD before anybody binds it.
 pool_doc=(--key "$out/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class "s-${vcpus}x16" --prestage "$ref")
 quiet "$C8S" session launch-config new --out "$out/bundle-probe" "${pool_doc[@]}" || die "the pool's first bundle"
-on "$cpus_td" sudo -n "$C8S" "${launcher[@]}" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
+on "$cpus_platform" sudo -n "$C8S" "${launcher[@]}" --vmm-cpus "$vmm_cpus" --image-dir "$IMG" --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/probe-vm" \
     --name "c8s-session-probe-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$out/probe.log" 2>&1 &
 probe_pid=$!
 serving "$probe_pid" "$probe_port" || die "the pool's probe never served"
@@ -410,6 +460,7 @@ sudo -n install -m 0644 "$out/image.env" "$fc/image.env"
     echo "vmm:"
     [ -S "$quote_socket" ] && echo "  quoteSocket: $quote_socket"
     [ -n "$confine" ] && echo "  confine: \"$confine\""
+    echo "  cpus: \"$vmm_cpus\""
     [ "$dev" = 1 ] && echo "  console: true"
     echo "classes:"
     echo "  s-${vcpus}x16: {vcpus: $vcpus, memory: 16G, lowMemory: 512M, scratch: 4G}"
@@ -436,8 +487,9 @@ came=0 filled=0 daemon_began=0
 start_daemon() {
     came=$(grep -c '"msg":"a TD is ready"' "$out/daemon.log" 2>/dev/null)
     came=${came:-0} daemon_began=$(date +%s)
-    # Its launchers and their VMMs inherit where the daemon keeps to.
-    on "$cpus_td" sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
+    # Its launchers inherit where the daemon keeps to, and start their VMMs
+    # on the guests' CPUs, as its configuration says.
+    on "$cpus_platform" sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
     daemon_pid=$!
 }
 # pool_full: the pool is full and no TD boots.
@@ -600,6 +652,17 @@ if [ "$pin_power" = 1 ]; then
     turbo=$(cat "$turbo_file")
     echo "$turbo_on" | sudo -n tee "$turbo_file" > /dev/null
 fi
+# The quoting service joins the platform's other programs before any pool
+# of the run asks it for a quote.
+quoting=${C8S_BURST_QUOTING:-1}
+if [ "$quoting" = 0 ]; then
+    quoting="the run was told to leave it"
+elif keep_quoting; then
+    quoting=kept
+else
+    restore_quoting
+    quoting="none was found that the run could move"
+fi
 
 field() { # field <manifest> <dotted path>: that value of it
     python3 -c 'import json,sys
@@ -613,10 +676,12 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
         "$([ "$pin_power" = 1 ] && echo "pinned (governor performance, idle states past C1E off, turbo on)" || echo "as the host had it")" "$others" "$busy"
     printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     printf 'baselines: Firecracker loading one snapshot of its leanest guest %s times at once, and Firecracker starting as many sessions at once in such guests booted ahead and idle, each to the first command over vsock to an agent that is its guest'"'"'s init on the same image'"'"'s tree, taking turns with the TDs burst by burst in an order that rotates, each side'"'"'s guests there for its own turn alone, which begins with them idle and the host rested; ' "$sessions"
-    [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each TD burst (%s); ' "$C8S_BURST_WATCH"
+    [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each burst (%s); ' "$C8S_BURST_WATCH"
     [ "$vcpus" = 4 ] || printf 'a departure: every guest has %s vCPUs where the session class has 4; ' "$vcpus"
     printf 'no second baseline: its guests hold all of their memory from boot; '
-    printf 'CPUs: TDs and their daemon %s, Firecracker %s, key service %s, the programs that start the bursts %s; ' "$cpus_td" "$cpus_fc" "$cpus_ks" "$cpus_drive"
+    printf 'CPUs: the TDs'"'"' VMMs %s, Firecracker'"'"'s VMMs %s, the platform'"'"'s own programs (the TDs'"'"' daemon and its launchers, the key service%s) %s, the programs that start the bursts %s; ' \
+        "$cpus_td" "$cpus_fc" "$([ "$quoting" = kept ] && echo ", and for the run the host's quoting service")" "$cpus_platform" "$cpus_drive"
+    [ "$quoting" = kept ] || printf 'a departure: the host'"'"'s quoting service ran on the CPUs the host has it on (%s); ' "$quoting"
     printf 'no claim: each bind claims its TD; before the measured path, on each side: its pool filled, rested %s s and then waited until every guest was idle by KVM'"'"'s own counters for it, the TDs'"'"' with the vendor'"'"'s documents fetched by the binder, each ready TD judged when it became ready and the image unpacked in each, and as that unpacking'"'"'s counterpart each of Firecracker'"'"'s guests having read its file system whole, the one its snapshot was made of (which had also run one command) and each one booted for its pool, which was left the same way with a connection to its agent made; a start that failed or lost its guest counts against its side'"'"'s success rate, and none is left out\n' "$rest"
     echo "run $run, $rounds bursts a side of $sessions sessions on a pool of $depth ready TDs (the host has $keys_all TDX key IDs, $keys_before in use before the pool), $(date -u +%FT%TZ), first command: $first_command, a credential of $credential_bytes bytes sealed with each bind and brought by each of Firecracker's starts, rest $rest s"
     echo "host kernel $(uname -r)"
@@ -666,9 +731,17 @@ for (( n = 0; n < rounds; n++ )); do
     for side in "${order[@]}"; do
         if [ "$side" != td ]; then
             sleep "$rest"
+            watch_pid=""
+            if [ -n "${C8S_BURST_WATCH:-}" ]; then
+                # shellcheck disable=SC2086
+                $C8S_BURST_WATCH "$n" "$side" >> "$out/watch.out" 2>&1 &
+                watch_pid=$!
+                sleep 2
+            fi
             (on "$cpus_drive" sudo -n "$fc_burst" -dir "$fc" -mode "$side" -sessions "$sessions" -round "$n" -vmm-cpus "$cpus_fc" -rest "${rest}s" \
                 -before-burst "$out/before-$side" -after-answers "$out/after-$side") \
                 >> "$records" 2>> "$out/fcburst.err" || die "Firecracker's burst $n ($side): $(tail -c 400 "$out/fcburst.err")"
+            [ -n "$watch_pid" ] && wait "$watch_pid"
             continue
         fi
         free_before=$(available_mib) pinned_before=$(pinned_mib)
@@ -690,7 +763,7 @@ for (( n = 0; n < rounds; n++ )); do
         watch_pid=""
         if [ -n "${C8S_BURST_WATCH:-}" ]; then
             # shellcheck disable=SC2086
-            $C8S_BURST_WATCH "$n" >> "$out/watch.out" 2>&1 &
+            $C8S_BURST_WATCH "$n" td >> "$out/watch.out" 2>&1 &
             watch_pid=$!
             sleep 2
         fi
