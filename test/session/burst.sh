@@ -58,6 +58,9 @@
 #                            burst's number and its side as its last two
 #                            words: a profiler, for a trial. A run that has
 #                            one says so
+#   C8S_BURST_PROFILE=1      for a trial: the binder writes its CPU profile
+#                            over each TD burst to <work>/warmstart.pprof.<n>
+#                            (go tool pprof). A run that has one says so
 #   C8S_BURST_LEAVE_FAILED=1 for a trial: leave the TD of a session whose
 #                            start failed running until the burst's logs are
 #                            kept, and say then whether its guest answers
@@ -677,6 +680,7 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     printf 'baselines: Firecracker loading one snapshot of its leanest guest %s times at once, and Firecracker starting as many sessions at once in such guests booted ahead and idle, each to the first command over vsock to an agent that is its guest'"'"'s init on the same image'"'"'s tree, taking turns with the TDs burst by burst in an order that rotates, each side'"'"'s guests there for its own turn alone, which begins with them idle and the host rested; ' "$sessions"
     [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each burst (%s); ' "$C8S_BURST_WATCH"
+    [ "${C8S_BURST_PROFILE:-0}" = 1 ] && printf 'a departure: the binder profiled itself over each burst; '
     [ "$vcpus" = 4 ] || printf 'a departure: every guest has %s vCPUs where the session class has 4; ' "$vcpus"
     printf 'no second baseline: its guests hold all of their memory from boot; '
     printf 'CPUs: the TDs'"'"' VMMs %s, Firecracker'"'"'s VMMs %s, the platform'"'"'s own programs (the TDs'"'"' daemon and its launchers, the key service%s) %s, the programs that start the bursts %s; ' \
@@ -717,6 +721,7 @@ args=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/o
     # none is made beside its start.
     --prejudge=false --preconnect=false)
 [ -n "${C8S_ACCEPT_TCB:-}" ] && args+=(--accept-tcb-status "$C8S_ACCEPT_TCB")
+[ "${C8S_BURST_PROFILE:-0}" = 1 ] && args+=(--cpu-profile "$out/warmstart.pprof")
 [ "${C8S_BURST_LEAVE_FAILED:-0}" = 1 ] && args+=(--leave-failed)
 [ "${C8S_BURST_KEEP:-0}" -gt 0 ] && args+=(--keep)
 

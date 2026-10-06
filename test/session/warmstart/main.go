@@ -91,6 +91,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
@@ -120,7 +121,7 @@ type options struct {
 	members                            string
 	sealedCredential, first            string
 	acceptTCB, collateralCache, before string
-	afterAnswers                       string
+	afterAnswers, cpuProfile           string
 	rounds, commands, burst, ready     int
 	firstRound                         int
 	wait, timeout                      time.Duration
@@ -312,6 +313,7 @@ func main() {
 	flag.StringVar(&o.collateralCache, "collateral-cache", "", "directory that keeps Intel's collateral between runs")
 	flag.StringVar(&o.before, "before-round", "", "a program run before each round, with the round's number: it returns once the host is as a round should find it")
 	flag.StringVar(&o.afterAnswers, "after-answers", "", "with --burst, a program run with the round's number once every session's first command has answered or failed, before any session is ended")
+	flag.StringVar(&o.cpuProfile, "cpu-profile", "", "with --burst, write this program's CPU profile over each burst to this file with the round's number after it: where a start's cost to its binder goes")
 	flag.IntVar(&o.rounds, "rounds", 1, "how many sessions to start, or with --burst how many bursts")
 	flag.IntVar(&o.firstRound, "first-round", 0, "the number the first round says it has, for a run that starts this program once a round")
 	flag.IntVar(&o.burst, "burst", 0, "start this many sessions at the same instant in each round, once as many ready TDs are judged (needs --claim-with-bind)")
@@ -609,6 +611,25 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 	ctx, cancel := context.WithTimeout(context.Background(), o.timeout)
 	defer cancel()
 	var all sync.WaitGroup
+	profiled := func() {}
+	if o.cpuProfile != "" {
+		f, err := os.Create(fmt.Sprintf("%s.%d", o.cpuProfile, round))
+		if err != nil {
+			return fmt.Errorf("--cpu-profile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("--cpu-profile: %w", err)
+		}
+		var once sync.Once
+		profiled = func() {
+			once.Do(func() {
+				pprof.StopCPUProfile()
+				_ = f.Close()
+			})
+		}
+		defer profiled()
+	}
 	given, counted := hostcpu.Now()
 	began := time.Now()
 	for i := range outcomes {
@@ -638,6 +659,7 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 		<-judged
 	}
 	span := time.Since(began)
+	profiled()
 	if now, ok := hostcpu.Now(); ok && counted {
 		given = now.Since(given)
 	} else {
