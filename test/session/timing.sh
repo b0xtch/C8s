@@ -118,15 +118,24 @@
 #                            guest's memory, which most of a simulated
 #                            guest's launch to ready is
 #   C8S_TIMING_CPUS          five CPU lists, as taskset takes them, separated
-#                            by spaces: the TD side's guests, the simulated
-#                            side's, the two key services, the Firecracker
-#                            baseline, and the daemons with the programs that
-#                            drive the rounds. Without it a run with the
-#                            second baseline splits the host's cores from the
-#                            third on into those five, 6, 6, 4, 4 and the
-#                            rest, each core with its sibling threads (it
-#                            needs 24 cores for that), and a run of the TD
-#                            side alone pins nothing
+#                            by spaces: the TD side's guests' VMMs', the
+#                            simulated side's, the platform's own programs'
+#                            (each side's key service, its daemon and the
+#                            daemon's launchers, and for the run the host's
+#                            quoting service or what stands in for it), the
+#                            Firecracker baseline's, and the programs' that
+#                            drive the rounds. The guests' VMMs share their
+#                            CPUs with nothing else of the run. Without it a
+#                            run with the second baseline splits the host's
+#                            cores from the third on into those five, 6, 6,
+#                            4, 4 and the rest, each core with its sibling
+#                            threads (it needs 24 cores for that), and a run
+#                            of the TD side alone pins nothing
+#   C8S_TIMING_QUOTING       0 leaves the host's quoting service on the CPUs
+#                            the host has it on, which the record then names
+#                            as a departure. Otherwise, in a run that names
+#                            CPUs, it keeps to the platform's for the run
+#                            and is put back when the run ends
 #   C8S_FIRECRACKER          directory written by firecracker-setup.sh
 #   C8S_FIRECRACKER_SAMPLE   the sampling program (default: beside this script)
 #   C8S_FIRECRACKER_AGENT    the baseline's guest agent, built for the guest
@@ -249,7 +258,7 @@ fi
 cpus_td="" cpus_sim="" cpus_ks="" cpus_fc="" cpus_drive=""
 if [ -n "${C8S_TIMING_CPUS:-}" ]; then
     read -r cpus_td cpus_sim cpus_ks cpus_fc cpus_drive <<< "$C8S_TIMING_CPUS"
-    [ -n "$cpus_drive" ] || { echo "C8S_TIMING_CPUS is five CPU lists: the TD side's guests, the simulated side's, the key services, Firecracker, the drivers" >&2; exit 2; }
+    [ -n "$cpus_drive" ] || { echo "C8S_TIMING_CPUS is five CPU lists: the TD side's guests' VMMs', the simulated side's, the platform's programs', Firecracker's, the drivers'" >&2; exit 2; }
 elif [ -n "$SIM" ]; then
     # By cores, each with its sibling threads: the first two are left to the
     # host, then 6, 6, 4 and 4, and the rest drives.
@@ -273,6 +282,25 @@ on() {
     local cpus=$1
     shift
     if [ -n "$cpus" ]; then exec taskset -c "$cpus" "$@"; else exec "$@"; fi
+}
+
+# kernel_order <CPU list>: the same CPUs as the kernel lists them, which is
+# how a daemon is told where its guests' VMMs keep to.
+kernel_order() {
+    python3 -c '
+import sys
+cpus = set()
+for part in sys.argv[1].split(","):
+    low, _, high = part.partition("-")
+    cpus.update(range(int(low), int(high or low) + 1))
+cpus, out = sorted(cpus), []
+while cpus:
+    end = 0
+    while end + 1 < len(cpus) and cpus[end + 1] == cpus[end] + 1:
+        end += 1
+    out.append(str(cpus[0]) if end == 0 else f"{cpus[0]}-{cpus[end]}")
+    cpus = cpus[end + 1:]
+print(",".join(out))' "$1"
 }
 
 # What else the host runs, before anything of this run does: the CPU time its
@@ -385,13 +413,35 @@ quiet openssl ecparam -name prime256v1 -genkey -noout -out "$out/authority.key"
 quiet openssl ecparam -name prime256v1 -genkey -noout -out "$pki/binder.key"
 quiet openssl req -x509 -new -key "$pki/binder.key" -subj "/CN=a binder of its own making" -days 2 -out "$pki/binder.pem"
 
-vendor_pid="" governor="" turbo="" idle_off=() halt_poll_was=""
+vendor_pid="" governor="" turbo="" idle_off=() halt_poll_was="" quoting_was=()
 stop_pid() { # stop_pid <pid>
     [ -n "$1" ] || return 0
     sudo -n kill -TERM "$1" 2>/dev/null
     wait "$1" 2>/dev/null
 }
+# The host's quoting service is the platform's too: for the run it keeps to
+# the platform's CPUs on the TD side, and it is put back where the host had
+# it.
+quoting_pids() { pgrep -x qgs; pgrep -x aesm_service; }
+keep_quoting() { # keep_quoting <CPU list>
+    local pid was
+    for pid in $(quoting_pids); do
+        was=$(taskset -cp "$pid" 2>/dev/null | sed 's/.*: //') || continue
+        [ -n "$was" ] || continue
+        sudo -n taskset -a -cp "$1" "$pid" > /dev/null 2>&1 || return 1
+        quoting_was+=("$pid $was")
+    done
+    [ "${#quoting_was[@]}" -gt 0 ]
+}
+restore_quoting() {
+    local each
+    for each in "${quoting_was[@]}"; do
+        sudo -n taskset -a -cp "${each#* }" "${each%% *}" > /dev/null 2>&1
+    done
+    quoting_was=()
+}
 restore_power() {
+    restore_quoting
     if [ -n "$halt_poll_was" ]; then
         echo "$halt_poll_was" | sudo -n tee "$halt_poll_file" > /dev/null
         halt_poll_was=""
@@ -441,7 +491,7 @@ launch_ks() { # launch_ks <side> <bundle> <work directory> <log>
 if [ -n "$SIM" ]; then
     mkdir -p "$out/sim"
     quiet "$SIM" session simtee new --out "$tee" || die "the simulated authority"
-    on "$cpus_drive" "$SIM" session simtee vendor --dir "$tee" > "$out/sim/vendor.log" 2>&1 &
+    on "${ks_cpus[sim]}" "$SIM" session simtee vendor --dir "$tee" > "$out/sim/vendor.log" 2>&1 &
     vendor_pid=$!
     deadline=$(( $(date +%s) + 20 ))
     until [ -s "$tee/vendor" ]; do
@@ -500,7 +550,11 @@ stand_up() {
     # The sandbox image is unpacked in every pooled TD before anybody binds it.
     local pool_doc=(--key "$d/pool.key" --key-service "$pin" --image-manifest "$manifest" --pool agents --class s-4x16 --prestage "$ref")
     quiet "$c" session launch-config new --out "$d/bundle-probe" "${pool_doc[@]}" || die "$side: the pool's first bundle"
-    on "${guest_cpus[$side]}" sudo -n "$c" "${launcher[@]}" --image-dir "${img[$side]}" --launch-dir "$d/bundle-probe/opkeydata" --work-dir "$d/probe-vm" \
+    # A launcher stays with the platform's programs and starts its VMM on
+    # the guests' CPUs, in a run that names any.
+    local away=()
+    [ -n "${guest_cpus[$side]}" ] && away=(--vmm-cpus "$(kernel_order "${guest_cpus[$side]}")")
+    on "${ks_cpus[$side]}" sudo -n "$c" "${launcher[@]}" "${away[@]}" --image-dir "${img[$side]}" --launch-dir "$d/bundle-probe/opkeydata" --work-dir "$d/probe-vm" \
         --name "c8s-session-probe-$side-$run" "${shape[@]}" --network user --port "127.0.0.1:$probe_port:8443" > "$d/probe.log" 2>&1 &
     probe_pid[$side]=$!
     serving "${probe_pid[$side]}" "$probe_port" || die "$side: the pool's probe never served"
@@ -526,6 +580,7 @@ stand_up() {
         [ "$side" = td ] && [ -S "$quote_socket" ] && echo "  quoteSocket: $quote_socket"
         [ "$side" = sim ] && echo "  simulatedTEE: $tee"
         [ -n "$confine" ] && echo "  confine: \"$confine\""
+        [ -n "${guest_cpus[$side]}" ] && echo "  cpus: \"$(kernel_order "${guest_cpus[$side]}")\""
         [ "$dev" = 1 ] && echo "  console: true"
         echo "classes:"
         echo "  s-4x16: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 4G}"
@@ -541,8 +596,9 @@ stand_up() {
         echo "      - \"$binder\""
         echo "      - {key: \"$own_binder\", authorities: [\"$authority\"]}"
     } > "$d/config.yaml"
-    # The daemon's launchers and their VMMs inherit where the daemon keeps to.
-    on "${guest_cpus[$side]}" sudo -n "$c" session-daemon run --config "$d/config.yaml" >> "$d/daemon.log" 2>&1 &
+    # The daemon's launchers inherit where the daemon keeps to, and start
+    # their VMMs on the guests' CPUs, as its configuration says.
+    on "${ks_cpus[$side]}" sudo -n "$c" session-daemon run --config "$d/config.yaml" >> "$d/daemon.log" 2>&1 &
     daemon_pid[$side]=$!
 }
 # What a plain guest's kernel says of clearing its memory: one boot of a
@@ -638,6 +694,19 @@ if [ "$pin_power" = 1 ]; then
     turbo=$(cat "$turbo_file")
     echo "$turbo_on" | sudo -n tee "$turbo_file" > /dev/null
 fi
+# The quoting service joins the TD side's other programs of the platform,
+# in a run that names CPUs.
+quoting=${C8S_TIMING_QUOTING:-1}
+if [ -z "${ks_cpus[td]}" ]; then
+    quoting=""
+elif [ "$quoting" = 0 ]; then
+    quoting="the run was told to leave it"
+elif keep_quoting "${ks_cpus[td]}"; then
+    quoting=kept
+else
+    restore_quoting
+    quoting="none was found that the run could move"
+fi
 field() { # field <manifest> <dotted path>: that value of it
     python3 -c 'import json,sys
 v = json.load(open(sys.argv[1]))
@@ -658,7 +727,9 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-[a-
     else
         printf 'no second baseline; '
     fi
-    [ -n "$cpus_drive" ] && printf 'CPUs: TD guests %s, simulated guests %s, key services %s, Firecracker %s, daemons and drivers %s; ' "$cpus_td" "${cpus_sim:-none}" "$cpus_ks" "$cpus_fc" "$cpus_drive"
+    [ -n "$cpus_drive" ] && printf 'CPUs: the TD side'"'"'s VMMs %s, the simulated side'"'"'s %s, the platform'"'"'s own programs (each side'"'"'s key service, daemon and launchers%s) %s, Firecracker %s, the programs that drive the rounds %s; ' \
+        "$cpus_td" "${cpus_sim:-none}" "$([ "$quoting" = kept ] && echo ", and for the run the host's quoting service")" "$cpus_ks" "$cpus_fc" "$cpus_drive"
+    [ -z "$quoting" ] || [ "$quoting" = kept ] || printf 'a departure: the host'"'"'s quoting service ran on the CPUs the host has it on (%s); ' "$quoting"
     [ "$claim_with_bind" = 1 ] && printf 'no claim: each bind claims its TD%s; ' "$([ "$lose_first" = 1 ] && echo ", and a second bind for that TD comes first")"
     printf 'before the measured path: the vendor'"'"'s documents fetched by the binder (timed beside the rounds); %s%s\n' "$([ "$watch" = 1 ] && echo "each ready TD judged when it became ready (timed beside the rounds)" || echo "each TD judged at its claim")" \
         "$([ "$stored" = 1 ] && echo "; the key service's replica judged by the binder, for its binds to name (timed beside the rounds)")"
