@@ -50,7 +50,7 @@ func readCPUs(t *testing.T, status string) []int {
 
 // A process started away from a CPU may not run on it, nor may a process it
 // starts in turn. The thread that started it may again.
-func TestStartAwayKeepsTheProcessOffTheCPUs(t *testing.T) {
+func TestStartOnKeepsTheProcessOffTheCPUs(t *testing.T) {
 	allowed := allowedCPUs(t)
 	if len(allowed) < 2 {
 		t.Skip("one CPU: a process cannot be kept off it")
@@ -60,7 +60,7 @@ func TestStartAwayKeepsTheProcessOffTheCPUs(t *testing.T) {
 		var out bytes.Buffer
 		cmd := exec.Command("sh", "-c", "grep Cpus_allowed_list: /proc/self/status; echo --; sh -c 'grep Cpus_allowed_list: /proc/self/status'")
 		cmd.Stdout = &out
-		off, err := startAway(cmd, avoid)
+		off, err := startOn(cmd, nil, avoid)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -84,6 +84,104 @@ func TestStartAwayKeepsTheProcessOffTheCPUs(t *testing.T) {
 	for name, avoid := range map[string][]int{"none": nil, "one it never had": {never}, "all it has": allowed} {
 		if off, child, _ := start(avoid); len(off) != 0 || !slices.Equal(child, allowed) {
 			t.Fatalf("%s: kept off %v, the process on %v; want %v", name, off, child, allowed)
+		}
+	}
+}
+
+// A process started on CPUs of its own may run on those and no other, and
+// so may a process it starts in turn, while the thread that started it stays
+// where it was. A CPU to stay away from is left out of them, unless that
+// would leave none.
+func TestStartOnKeepsTheProcessToItsCPUs(t *testing.T) {
+	allowed := allowedCPUs(t)
+	if len(allowed) < 3 {
+		t.Skip("fewer than three CPUs: a process cannot be kept to some of them and off one of those")
+	}
+	start := func(keep, avoid []int) (off, child, grandchild []int) {
+		t.Helper()
+		var out bytes.Buffer
+		cmd := exec.Command("sh", "-c", "grep Cpus_allowed_list: /proc/self/status; echo --; sh -c 'grep Cpus_allowed_list: /proc/self/status'")
+		cmd.Stdout = &out
+		off, err := startOn(cmd, keep, avoid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		own, descendant, _ := strings.Cut(out.String(), "--")
+		if after := allowedCPUs(t); !slices.Equal(after, allowed) {
+			t.Fatalf("after a start on %v the caller may run on %v, was %v", keep, after, allowed)
+		}
+		return off, readCPUs(t, own), readCPUs(t, descendant)
+	}
+	keep := allowed[1:]
+	if off, child, grandchild := start(keep, nil); len(off) != 0 || !slices.Equal(child, keep) || !slices.Equal(grandchild, keep) {
+		t.Fatalf("on %v: kept off %v, the process on %v, its child on %v", keep, off, child, grandchild)
+	}
+	// Away from one of its own, and from one that was never among them.
+	if off, child, _ := start(keep, []int{allowed[0], keep[0]}); !slices.Equal(off, keep[:1]) || !slices.Equal(child, keep[1:]) {
+		t.Fatalf("on %v away from %d and %d: kept off %v, the process on %v", keep, allowed[0], keep[0], off, child)
+	}
+	// Away from all it was to keep to, it keeps to them.
+	if off, child, _ := start(keep[:1], keep[:1]); len(off) != 0 || !slices.Equal(child, keep[:1]) {
+		t.Fatalf("on %v away from the same: kept off %v, the process on %v", keep[:1], off, child)
+	}
+	// CPUs the machine does not have are no place to start anything.
+	cmd := exec.Command("true")
+	if _, err := startOn(cmd, []int{maxCPUs - 1}, nil); err == nil {
+		_ = cmd.Wait()
+		t.Fatal("a process was started on a CPU no machine has")
+	}
+}
+
+// Run starts the VMM on the CPUs it is told to keep the VMM to, and stays
+// where it was itself. A list that is none is refused before anything is
+// started.
+func TestRunKeepsTheVMMToItsCPUs(t *testing.T) {
+	allowed := allowedCPUs(t)
+	if len(allowed) < 2 {
+		t.Skip("one CPU: a VMM cannot be kept to fewer than its launcher has")
+	}
+	real := sysfsRoot
+	t.Cleanup(func() { sysfsRoot = real })
+	sysfsRoot = t.TempDir()
+	qemu, record := fakeQEMU(t, `grep Cpus_allowed_list: /proc/self/status > "$record/cpus"; exec sleep 30`)
+	cfg := launchConfig(t, qemu)
+	cfg.AvoidFirstCPU = false
+	cfg.VMMCPUs = strconv.Itoa(allowed[1])
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var said bytes.Buffer
+	go func() { done <- Run(ctx, cfg, slog.New(slog.NewJSONHandler(&said, nil))) }()
+	waitFor(t, filepath.Join(record, "cpus"), done)
+	status, err := os.ReadFile(filepath.Join(record, "cpus"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := readCPUs(t, string(status)); !slices.Equal(got, allowed[1:2]) {
+		t.Fatalf("the VMM may run on %v, want %v", got, allowed[1:2])
+	}
+	if after := allowedCPUs(t); !slices.Equal(after, allowed) {
+		t.Fatalf("the launcher may run on %v after it started its VMM, was %v", after, allowed)
+	}
+	if want := fmt.Sprintf(`"msg":"the VMM keeps to CPUs of its own","cpus":"%d"`, allowed[1]); !strings.Contains(said.String(), want) {
+		t.Fatalf("the launcher did not say where its VMM runs:\n%s", said.String())
+	}
+
+	for _, list := range []string{"3-1", "x", "1,1", "2-"} {
+		qemu, record := fakeQEMU(t, "exec sleep 30")
+		cfg := launchConfig(t, qemu)
+		cfg.VMMCPUs = list
+		if err := Run(context.Background(), cfg, quiet); err == nil || !strings.Contains(err.Error(), "--vmm-cpus") {
+			t.Fatalf("CPUs %q: Run = %v", list, err)
+		}
+		if _, err := os.Stat(filepath.Join(record, "args")); err == nil {
+			t.Fatalf("CPUs %q: the VMM was started", list)
 		}
 	}
 }

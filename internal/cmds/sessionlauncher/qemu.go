@@ -123,6 +123,10 @@ type Config struct {
 	// AvoidFirstCPU keeps the VMM off the first online CPU of each package,
 	// on TDX: see packageFirstCPUs.
 	AvoidFirstCPU bool
+	// VMMCPUs are the CPUs the VMM keeps to, as the kernel lists them, such
+	// as 2-19,26-43. The launcher stays on its own. Empty leaves the VMM
+	// where its launcher runs.
+	VMMCPUs string
 	// Console attaches a virtio console wired to this process's stdout. A
 	// locked image never gets one: the device is one more thing the host can
 	// reach, and a console getty would answer on it.
@@ -307,6 +311,9 @@ func (c *Config) validate() error {
 	}
 	if c.VCPUs < 1 || c.VCPUs > 256 {
 		return fmt.Errorf("--vcpus must be 1..256")
+	}
+	if _, err := c.vmmCPUs(); err != nil {
+		return fmt.Errorf("--vmm-cpus: %w", err)
 	}
 	if c.MemoryMiB < 512 {
 		return fmt.Errorf("--memory must be at least 512M")

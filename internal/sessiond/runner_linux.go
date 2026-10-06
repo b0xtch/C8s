@@ -106,7 +106,7 @@ func (r *QEMURunner) Start(_ context.Context, spec Spec) (Instance, error) {
 		"--end-file", filepath.Join(spec.Dir, endFile),
 	}
 	for _, option := range [][2]string{
-		{"--qemu", vmm.QEMU}, {"--quote-socket", vmm.QuoteSocket}, {"--confine", vmm.Confine},
+		{"--qemu", vmm.QEMU}, {"--quote-socket", vmm.QuoteSocket}, {"--confine", vmm.Confine}, {"--vmm-cpus", vmm.CPUs},
 		{"--low-memory", spec.Class.LowMemory}, {"--scratch", spec.Class.Scratch}, {"--image-store", spec.Pool.ImageStore},
 	} {
 		if option[1] != "" {

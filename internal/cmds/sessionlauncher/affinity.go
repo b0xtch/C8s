@@ -18,7 +18,7 @@ const maxCPUs = 1 << 16
 // A TDX host writes a package's caches back before it frees a guest's key,
 // and runs that write-back on those CPUs in an interrupt handler until it is
 // done (tdx_mmu_release_hkid). That takes tens of milliseconds for every
-// guest taken apart, and whatever runs there waits. See startAway.
+// guest taken apart, and whatever runs there waits. See startOn.
 func packageFirstCPUs(root string) ([]int, error) {
 	dir := filepath.Join(root, "devices", "system", "cpu")
 	raw, err := os.ReadFile(filepath.Join(dir, "online"))
@@ -43,6 +43,13 @@ func packageFirstCPUs(root string) ([]int, error) {
 		}
 	}
 	return first, nil
+}
+
+// CheckCPUs reports what is wrong with a list of CPUs a VMM is to keep to,
+// if anything is: whoever passes a launcher one can refuse it sooner.
+func CheckCPUs(list string) error {
+	_, err := parseCPUList(list)
+	return err
 }
 
 // parseCPUList reads the kernel's list of CPUs, such as "0-3,8,10-11", in

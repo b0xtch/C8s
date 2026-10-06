@@ -21,6 +21,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/confidential-dot-ai/c8s/internal/cmds/sessionlauncher"
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
@@ -174,6 +175,11 @@ type VMM struct {
 	QuoteSocket string `yaml:"quoteSocket,omitempty"`
 	// Confine runs the VMM as this numeric uid[:gid] with no capability.
 	Confine string `yaml:"confine,omitempty"`
+	// CPUs are the CPUs every guest's VMM keeps to, as the kernel lists
+	// them, such as 2-19,26-43. The daemon and its launchers stay where the
+	// daemon was started, so a host can give its guests CPUs that none of
+	// its own programs run on. Empty runs each VMM where the daemon runs.
+	CPUs string `yaml:"cpus,omitempty"`
 	// Console attaches each guest's console to its launcher's log. A locked
 	// image prints nothing there.
 	Console bool `yaml:"console,omitempty"`
@@ -302,6 +308,11 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Network.validate(c.Capacity); err != nil {
 		return fmt.Errorf("network: %w", err)
+	}
+	if c.VMM.CPUs != "" {
+		if err := sessionlauncher.CheckCPUs(c.VMM.CPUs); err != nil {
+			return fmt.Errorf("vmm.cpus: %w", err)
+		}
 	}
 	if len(c.Classes) == 0 {
 		return errors.New("classes: at least one is required")

@@ -224,6 +224,7 @@ network:
 vmm:
   quoteSocket: /var/run/tdx-qgs/qgs.socket
   confine: "64055"              # run the VMM as this user, with no capability
+  cpus: "2-19,26-43"            # optional: the CPUs every guest's VMM keeps to; the daemon and its launchers stay on the daemon's
 classes:
   s-4x16: {vcpus: 4, memory: 16G, scratch: 8G}
 pools:

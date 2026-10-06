@@ -266,9 +266,16 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("--avoid-first-cpu: %w", err)
 	}
+	keep, err := cfg.vmmCPUs()
+	if err != nil {
+		return fmt.Errorf("--vmm-cpus: %w", err)
+	}
 	started := time.Now()
 	var off []int
-	if off, err = startAway(cmd, avoid); err == nil {
+	if off, err = startOn(cmd, keep, avoid); err == nil {
+		if len(keep) > 0 {
+			log.Info("the VMM keeps to CPUs of its own", "cpus", cfg.VMMCPUs)
+		}
 		if len(off) > 0 {
 			log.Info("the VMM is kept off the first CPU of each package", "cpus", off)
 		}
@@ -322,6 +329,15 @@ func (c *Config) avoidCPUs() ([]int, error) {
 		return nil, nil
 	}
 	return writeBackCPUs()
+}
+
+// vmmCPUs lists the CPUs this guest's VMM keeps to, or none for a VMM that
+// runs where its launcher does.
+func (c *Config) vmmCPUs() ([]int, error) {
+	if c.VMMCPUs == "" {
+		return nil, nil
+	}
+	return parseCPUList(c.VMMCPUs)
 }
 
 // guestCID is the guest's vsock context id, or zero for a guest without a

@@ -38,7 +38,7 @@ stateDir: state
 capacity: 8
 tls: {cert: pki/server.pem, key: pki/server.key, clientCA: pki/ca.pem}
 network: {mode: tap, guestCIDR: 10.99.0.0/24, dns: [192.0.2.53]}
-vmm: {quoteSocket: /run/qgs.socket, confine: "64055"}
+vmm: {quoteSocket: /run/qgs.socket, confine: "64055", cpus: "2-19,26-43"}
 classes:
   sim: {vcpus: 4, memory: 16G, lowMemory: 512M, scratch: 8G}
 pools:
@@ -63,7 +63,7 @@ func TestLoadConfig(t *testing.T) {
 	if pool.Name() != "sim" || pool.class != "sim" || pool.platform != "tdx" || time.Duration(pool.BindGrace) != 45*time.Second {
 		t.Fatalf("the pool: %+v", pool)
 	}
-	if cfg.Classes["sim"].VCPUs != 4 || cfg.VMM.Confine != "64055" {
+	if cfg.Classes["sim"].VCPUs != 4 || cfg.VMM.Confine != "64055" || cfg.VMM.CPUs != "2-19,26-43" {
 		t.Fatalf("the configuration: %+v", cfg)
 	}
 
@@ -138,6 +138,8 @@ func TestLoadConfigRefuses(t *testing.T) {
 		"the same pool twice":               {"pools:", "pools:\n  - {imageDir: image, launchDir: LAUNCH, depth: 1}"},
 		"a negative depth":                  {"depth: 2", "depth: -1"},
 		"no listen address":                 {"listen: 127.0.0.1:7443", "listen: \"\""},
+		"VMM CPUs out of order":             {"cpus: \"2-19,26-43\"", "cpus: \"26-43,2-19\""},
+		"VMM CPUs that are no list":         {"cpus: \"2-19,26-43\"", "cpus: \"most\""},
 		"no state directory":                {"stateDir: state", "stateDir: \"\""},
 		"a binder by its name":              {"depth: 2", "depth: 2\n    binders: [orchestrator]"},
 		"a binder by a digest too short":    {"depth: 2", "depth: 2\n    binders: [\"sha256:" + strings.Repeat("a", 63) + "\"]"},
