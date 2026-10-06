@@ -9,7 +9,11 @@ how long they waited for a CPU, as the scheduler counts both; the same
 threads' CPU time as the kernel samples it, apart as user (of which in the
 guest) and system; the memory the processes hold resident, which is a plain
 guest's memory and none of a TD's private pages; and what KVM counts for its
-VM, such as exits by kind, page faults it resolved and pages it has mapped.
+VM, such as exits by kind, page faults it resolved and pages it has mapped;
+and how the host schedules them: the vCPU threads by scheduling class and by
+how many CPUs each may run on, and how many VMMs have a core-scheduling
+cookie of their own on every thread, so that no core's two threads run two
+guests at once.
 With them goes what the host has available and holds unevictable, where it
 counts the private pages of TDs; all the CPU the host has given so far, by
 the kernel's count at the root of its control groups, and what this program
@@ -30,6 +34,7 @@ given some, fail it, and the failure names the busiest's process.
 
 It runs as root: KVM's counters are in debugfs.
 """
+import ctypes
 import glob
 import json
 import os
@@ -50,6 +55,10 @@ COUNTERS = ("exits", "halt_exits", "halt_wakeup", "io_exits", "mmio_exits", "irq
             "halt_attempted_poll", "halt_successful_poll", "halt_poll_success_ns", "halt_poll_fail_ns", "halt_wait_ns")
 TICK = os.sysconf("SC_CLK_TCK")
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
+# The scheduling classes by the number the kernel gives each.
+CLASSES = {0: "SCHED_OTHER", 1: "SCHED_FIFO", 2: "SCHED_RR", 3: "SCHED_BATCH", 5: "SCHED_IDLE", 6: "SCHED_DEADLINE", 7: "SCHED_EXT"}
+# prctl's request for a thread's core-scheduling cookie.
+PR_SCHED_CORE, PR_SCHED_CORE_GET = 62, 0
 
 
 def vcpu(name, guest):
@@ -72,6 +81,52 @@ def threads(pid):
         # After the name: user and system time as the 12th and 13th, and the
         # time in a guest, which user time includes, as the 41st, in ticks.
         yield name.split("(", 1)[1], int(ran), int(waited), int(fields[11]), int(fields[12]), int(fields[40])
+
+
+def cookie(libc, tid):
+    """A thread's core-scheduling cookie: 0 for none, and nothing where the
+    kernel has no core scheduling or the thread is gone."""
+    if libc is None:
+        return None
+    value = ctypes.c_ulonglong()
+    if libc.prctl(PR_SCHED_CORE, PR_SCHED_CORE_GET, tid, 0, ctypes.addressof(value)) != 0:
+        return None
+    return value.value
+
+
+def placed(pids):
+    """How the host schedules the VMMs: their vCPU threads by class and by
+    the CPUs each may run on, and the VMMs whose every thread has one cookie
+    that no other VMM has."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+    except (OSError, AttributeError):
+        libc = None
+    classes, cpus, cookies, known = {}, {}, {}, libc is not None
+    for pid in pids:
+        mine = set()
+        for task in glob.glob(f"/proc/{pid}/task/[0-9]*"):
+            tid = int(os.path.basename(task))
+            try:
+                with open(task + "/stat") as f:
+                    name, fields = f.read().rsplit(")", 1)
+                guest = int(fields.split()[40])
+                if vcpu(name.split("(", 1)[1], guest):
+                    kind = os.sched_getscheduler(tid) & ~0x40000000
+                    kind = CLASSES.get(kind, str(kind))
+                    classes[kind] = classes.get(kind, 0) + 1
+                    count = str(len(os.sched_getaffinity(tid)))
+                    cpus[count] = cpus.get(count, 0) + 1
+            except (OSError, ValueError, IndexError):
+                continue
+            mine.add(cookie(libc, tid))
+        cookies[pid] = mine
+    if any(None in mine for mine in cookies.values()):
+        known = False
+    held = [next(iter(mine)) for mine in cookies.values() if len(mine) == 1 and next(iter(mine))]
+    apart = sum(1 for c in held if held.count(c) == 1) if known else None
+    return {"vcpu_classes": classes, "vcpu_cpus": cpus, "vmms_apart": apart}
 
 
 def taken(side, when, burst, text):
@@ -207,7 +262,8 @@ def main():
     side, when, burst, text = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
     limit = int(sys.argv[5]) if len(sys.argv) > 5 else LIMIT
     if when != "quiet":
-        print(json.dumps(taken(side, when, burst, text)[0]))
+        now, now_each = taken(side, when, burst, text)
+        print(json.dumps(dict(now, placed=placed(now_each))))
         return
     began, quiet = time.monotonic(), 0
     was, was_each = taken(side, "idle", burst, text)
@@ -230,7 +286,9 @@ def main():
             sys.exit(f"the {side} side's guests were not idle after {limit} s: in the last second one's VMM ran {busiest[0] / 1000:.1f} ms ({who}) and one resolved {busiest[1]} page faults")
         was, was_each = dict(now, when="idle"), now_each
     print(json.dumps(was))
-    print(json.dumps(now))
+    # How the guests are placed is read once they are idle: after the reading
+    # the burst's cost is counted from.
+    print(json.dumps(dict(now, placed=placed(now_each))))
     print(json.dumps({"kind": "vmm-quiet", "side": side, "round": burst, "vmms": now["vmms"], "waited_s": round(waited, 1),
                       "busiest_ran_ms": round(busiest[0] / 1000, 2), "busiest_faults": busiest[1]}))
 

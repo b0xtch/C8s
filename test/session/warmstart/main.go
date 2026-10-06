@@ -192,9 +192,12 @@ type volley struct {
 	// quote judged. HostCPU is all the CPU the host gave over it, whoever
 	// took it, by its kernel's count, and OwnCPU the part this program took:
 	// the binders' work, which is no part of what the host's guests cost.
-	Span    int64 `json:"span_us,omitempty"`
-	HostCPU int64 `json:"host_cpu_us,omitempty"`
-	OwnCPU  int64 `json:"own_cpu_us,omitempty"`
+	// OwnWaited is how long this program's threads stood ready with no
+	// processor to run on: with much of it, the binders bounded the burst.
+	Span      int64 `json:"span_us,omitempty"`
+	HostCPU   int64 `json:"host_cpu_us,omitempty"`
+	OwnCPU    int64 `json:"own_cpu_us,omitempty"`
+	OwnWaited int64 `json:"own_waited_us,omitempty"`
 	// Ready is how many ready TDs this side held a verdict on at that
 	// instant: with fewer than Sessions, the rest started as more booted.
 	Ready int `json:"ready"`
@@ -677,7 +680,7 @@ func burst(o *options, round int, verdicts *session.ReadyVerdicts,
 	}
 	close(release)
 	all.Wait()
-	said := &volley{Kind: "burst", Round: round, At: began.UnixMicro(), Sessions: o.burst, Ready: o.ready, Span: span.Microseconds(), HostCPU: given.Host, OwnCPU: given.Own}
+	said := &volley{Kind: "burst", Round: round, At: began.UnixMicro(), Sessions: o.burst, Ready: o.ready, Span: span.Microseconds(), HostCPU: given.Host, OwnCPU: given.Own, OwnWaited: given.Waited}
 	for _, each := range outcomes {
 		// A session whose quote disagreed after its answer did not start.
 		if each.err != nil {

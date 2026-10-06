@@ -17,6 +17,8 @@
 <dir> is a directory written by firecracker-setup.sh. Prints one JSON record.
 Times are from the start of the VMM's process, in milliseconds and, for the
 first command, in microseconds too.
+Each VMM is started with a core-scheduling cookie of its own, where the
+host's kernel has them, as a session's launcher starts a guest's VMM.
 
 cold and load drive the guest over its serial console, which is the VMM's
 own standard input and output: no network, no key, no login service beyond
@@ -74,6 +76,8 @@ connection made then.
                  its own to the guest that now runs
 """
 import base64
+import ctypes
+import errno
 import hashlib
 import http.client
 import json
@@ -109,6 +113,37 @@ READ_BACK = ["sh", "-c", 'cat "$C8S_CREDENTIALS_DIR/' + CREDENTIAL + '"']
 PROMPT = re.compile(rb"[#$] $")
 LOGIN = re.compile(rb"login: |[#$] $")
 PASSWORD = re.compile(rb"[Pp]assword: |[#$] $")
+
+
+# The C library, loaded before any VMM is started: apart calls into it in a
+# child that has only just been forked.
+try:
+    LIBC = ctypes.CDLL(None, use_errno=True)
+    LIBC.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+except (OSError, AttributeError):
+    LIBC = None
+
+
+def apart():
+    """Give the VMM that is about to start a core-scheduling cookie of its
+    own, as a session's launcher gives a guest's VMM: a core's two threads
+    then never run it and another guest at the same time. It runs in the
+    forked child, before its exec, and every thread the VMM makes takes the
+    cookie from it. A host whose cores have one thread each has nothing to
+    keep apart, and one with two and no core scheduling starts no VMM."""
+    if LIBC is None:
+        return
+    # PR_SCHED_CORE with PR_SCHED_CORE_CREATE, for the calling thread.
+    if LIBC.prctl(62, 1, 0, 0, 0) == 0 or ctypes.get_errno() == errno.ENODEV:
+        return
+    reason = os.strerror(ctypes.get_errno())
+    try:
+        with open("/sys/devices/system/cpu/smt/active") as f:
+            two = f.read().strip() == "1"
+    except OSError:
+        two = False
+    if two:
+        raise OSError(f"this host's cores run two threads each, and its kernel gives a VMM no core-scheduling cookie: {reason}")
 
 
 def ms(since):
@@ -424,7 +459,7 @@ def main():
         os.unlink(sock)
     log = open(f"{d}/console.log", "ab")
     record = {"kind": "fc-" + kind, "vcpus": VCPUS, "mem_mib": MEM_MIB}
-    pipes = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    pipes = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, preexec_fn=apart)
     for stale in ("v.sock",):
         if os.path.exists(f"{d}/{stale}"):
             os.unlink(f"{d}/{stale}")

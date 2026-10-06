@@ -2,7 +2,7 @@
 // holds a burst of session starts to it. It starts many sessions at the same
 // instant in one of three ways, and has each guest run its first command.
 //
-//	fcburst -dir <fc dir> -sessions 100 [-mode load|load-ci|pool] [-vmm-cpus 12-21,36-45] [-timeout 2m]
+//	fcburst -dir <fc dir> -sessions 100 [-mode load|load-ci|pool] [-vmm-cpus 12-21,36-45] [-at-once 18] [-timeout 2m]
 //
 // <fc dir> is as the steps of test/session/firecracker_sample.py left it.
 //
@@ -27,11 +27,19 @@
 // made for it and the first command: the agent writes the credential where
 // a session's goes and runs the command.
 //
+// With -at-once only so many starts are under way at a time, as a daemon
+// with bindsAtOnce keeps its binds. The rest wait in the order they came,
+// having started no VMM and reached no guest, and their time runs on from
+// the burst's instant. A turn ends at the agent's word that it has the
+// command, before it runs it, and never waits on the command.
+//
 // Each VMM runs in a directory of its own under <fc dir>/burst, where its
 // sockets are, and is stopped once every guest has answered or failed. With
 // -vmm-cpus the VMMs keep to those CPUs and this program stays where it was
 // started, as a session's guests and the program that starts them keep to
-// CPUs apart.
+// CPUs apart. Each VMM is started with a core-scheduling cookie of its own,
+// where the host's kernel has them, as a session's is: no two guests run on
+// one core's two threads at a time.
 //
 // It prints one JSON record for each guest that answered and one for the
 // burst, with times in microseconds: kinds "fc-load-session" and "fc-load",
@@ -62,6 +70,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/confidential-dot-ai/c8s/internal/coresched"
 	"github.com/confidential-dot-ai/c8s/test/session/hostcpu"
 )
 
@@ -96,8 +105,12 @@ type started struct {
 	// times after it run from there. For a snapshot: the API socket there,
 	// the snapshot loaded and its guest resumed, and the agent's accept of
 	// the connection, after Connections tries. For both: the command's
-	// answer.
+	// answer. Queued is the part of Offset a start waited for its turn, when
+	// only so many are under way at once, and Taken the agent's word that it
+	// has the command, which ends the turn.
 	Offset      int64  `json:"offset_us"`
+	Queued      int64  `json:"queued_us,omitempty"`
+	Taken       int64  `json:"taken_us,omitempty"`
 	APIUp       int64  `json:"api_up_us,omitempty"`
 	Loaded      int64  `json:"loaded_us,omitempty"`
 	Connected   int64  `json:"vsock_connected_us,omitempty"`
@@ -118,11 +131,16 @@ type volley struct {
 	Wall     int64  `json:"wall_us,omitempty"`
 	// Span is from that instant until every start had answered or failed.
 	// HostCPU is all the CPU the host gave over it, whoever took it, by its
-	// kernel's count, and OwnCPU the part this program took.
-	Span    int64    `json:"span_us,omitempty"`
-	HostCPU int64    `json:"host_cpu_us,omitempty"`
-	OwnCPU  int64    `json:"own_cpu_us,omitempty"`
-	Command []string `json:"first_command"`
+	// kernel's count, and OwnCPU the part this program took. OwnWaited is
+	// how long this program's threads stood ready with no processor to run
+	// on: with much of it, this program bounded the burst.
+	Span      int64    `json:"span_us,omitempty"`
+	HostCPU   int64    `json:"host_cpu_us,omitempty"`
+	OwnCPU    int64    `json:"own_cpu_us,omitempty"`
+	OwnWaited int64    `json:"own_waited_us,omitempty"`
+	Command   []string `json:"first_command"`
+	// AtOnce is how many starts were under way at once, or 0 for all.
+	AtOnce int `json:"at_once,omitempty"`
 	// PoolBoot is how long the pool's guests took to boot, all of them, so
 	// many at a time, and Idle how long they then sat before the burst.
 	// Neither is part of a start.
@@ -136,7 +154,7 @@ type volley struct {
 type options struct {
 	dir, mode, cpus string
 	sessions, round int
-	boots           int
+	boots, atOnce   int
 	timeout, rest   time.Duration
 	before, after   string
 }
@@ -151,6 +169,7 @@ func main() {
 	flag.IntVar(&o.round, "round", 0, "the number each record says its burst has")
 	flag.IntVar(&o.boots, "boots", 8, "with -mode pool, how many guests boot at a time")
 	flag.DurationVar(&o.rest, "rest", 5*time.Second, "with -mode pool, how long the booted guests sit idle before the burst")
+	flag.IntVar(&o.atOnce, "at-once", 0, "how many starts are under way at once, the rest waiting their turn in the order they came, as a daemon with bindsAtOnce keeps binds (0: all of them)")
 	flag.StringVar(&o.before, "before-burst", "", "a program run with the burst's number before the burst is let go, which waits for it")
 	flag.StringVar(&o.after, "after-answers", "", "a program run with the burst's number once every start has answered or failed, while the VMMs still run")
 	flag.Parse()
@@ -161,8 +180,8 @@ func main() {
 }
 
 func run(o *options) error {
-	if o.dir == "" || o.sessions < 1 || o.boots < 1 {
-		return errors.New("-dir is required, and -sessions and -boots are at least 1")
+	if o.dir == "" || o.sessions < 1 || o.boots < 1 || o.atOnce < 0 {
+		return errors.New("-dir is required, -sessions and -boots are at least 1, and -at-once is not negative")
 	}
 	how, known := modes[o.mode]
 	if !known {
@@ -173,7 +192,7 @@ func run(o *options) error {
 	if err != nil {
 		return err
 	}
-	said := &volley{Kind: how.kind, Round: o.round, Sessions: o.sessions}
+	said := &volley{Kind: how.kind, Round: o.round, Sessions: o.sessions, AtOnce: o.atOnce}
 	each, from := how.kind+"-session", how.first
 	data, err := os.ReadFile(filepath.Join(dir, from))
 	if err != nil {
@@ -229,15 +248,32 @@ func run(o *options) error {
 	answers := make([]*started, o.sessions)
 	var all sync.WaitGroup
 	release := make(chan struct{})
+	turns := newLine(o.atOnce)
 	for i, v := range vmms {
 		all.Add(1)
 		go func() {
 			defer all.Done()
 			<-release
+			// A start that waits has reached no guest and started no VMM.
+			done, err := turns.take(ctx)
+			if err != nil {
+				outcomes[i] = fmt.Errorf("the start's turn: %w", err)
+				return
+			}
+			defer done()
+			queued := time.Since(v.burst)
+			// With no line there is no turn to end, and no word is asked.
+			word := done
+			if turns == nil {
+				word = nil
+			}
 			if pooled {
-				answers[i], outcomes[i] = v.take(ctx, &command)
+				answers[i], outcomes[i] = v.take(ctx, &command, word)
 			} else {
-				answers[i], outcomes[i] = v.start(ctx, &command, how)
+				answers[i], outcomes[i] = v.start(ctx, &command, how, word)
+			}
+			if answers[i] != nil && turns != nil {
+				answers[i].Queued = queued.Microseconds()
 			}
 		}()
 	}
@@ -255,7 +291,7 @@ func run(o *options) error {
 	said.Span = time.Since(began).Microseconds()
 	if now, ok := hostcpu.Now(); ok && counted {
 		given = now.Since(given)
-		said.HostCPU, said.OwnCPU = given.Host, given.Own
+		said.HostCPU, said.OwnCPU, said.OwnWaited = given.Host, given.Own, given.Waited
 	}
 	if err := hook(o.after, o.round); err != nil {
 		return fmt.Errorf("-after-answers: %w", err)
@@ -292,6 +328,32 @@ func hook(program string, round int) error {
 	cmd := exec.Command(program, strconv.Itoa(round))
 	cmd.Stdout, cmd.Stderr = os.Stderr, os.Stderr
 	return cmd.Run()
+}
+
+// line is where starts wait when only so many are under way at once: a turn
+// goes to the start that has waited longest, as the runtime wakes those that
+// wait to send on a channel.
+type line chan struct{}
+
+func newLine(atOnce int) line {
+	if atOnce <= 0 {
+		return nil
+	}
+	return make(line, atOnce)
+}
+
+// take waits for a turn and returns what ends it, which may be called again.
+// With no line every start has its turn at once.
+func (l line) take(ctx context.Context) (done func(), err error) {
+	if l == nil {
+		return func() {}, nil
+	}
+	select {
+	case l <- struct{}{}:
+		return sync.OnceFunc(func() { <-l }), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // mode is one way to start a session: the kind its burst's record has, the
@@ -345,20 +407,19 @@ type vmm struct {
 	ahead *link
 }
 
-// run starts the VMM's process, kept to the VMMs' CPUs.
+// run starts the VMM's process, kept to the VMMs' CPUs and apart from every
+// other VMM on the host's cores: a core's two threads run one guest at a
+// time, as a session's VMM is started.
 func (v *vmm) run(args ...string) (time.Time, error) {
 	cmd := exec.Command(filepath.Join(v.dir, "firecracker"), args...)
 	cmd.Dir, cmd.Stdout, cmd.Stderr = v.work, v.console, v.console
-	// The VMM is a child of the thread that starts it, and keeps to that
-	// thread's CPUs.
-	restore, err := v.pin()
-	if err != nil {
-		return time.Time{}, err
-	}
 	began := time.Now()
-	err = cmd.Start()
-	restore()
-	if err != nil {
+	// The VMM is a child of the thread that starts it, and keeps to that
+	// thread's CPUs. The thread ends with the start, so it is not put back.
+	if _, err := coresched.Start(cmd, func() error {
+		_, err := v.pin()
+		return err
+	}); err != nil {
 		return time.Time{}, err
 	}
 	v.process = cmd
@@ -396,17 +457,36 @@ func (v *vmm) boot(ctx context.Context) error {
 }
 
 // take starts a session in a guest booted ahead: one message on the
-// connection made to its agent.
-func (v *vmm) take(ctx context.Context, command *first) (*started, error) {
+// connection made to its agent. A start that had to wait its turn ends it
+// with taken, at the agent's word that it has the command.
+func (v *vmm) take(ctx context.Context, command *first, taken func()) (*started, error) {
 	// The connection was made under the deadline of its guest's boot.
 	deadline, _ := ctx.Deadline()
 	_ = v.ahead.conn.SetDeadline(deadline)
 	began := time.Now()
+	rec := &started{Index: v.index, Offset: began.Sub(v.burst).Microseconds()}
+	v.ahead.word(taken, began, rec)
 	output, err := v.ahead.session(command)
 	if err != nil {
 		return nil, err
 	}
-	return &started{Index: v.index, Offset: began.Sub(v.burst).Microseconds(), FirstCmd: time.Since(began).Microseconds(), Output: output}, nil
+	rec.FirstCmd, rec.Output = time.Since(began).Microseconds(), output
+	return rec, nil
+}
+
+// word has the connection's request ask for the agent's word that it has
+// the command, and at that word end the start's turn and note when it came.
+// With no turn to end, the request asks for nothing.
+func (l *link) word(taken func(), began time.Time, rec *started) {
+	if taken == nil {
+		return
+	}
+	l.taken = func() {
+		if rec.Taken == 0 {
+			rec.Taken = time.Since(began).Microseconds()
+		}
+		taken()
+	}
 }
 
 // session sends a session's first command on the connection, with a
@@ -445,8 +525,9 @@ func (l *link) session(command *first) (string, error) {
 }
 
 // start runs the VMM, loads the snapshot into it, and has its guest's agent
-// run the first command.
-func (v *vmm) start(ctx context.Context, command *first, how mode) (*started, error) {
+// run the first command. A start that had to wait its turn ends it with
+// taken, at the agent's word that it has the command.
+func (v *vmm) start(ctx context.Context, command *first, how mode, taken func()) (*started, error) {
 	rec := &started{Index: v.index}
 	began, err := v.run("--api-sock", "fc.sock")
 	if err != nil {
@@ -503,6 +584,7 @@ func (v *vmm) start(ctx context.Context, command *first, how mode) (*started, er
 		to, err := v.connect(ctx)
 		if err == nil {
 			rec.Connected = to.at.Sub(began).Microseconds()
+			to.word(taken, began, rec)
 			if rec.Output, err = to.session(command); err == nil {
 				rec.FirstCmd = since()
 				return rec, nil
@@ -519,12 +601,14 @@ func (v *vmm) start(ctx context.Context, command *first, how mode) (*started, er
 	}
 }
 
-// answer is what the guest's agent says of one command.
+// answer is what the guest's agent says of one command, or with Taken its
+// word that it has the command and will now run it.
 type answer struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   []byte `json:"stdout"`
 	Stderr   []byte `json:"stderr"`
 	Error    string `json:"error,omitempty"`
+	Taken    bool   `json:"taken,omitempty"`
 }
 
 // commandError is a command the agent ran, or would not: no connection made
@@ -539,6 +623,8 @@ type link struct {
 	conn  net.Conn
 	lines *bufio.Reader
 	at    time.Time
+	// taken, if set, is asked of the agent and called at its word.
+	taken func()
 }
 
 // connect makes a connection to the guest's agent: the VMM's vsock socket
@@ -565,11 +651,13 @@ func (v *vmm) connect(ctx context.Context) (*link, error) {
 }
 
 // request is what the guest's agent is asked: a command, what credentials
-// come with it, and a directory to read whole before either.
+// come with it, a directory to read whole before either, and whether to say
+// that it has the command before it runs it.
 type request struct {
 	Argv        []string          `json:"argv"`
 	Credentials map[string][]byte `json:"credentials,omitempty"`
 	Read        string            `json:"read,omitempty"`
+	Word        bool              `json:"word,omitempty"`
 }
 
 // ask sends a command and what credentials come with it, and returns the
@@ -583,25 +671,33 @@ func (l *link) ask(argv []string, credentials map[string][]byte) (*answer, error
 func (l *link) do(req *request) (*answer, error) {
 	defer l.conn.Close()
 	argv := req.Argv
-	request, err := json.Marshal(req)
+	asked := *req
+	asked.Word = l.taken != nil
+	request, err := json.Marshal(&asked)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := l.conn.Write(append(request, '\n')); err != nil {
 		return nil, err
 	}
-	data, err := l.lines.ReadBytes('\n')
-	if err != nil {
-		return nil, err
+	for {
+		data, err := l.lines.ReadBytes('\n')
+		if err != nil {
+			return nil, err
+		}
+		var said answer
+		if err := json.Unmarshal(data, &said); err != nil {
+			return nil, &commandError{fmt.Sprintf("the guest's agent answered %q", bytes.TrimSpace(data))}
+		}
+		if said.Taken && asked.Word {
+			l.taken()
+			continue
+		}
+		if said.Error != "" || said.ExitCode != 0 {
+			return nil, &commandError{fmt.Sprintf("%v: exit %d, %s%s", argv, said.ExitCode, said.Error, bytes.TrimSpace(said.Stderr))}
+		}
+		return &said, nil
 	}
-	var said answer
-	if err := json.Unmarshal(data, &said); err != nil {
-		return nil, &commandError{fmt.Sprintf("the guest's agent answered %q", bytes.TrimSpace(data))}
-	}
-	if said.Error != "" || said.ExitCode != 0 {
-		return nil, &commandError{fmt.Sprintf("%v: exit %d, %s%s", argv, said.ExitCode, said.Error, bytes.TrimSpace(said.Stderr))}
-	}
-	return &said, nil
 }
 
 // ask sends one command to the guest's agent on a connection of its own,

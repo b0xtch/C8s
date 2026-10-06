@@ -15,7 +15,7 @@ func ask(t *testing.T, req request) answer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return run(strings.NewReader(string(line) + "\n"))
+	return run(strings.NewReader(string(line)+"\n"), func() {})
 }
 
 // A command's answer is what it wrote and how it ended, and a command that
@@ -28,7 +28,7 @@ func TestRunAnswersWithWhatTheCommandWroteAndHowItEnded(t *testing.T) {
 		t.Fatalf("a command that is not there was answered %+v", got)
 	}
 	for name, line := range map[string]string{"no command": "{}\n", "no JSON": "true\n", "no line": `{"argv":["true"]}`} {
-		if got := run(strings.NewReader(line)); got.Error == "" {
+		if got := run(strings.NewReader(line), func() {}); got.Error == "" {
 			t.Fatalf("%s: answered %+v", name, got)
 		}
 	}
@@ -106,5 +106,48 @@ func TestReadReadsATreeBeforeItsCommand(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Fatal("a command ran after a read that failed")
+	}
+}
+
+// A request that asks for the agent's word gets it once its credentials are
+// in place and before its command runs, and never for a command the agent
+// will not run. A request that does not ask gets none.
+func TestWordComesBeforeTheCommandRuns(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(credentialsDir, dir)
+	marker := filepath.Join(t.TempDir(), "ran")
+	said := func(req request) (words int, got answer) {
+		t.Helper()
+		line, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = run(strings.NewReader(string(line)+"\n"), func() {
+			words++
+			if _, err := os.Stat(marker); err == nil {
+				t.Error("the agent's word came after its command had run")
+			}
+			if secret, err := os.ReadFile(filepath.Join(dir, "api-token")); err != nil || string(secret) != "s3cr3t" {
+				t.Errorf("the agent's word came with the credential at %q, %v", secret, err)
+			}
+		})
+		return words, got
+	}
+	touch := []string{"sh", "-c", `: > "$0"`, marker}
+	brings := map[string][]byte{"api-token": []byte("s3cr3t")}
+	if words, got := said(request{Argv: touch, Credentials: brings, Word: true}); words != 1 || got.Error != "" || got.ExitCode != 0 {
+		t.Fatalf("a request that asked for the word: %d words, %+v", words, got)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the command did not run after the word: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	if words, got := said(request{Argv: touch, Credentials: brings}); words != 0 || got.Error != "" {
+		t.Fatalf("a request that asked for no word: %d words, %+v", words, got)
+	}
+	if words, got := said(request{Argv: touch, Credentials: map[string][]byte{"../outside": []byte("x")}, Word: true}); words != 0 || got.Error == "" {
+		t.Fatalf("a request whose credential was refused: %d words, %+v", words, got)
 	}
 }

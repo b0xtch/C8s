@@ -52,6 +52,14 @@
 #                            time, and their times say so
 #   C8S_BURST_ROUNDS         bursts a side (default 4: the first finds every
 #                            cache cold and is left out of a summary)
+#   C8S_BURST_BINDS_AT_ONCE  how many of a burst's starts each side's starter
+#                            lets through at once: the TDs' daemon so many
+#                            binds to its guests (bindsAtOnce), Firecracker's
+#                            program so many starts (-at-once). The rest wait
+#                            their turn in the order they came, on a clock
+#                            that runs from the burst's instant, and a turn
+#                            never waits on the command (default 0: the
+#                            whole burst at once). The run names the number
 #   C8S_BURST_WATCH          a command line run beside each burst, begun
 #                            two seconds before a TD burst is let go and
 #                            before Firecracker's program starts, with the
@@ -59,8 +67,10 @@
 #                            words: a profiler, for a trial. A run that has
 #                            one says so
 #   C8S_BURST_PROFILE=1      for a trial: the binder writes its CPU profile
-#                            over each TD burst to <work>/warmstart.pprof.<n>
-#                            (go tool pprof). A run that has one says so
+#                            over each TD burst to <work>/warmstart.pprof.<n>,
+#                            and the daemon its own over the same burst to
+#                            <work>/daemon.pprof.<turn>.0 (go tool pprof). A
+#                            run that has them says so
 #   C8S_BURST_LEAVE_FAILED=1 for a trial: leave the TD of a session whose
 #                            start failed running until the burst's logs are
 #                            kept, and say then whether its guest answers
@@ -147,6 +157,8 @@ vmm_stat=${C8S_VMM_STAT:-$(dirname "$(readlink -f "$0")")/vmm_stat.py}
 sessions=${C8S_BURST_SESSIONS:-100}
 depth=${C8S_BURST_POOL:-$sessions}
 rounds=${C8S_BURST_ROUNDS:-4}
+at_once=${C8S_BURST_BINDS_AT_ONCE:-0}
+case "$at_once" in ''|*[!0-9]*) echo "C8S_BURST_BINDS_AT_ONCE is a number of starts, and 0 for the whole burst" >&2; exit 2 ;; esac
 first_command=${C8S_BURST_COMMAND:-node -v}
 rest=${C8S_TIMING_REST:-5}
 vcpus=${C8S_BURST_VCPUS:-4}
@@ -458,6 +470,7 @@ sudo -n install -m 0644 "$out/image.env" "$fc/image.env"
     echo "host: test-host"
     echo "stateDir: $out/state"
     echo "capacity: $depth"
+    [ "$at_once" -gt 0 ] && echo "bindsAtOnce: $at_once"
     echo "tls: {cert: $pki/server.pem, key: $pki/server.key, clientCA: $pki/ca.pem}"
     echo "network: {mode: tap, guestCIDR: $cidr}"
     echo "vmm:"
@@ -486,14 +499,22 @@ keys_all=$(tdx_capacity) || die "this host does not say how many TDX key IDs it 
 
 # The daemon runs for a TD turn and no longer. came is how many TDs its log
 # says came ready before this start, and filled how long the pool took.
-came=0 filled=0 daemon_began=0
+came=0 filled=0 daemon_began=0 daemon_turn=0
 start_daemon() {
     came=$(grep -c '"msg":"a TD is ready"' "$out/daemon.log" 2>/dev/null)
     came=${came:-0} daemon_began=$(date +%s)
+    # For a trial, the daemon's own CPU profile over each burst of its turn:
+    # it profiles between two signals, which the burst's hooks send.
+    local daemon_profile=()
+    if [ "${C8S_BURST_PROFILE:-0}" = 1 ]; then
+        daemon_turn=$((daemon_turn + 1))
+        daemon_profile=(--cpu-profile "$out/daemon.pprof.$daemon_turn")
+    fi
     # Its launchers inherit where the daemon keeps to, and start their VMMs
     # on the guests' CPUs, as its configuration says.
-    on "$cpus_platform" sudo -n "$C8S" session-daemon run --config "$out/config.yaml" >> "$out/daemon.log" 2>&1 &
+    on "$cpus_platform" sudo -n "$C8S" session-daemon run --config "$out/config.yaml" "${daemon_profile[@]}" >> "$out/daemon.log" 2>&1 &
     daemon_pid=$!
+    echo "$daemon_pid" > "$out/daemon.pid"
 }
 # pool_full: the pool is full and no TD boots.
 pool_full() {
@@ -553,7 +574,7 @@ def at(entry):
 # beside it, of the bind's whole call with what followed its answer, and of
 # its first second after it was prepared.
 guest_said = {"a bind was served": "guest-bind", "took the quote over the bind's nonce": "guest-quote", "a bind's call ended": "guest-call",
-              "a guest's first second prepared": "guest-prepared"}
+              "a guest's first second prepared": "guest-prepared", "the sandbox's first command ran": "guest-command"}
 def entries(path):
     try:
         with open(path, errors="replace") as f:
@@ -603,7 +624,7 @@ for line in open(sys.argv[1], errors="replace"):
     if isinstance(entry, dict) and entry.get("msg") == "bound a TD":
         bound.append(entry)
 for entry in bound[-int(sys.argv[3]):]:
-    print(json.dumps({"kind": "daemon-bind", "round": int(sys.argv[2]), "td": entry.get("td"), "took_us": entry.get("took_us"), "guest_us": entry.get("guest_us"), "answer_bytes": entry.get("answer_bytes")}))
+    print(json.dumps({"kind": "daemon-bind", "round": int(sys.argv[2]), "td": entry.get("td"), "took_us": entry.get("took_us"), "turn_us": entry.get("turn_us"), "guest_us": entry.get("guest_us"), "answer_bytes": entry.get("answer_bytes")}))
 BOUND
 }
 
@@ -631,9 +652,30 @@ until [ -e "$out/go.\$1" ]; do
     kill -0 $$ 2>/dev/null || { echo "the run ended" >&2; exit 1; }
     sleep 0.02
 done
-exec "$out/sample" td before "\$1"
+"$out/sample" td before "\$1" || exit
+# For a trial: the daemon profiles itself from here to the burst's last answer.
+[ "${C8S_BURST_PROFILE:-0}" = 1 ] && "$out/signal-daemon" USR1
+exit 0
 HOOK
-chmod 0755 "$out/sample" "$out"/before-* "$out"/after-*
+if [ "${C8S_BURST_PROFILE:-0}" = 1 ]; then
+    cat > "$out/after-td" <<HOOK
+#!/usr/bin/env bash
+"$out/signal-daemon" USR2
+exec "$out/sample" td after "\$1"
+HOOK
+fi
+# signal-daemon <signal>: to the daemon itself, which sudo started and whose
+# command line begins with its program.
+cat > "$out/signal-daemon" <<HOOK
+#!/usr/bin/env bash
+top=\$(cat "$out/daemon.pid" 2>/dev/null) || exit 0
+for pid in \$(pgrep -P "\$top") "\$top"; do
+    if [ "\$(tr '\\0' ' ' < "/proc/\$pid/cmdline" 2>/dev/null | cut -d' ' -f2-3)" = "session-daemon run" ]; then
+        exec sudo -n kill "-\$1" "\$pid"
+    fi
+done
+HOOK
+chmod 0755 "$out/sample" "$out"/before-* "$out"/after-* "$out/signal-daemon"
 
 if [ -n "$halt_poll" ]; then
     halt_poll_was=$(cat "$halt_poll_file") || die "this host's KVM names no halt_poll_ns: the run cannot set it"
@@ -680,7 +722,12 @@ others=$(pgrep -a qemu-system | grep -v -c "guest=td-\|guest=c8s-key-service-$ru
     printf 'KVM lets a halted vCPU spin %s ns for a wakeup%s; ' "${halt_polled:-an unknown number of}" "$([ -n "$halt_poll" ] && echo ", set by this run")"
     printf 'baselines: Firecracker loading one snapshot of its leanest guest %s times at once, and Firecracker starting as many sessions at once in such guests booted ahead and idle, each to the first command over vsock to an agent that is its guest'"'"'s init on the same image'"'"'s tree, taking turns with the TDs burst by burst in an order that rotates, each side'"'"'s guests there for its own turn alone, which begins with them idle and the host rested; ' "$sessions"
     [ -n "${C8S_BURST_WATCH:-}" ] && printf 'a departure: a program of the trial ran beside each burst (%s); ' "$C8S_BURST_WATCH"
-    [ "${C8S_BURST_PROFILE:-0}" = 1 ] && printf 'a departure: the binder profiled itself over each burst; '
+    if [ "$at_once" -gt 0 ]; then
+        printf 'bindsAtOnce %s on every side: the TDs'"'"' daemon let %s binds through to its guests at once and Firecracker'"'"'s program had %s starts under way, the rest waiting their turn in the order they came, on the burst'"'"'s clock, and a turn ended at the guest'"'"'s receipt and quote, or at the agent'"'"'s word that it had the command, and never waited on the command; ' "$at_once" "$at_once" "$at_once"
+    else
+        printf 'bindsAtOnce 0 on every side: the whole burst let through at once; '
+    fi
+    [ "${C8S_BURST_PROFILE:-0}" = 1 ] && printf 'a departure: the binder and the daemon profiled themselves over each burst; '
     [ "$vcpus" = 4 ] || printf 'a departure: every guest has %s vCPUs where the session class has 4; ' "$vcpus"
     printf 'no second baseline: its guests hold all of their memory from boot; '
     printf 'CPUs: the TDs'"'"' VMMs %s, Firecracker'"'"'s VMMs %s, the platform'"'"'s own programs (the TDs'"'"' daemon and its launchers, the key service%s) %s, the programs that start the bursts %s; ' \
@@ -743,7 +790,7 @@ for (( n = 0; n < rounds; n++ )); do
                 watch_pid=$!
                 sleep 2
             fi
-            (on "$cpus_drive" sudo -n "$fc_burst" -dir "$fc" -mode "$side" -sessions "$sessions" -round "$n" -vmm-cpus "$cpus_fc" -rest "${rest}s" \
+            (on "$cpus_drive" sudo -n "$fc_burst" -dir "$fc" -mode "$side" -sessions "$sessions" -round "$n" -vmm-cpus "$cpus_fc" -rest "${rest}s" -at-once "$at_once" \
                 -before-burst "$out/before-$side" -after-answers "$out/after-$side") \
                 >> "$records" 2>> "$out/fcburst.err" || die "Firecracker's burst $n ($side): $(tail -c 400 "$out/fcburst.err")"
             [ -n "$watch_pid" ] && wait "$watch_pid"
@@ -875,9 +922,10 @@ def side(name, bursts, sessions, parts):
 side("TDs", [r for r in rows if r.get("kind") == "burst"], [r for r in rows if r.get("kind") == "session"],
      (("sign_us", "sign"), ("seal_us", "seal"), ("bind_us", "bind"), ("judge_us", "the receipt's check"), ("first_exec_us", "the first command after the start"),
       ("quote_us", "the bind's quote, after its answer"), ("confirmed_us", "the quote judged, from the start")))
+turn = (("queued_us", "of that, its wait for a turn"), ("taken_us", "the agent's word that it has the command"))
 side("Firecracker, each start a snapshot's load", [r for r in rows if r.get("kind") == "fc-load"], [r for r in rows if r.get("kind") == "fc-load-session"],
-     (("api_up_us", "the VMM's API socket"), ("loaded_us", "the snapshot loaded and resumed"), ("vsock_connected_us", "the agent's accept")))
-side("Firecracker, each start a guest booted ahead", [r for r in rows if r.get("kind") == "fc-pool"], [r for r in rows if r.get("kind") == "fc-pool-session"], ())
+     turn[:1] + (("api_up_us", "the VMM's API socket"), ("loaded_us", "the snapshot loaded and resumed"), ("vsock_connected_us", "the agent's accept")) + turn[1:])
+side("Firecracker, each start a guest booted ahead", [r for r in rows if r.get("kind") == "fc-pool"], [r for r in rows if r.get("kind") == "fc-pool-session"], turn)
 show("Firecracker's pool booted, eight at a time", [r["pool_boot_ms"] for r in rows if r.get("kind") == "fc-pool"], "ms (before its burst: no part of a start)")
 for r in rows:
     if r.get("kind") == "fc-lean":
@@ -886,6 +934,7 @@ for r in rows:
         print(f"Firecracker's snapshot: made in {r['snapshot_create_ms']} ms, of that guest {r['agent_up_us'] / 1000:.0f} ms after its VMM started and once it had read its file system whole")
 steady = lambda kind: [r for r in rows if r.get("kind") == kind and r.get("round", 0) > 0]
 show("the daemon's time over a bind", [r["took_us"] / 1000 for r in steady("daemon-bind") if r.get("took_us")])
+show("  of which its wait for a turn", [r["turn_us"] / 1000 for r in steady("daemon-bind") if r.get("turn_us")])
 show("  of which the guest's answer", [r["guest_us"] / 1000 for r in steady("daemon-bind") if r.get("guest_us")])
 # A guest with a console says how long its bind took in parts, each from the
 # bind's arrival, and the quote it took beside it.
@@ -901,6 +950,7 @@ def told_by(kind, label):
 told_by("guest-bind", "guest's bind, to ")
 told_by("guest-quote", "guest's quote: ")
 told_by("guest-call", "guest's bind and what followed: ")
+told_by("guest-command", "guest's first command, to ")
 told_by("guest-prepared", "guest's first second prepared: ")
 cold = [r for r in rows if r.get("kind") == "session-cold"]
 show("TD launch to ready", [r["boot_ms"] for r in cold], "ms (two boot at a time, beside whatever else ran)")
@@ -928,6 +978,27 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
         return total / starts
     ms = lambda *path: per(*path) / 1000
     print(f"--- what a start cost its host: {name} ({starts} starts, each VMM's threads from the burst's go to its last answer)")
+    # How the host scheduled the side's guests: as they waited in their pool,
+    # where the side has one, and at the burst's last answer.
+    def placement(reading):
+        placed = reading.get("placed")
+        if not placed or not reading["vmms"]:
+            return None
+        threads = "; ".join(f"{n} {kind}" for kind, n in sorted(placed["vcpu_classes"].items()))
+        cpus = ", ".join(f"{n} free on {count} CPUs" for count, n in sorted(placed["vcpu_cpus"].items(), key=lambda kv: int(kv[0])))
+        apart = placed.get("vmms_apart")
+        if apart is None:
+            cores = "the host told no core-scheduling cookies, so one core's two threads may have run two guests at once"
+        elif apart == reading["vmms"]:
+            who = "the one VMM" if apart == 1 else f"each of the {apart} VMMs"
+            cores = f"{who} had a core-scheduling cookie of its own on every thread, so no core's two threads ran two guests at once"
+        else:
+            cores = f"{apart} of the {reading['vmms']} VMMs had a core-scheduling cookie of their own on every thread, so one core's two threads may have run two guests at once"
+        return f"vCPU threads {threads} ({cpus}); {cores}"
+    for when, label in (("before", "idle before a burst"), ("after", "at a burst's last answer")):
+        said = sorted({p for before, after, _ in pairs for p in [placement(before if when == "before" else after)] if p})
+        for p in said:
+            print(f"placement, {label}: {p}")
     print(f"vCPU threads ran {ms('vcpu', 'ran_us'):8.2f} ms a start and waited for a CPU {ms('vcpu', 'waited_us'):8.2f} ms; sampled by the kernel's tick: in the guest {ms('vcpu', 'guest_us'):.2f}, in the host's kernel {ms('vcpu', 'system_us'):.2f}")
     print(f"other threads ran {ms('other', 'ran_us'):8.2f} ms a start and waited {ms('other', 'waited_us'):8.2f} ms")
     # All the CPU the host gave a start: its kernel's own count over each
@@ -937,7 +1008,7 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
     whole = [(b, pair) for b in rows if b.get("kind") == kind and b["round"] > 0 and b.get("host_cpu_us") and b.get("started")
              for pair in [taken.get((key, b["round"]), {})] if all(pair.get(w, {}).get("host_cpu_us") for w in ("idle", "before", "after"))]
     if whole:
-        host = drivers = 0.0
+        host = drivers = stood = 0.0
         ran = dict.fromkeys(("vcpu", "other", "kernel", "quoting", "daemon", "launchers"), 0.0)
         for b, pair in whole:
             idle, before, after = pair["idle"], pair["before"], pair["after"]
@@ -945,6 +1016,7 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
             resting = (before["host_cpu_us"] - idle["host_cpu_us"] - (before["own_cpu_us"] - idle["own_cpu_us"])) / rested
             host += b["host_cpu_us"] - b["own_cpu_us"] - resting * b["span_us"]
             drivers += b["own_cpu_us"]
+            stood += b.get("own_waited_us", 0)
             for group in ran:
                 at = (lambda r: r[group]["ran_us"]) if group in ("vcpu", "other") else (lambda r: r["groups_ran_us"][group])
                 ran[group] += at(after) - at(before) - (at(before) - at(idle)) / rested * watched
@@ -954,7 +1026,9 @@ for name, key, kind in (("TDs", "td", "burst"), ("Firecracker, a snapshot's load
               f"what it gave over as long with these guests idle). Of that, by the scheduler's own count of each thread: the VMMs' vCPU threads {each(ran['vcpu']):.2f}, their other threads {each(ran['other']):.2f}, "
               f"the kernel's own threads {each(ran['kernel']):.2f}, the quoting service {each(ran['quoting']):.2f}, the daemon {each(ran['daemon']):.2f}, the launchers {each(ran['launchers']):.2f}; "
               f"the two counts differ by {each(host - sum(ran.values())):+.2f}, which is whatever else ran and what a tick's sample is off by")
-        print(f"the program that started the bursts took {each(drivers):.2f} ms a start more, on processors of its own")
+        span = statistics.median(b["span_us"] for b, _ in whole) / 1000
+        print(f"the program that started the bursts took {each(drivers):.2f} ms a start more, on processors of its own, where its threads stood ready with no processor "
+              f"to run on for {each(stood):.2f} ms a start ({stood / len(whole) / 1000:.1f} ms a burst in all, and a burst took {span:.1f} ms at the median)")
     held = [before for before, _, _ in pairs if before["vmms"] and "resident_kb" in before]
     if held:
         guests = sum(b["vmms"] for b in held)

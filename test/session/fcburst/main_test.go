@@ -59,9 +59,13 @@ func guestWith(t *testing.T, answerTo func(argv []string, credentials map[string
 				var request struct {
 					Argv        []string          `json:"argv"`
 					Credentials map[string][]byte `json:"credentials"`
+					Word        bool              `json:"word"`
 				}
 				if json.Unmarshal(line, &request) != nil {
 					return
+				}
+				if request.Word {
+					fmt.Fprintf(conn, "{\"taken\":true}\n")
 				}
 				fmt.Fprintf(conn, "%s\n", answerTo(request.Argv, request.Credentials))
 			}()
@@ -157,11 +161,11 @@ func TestTakeSendsACredentialAndTheFirstCommandOnTheConnectionMadeAhead(t *testi
 		return v
 	}
 	reads := &first{Argv: []string{"sh", "-c", `cat "$C8S_CREDENTIALS_DIR/api-token"`}, ReadsBack: true, Bytes: 22}
-	rec, err := pooled().take(ctx, reads)
-	if err != nil || rec.Output != "" || rec.Offset < time.Second.Microseconds() || rec.FirstCmd <= 0 || rec.Connected != 0 {
+	rec, err := pooled().take(ctx, reads, nil)
+	if err != nil || rec.Output != "" || rec.Offset < time.Second.Microseconds() || rec.FirstCmd <= 0 || rec.Connected != 0 || rec.Taken != 0 {
 		t.Fatalf("a start whose command reads its credential back: %+v, %v", rec, err)
 	}
-	if again, err := pooled().take(ctx, reads); err != nil || again == nil {
+	if again, err := pooled().take(ctx, reads, nil); err != nil || again == nil {
 		t.Fatal(err)
 	}
 	seen := func() [][]byte {
@@ -173,12 +177,12 @@ func TestTakeSendsACredentialAndTheFirstCommandOnTheConnectionMadeAhead(t *testi
 		t.Fatalf("two starts brought the credentials %q", got)
 	}
 	// A command that answers with something else has not read it back.
-	if rec, err := pooled().take(ctx, &first{Argv: []string{"stale"}, ReadsBack: true, Bytes: 22}); err == nil {
+	if rec, err := pooled().take(ctx, &first{Argv: []string{"stale"}, ReadsBack: true, Bytes: 22}, nil); err == nil {
 		t.Fatalf("a command that wrote another credential than its start brought: %+v", rec)
 	}
 	// A command that was named says what it will, and a start that brings
 	// no credential sends none.
-	rec, err = pooled().take(ctx, &first{Argv: []string{"node", "-v"}})
+	rec, err = pooled().take(ctx, &first{Argv: []string{"node", "-v"}}, nil)
 	if got := seen(); err != nil || rec.Output != "v24.9.0" || got[len(got)-1] != nil {
 		t.Fatalf("a named command with no credential: %+v, %v, brought %q", rec, err, got[len(got)-1])
 	}
@@ -203,5 +207,96 @@ func TestHookRunsItsProgramWithTheBurstsNumber(t *testing.T) {
 	}
 	if err := hook(program, 9); err == nil {
 		t.Fatal("a hook that failed did not fail the burst")
+	}
+}
+
+// With so many starts at once, a start past them waits in line: it sends its
+// guest nothing until one before it has its agent's word, and it does not
+// wait on that one's command. A start with no line asks for no word.
+func TestStartPastTheBoundWaitsForAWordAndNotForACommand(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// The first guest's command ends only when the test lets it.
+	hold := make(chan struct{})
+	reached := make(chan string, 3)
+	pooled := func(name string, wait <-chan struct{}) *vmm {
+		v := guest(t, func([]string) string {
+			reached <- name
+			if wait != nil {
+				<-wait
+			}
+			return `{"exit_code":0,"stdout":"djI0LjkuMAo="}`
+		})
+		var err error
+		if v.ahead, err = v.connect(ctx); err != nil {
+			t.Fatal(err)
+		}
+		v.burst = time.Now()
+		return v
+	}
+	command := &first{Argv: []string{"node", "-v"}}
+	turns := newLine(1)
+	type outcome struct {
+		rec *started
+		err error
+	}
+	start := func(v *vmm) <-chan outcome {
+		out := make(chan outcome, 1)
+		done, err := turns.take(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			defer done()
+			rec, err := v.take(ctx, command, done)
+			out <- outcome{rec, err}
+		}()
+		return out
+	}
+	// The one turn is taken, and the test's own next take must wait for the
+	// first agent's word: it comes while that agent's command still runs.
+	one := start(pooled("first", hold))
+	if got := <-reached; got != "first" {
+		t.Fatalf("the guest reached first was %s", got)
+	}
+	two := start(pooled("second", nil))
+	second := <-two
+	if second.err != nil || second.rec.Taken <= 0 || second.rec.Taken > second.rec.FirstCmd {
+		t.Fatalf("the start that waited its turn: %+v, %v", second.rec, second.err)
+	}
+	select {
+	case got := <-one:
+		t.Fatalf("the first start ended with its command held: %+v, %v", got.rec, got.err)
+	default:
+	}
+	close(hold)
+	if got := <-one; got.err != nil || got.rec.Taken <= 0 {
+		t.Fatalf("the first start: %+v, %v", got.rec, got.err)
+	}
+	// A turn that nobody ends is given back when its start is over, and a
+	// start that waits past its deadline is told.
+	full := newLine(1)
+	held, err := full.take(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	short, stop := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer stop()
+	if _, err := full.take(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a start whose turn did not come: %v", err)
+	}
+	held()
+	held()
+	if again, err := full.take(ctx); err != nil {
+		t.Fatalf("a turn given back twice: %v", err)
+	} else {
+		again()
+	}
+	// No line: every start has its turn, and none asks its agent for a word.
+	if done, err := newLine(0).take(ctx); err != nil || done == nil {
+		t.Fatalf("a start with no line: %v", err)
+	}
+	if rec, err := pooled("third", nil).take(ctx, command, nil); err != nil || rec.Taken != 0 {
+		t.Fatalf("a start with no line: %+v, %v", rec, err)
 	}
 }

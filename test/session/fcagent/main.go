@@ -13,7 +13,9 @@
 // "..."} for a command that did not start. A request with "read", a
 // directory, has the agent read every file of that directory's file system
 // first, as a pooled session guest has its sandbox image unpacked, and in
-// its memory, before anybody binds it.
+// its memory, before anybody binds it. A request with "word" is answered
+// twice: with the line {"taken": true} once the agent has the command and
+// its credentials in place, before it runs it, and then with the answer.
 //
 // Started as a guest's init it is all the user space that guest has: the
 // leanest guest that takes a command. It mounts what a command expects of a
@@ -58,6 +60,7 @@ type request struct {
 	Argv        []string          `json:"argv"`
 	Credentials map[string][]byte `json:"credentials,omitempty"`
 	Read        string            `json:"read,omitempty"`
+	Word        bool              `json:"word,omitempty"`
 }
 
 type answer struct {
@@ -66,6 +69,9 @@ type answer struct {
 	Stderr   []byte `json:"stderr"`
 	Error    string `json:"error,omitempty"`
 }
+
+// taken is the agent's word that it has a command and will now run it.
+const taken = `{"taken":true}` + "\n"
 
 func main() {
 	port := uint64(initPort)
@@ -104,7 +110,7 @@ func main() {
 
 func serve(conn net.Conn) {
 	defer conn.Close()
-	out := run(conn)
+	out := run(conn, func() { _, _ = io.WriteString(conn, taken) })
 	data, err := json.Marshal(out)
 	if err != nil {
 		return
@@ -112,7 +118,9 @@ func serve(conn net.Conn) {
 	_, _ = conn.Write(append(data, '\n'))
 }
 
-func run(conn io.Reader) answer {
+// run reads a request and does what it asks. It calls word once the
+// request's command is the next thing it does, if the request asked for it.
+func run(conn io.Reader, word func()) answer {
 	line, err := bufio.NewReaderSize(io.LimitReader(conn, maxRequest), maxRequest).ReadBytes('\n')
 	if err != nil {
 		return answer{Error: "the request is one line of at most " + strconv.Itoa(maxRequest) + " bytes"}
@@ -133,6 +141,9 @@ func run(conn io.Reader) answer {
 		if err := putCredential(name, value); err != nil {
 			return answer{Error: err.Error()}
 		}
+	}
+	if req.Word {
+		word()
 	}
 	var stdout, stderr bytes.Buffer
 	cmd := exec.Command(req.Argv[0], req.Argv[1:]...)
