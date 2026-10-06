@@ -69,6 +69,14 @@ type Config struct {
 	// that to whoever touches it first.
 	Memory *Memory
 	Logger *slog.Logger
+	// KeyHelper is the program that holds the guest's one-time keys, with
+	// its arguments. The agent starts it once, at its own start, and reaps
+	// it before anything of a tenant's runs. Empty, the agent holds the keys
+	// itself and erases what work on them leaves by a collection: for a
+	// test, and where there is no such program.
+	KeyHelper []string
+	// keyHelper, when set, starts the helper in KeyHelper's place.
+	keyHelper func() (*keyHelper, error)
 	// CertTTL bounds one serving certificate; the instance key outlives it.
 	CertTTL time.Duration
 	// Engine verifies the evidence of the key service a launch document
@@ -302,8 +310,22 @@ func Stage(ctx context.Context, cfg Config) (*Agent, error) {
 	if a.audience, err = session.InstanceKeyDigest(&a.key.PublicKey); err != nil {
 		return nil, err
 	}
-	if a.oneTime, err = newOneTime(); err != nil {
+	helper := cfg.keyHelper
+	if helper == nil && len(cfg.KeyHelper) > 0 {
+		helper = func() (*keyHelper, error) { return startKeyHelper(cfg.KeyHelper) }
+	}
+	if a.oneTime, err = newOneTime(helper); err != nil {
 		return nil, fmt.Errorf("generate one-time keys: %w", err)
+	}
+	if a.oneTime.helper != nil {
+		// What the helper holds in memory is part of what a ready guest
+		// costs while it waits.
+		resident, own := helperMemory(a.oneTime.helper.pid)
+		a.log.Info("the one-time keys are held by a key helper", "pid", a.oneTime.helper.pid, "resident_kb", resident, "own_kb", own)
+		// A guest whose helper is gone before its bind can take none.
+		a.oneTime.helper.onDeath(func(err error) {
+			_ = a.fail(fmt.Errorf("the key helper ended before it was done: %w", err))
+		})
 	}
 	serving := a.provider()
 	serving.seen = a.notePlatform
@@ -538,10 +560,14 @@ func (a *Agent) admit(ctx context.Context, bind *session.SignedBind) (*session.S
 	a.closeSealed()
 	a.putSealedCredentials()
 	// No work on a one-time key begins any more. The sandbox starts once
-	// what all of it left is collected: the collection begun above, and one
-	// more for a sealed message that was opened after that began.
+	// nothing of the keys is left: the helper that held them is reaped, or,
+	// where the agent held them, what work on them left is collected: the
+	// collection begun above, and one more for a sealed message that was
+	// opened after that began.
 	waited := time.Now()
-	a.oneTime.finish()
+	if err := a.oneTime.finish(); err != nil {
+		return nil, nil, fmt.Errorf("erase the one-time keys: %w", err)
+	}
 	tracedFor(ctx, "collection", time.Since(waited))
 	traced(ctx, "collected")
 	if sandbox != nil {

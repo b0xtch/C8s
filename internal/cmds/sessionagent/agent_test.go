@@ -122,6 +122,9 @@ func newUnbound(t *testing.T, mutate func(*session.BundleOptions)) *harness {
 		// A dev guest: most of these tests drive a guest with no sandbox image.
 		Bare: true,
 	}
+	if keysInHelper {
+		sessionagent.HoldKeysInHelper(&h.cfg)
+	}
 	identity, err := runtimemeasure.LoadImageManifest(opts.ManifestPath)
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +137,20 @@ func newUnbound(t *testing.T, mutate func(*session.BundleOptions)) *harness {
 	// launch key, and its own authority.
 	h.policy = session.Policy{Image: identity, LaunchKey: bundle.LaunchKey, Authority: pub, AllowReady: true}
 	return h
+}
+
+// keysInHelper has every guest of these tests hold its one-time keys in a
+// key helper, as a real guest does, where it otherwise holds them itself:
+// C8S_TEST_KEYS=helper runs the package's tests that way.
+var keysInHelper = os.Getenv("C8S_TEST_KEYS") == "helper"
+
+// keysInAgent skips a test of what an agent that holds its own one-time keys
+// does to erase them, when these tests' guests hold theirs in a helper.
+func keysInAgent(t *testing.T) {
+	t.Helper()
+	if keysInHelper {
+		t.Skip("these guests hold their one-time keys in a helper, and collect nothing for them")
+	}
 }
 
 // start stages and serves the agent on a loopback listener, and binds the

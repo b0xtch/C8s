@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"log/slog"
+	"net"
 	"time"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
@@ -96,9 +97,59 @@ func OneTimeCollections(a *Agent) int {
 	return a.oneTime.collected
 }
 
+// pipeKeyHelper is a key helper that runs in this process, at the other end
+// of a pipe: the helper's own code and the agent's, without the process
+// between them.
+func pipeKeyHelper() (*keyHelper, error) {
+	ours, theirs := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		err := serveKeys(theirs)
+		_ = theirs.Close()
+		done <- err
+	}()
+	return newKeyHelper(ours, func() error { return <-done }), nil
+}
+
+// HoldKeysInHelper has an agent staged from cfg hold its one-time keys in a
+// key helper, as a guest's does, with the helper in this process.
+func HoldKeysInHelper(cfg *Config) { cfg.keyHelper = pipeKeyHelper }
+
+// KeysInHelper reports whether the guest's one-time keys are a helper's.
+func KeysInHelper(a *Agent) bool { return a.oneTime.helper != nil }
+
+// KeyHelperPID is the process of the guest's key helper, or 0 where the
+// helper is none.
+func KeyHelperPID(a *Agent) int { return a.oneTime.helper.pid }
+
+// AskKeyHelperTwice has the guest's key helper asked to sign once more than
+// the agent asks it, as nothing of the agent's does.
+func AskKeyHelperTwice(a *Agent) error {
+	h := a.oneTime.helper
+	_, err := h.exchange(helperSign, [][]byte{[]byte("once more")}, helperSigned, 64)
+	return err
+}
+
+// EndKeyHelper ends the guest's key helper under its agent, as a helper that
+// died would end.
+func EndKeyHelper(a *Agent) {
+	h := a.oneTime.helper
+	h.mu.Lock()
+	conn := h.conn
+	h.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
 // OneTimeSigningGone reports whether the guest has erased its one-time
 // signing key.
 func OneTimeSigningGone(a *Agent) bool {
+	if h := a.oneTime.helper; h != nil {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		return h.signed
+	}
 	a.oneTime.mu.Lock()
 	defer a.oneTime.mu.Unlock()
 	return a.oneTime.signing == nil
@@ -106,6 +157,9 @@ func OneTimeSigningGone(a *Agent) bool {
 
 // OneTimeKEMGone reports whether the guest has erased its one-time KEM key.
 func OneTimeKEMGone(a *Agent) bool {
+	if h := a.oneTime.helper; h != nil {
+		return h.kemGone()
+	}
 	a.oneTime.mu.Lock()
 	defer a.oneTime.mu.Unlock()
 	return a.oneTime.kem == nil

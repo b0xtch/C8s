@@ -61,8 +61,25 @@ func NewCmd() *cobra.Command {
 		Use:   "session-agent",
 		Short: "The measured in-guest agent of a session guest",
 	}
-	cmd.AddCommand(newLoadCmd(), newRunCmd(), newHoldCmd())
+	cmd.AddCommand(newLoadCmd(), newRunCmd(), newHoldCmd(), newKeysCmd())
 	return cmd
+}
+
+// keysCommand is what the agent's executable is run as to be the guest's key
+// helper.
+const keysCommand = "one-time-keys"
+
+// newKeysCmd is the key helper: the process that holds the private halves of
+// the guest's one-time keys, started by the agent at its own start. Nothing
+// else calls it.
+func newKeysCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    keysCommand,
+		Short:  "Hold the guest's one-time keys for the agent that started this: sign one receipt, open one sealed message, and exit",
+		Hidden: true,
+		Args:   cobra.NoArgs, SilenceUsage: true,
+		RunE: func(*cobra.Command, []string) error { return RunKeyHelper() },
+	}
 }
 
 // newHoldCmd is what the agent runs itself as, in the new namespaces it makes
@@ -139,6 +156,17 @@ func newRunCmd() *cobra.Command {
 			if !erasesTemporaries {
 				return errors.New("this guest's program was built without the runtime's secret mode (GOEXPERIMENT=runtimesecret): it cannot erase what its one-time keys leave in memory")
 			}
+			// The keys are gone with the helper that held them because the
+			// kernel zeroes every page it frees. Its build and its measured
+			// command line decide that, and its own log says what they came to.
+			said, err := kernelOnFreedMemory()
+			if err != nil {
+				return fmt.Errorf("erasing the one-time keys rests on a kernel that zeroes what it frees: %w", err)
+			}
+			if !zeroesFreedMemory(said) {
+				return fmt.Errorf("this guest's kernel says %q: erasing the one-time keys rests on a kernel that zeroes what it frees", said)
+			}
+			cfg.Logger.Info("the kernel zeroes the memory it frees", "kernel", said)
 			if processors < 0 {
 				return errors.New("--processors is a number of processors, or 0 for all of the guest's")
 			}
@@ -148,8 +176,10 @@ func newRunCmd() *cobra.Command {
 					return err
 				}
 			}
+			// The guest's one-time keys live in a process of their own, which
+			// this one starts now and reaps before anything of a tenant runs.
+			cfg.KeyHelper = []string{ownExecutable, "session-agent", keysCommand}
 			cfg.Memory = NewMemory(acceptReserve, acceptRest, cfg.Logger)
-			var err error
 			// For the key service a launch document may pin. The guest has no
 			// road to the vendor: it asks its host for the vendor's documents.
 			if cfg.Engine, err = GuestEngine(); err != nil {

@@ -173,6 +173,7 @@ func TestReceiptOfAGuestThatAdmitsNoSandboxIsNeverReleased(t *testing.T) {
 // preparation. While a message may still come it waits for that: for the
 // message that comes after the bind, or for the time of one to be over.
 func TestSandboxStartWaitsForTheOneCollection(t *testing.T) {
+	keysInAgent(t)
 	for name, tc := range map[string]struct {
 		with, late bool
 	}{

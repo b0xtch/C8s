@@ -9,7 +9,7 @@ import (
 // A guest's one-time signing key signs once, and is gone from where it was
 // kept when it has.
 func TestOneTimeSigningKeySignsOnce(t *testing.T) {
-	keys, err := newOneTime()
+	keys, err := newOneTime(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestOneTimeSigningKeySignsOnce(t *testing.T) {
 	keys.eraseKEM()
 
 	// Two guests make different keys.
-	other, err := newOneTime()
+	other, err := newOneTime(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

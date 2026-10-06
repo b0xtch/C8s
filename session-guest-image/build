@@ -110,6 +110,15 @@ if ! diff -q <(common "$PGI_DIR/kernel/session.config") <(common "$PGI_DIR/kerne
     exit 1
 fi
 
+# The guest's one-time keys are gone when the helper that holds them exits,
+# because the kernel zeroes every page it frees. The fragment asks for that,
+# the build is checked for it below, and the measured command line has no
+# word on it. The agent serves only where the kernel's own log says it does.
+if sed -n 's/^KernelCommandLine=//p' "$PGI_DIR/c8s-session/mkosi.conf" | tr ' ' '\n' | grep -q -E '^init_on_free(=|$)'; then
+    echo "session-guest-image/build: the kernel's command line has a word on init_on_free: this image's kernel zeroes what it frees by its build" >&2
+    exit 1
+fi
+
 # Kernel source patches, applied in name order. Each one changes the kernel,
 # and so the measurement, and is named by hash in the image's manifest.
 PATCHES=()
@@ -232,6 +241,12 @@ bin/confos build "$C8S_NAME" \
     "$@"
 [ -f "output/$C8S_NAME/manifest.json" ] \
     || { echo "session-guest-image/build: no output/$C8S_NAME/manifest.json to publish the schemas beside" >&2; exit 1; }
+# The kernel as it was built, which the builder writes beside the fragment.
+SNAPSHOT=$PGI_DIR/kernel/config-x86_64-$(basename "$FRAGMENT" .config).snapshot
+if ! grep -q -x 'CONFIG_INIT_ON_FREE_DEFAULT_ON=y' "$SNAPSHOT"; then
+    echo "session-guest-image/build: the kernel that was built does not zero what it frees (no CONFIG_INIT_ON_FREE_DEFAULT_ON=y in $SNAPSHOT): the one-time keys would outlive their helper" >&2
+    exit 1
+fi
 # The builder clears its staging area. The binary prints the same bytes again.
 for schema in disclosure bind; do
     "$C8S_BINARY" schema "$schema" > "output/$C8S_NAME/$schema-schema.json"

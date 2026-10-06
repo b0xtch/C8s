@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/ed25519"
 	"crypto/hkdf"
 	"crypto/hpke"
 	"crypto/rand"
@@ -403,34 +404,95 @@ type OpenedCredential struct {
 // The caller erases key, and holds what this returns no longer than it takes
 // to act on it and answer.
 func OpenSealed(key hpke.PrivateKey, bind *SignedBind, sealed []byte) (*OpenedSealed, error) {
-	if len(sealed) > MaxSealedBytes {
-		return nil, errors.New("the sealed message is larger than one is")
-	}
-	// The hybrid KEM's encapsulated key leads the sealed message.
-	if len(sealed) <= encapsulationSize {
-		return nil, errors.New("the sealed message is no sealed message")
-	}
-	enc, ciphertext := sealed[:encapsulationSize], sealed[encapsulationSize:]
-	kdf, aead := sealedSuite()
-	recipient, err := hpke.NewRecipient(enc, key, kdf, aead, sealedInfoFor(bind))
-	if err != nil {
-		return nil, errors.New("the sealed message does not open: it was sealed to another guest's key")
-	}
-	text, err := recipient.Open(nil, ciphertext)
-	if err != nil {
-		return nil, errors.New("the sealed message does not open: it was sealed to another key, or for another bind")
-	}
-	secret, err := recipient.Export(sealedExport, 32)
+	text, secret, err := OpenSealedWithKey(key, SealedInfo(bind), sealed)
 	if err != nil {
 		return nil, err
 	}
-	out := &OpenedSealed{enc: bytes.Clone(enc), secret: secret}
+	return OpenedSealedOf(sealed, text, secret), nil
+}
+
+// SealedInfo is what a message sealed with bind is sealed under, beside the
+// guest's key: the bind's digest, so that it opens under no other bind.
+func SealedInfo(bind *SignedBind) []byte { return sealedInfoFor(bind) }
+
+// OpenSealedWithKey is the part of opening a sealed message that takes the
+// guest's one-time KEM key: it gives what was sealed, and the secret the
+// answer is sealed under, which is exported from the opening and is no key
+// to the message. Whoever holds the key does this and nothing else of
+// opening, so that the key can live where nothing else of a bind is read. A
+// message sealed to another key, or under other info, does not open.
+func OpenSealedWithKey(key hpke.PrivateKey, info, sealed []byte) (text, secret []byte, err error) {
+	if len(sealed) > MaxSealedBytes {
+		return nil, nil, errors.New("the sealed message is larger than one is")
+	}
+	// The hybrid KEM's encapsulated key leads the sealed message.
+	if len(sealed) <= encapsulationSize {
+		return nil, nil, errors.New("the sealed message is no sealed message")
+	}
+	enc, ciphertext := sealed[:encapsulationSize], sealed[encapsulationSize:]
+	kdf, aead := sealedSuite()
+	recipient, err := hpke.NewRecipient(enc, key, kdf, aead, info)
+	if err != nil {
+		return nil, nil, errors.New("the sealed message does not open: it was sealed to another guest's key")
+	}
+	if text, err = recipient.Open(nil, ciphertext); err != nil {
+		return nil, nil, errors.New("the sealed message does not open: it was sealed to another key, or for another bind")
+	}
+	if secret, err = recipient.Export(sealedExport, 32); err != nil {
+		return nil, nil, err
+	}
+	return text, secret, nil
+}
+
+// RehearseOneTime does once, with keys it makes and throws away, what a
+// guest's one-time keys do at its bind: a signature, and the opening of a
+// sealed message. A bind is every guest's first, so whatever that work sets
+// up on first use, every start would pay for. It touches no key of the
+// guest's and leaves nothing a bind could find.
+func RehearseOneTime() error {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return err
+	}
+	word := []byte("a rehearsal")
+	if !ed25519.Verify(public, word, ed25519.Sign(private, word)) {
+		return errors.New("a signature made in rehearsal does not verify")
+	}
+	key, err := oneTimeKEM().GenerateKey()
+	if err != nil {
+		return err
+	}
+	kdf, aead := sealedSuite()
+	info := []byte(sealedInfo + "a rehearsal")
+	enc, sender, err := hpke.NewSender(key.PublicKey(), kdf, aead, info)
+	if err != nil {
+		return err
+	}
+	ciphertext, err := sender.Seal(nil, word)
+	if err != nil {
+		return err
+	}
+	text, _, err := OpenSealedWithKey(key, info, append(enc, ciphertext...))
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(text, word) {
+		return errors.New("a message sealed in rehearsal opened to something else")
+	}
+	return nil
+}
+
+// OpenedSealedOf is what a guest acts on of a sealed message that opened to
+// text, with the secret its answer is sealed under. It takes text and secret
+// for its own.
+func OpenedSealedOf(sealed, text, secret []byte) *OpenedSealed {
+	out := &OpenedSealed{enc: bytes.Clone(sealed[:min(len(sealed), encapsulationSize)]), secret: secret}
 	var plain sealedPlain
 	if err := decodeOne(text, &plain); err != nil || !plain.wellFormed() {
 		// It opened, so its sender gets a sealed answer, which says that
 		// what it sealed is no message.
 		out.Malformed = true
-		return out, nil
+		return out
 	}
 	if plain.Command != nil {
 		out.Command = &OpenedCommand{Authorization: plain.Command.Authorization, Exec: plain.Command.Exec}
@@ -438,7 +500,7 @@ func OpenSealed(key hpke.PrivateKey, bind *SignedBind, sealed []byte) (*OpenedSe
 	for _, c := range plain.Credentials {
 		out.Credentials = append(out.Credentials, OpenedCredential{Name: c.Name, Authorization: c.Authorization, Put: c.Put})
 	}
-	return out, nil
+	return out
 }
 
 // decodeOne reads text as exactly one JSON document with no member out does

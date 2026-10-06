@@ -153,7 +153,7 @@ func TestErasedOneTimeKeysLeaveNothingInMemory(t *testing.T) {
 	if !erasesTemporaries {
 		t.Fatal("this build does not erase what work on a secret leaves behind")
 	}
-	keys, err := newOneTime()
+	keys, err := newOneTime(nil)
 	if err != nil {
 		t.Fatal(err)
 	}

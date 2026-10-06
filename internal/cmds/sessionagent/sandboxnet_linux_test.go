@@ -36,6 +36,14 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	// And for the key helper, which the agent starts the same way.
+	if len(os.Args) == 3 && os.Args[1] == "session-agent" && os.Args[2] == "one-time-keys" {
+		if err := sessionagent.RunKeyHelper(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	// The limit the agent sets on user namespaces is the whole machine's. A
 	// test writes it to a file of its own.
 	limit, err := os.CreateTemp("", "max_user_namespaces")

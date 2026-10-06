@@ -5,27 +5,38 @@ import (
 	"crypto/hpke"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"runtime"
 	"sync"
 
 	"github.com/confidential-dot-ai/c8s/pkg/session"
 )
 
-// oneTime holds the private halves of the two keys a guest makes for its one
-// bind (session.OneTimeKeys), from boot until the bind has used them. Each is
-// kept in one place, which is zeroed when the key is erased, and is worked
-// with in the runtime's secret mode where the build has it: the registers
-// and the stack the work used are erased as it returns, and what it
-// allocated is erased when it is collected, which collect sees to.
+// oneTime is the two keys a guest makes for its one bind
+// (session.OneTimeKeys), from boot until the bind has used them.
+//
+// In a guest their private halves live in a helper process (keyHelper),
+// which signs and opens with them for the agent and exits: the agent never
+// holds either, and they are gone when the helper is reaped, which the
+// sandbox's start waits for.
+//
+// Without a helper, as in a test, this holds them itself. Each is kept in
+// one place, which is zeroed when the key is erased, and is worked with in
+// the runtime's secret mode where the build has it: the registers and the
+// stack the work used are erased as it returns, and what it allocated is
+// erased when it is collected, which collect sees to.
 //
 // Code that breaks out of the session's sandbox can read this process. By
 // then both keys are gone: the signing key before the guest takes anything
 // for the tenant, the KEM key before the sandbox runs, and what either left
-// on the heap before the sandbox is started.
+// behind before the sandbox is started.
 type oneTime struct {
 	// public are the public halves, which the guest serves for as long as
 	// it lives.
 	public session.OneTimeKeys
+	// helper, when set, is the process that holds the private halves. What
+	// follows it is then unused.
+	helper *keyHelper
 
 	mu sync.Mutex
 	// signing is the Ed25519 private key, nil once erased.
@@ -54,8 +65,24 @@ var spentKey = ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 // seed its two halves are derived from.
 const kemSeedSize = 32
 
-// newOneTime makes the two keys.
-func newOneTime() (*oneTime, error) {
+// newOneTime makes the two keys: in the helper that start starts, or here
+// when start is nil.
+func newOneTime(start func() (*keyHelper, error)) (*oneTime, error) {
+	if start != nil {
+		helper, err := start()
+		if err != nil {
+			return nil, fmt.Errorf("start the key helper: %w", err)
+		}
+		o := &oneTime{helper: helper}
+		if o.public, err = helper.keys(); err == nil {
+			err = o.public.Validate()
+		}
+		if err != nil {
+			_ = helper.finish()
+			return nil, err
+		}
+		return o, nil
+	}
 	o := &oneTime{
 		signing: make([]byte, ed25519.PrivateKeySize),
 		kem:     make([]byte, kemSeedSize),
@@ -103,6 +130,10 @@ func newOneTime() (*oneTime, error) {
 // unreachable, and a collection is what makes it look. It returns when that
 // is done, at once if nothing was left.
 func (o *oneTime) collect() {
+	if o.helper != nil {
+		// Nothing of the keys was ever on this process's heap.
+		return
+	}
 	o.mu.Lock()
 	due := o.used
 	o.used = false
@@ -125,18 +156,31 @@ func (o *oneTime) collect() {
 	}
 }
 
-// finish returns once nothing of the keys is left on the heap: it runs the
-// collection that is due, if one is, and waits for every other on its way,
-// whoever began it. Its caller has seen to it that no work on a key begins
-// any more.
-func (o *oneTime) finish() {
+// finish returns once nothing of the keys is left. With a helper that is
+// once the helper is reaped: every thread of it has exited by then and its
+// memory is freed, which the kernel zeroes as it frees it. A helper that
+// went badly, as one asked for what it does not do, fails the admission
+// that waits here. Without one, finish runs the collection that is due, if
+// one is, and waits for every other on its way, whoever began it. Its
+// caller has seen to it that no work on a key begins any more.
+func (o *oneTime) finish() error {
+	if o.helper != nil {
+		if err := o.helper.finish(); err != nil {
+			return fmt.Errorf("the key helper: %w", err)
+		}
+		return nil
+	}
 	o.collect()
 	o.inflight.Wait()
+	return nil
 }
 
 // erased reports whether nothing of the keys is left: both are gone, and so
-// is what work on them left on the heap.
+// is what work on them left behind.
 func (o *oneTime) erased() bool {
+	if o.helper != nil {
+		return o.helper.gone()
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.signing == nil && o.kem == nil && !o.used && o.collecting == 0
@@ -145,6 +189,9 @@ func (o *oneTime) erased() bool {
 // sign signs message with the one-time signing key and erases the key. It
 // signs once: a second call finds no key.
 func (o *oneTime) sign(message []byte) ([]byte, error) {
+	if o.helper != nil {
+		return o.helper.sign(message)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.signing == nil {
@@ -168,6 +215,10 @@ func (o *oneTime) sign(message []byte) ([]byte, error) {
 
 // eraseKEM erases the one-time KEM key.
 func (o *oneTime) eraseKEM() {
+	if o.helper != nil {
+		o.helper.noMoreOpens()
+		return
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	clear(o.kem)
@@ -177,6 +228,9 @@ func (o *oneTime) eraseKEM() {
 // kemGone reports whether the KEM key is erased: a sealed message was
 // opened with it, or the time for one is over.
 func (o *oneTime) kemGone() bool {
+	if o.helper != nil {
+		return o.helper.kemGone()
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.kem == nil
@@ -184,6 +238,9 @@ func (o *oneTime) kemGone() bool {
 
 // gone reports whether both keys are erased.
 func (o *oneTime) gone() bool {
+	if o.helper != nil {
+		return o.helper.gone()
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.signing == nil && o.kem == nil
@@ -192,6 +249,13 @@ func (o *oneTime) gone() bool {
 // open opens a message sealed to the one-time KEM key, under bind, and erases
 // the key: it opens one message, or none. A second call finds no key.
 func (o *oneTime) open(bind *session.SignedBind, sealed []byte) (*session.OpenedSealed, error) {
+	if o.helper != nil {
+		text, secret, err := o.helper.open(session.SealedInfo(bind), sealed)
+		if err != nil {
+			return nil, err
+		}
+		return session.OpenedSealedOf(sealed, text, secret), nil
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.kem == nil {
