@@ -68,6 +68,8 @@ type Daemon struct {
 	now    func() time.Time
 	// bootTimeout is how long a TD may take to serve.
 	bootTimeout time.Duration
+	// turns bounds the binds in guests' hands at once: nil bounds nothing.
+	turns *turns
 	// writeFile puts a record's file in place, whole or not at all, where a
 	// test has its own way to: see write.
 	writeFile atomic.Pointer[func(path string, data []byte, mode os.FileMode) error]
@@ -117,6 +119,7 @@ func New(cfg *Config, runner Runner, log *slog.Logger) *Daemon {
 	for i := range cfg.Pools {
 		d.pools[cfg.Pools[i].name] = &poolState{cfg: &cfg.Pools[i]}
 	}
+	d.turns = newTurns(cfg.BindsAtOnce, cfg.Capacity)
 	return d
 }
 
@@ -468,7 +471,7 @@ func (d *Daemon) armLapse(t *td) {
 func (d *Daemon) lapsed(t *td) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.releasable(t) {
+	if d.lapsable(t) {
 		d.log.Info("a claim lapsed", "td", t.rec.ID, "session", t.rec.Claim.Session)
 		d.release(t, "")
 	}
@@ -479,6 +482,13 @@ func (d *Daemon) lapsed(t *td) {
 // nobody else reaches a guest that is not bound. The caller holds the lock.
 func (d *Daemon) releasable(t *td) bool {
 	return t.rec.State == StateClaimed && t.rec.Bind == nil && !t.busy
+}
+
+// lapsable is releasable for a claim whose grace has run out: a TD whose
+// bind waits its turn stays claimed for as long as it waits. The caller
+// holds the lock.
+func (d *Daemon) lapsable(t *td) bool {
+	return d.releasable(t) && t.waits == 0
 }
 
 // release returns a releasable TD to its pool, for destroyID when a Destroy

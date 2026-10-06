@@ -502,7 +502,7 @@ func (d *Daemon) lateSealed(stream sessionv1alpha1.Sessions_BindServer, relaying
 // never was: a sealed message that follows the bind is sent to the guest
 // after the bind, on a connection opened after it, which is one the guest's
 // fence lets in.
-func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (*sessionv1alpha1.Bound, following, error) {
+func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, relaying chan<- *td) (answer *sessionv1alpha1.Bound, later following, err error) {
 	began := time.Now()
 	var told sync.Once
 	tell := func(t *td) { told.Do(func() { relaying <- t }) }
@@ -526,13 +526,58 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	// claims the one it is for.
 	var claiming *claimant
 	if req.GetTd() == "" {
-		var err error
 		if claiming, err = d.claimant(ctx, req); err != nil {
 			return nil, nil, err
 		}
 	} else if certs := presented(ctx); len(certs) == 0 || !d.chained(certs) {
 		return nil, nil, status.Error(codes.Unauthenticated, "a bind for a claimed TD needs an orchestrator's certificate")
 	}
+
+	// The caller may bind: past the bound on binds at once, this one now
+	// waits its turn, having reached no guest. A bind that claims its TD
+	// claims it when its turn comes. A TD that was claimed before its bind
+	// stays claimed while the bind waits.
+	held := d.holdClaim(req.GetTd())
+	queued := time.Now()
+	done, waited, err := d.turns.take(ctx, caller(ctx))
+	turn := time.Since(queued)
+	if err == nil && waited {
+		// A bind whose time ran out as it waited is dropped here: handed on,
+		// its guest would refuse it and end.
+		if at, ok := session.BindExpiry(req.GetBind()); ok && d.now().After(at) {
+			done()
+			err = errBindLapsed
+		}
+	}
+	d.freeClaim(held, err != nil)
+	switch {
+	case errors.Is(err, errLineFull):
+		return nil, nil, status.Error(codes.ResourceExhausted, "as many of this caller's binds wait their turn as this host runs TDs: this one reached no guest and claimed nothing")
+	case errors.Is(err, errBindLapsed):
+		return nil, nil, status.Error(codes.DeadlineExceeded, "the bind's time ran out before its turn came: it reached no guest and claimed nothing")
+	case errors.Is(err, context.DeadlineExceeded):
+		return nil, nil, status.Error(codes.DeadlineExceeded, "the bind's turn had not come when its caller gave up: it reached no guest and claimed nothing")
+	case err != nil:
+		return nil, nil, status.Error(codes.Canceled, "the bind's turn had not come when its caller left: it reached no guest and claimed nothing")
+	}
+	// The turn lasts until the guest has sent its receipt and its quote
+	// over the bind's nonce, or given the quote up, or the call is over. It
+	// does not wait for the command that came sealed with the bind: that is
+	// a tenant's own work, and no other caller's bind waits on it.
+	defer func() {
+		if err != nil || later == nil || settled(answer.GetEvidence()) {
+			done()
+			return
+		}
+		said := later
+		later = func() (*followed, error) {
+			next, err := said()
+			if err != nil || next.evidence != nil {
+				done()
+			}
+			return next, err
+		}
+	}()
 
 	d.mu.Lock()
 	var t *td
@@ -543,7 +588,6 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 			return nil, nil, status.Error(codes.NotFound, "no such TD")
 		}
 	} else {
-		var err error
 		if t, err = d.claimable(claiming, req.GetRequestId()); err != nil {
 			d.mu.Unlock()
 			return nil, nil, err
@@ -657,13 +701,13 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	}
 	// Of the guest's evidence the answer carries what the bind changed.
 	evidence := changed(relayed.evidence)
-	answer := &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, SealedStatus: relayed.sealed}
+	answer = &sessionv1alpha1.Bound{Evidence: evidence, Receipt: relayed.receipt, SealedStatus: relayed.sealed}
 	if t.rec.Claim != nil && t.rec.Claim.ByBind {
 		// Whoever sent the bind learns which TD it claimed.
 		answer.Td, answer.Host = t.rec.ID, d.cfg.Host
 	}
 	// And so does what follows.
-	later := func() (*followed, error) {
+	later = func() (*followed, error) {
 		next, err := relayed.later()
 		if err == nil && next.evidence != nil {
 			next.evidence = changed(next.evidence)
@@ -682,10 +726,65 @@ func (d *Daemon) bind(ctx context.Context, req *sessionv1alpha1.BindRequest, rel
 	snapshot := t.snapshot()
 	answered = &snapshot
 	d.log.Info("bound a TD", "td", t.rec.ID, "session", t.session(), "phase", evidence.GetPhase(),
-		"took_us", time.Since(began).Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
+		"took_us", time.Since(began).Microseconds(), "turn_us", turn.Microseconds(), "guest_us", guest.Microseconds(), "answer_bytes", len(t.rec.Bind.Answer),
 		"sealed", relayed.sealed, "claimed_by_bind", t.rec.Claim != nil && t.rec.Claim.ByBind)
 	d.notify()
 	return answer, later, nil
+}
+
+// errBindLapsed is a bind whose time ran out while it waited its turn.
+var errBindLapsed = errors.New("the bind's time ran out before its turn came")
+
+// caller names whoever sent a call, for the turns of its binds: by the key
+// of the certificate it presented.
+func caller(ctx context.Context) string {
+	certs := presented(ctx)
+	if len(certs) == 0 {
+		return ""
+	}
+	key, err := session.InstanceKeyDigest(certs[0].PublicKey)
+	if err != nil {
+		return ""
+	}
+	return key
+}
+
+// settled reports whether evidence a guest gave after its bind says where
+// the quote over the bind's nonce ended: taken, and here, or given up.
+func settled(e *sessionv1alpha1.Evidence) bool {
+	return len(e.GetQuote()) > 0 || e.GetBindQuote() == session.BindQuoteTaken || e.GetBindQuote() == session.BindQuoteGivenUp
+}
+
+// holdClaim keeps the claim on the TD named, if it is claimed and waits for
+// its bind, from lapsing while that bind waits its turn. It returns the TD
+// it holds, or nil.
+func (d *Daemon) holdClaim(id string) *td {
+	if d.turns == nil || id == "" {
+		return nil
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t, ok := d.tds[id]
+	if !ok || !d.releasable(t) {
+		return nil
+	}
+	t.waits++
+	return t
+}
+
+// freeClaim ends holdClaim's hold on a TD. gone says the bind it was held
+// for never had its turn: a claim whose grace ran out meanwhile lapses now.
+func (d *Daemon) freeClaim(t *td, gone bool) {
+	if t == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	t.waits--
+	if gone && d.lapsable(t) && !d.now().Before(t.rec.Claim.BindBy) {
+		d.log.Info("a claim lapsed", "td", t.rec.ID, "session", t.rec.Claim.Session)
+		d.release(t, "")
+	}
 }
 
 // changed is what a bind changed of its guest's evidence, which is all that

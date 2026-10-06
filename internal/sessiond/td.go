@@ -108,6 +108,9 @@ type td struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	lapse  *time.Timer
+	// waits counts the binds for this TD that wait their turn: its claim
+	// does not lapse meanwhile.
+	waits int
 	// busy marks a call that is talking to the guest about a claim or a bind.
 	busy bool
 	// gone is set once the TD's process is no more: its slot and its share of

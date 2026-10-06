@@ -199,6 +199,13 @@ func NewHostWithSandbox(t testing.TB, depth int, sandbox sessionsim.Sandbox) *Ho
 	return newHost(t, depth, nil, false, sandbox)
 }
 
+// NewHostWith is NewHostWithSandbox for a daemon whose configuration mutate
+// changes first.
+func NewHostWith(t testing.TB, depth int, mutate func(*sessiond.Config), sandbox sessionsim.Sandbox) *Host {
+	t.Helper()
+	return newHost(t, depth, mutate, false, sandbox)
+}
+
 // NewHostWithKeyService is NewHost for a pool whose launch document pins a
 // key service, which runs beside the host.
 func NewHostWithKeyService(t testing.TB, depth int, mutate func(*sessiond.Config)) *Host {

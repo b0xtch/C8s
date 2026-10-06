@@ -122,10 +122,16 @@ type Config struct {
 	// launcher's log.
 	StateDir string `yaml:"stateDir"`
 	// Capacity is the most TDs this host runs at once, in every state.
-	Capacity int       `yaml:"capacity"`
-	TLS      TLSConfig `yaml:"tls"`
-	Network  Network   `yaml:"network"`
-	VMM      VMM       `yaml:"vmm,omitempty"`
+	Capacity int `yaml:"capacity"`
+	// BindsAtOnce is the most binds this host's guests work on at once. A
+	// start takes processor time on the host, and past what the host has,
+	// every start in flight is served slower and they all end late
+	// together. A bind past the bound waits its turn, in the order it came.
+	// 0 bounds nothing.
+	BindsAtOnce int       `yaml:"bindsAtOnce,omitempty"`
+	TLS         TLSConfig `yaml:"tls"`
+	Network     Network   `yaml:"network"`
+	VMM         VMM       `yaml:"vmm,omitempty"`
 	// Classes are the launch shapes this host offers, by name. A pool's
 	// launch document names one.
 	Classes map[string]Class `yaml:"classes"`
@@ -295,6 +301,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Capacity <= 0 {
 		return errors.New("capacity must be at least 1: it is the most TDs this host runs at once")
+	}
+	if c.BindsAtOnce < 0 {
+		return errors.New("bindsAtOnce is the most binds this host's guests work on at once, or 0 for no bound")
 	}
 	if c.TLS.Cert == "" || c.TLS.Key == "" || c.TLS.ClientCA == "" {
 		return errors.New("tls.cert, tls.key and tls.clientCA are required")

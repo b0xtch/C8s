@@ -207,6 +207,21 @@ func (b *Bind) Validate() error {
 	return nil
 }
 
+// BindExpiry reads from a bind's bytes when the bind stops being applicable,
+// for a relay that holds a bind back and must not hand on one whose time has
+// passed. It judges nothing else of the bind: ok is false for bytes that
+// name no such time, which their guest refuses.
+func BindExpiry(raw []byte) (at time.Time, ok bool) {
+	var doc struct {
+		NotAfter string `json:"notAfter"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(bindTimeLayout, doc.NotAfter)
+	return at, err == nil
+}
+
 // Expiry is NotAfter as a time. Validate has established that it parses.
 func (b *Bind) Expiry() time.Time {
 	t, _ := time.Parse(bindTimeLayout, b.NotAfter)

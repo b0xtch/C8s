@@ -100,3 +100,14 @@ func (d *Daemon) SaveOutOfOrder(td string, later State) (State, error) {
 	}
 	return "", os.ErrNotExist
 }
+
+// StateOf is the state the daemon holds td in, or "" for a TD it does not
+// hold.
+func (d *Daemon) StateOf(td string) State {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if t, ok := d.tds[td]; ok {
+		return t.rec.State
+	}
+	return ""
+}
