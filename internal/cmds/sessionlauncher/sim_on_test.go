@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -389,5 +390,55 @@ func TestSimulatedTEEFlagSaysWhatItIs(t *testing.T) {
 	s.flags(set)
 	if err := set.Parse([]string{"--simulated-tee", "/authority"}); err != nil || !s.on() || s.Dir != "/authority" {
 		t.Fatalf("--simulated-tee /authority: %v, on %v", err, s.on())
+	}
+}
+
+// A test adds words to a simulated guest's kernel command line through the
+// string the image's boot stub reads outside a TEE. No guest in a TEE is
+// launched with them, and a word is one word.
+func TestSimulatedKernelWordsGoToTheBootStub(t *testing.T) {
+	flag := newRunCmd().Flags().Lookup("simulated-kernel-word")
+	if flag == nil || !strings.Contains(flag.Usage, "DEVELOPMENT ONLY") {
+		t.Fatalf("--simulated-kernel-word: %+v", flag)
+	}
+	cfg := baseConfig()
+	cfg.ImageDir = t.TempDir()
+	for _, name := range []string{diskFile, tdxFirmwareFile} {
+		if err := os.WriteFile(filepath.Join(cfg.ImageDir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	simulated(t, &cfg)
+	if got := cfg.sim.board(); got != nil {
+		t.Fatalf("a simulated machine with no word added has %q", got)
+	}
+	cfg.sim.KernelWords = []string{"init_on_free=0", "quiet"}
+	if err := cfg.sim.open(&cfg); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-smbios", "type=11,value=io.systemd.stub.kernel-cmdline-extra=init_on_free=0 quiet"}
+	if got := cfg.sim.board(); !slices.Equal(got, want) {
+		t.Fatalf("the machine's option for the words: %q, want %q", got, want)
+	}
+	args, err := cfg.QEMUArgs(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if at := slices.Index(args, want[0]); at < 0 || at+1 >= len(args) || args[at+1] != want[1] {
+		t.Fatalf("the VMM is not started with the words: %q", args)
+	}
+	for _, word := range []string{"", "a b", "a,b", "a\"b", "caf\u00e9", "a\nb"} {
+		cfg.sim.KernelWords = []string{word}
+		if err := cfg.sim.open(&cfg); err == nil || !strings.Contains(err.Error(), "no single word") {
+			t.Errorf("the word %q was taken: %v", word, err)
+		}
+	}
+	// With no simulation there is no machine to add them to.
+	alone := simulation{KernelWords: []string{"init_on_free=0"}}
+	if err := alone.open(&Config{Platform: "tdx"}); err == nil || !strings.Contains(err.Error(), "--simulated-tee") {
+		t.Fatalf("words for a guest in a TEE were taken: %v", err)
+	}
+	if got := alone.board(); got != nil {
+		t.Fatalf("a guest in a TEE is given %q", got)
 	}
 }

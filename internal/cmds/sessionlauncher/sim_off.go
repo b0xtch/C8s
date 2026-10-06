@@ -20,6 +20,9 @@ func (*simulation) flags(*pflag.FlagSet) {}
 
 func (*simulation) on() bool { return false }
 
+// board is what a simulation adds to its machine: this build adds nothing.
+func (*simulation) board() []string { return nil }
+
 func (*simulation) note() []any { return nil }
 
 func (*simulation) open(*Config) error { return nil }

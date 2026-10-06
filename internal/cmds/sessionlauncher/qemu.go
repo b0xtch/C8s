@@ -439,6 +439,7 @@ func (c *Config) QEMUArgs(launchPubPEM []byte) ([]string, error) {
 		// The board, the CPU and the firmware of a TD of this class, and no
 		// object that guards the guest: its TEE is simulated inside it.
 		args = append(args, "-cpu", "host", "-machine", c.machine(""), "-bios", fdPath(c.disks.firmware))
+		args = append(args, c.sim.board()...)
 	case c.Platform == "tdx":
 		object := map[string]any{"qom-type": "tdx-guest", "id": "tee0"}
 		if c.QuoteSocket != "" {

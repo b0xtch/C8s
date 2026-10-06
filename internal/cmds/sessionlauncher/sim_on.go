@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -38,13 +39,26 @@ type simulation struct {
 	// image's manifest: work no launcher of a TD does, since the TDX module
 	// measures what a TD boots.
 	checked time.Duration
+	// KernelWords are more words for the guest kernel's command line: for a
+	// test of what a guest does when its kernel is started otherwise than
+	// its image has it.
+	KernelWords []string
 }
 
 // open reads the authority, before the launcher makes any road that leads
 // to whoever serves its documents.
 func (s *simulation) open(cfg *Config) (err error) {
 	if !s.on() {
+		if len(s.KernelWords) != 0 {
+			return errors.New("--simulated-kernel-word is for a guest whose TEE is simulated (--simulated-tee)")
+		}
 		return nil
+	}
+	for _, word := range s.KernelWords {
+		// A word, as the VMM's option and the kernel's command line take one.
+		if word == "" || strings.ContainsFunc(word, func(r rune) bool { return r <= ' ' || r > '~' || r == ',' || r == '"' }) {
+			return fmt.Errorf("--simulated-kernel-word %q is no single word of a kernel's command line", word)
+		}
 	}
 	if cfg.Platform != "tdx" {
 		return fmt.Errorf("a TEE is simulated for tdx alone, and the guest's platform is %s", cfg.Platform)
@@ -59,9 +73,25 @@ func (s *simulation) open(cfg *Config) (err error) {
 func (s *simulation) flags(f *pflag.FlagSet) {
 	f.StringVar(&s.Dir, "simulated-tee", "",
 		"DEVELOPMENT ONLY, and protects nothing: boot the guest with no TEE and simulate one in software, under the simulated authority in this directory ('c8s session simtee new'). The image must be one built for it. The launcher declares the registers its manifest names, where a TDX module would measure them")
+	f.StringArrayVar(&s.KernelWords, "simulated-kernel-word", nil,
+		"DEVELOPMENT ONLY, with --simulated-tee: one more word for the guest kernel's command line, which the image's boot stub takes from its machine where it finds no TEE. For a test of what a guest does when its kernel is started otherwise than its image has it")
 }
 
 func (s *simulation) on() bool { return s.Dir != "" }
+
+// stubCommandLine names the SMBIOS string from which the image's boot stub
+// takes more words for the kernel's command line. The stub reads it only
+// where it finds no TEE: a TD's host can add no word this way.
+const stubCommandLine = "io.systemd.stub.kernel-cmdline-extra="
+
+// board is what a test adds to the simulated machine: the words for the
+// kernel's command line, as the VMM's option for that string.
+func (s *simulation) board() []string {
+	if !s.on() || len(s.KernelWords) == 0 {
+		return nil
+	}
+	return []string{"-smbios", "type=11,value=" + stubCommandLine + strings.Join(s.KernelWords, " ")}
+}
 
 // note is what the launcher's log says of the simulation beside its warning:
 // the time of its own check, which a record of a boot names apart.

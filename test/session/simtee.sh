@@ -343,6 +343,27 @@ if ! [[ $machine =~ ^[0-9a-f]{96}$ ]]; then
 fi
 check "two shapes are two machines" test "$machine" != "$ks_machine"
 stop_pid "$probe_pid"; probe_pid=""
+# One more development boot, of a guest whose kernel is told to leave the
+# memory it frees as it is. The boot stub of a guest in no TEE takes the
+# word from its machine; in a TEE it takes none from there. The agent reads
+# what came of it in the kernel's log, says so, and does not serve: its
+# guest ends.
+if [ "$dev" = 1 ]; then
+    sudo -n "$SIM" "${launcher[@]}" "${simulated[@]}" --simulated-kernel-word init_on_free=0 --image-dir "$IMG" \
+        --launch-dir "$out/bundle-probe/opkeydata" --work-dir "$out/unzeroed-vm" --name "c8s-session-unzeroed-$run" "${shape[@]}" \
+        --network user --port "127.0.0.1:$probe_port:8443" > "$out/unzeroed.log" 2>&1 &
+    probe_pid=$!
+    if serving "$probe_pid" "$probe_port"; then
+        record FAIL "a guest whose kernel does not zero the memory it frees does not serve" "it serves"
+    elif kill -0 "$probe_pid" 2>/dev/null; then
+        record FAIL "a guest whose kernel does not zero the memory it frees does not serve" "it neither served nor ended: $(tail -c 400 "$out/unzeroed.log" | tr '\n' ' ')"
+    else
+        record PASS "a guest whose kernel does not zero the memory it frees does not serve"
+    fi
+    stop_pid "$probe_pid"; probe_pid=""
+    check "its agent said what its kernel's log says of freed memory" \
+        grep -a -q -E 'kernel says \\?"mem auto-init: [^"]*heap free:off' "$out/unzeroed.log"
+fi
 
 # What the guest's kernel takes of KVM's paravirtual features, as hardware.sh
 # checks of a TD: the guest is launched once more under a VMM that offers

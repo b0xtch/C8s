@@ -259,6 +259,9 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if cfg.sim.on() {
 		log.Warn("this guest runs in no TEE: its launcher declared its registers and handed it its platform's quoting enclave", cfg.sim.note()...)
 	}
+	if words := cfg.sim.board(); words != nil {
+		log.Warn("this guest's kernel is started with more words than its image has, and its registers do not show them", "machine", words[1])
+	}
 	log.Info("starting guest", append([]any{"platform", cfg.Platform,
 		"launch_digest", session.DocumentDigest(launch), "vcpus", cfg.VCPUs, "memory_mib", cfg.MemoryMiB, "network", cfg.Network},
 		described...)...)
