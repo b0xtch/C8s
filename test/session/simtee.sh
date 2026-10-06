@@ -81,9 +81,11 @@ if sudo -n nft list table inet c8s_sessions > /dev/null 2>&1; then
     echo "the packet filter holds a table inet c8s_sessions: a session daemon runs here, or one left it behind" >&2
     exit 2
 fi
-sandbox=() ref="" store=""
+sandbox=() ref="" ref_ends="" store=""
 if [ -n "$store_dir" ]; then
     ref=$(cat "$store_dir/ref") store=$store_dir/images.store
+    # A store written before the tool made this image has none of it.
+    ref_ends=$(cat "$store_dir/ref-ends" 2>/dev/null || true)
     [ -n "$ref" ] && [ -f "$store" ] || { echo "$store_dir is no directory written by test/session/sandboximage" >&2; exit 2; }
     sandbox=(--sandbox-image "$ref")
 elif [ "$dev" != 1 ]; then
@@ -440,8 +442,9 @@ check "no VMM of the pool was asked for a TEE" sh -c "! pgrep -af '[q]emu-system
 # A session, as on a TD: claimed, bound, handed the stored credential by the
 # key service, and verified from a fresh quote.
 orchestrator=(--daemon "127.0.0.1:$port" --daemon-ca "$pki/ca.pem" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key")
-session=(--pool agents --wait 120s --image-manifest "$manifest" --launch-key "$out/bundle/opkeydata/pubkey" --authority-key "$out/authority.key"
-    --tenant acme --key-service "$pin" --stored-credential api-token:256 "${sandbox[@]}")
+asked=(--pool agents --wait 120s --image-manifest "$manifest" --launch-key "$out/bundle/opkeydata/pubkey" --authority-key "$out/authority.key"
+    --tenant acme --key-service "$pin" --stored-credential api-token:256)
+session=("${asked[@]}" "${sandbox[@]}")
 expect 0 "a session starts in a guest with no TEE, under the simulated authority" start \
     "$SIM" session start "${orchestrator[@]}" "${session[@]}" --session s1 --out "$out/s1" -o json "${simulated[@]}"
 s1=(--binding "$out/s1" --image-manifest "$manifest" "${simulated[@]}")
@@ -469,6 +472,30 @@ expect 2 "a verifier under another simulated authority refuses the session" veri
 expect 0 "the session's own verifier still takes it" verify-again "$SIM" session verify "${s1[@]}" --fresh
 
 expect 0 "the session ends" destroy "$SIM" session destroy --binding "$out/s1" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
+
+# A session whose policy names its image's command as its own process ends
+# when that process does. Its guest ends itself and tells its launcher why as
+# it goes, which needs no TEE, and powers off once the launcher has kept the
+# word: the daemon gives that word as the reason, and nothing of what the
+# process exited with. Three guests in a row: a word that only sometimes
+# arrives is one a guest took with it.
+if [ -n "$ref_ends" ]; then
+    said_why() { # said_why <count> <word>: so many guests ended with that word of their own
+        local deadline=$(( $(date +%s) + 60 ))
+        until [ "$(grep '"msg":"a TD ended"' "$out/daemon.log" 2>/dev/null | grep -c "\"reason\":\"the guest ended: $2\"")" -ge "$1" ]; do
+            [ "$(date +%s)" -lt "$deadline" ] || return 1
+            sleep 0.2
+        done
+    }
+    for i in 1 2 3; do
+        expect 0 "session e$i starts, whose own process is its image's command" "start-e$i" \
+            "$SIM" session start "${orchestrator[@]}" "${asked[@]}" --sandbox-image "$ref_ends" --sandbox-process image \
+            --session "e$i" --out "$out/e$i" -o json "${simulated[@]}"
+        expect 0 "a command has e$i's process end" "end-e$i" "$SIM" session exec --binding "$out/e$i" --image-manifest "$manifest" "${simulated[@]}" -- sh -c ': > /tmp/end'
+        check "e$i's guest ended itself and said that its session's process had ended" said_why "$i" "process_ended in phase running"
+    done
+    check "and none said anything of what its process exited with" sh -c "! grep '\"msg\":\"a TD ended\"' '$out/daemon.log' | grep -q 'status 3'"
+fi
 # Whoever served the documents takes its address with it.
 kill "$vendor_pid" 2>/dev/null
 deadline=$(( $(date +%s) + 20 ))

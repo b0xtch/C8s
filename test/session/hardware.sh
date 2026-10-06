@@ -102,9 +102,11 @@ if sudo -n nft list table inet c8s_sessions > /dev/null 2>&1; then
     echo "the packet filter holds a table inet c8s_sessions: a session daemon runs here, or one left it behind" >&2
     exit 2
 fi
-sandbox=() ref="" ref_changed="" store=""
+sandbox=() ref="" ref_changed="" ref_ends="" store=""
 if [ -n "$store_dir" ]; then
     ref=$(cat "$store_dir/ref") ref_changed=$(cat "$store_dir/ref-changed") store=$store_dir/images.store
+    # A store written before the tool made this image has none of it.
+    ref_ends=$(cat "$store_dir/ref-ends" 2>/dev/null || true)
     [ -n "$ref" ] && [ -f "$store" ] || { echo "$store_dir is no directory written by test/session/sandboximage" >&2; exit 2; }
     sandbox=(--sandbox-image "$ref")
 elif [ "$dev" != 1 ]; then
@@ -559,17 +561,9 @@ if [ -n "$ref_changed" ]; then
     expect 3 "a sandbox image whose content was changed is not run" start-changed \
         start_session s0 "$out/s0-changed" acme "$out/authority.key" "$manifest" "$launch_key" --sandbox-image "$ref_changed"
 fi
-# Each of those guests ended itself, and its init told its launcher why as
-# it went: the service exited while the guest was bound. The daemon gives
-# that word as the TD's reason for ending, on a locked image as on a dev one.
-said_why() { # said_why <count> <word>: so many TDs ended with that word
-    local deadline=$(( $(date +%s) + 60 ))
-    until [ "$(grep '"msg":"a TD ended"' "$out/daemon.log" 2>/dev/null | grep -c "\"reason\":\"the guest ended: $2\"")" -ge "$1" ]; do
-        [ "$(date +%s)" -lt "$deadline" ] || return 1
-        sleep 0.5
-    done
-}
-check "each guest that could not act on its bind said why it ended" said_why 3 "service_exited (status 1) in phase bound"
+# The daemon ended each of those TDs itself, on its guest's refusal.
+check "the daemon ended each TD whose guest could not act on its bind" \
+    [ "$(grep '"msg":"a TD ended"' "$out/daemon.log" | grep -c '"reason":"the guest refused its bind"')" -ge 3 ]
 
 # Two sessions of two tenants, each on a TD of its own. The first takes one
 # credential from the key service and is handed another by a key its bind
@@ -612,6 +606,61 @@ s3=(--binding "$out/s3" --image-manifest "$manifest" "${accept[@]}")
 expect 0 "a later command in s3" exec-s3 "$C8S" session exec "${s3[@]}" -- cat /tmp/first
 check "the first command ran once" [ "$(cat "$out/exec-s3.out")" = ran ]
 expect 0 "destroy s3" destroy-s3 "$C8S" session destroy --binding "$out/s3" --daemon-cert "$pki/orchestrator.pem" --daemon-key "$pki/orchestrator.key"
+
+# A session whose policy names its image's command as its own process ends
+# when that process does. Nobody ends this guest: it ends itself, and its
+# init tells its launcher why as it goes, as a code, and powers off once the
+# launcher has kept the word. The daemon gives that word as the TD's reason
+# for ending, on a locked image as on a dev one, and nothing of what the
+# process exited with. Three guests in a row: a word that only sometimes
+# arrives is one a guest took with it.
+said_why() { # said_why <count> <word>: so many TDs ended with that word of their guests'
+    local deadline=$(( $(date +%s) + 60 ))
+    until [ "$(grep '"msg":"a TD ended"' "$out/daemon.log" 2>/dev/null | grep -c "\"reason\":\"the guest ended: $2\"")" -ge "$1" ]; do
+        [ "$(date +%s)" -lt "$deadline" ] || return 1
+        sleep 0.2
+    done
+}
+# ended_after <seconds> <word>: how long after that time, in ms, the daemon
+# found the last TD that ended with that word gone, its VMM with it.
+ended_after() {
+    python3 -c '
+import datetime, json, sys
+took = None
+for line in open(sys.argv[1]):
+    try:
+        said = json.loads(line)
+    except ValueError:
+        continue
+    if said.get("msg") == "a TD ended" and said.get("reason") == "the guest ended: " + sys.argv[3]:
+        whole, _, rest = said["time"].partition(".")
+        digits = "".join(c for c in rest if c.isdigit())
+        ended = datetime.datetime.fromisoformat(whole + "+00:00").timestamp() + float("0." + (digits or "0"))
+        took = round((ended - float(sys.argv[2])) * 1000)
+if took is not None:
+    print(took)' "$out/daemon.log" "$1" "$2"
+}
+if [ -n "$ref_ends" ]; then
+    for i in 1 2 3; do
+        expect 0 "start session e$i, whose own process is its image's command" "start-e$i" \
+            start_session "e$i" "$out/e$i" acme "$out/authority.key" "$manifest" "$launch_key" --sandbox-image "$ref_ends" --sandbox-process image
+        ends=(--binding "$out/e$i" --image-manifest "$manifest" "${accept[@]}")
+        expect 0 "a command in e$i while its process runs" "exec-e$i" "$C8S" session exec "${ends[@]}" -- true
+        expect 0 "a command that has e$i's process end" "end-e$i" "$C8S" session exec "${ends[@]}" -- sh -c ': > /tmp/end'
+        told=$(date -u +%s.%N)
+        if said_why "$i" "process_ended in phase running"; then
+            took=$(ended_after "$told" "process_ended in phase running")
+            record PASS "e$i's guest ended itself and said that its session's process had ended" "gone ${took:-?} ms after the command returned"
+            printf '{"step":"guest-ended-itself","ms":%d}\n' "${took:-0}" >> "$out/records.jsonl"
+        else
+            record FAIL "e$i's guest ended itself and said that its session's process had ended" \
+                "$(grep '"msg":"a TD ended"' "$out/daemon.log" | tail -1 | cut -c1-300)"
+        fi
+        expect 124 "e$i runs nothing once its guest ended" "exec-e$i-ended" "$C8S" session exec "${ends[@]}" --timeout 20s -- true
+    done
+    check "no guest said anything of what its session's process exited with" \
+        sh -c "! grep '\"msg\":\"a TD ended\"' '$out/daemon.log' | grep -q 'status 3'"
+fi
 
 # A binder the pool names watches its ready TDs and judges each before its
 # claim: the second of two starts finds its guest judged, by its certificate
@@ -795,17 +844,27 @@ if [ "$dev" = 1 ] && [ -z "$store_dir" ]; then
     fi
 fi
 
-# A daemon restarted under live sessions finds its TDs. A TD that ended keeps
-# its VMM until its memory is the host's again, which takes seconds: those
-# are waited for first, so that the count is of TDs that live.
-live_tds() { sudo -n sh -c "grep -L '\"state\": *\"ended\"' '$out'/state/tds/*/td.json 2>/dev/null | wc -l"; }
-deadline=$(( $(date +%s) + 120 ))
-until [ "$(guests td-)" = "$(live_tds)" ] || [ "$(date +%s)" -ge "$deadline" ]; do
-    sleep 0.2
-done
-before=$(guests td-)
+# A daemon restarted under live sessions finds its TDs. What must outlive it
+# is the VMM of each TD that lives, which is at least s1's and s2's. A TD
+# that ended keeps its VMM for seconds, and a pool being refilled starts
+# more: a count of VMMs would take in both.
+live_vmms() {
+    local td
+    sudo -n sh -c "grep -L '\"state\": *\"ended\"' '$out'/state/tds/*/td.json 2>/dev/null" | while read -r td; do
+        pgrep -f "[q]emu-system.*guest=$(basename "$(dirname "$td")")"
+    done
+}
+outlived() { # outlived <pid>...: two VMMs or more, each of which still runs
+    local pid
+    [ "$#" -ge 2 ] || return 1
+    for pid in "$@"; do
+        [ -d "/proc/$pid" ] || return 1
+    done
+}
+lived=$(live_vmms)
 stop_pid "$daemon_pid"; daemon_pid=""
-check "the TDs outlive their daemon" [ "$(guests td-)" = "$before" ]
+# shellcheck disable=SC2086 # one word a VMM
+check "the TDs outlive their daemon" outlived $lived
 start_daemon
 sleep 2
 expect 0 "a command in s1 after the daemon restarted" exec-restart "$C8S" session exec "${s1[@]}" -- true

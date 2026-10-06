@@ -7,9 +7,11 @@
 // <dir>/ref names an image the registry serves truthfully. <dir>/ref-changed
 // names one whose layer was changed after its digest was taken, as a registry
 // substituting content would serve it. A guest must run the first and refuse
-// the second.
+// the second. <dir>/ref-ends names the first image's tree with a command
+// that ends, with status 3, once a file /tmp/end is there: a session that
+// names its image's command as its own process ends with it.
 //
-// With -store <file> it also writes both images as an image store, the file a
+// With -store <file> it also writes the images as an image store, the file a
 // launcher hands its guests with --image-store, and changes the same layer
 // there once the store is written, as a host would change its own file. With
 // -serve=false it writes the files and serves nothing: a guest then has the
@@ -110,6 +112,10 @@ func run(busyboxPath, listen, host, out, store string, serve bool) error {
 		Body:   "#!/bin/sh\ncat\necho $? >> /tmp/endings\n",
 	}
 	good := registry.Image([][]byte{imagestoretest.BusyboxLayer(busybox, echo)}, imagestoretest.ImageOptions{Config: config})
+	// The same tree under a command that ends when it is told to.
+	ending := *config
+	ending.Cmd = []string{"/bin/sh", "-c", "until [ -e /tmp/end ]; do sleep 0.1; done; exit 3"}
+	ends := registry.Image([][]byte{imagestoretest.BusyboxLayer(busybox, echo)}, imagestoretest.ImageOptions{Config: &ending})
 	whole := maps.Clone(registry.Blobs)
 
 	// A layer of its own, so changing it leaves the first image whole.
@@ -143,7 +149,7 @@ func run(busyboxPath, listen, host, out, store string, serve bool) error {
 	}
 
 	refs := func() error {
-		for name, desc := range map[string]ocispec.Descriptor{"ref": good, "ref-changed": changed} {
+		for name, desc := range map[string]ocispec.Descriptor{"ref": good, "ref-changed": changed, "ref-ends": ends} {
 			if err := os.WriteFile(filepath.Join(out, name), []byte(registry.Ref(desc.Digest)+"\n"), 0o644); err != nil {
 				return err
 			}
